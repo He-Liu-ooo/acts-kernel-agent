@@ -31,9 +31,9 @@
 
 ## Next Up
 
-### memory/retriever.py — experience retrieval
+### agents/llm_backend.py — OpenAI Agents SDK integration
 
-Pure Python, no GPU needed. Kernel-type filtering + bottleneck matching for optimization memory retrieval. Currently a skeleton.
+Foundation for all three agents. Skeleton currently returns defaults without calling an LLM. Needs: SDK wrapper, model configuration, structured output parsing via `OpenAIChatCompletionsModel`.
 
 ## Remaining (dependency-ordered)
 
@@ -58,7 +58,7 @@ Items marked `(skeleton)` have interfaces + placeholder logic that keeps the pip
 
 - [x] memory/experience.py (done) — Experience dataclass
 - [x] memory/store.py (done) — JSON persistence with save/load
-- [ ] memory/retriever.py (skeleton) — kernel-type filtering + bottleneck matching. Pure Python, no GPU.
+- [x] memory/retriever.py (done) — scored retrieval: kernel-type + hardware filtering, bottleneck + success + speedup scoring, reserved failure slots. Pure Python, no GPU.
 - [x] actions/registry.py (done) — registry + tier system
 - [ ] actions/tier1-6 (skeleton) — action definitions exist but guidance text is placeholder
 

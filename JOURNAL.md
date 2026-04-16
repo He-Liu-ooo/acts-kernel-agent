@@ -196,6 +196,22 @@ Search tree = intra-task working memory (full state per node, orchestrator uses 
 
 Planner doesn't read tree directly. Orchestrator extracts brief tree context (what actions tried at this state + outcomes). Prevents redundant exploration without exposing full tree. Combined with optimization memory, Planner sees: (1) what's been tried on THIS kernel, (2) what worked on SIMILAR past kernels, (3) what CAN be done, (4) what's happening NOW.
 
+### Scored retrieval with reserved failure slots (2026-04-16)
+
+**Rationale**: The skeleton retriever partitioned experiences by bottleneck match (exact first, then rest) but had no ranking within each partition and no guarantee that failures would surface. Three problems:
+
+1. **No success/failure differentiation**: The Planner needs both — successes to know what works, failures to know what to avoid. Pure score ranking would push failures to the bottom since they have low speedup (< 1.0), potentially excluding them entirely at small top_k.
+
+2. **No hardware awareness**: Experiences from different GPUs may be less relevant (e.g., an H100 tiling strategy may not transfer to A100). Same-hardware experiences should be preferred, with cross-hardware fallback when the same-hardware pool is too small.
+
+3. **No secondary ranking**: Among experiences with the same bottleneck match status, there was no ordering — insertion order determined results.
+
+**Scoring design**: Bottleneck match (+10) dominates, ensuring relevant experiences rank first. Success bonus (+3) separates successes from failures within the same bottleneck tier. Speedup (+min(speedup, 5.0), capped to prevent one outlier from dominating) provides fine-grained ordering. Tiebreaker is speedup.
+
+**Reserved failure slots**: `max(1, top_k // 3)` slots reserved for failures (at top_k >= 3). This ensures the Planner always sees "don't do this" examples alongside "do this" examples. For top_k < 3, no reservation — the single or two slots are too scarce to split, so pure score ranking applies (successes naturally outscore failures due to the +3 bonus).
+
+**Hardware filter is optional**: The retriever accepts `hardware=""` (default), which skips hardware filtering. The orchestrator is still a skeleton and doesn't pass hardware — this will be wired when the orchestrator gets its real implementation.
+
 ### Future: Reviewer Knowledge Base
 
 Three-tier structure: Compute-Reviewer KB, Memory-Reviewer KB, Shared Interaction KB.

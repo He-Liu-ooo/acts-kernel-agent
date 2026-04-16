@@ -35,11 +35,28 @@ This is real implemented logic (JSON serialization via `dataclasses.asdict`).
 
 Retrieves relevant past experiences for the Planner.
 
-Strategy:
-1. Filter by `kernel_type`
-2. Rank by bottleneck relevance (exact match first)
-3. Select top-K (configured by `optimization_memory_top_k`, default 5)
+### Retrieval pipeline
+
+1. **Filter by `kernel_type`** — exact match
+2. **Hardware filter** — if `hardware` is provided, prefer same-hardware experiences. Falls back to cross-hardware if fewer than `top_k` same-hardware matches exist.
+3. **Score and rank** — each experience gets a relevance score:
+   - Bottleneck exact match: +10
+   - Success: +3
+   - Speedup: +min(speedup, 5.0)
+   - Tiebreaker: speedup (higher first)
+4. **Select top-K with reserved failure slots** — successes and failures are ranked independently, then merged:
+   - `top_k >= 3`: reserves `max(1, top_k // 3)` slots for failures
+   - `top_k == 2`: reserves 1 slot for failures (if both pools exist)
+   - `top_k == 1`: no reservation — returns the single highest-scored experience
+   - If either pool is empty, its slots are given to the other pool
+
+### Interface
+
+```python
+MemoryRetriever(store: MemoryStore, top_k: int = 5)
+    .retrieve(kernel_type: str, current_bottleneck: str, hardware: str = "") -> list[Experience]
+```
+
+`hardware` is optional — the orchestrator currently omits it (skeleton phase). When the orchestrator gets its real implementation, it will pass the hardware identifier from config.
 
 Injected into Planner only — not Coder (has the plan), not Reviewer (evaluates independently).
-
-This is real implemented logic.

@@ -277,7 +277,7 @@ No kernel code stored — only summaries. Both successes and failures stored.
 ### Storage & Retrieval
 
 - **Backend**: JSON files. Simple, git-friendly, human-readable. No database.
-- **Retrieval**: (1) Filter by kernel type, (2) rank by bottleneck relevance, (3) select top-K (3-5 experiences).
+- **Retrieval**: (1) Filter by kernel type, (2) prefer same-hardware experiences (fall back to cross-hardware if insufficient), (3) score by bottleneck match + success + speedup, (4) select top-K with reserved failure slots so the Planner sees both what worked and what to avoid.
 - **Injection**: Planner only, contrastive summary format.
 
 ### Relationship to Search Tree
