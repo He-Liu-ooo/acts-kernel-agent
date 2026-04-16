@@ -91,6 +91,7 @@ class ACTSConfig:
 
     # Search parameters
     beam_width: int = 3
+    beam_diversity: bool = True
     max_depth: int = 20
     epsilon_start: float = 0.3
     epsilon_end: float = 0.05
@@ -130,7 +131,7 @@ def load_config(path: Path) -> ACTSConfig:
     cfg.read(path)
     kwargs: dict = {}
     _section_map = {
-        "search": ["beam_width", "max_depth", "epsilon_start", "epsilon_end"],
+        "search": ["beam_width", "beam_diversity", "max_depth", "epsilon_start", "epsilon_end"],
         "eval": ["warmup_runs", "timed_runs"],
         "move_on": ["sol_plateau_window", "sol_plateau_delta", "sol_target"],
         "debug": ["max_debug_retries", "max_baseline_retries"],
@@ -144,7 +145,10 @@ def load_config(path: Path) -> ACTSConfig:
         for key in keys:
             if cfg.has_option(section, key):
                 default_val = getattr(defaults, key)
-                kwargs[key] = type(default_val)(cfg.get(section, key))
+                if isinstance(default_val, bool):
+                    kwargs[key] = cfg.getboolean(section, key)
+                else:
+                    kwargs[key] = type(default_val)(cfg.get(section, key))
     # Hardware: load from SOLAR arch YAML if specified, else detect at runtime
     arch_path_str = cfg.get("hardware", "arch_config_path", fallback="")
     if arch_path_str:

@@ -2,11 +2,10 @@
 
 ## Session Start
 
-New session. Read the following files in order:
-
-1. [PRD.md](PRD.md) for project requirements, architecture, and constraints
-2. [PROCESS.md](PROCESS.md) — specifically the Implementation Status section
-3. If you want to review rationale behind certain design choices, refer to [JOURNAL.md](JOURNAL.md); if you want to know details about already implemented code, refer to [doc/](doc/README.md)
+1. [PROCESS.md](PROCESS.md) — current status and next feature
+2. Read doc/ files only for the specific module you're about to work on
+3. [PRD.md](PRD.md) — only if the task touches architecture or requirements
+4. [JOURNAL.md](JOURNAL.md) — only if you need rationale for a past decision
 
 Confirm your understanding of the project state and tell me where we left off.
 
@@ -30,3 +29,32 @@ Each step is user-triggered — Claude does not auto-advance to the next step.
 - Keep PRs small — each change should be small enough to be reviewed efficiently.
 - Do not commit until both Codex review and user review are complete.
 - Do not skip the test-first step for deterministic modules (eval, search, memory, config). For LLM agent modules, mocked tests are acceptable.
+
+### Design decisions
+
+When multiple approaches exist, present options with tradeoffs. Wait for user to pick before implementing. Record the decision + rationale in JOURNAL.md.
+
+### After any architectural change
+
+Run a consistency check across src/, doc/, PRD.md, JOURNAL.md, and PROCESS.md. Verify that terminology, function signatures, and data flow descriptions match the actual code. Fix stale references before committing.
+
+### Test Environment
+
+Tests run via: `source /tmp/acts_test_venv/bin/activate && python -m pytest tests/ -v`
+
+Venv has: pytest, pyyaml. Add new deps to both pyproject.toml AND the venv.
+
+### Doc mapping
+
+- `doc/eval.md` — eval harness (correctness, benchmark, profiler, roofline, scorer)
+- `doc/config.md` — HardwareSpec, ACTSConfig, load paths
+- `doc/search.md` — tree, beam, orchestrator
+- `doc/memory.md` — experience, store, retriever
+- `doc/pipeline.md` — optimize, verify, report
+
+### Don'ts
+
+- Don't read PRD.md or JOURNAL.md in full unless the task requires it.
+- Don't implement beyond the current skeleton interface without discussion.
+- Don't change function signatures of (done) modules without consistency check.
+- Don't add GPU-dependent logic to modules marked "Pure Python, no GPU."

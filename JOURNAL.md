@@ -20,6 +20,29 @@ When a node is expanded, the parent stays in the frontier. This is the key advan
 
 Some optimizations require passing through a performance valley (e.g., restructuring memory layout is temporarily slower but enables vectorized access for a net gain). AutoKernel's greedy revert-on-regression policy can never discover these paths. Regressed children are handled by three mechanisms: (1) score-based deprioritization, (2) beam constraint pruning, (3) Reviewer `branch_quality` override.
 
+### Diversity-aware beam pruning (B2) + branch-quality weighting (B3) (2026-04-16)
+
+**B3 — quality-weighted effective score**: Raw SOL score alone doesn't capture the Reviewer's assessment. A PROMISING node at 0.60 may be more valuable than a PLATEAU node at 0.62, because "promising" means the Reviewer sees visible underlying improvement. Small bonuses (+0.05 PROMISING, +0.02 BLOCKED_POTENTIAL, -0.02 PLATEAU) shift the ranking without overriding large score gaps.
+
+**B2 — diversity rescue**: Pure score ranking can collapse the frontier to one action type (e.g., all "tiling" nodes). This starves exploration — if tiling is a local optimum, the search can't escape. The diversity pass rescues one node per missing action type, but only if it's close enough to the cutoff (within 0.3) and there's redundancy to swap out. This preserves the PRD's "simple and debuggable" principle: diversity is a single post-sort pass, not a complex multi-objective ranking.
+
+**Root exclusion**: The orchestrator creates the root with `action_applied=""`. Without exclusion, diversity would rescue the root (unique empty action) over useful optimization nodes. Empty actions are excluded from diversity accounting.
+
+**Configurable**: `beam_diversity` config flag (default `true`). Allows disabling diversity for ablation studies or problems where pure exploitation is preferred.
+
+### Atomic checkpoint writes (2026-04-16)
+
+**Rationale**: Checkpointing exists to survive crashes. Writing directly to the final path means a crash mid-write corrupts the only recovery point — defeating the purpose. Temp file + `os.replace` is atomic on POSIX: the checkpoint is either the old version or the new version, never partial.
+
+### Global plateau detection (2026-04-16)
+
+**Rationale**: Two distinct plateau concepts in the system:
+
+- **Branch-level**: Reviewer marks individual nodes as `BranchQuality.PLATEAU`. These stay in the frontier but get deprioritized by score + quality weighting. This steers the search away from stale branches.
+- **Global**: The best score across the entire tree hasn't improved in `sol_plateau_window` consecutive iterations. This terminates the search — no branch is making progress.
+
+`detect_plateau` tracks the global best score per iteration (not the child's score, which could regress while the global best stays flat). The function lives in `orchestrator.py` (decision C2) because the tree is a pure data structure — tracking score history is a control-flow concern.
+
 ### Reviewer branch quality values
 
 - `"promising"` — regression but underlying improvement visible (e.g., "memory traffic dropped 40%, one more fix should recover latency")

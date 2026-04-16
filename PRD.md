@@ -24,7 +24,7 @@ Best-first tree search with beam constraint.
 - **Parent retention**: Parent stays in frontier after expansion, enabling backtracking.
 - **Child retention**: Children worse than their parent are kept by default. Regressed children are handled by: (1) score-based deprioritization, (2) beam constraint pruning, (3) Reviewer `branch_quality` override (`"promising"`, `"blocked_potential"`, `"plateau"`, `"dead_end"`).
 - **Scoring**: SOL Score (see Roofline Model & Optimization Headroom section).
-- **Termination**: All frontier nodes marked dead_end, iteration budget exhausted, SOL score approaching 1.0, or target speedup reached.
+- **Termination**: All frontier nodes marked dead_end, iteration budget exhausted, SOL score ≥ `sol_target`, or global plateau (best score stalled for `sol_plateau_window` iterations).
 - **Single strategy**: Tree search with beam pruning only. No evolutionary fallback — keeps the search layer simple and debuggable.
 
 ---
@@ -329,6 +329,7 @@ Run parameters are set through `.cfg` files (INI format, parsed via Python's `co
 ```ini
 [search]
 beam_width = 3
+beam_diversity = true
 max_depth = 20
 epsilon_start = 0.3
 epsilon_end = 0.05

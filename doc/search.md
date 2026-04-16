@@ -26,19 +26,43 @@ Manages tree state: nodes, frontier, and expansion.
 - `get_node(id) -> TreeNode`: Lookup.
 - `frontier() -> list[TreeNode]`: All non-dead_end nodes.
 - `best_node() -> TreeNode`: Highest SOL score.
-
-All real implemented logic.
+- `path_to_node(id) -> list[TreeNode]`: Ordered path from root to given node. Raises `KeyError` for unknown IDs.
+- `save(path)`: Serialize tree to JSON checkpoint. Uses atomic write (temp file + `os.replace`) so a crash mid-write can't corrupt the file.
+- `SearchTree.load(path) -> SearchTree`: Deserialize from JSON checkpoint. Raises `FileNotFoundError` for missing files. Preserves `_next_id` so new nodes don't collide.
 
 ## Beam Pruning — `beam.py`
 
-- `beam_prune(tree, beam_width) -> list[int]`: Prune frontier to beam_width nodes. Keeps highest-scoring. Returns pruned node IDs.
-- `select_next(tree, epsilon) -> TreeNode`: Epsilon-greedy selection. With probability (1-ε) pick best, with probability ε pick random.
+### `beam_prune(tree, beam_width, *, enable_diversity=True) -> list[int]`
 
-All real implemented logic.
+Prune frontier to `beam_width` nodes. Returns pruned node IDs.
+
+Ranking uses **effective score** = raw SOL score + branch-quality bonus (B3):
+
+| BranchQuality | Bonus |
+|---------------|-------|
+| PROMISING | +0.05 |
+| BLOCKED_POTENTIAL | +0.02 |
+| PLATEAU | -0.02 |
+| None | 0 |
+
+After score-based selection, a **diversity rescue pass** (B2) swaps in the best node of each missing action type — but only when:
+1. The candidate's effective score is within 0.3 of the worst kept node (large score gaps still dominate).
+2. There's a redundant action type with >1 kept nodes to swap out.
+3. The candidate has a non-empty `action_applied` (root/baseline nodes are excluded).
+
+Diversity can be disabled via config (`beam_diversity = false`) or `enable_diversity=False` parameter.
+
+### `select_next(tree, epsilon) -> TreeNode`
+
+Epsilon-greedy selection. With probability (1−ε) pick best, with probability ε pick random.
 
 ## Orchestrator — `orchestrator.py`
 
 Deterministic orchestrator. Not an LLM — pure Python control flow.
+
+### `detect_plateau(score_history, window, delta) -> bool`
+
+Returns True if the best score hasn't improved beyond `delta` over the last `window` entries. Used for global search termination — distinct from per-branch `BranchQuality.PLATEAU`.
 
 ### Per-Iteration Flow
 
@@ -54,7 +78,7 @@ Deterministic orchestrator. Not an LLM — pure Python control flow.
 ### Termination
 
 - `sol_target`: SOL score ≥ 0.95 (within 5% of hardware limit)
-- `plateau`: SOL score stalled for `sol_plateau_window` iterations
+- `plateau`: Best score stalled for `sol_plateau_window` iterations (checked via `detect_plateau`)
 - `budget`: `max_depth` iterations exhausted
 - `all_dead_end`: no expandable frontier nodes
 

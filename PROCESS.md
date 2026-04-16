@@ -7,71 +7,87 @@
 - [x] Architecture design (search strategy, agent architecture, action library, eval harness, optimization memory, backend choice, hardware handling)
 - [x] Directory structure design
 - [x] Pipeline flow design
+- [x] Project scaffolding (pyproject.toml, src/ skeleton with placeholder modules, pipeline runs end-to-end)
 
-## In Progress
+### Implemented during scaffolding (real logic, not placeholders)
 
-- [ ] Project scaffolding (pyproject.toml, src/ skeleton with placeholder modules)
+- [x] config.py — HardwareSpec (SOLAR arch YAML schema), load_hardware_spec(), load_config(), ACTSConfig
+- [x] kernels/kernel.py — Kernel, KernelSpec, KernelType dataclasses
+- [x] eval/scorer.py — SOL Score formula + reward_hack_suspect / calibration_warning audit flags
+- [x] eval/roofline.py — compute_roofline() (built-in fallback) + derive_t_sol_from_solar() wrapper
+- [x] benchmark/problem_loader.py — load_problem(), load_definition(), load_workloads(), problem_to_kernel_spec(), op_type mapping
+- [x] benchmark/workload_selector.py — select_workloads() (evenly-spaced sampling by problem size)
+- [x] benchmark/solution_formatter.py — format_solution() (SOL-ExecBench solution JSON)
+- [x] actions/registry.py — Action dataclass, ActionTier enum, build_default_registry()
+- [x] actions/tier1-6 — action definitions (guidance text is placeholder, but structure/metadata is real)
+- [x] memory/experience.py — Experience dataclass
+- [x] memory/store.py — MemoryStore with save/load/add_experience/query (real JSON persistence)
+
+### Implemented during search (real logic, not placeholders)
+
+- [x] search/tree.py — path_to_node, checkpoint save/load (atomic writes)
+- [x] search/beam.py — diversity-aware beam pruning (B2), branch-quality-weighted pruning (B3), configurable diversity (`beam_diversity`)
+- [x] search/orchestrator.py — `detect_plateau` wired into search loop, plateau termination
+
+## Next Up
+
+### memory/retriever.py — experience retrieval
+
+Pure Python, no GPU needed. Kernel-type filtering + bottleneck matching for optimization memory retrieval. Currently a skeleton.
 
 ## Remaining (dependency-ordered)
 
-### Phase 1: Foundation
-No dependencies. Everything else builds on these.
+Items marked `(skeleton)` have interfaces + placeholder logic that keeps the pipeline runnable. Items marked `(done)` have real implementations. Unmarked items need real implementation.
 
-- [ ] config.py — global config, hardware spec from SOLAR arch YAML (or runtime detection fallback)
-- [ ] kernels/kernel.py — kernel abstraction (code + metadata)
-- [ ] kernels/compiler.py — Triton compilation
+### Phase 1: Foundation
+
+- [x] config.py (done) — detect_hardware() is placeholder (deferred — YAML loading covers the primary path)
+- [x] kernels/kernel.py (done) — dataclasses complete
+- [ ] kernels/compiler.py (skeleton) — Triton compilation. Needs GPU for real tests.
 
 ### Phase 2: Evaluation Harness
-Depends on: Phase 1 (kernel abstraction, config for hardware specs)
 
-- [ ] eval/correctness.py — 5-stage correctness verification (against PyTorch reference)
-- [ ] eval/benchmark.py — latency measurement (CUDA events, SOL-ExecBench timing methodology)
-- [ ] eval/profiler.py — NCU integration + per-iteration bottleneck classification from candidate kernel metrics. Note: orchestrator must call per candidate and feed dynamic classification to retriever/reviewer/planner (see JOURNAL.md "Dynamic bottleneck reclassification")
-- [ ] eval/roofline.py — SOLAR integration for T_SOL derivation + initial bottleneck classification (runs once at problem load, not per iteration)
-- [ ] eval/scorer.py — SOL Score scoring (T_b from Triton baseline, T_SOL from roofline.py). Includes reward_hack_suspect / calibration_warning audit flags per SOL-ExecBench paper Section 4.3
-- [ ] eval/anti_cheat.py — two surfaces: correctness-level (input randomization, precision checks in Coder's tool loop) + performance-level (T_k < T_SOL flagging from scorer, inspected by orchestrator)
+- [ ] eval/correctness.py (skeleton) — 5-stage correctness verification. Needs compiler.py + GPU.
+- [ ] eval/benchmark.py (skeleton) — latency measurement. Needs compiler.py + GPU.
+- [ ] eval/profiler.py (skeleton) — NCU integration + per-iteration bottleneck classification. Needs GPU. Note: orchestrator must call per candidate and feed dynamic classification to retriever/reviewer/planner (see JOURNAL.md "Dynamic bottleneck reclassification")
+- [x] eval/roofline.py (done) — two clean paths: SOLAR (T_SOL + bottleneck together) or built-in fallback. solar_adapter.py placeholder returns synthetic data until SOLAR is installed.
+- [x] eval/scorer.py (done) — SOL Score with audit flags per SOL-ExecBench paper Section 4.3
+- [ ] eval/anti_cheat.py (skeleton) — two surfaces: correctness-level (input randomization, precision checks) + performance-level (T_k < T_SOL flagging from scorer)
 
 ### Phase 3: Actions & Memory
-Depends on: Phase 1 (kernel abstraction for action targets, experience schema)
 
-- [ ] memory/experience.py — experience dataclass
-- [ ] memory/store.py — JSON storage backend
-- [ ] memory/retriever.py — kernel-type filtering + bottleneck matching
-- [ ] actions/registry.py — action registry + tier system
-- [ ] actions/tier1_sizing.py — block/grid tuning
-- [ ] actions/tier2_memory.py — memory optimization
-- [ ] actions/tier3_compute.py — compute optimization
-- [ ] actions/tier4_advanced.py — split-K, persistent kernels
-- [ ] actions/tier5_arch.py — architecture-specific (H100/A100)
-- [ ] actions/tier6_specific.py — kernel-specific tricks
+- [x] memory/experience.py (done) — Experience dataclass
+- [x] memory/store.py (done) — JSON persistence with save/load
+- [ ] memory/retriever.py (skeleton) — kernel-type filtering + bottleneck matching. Pure Python, no GPU.
+- [x] actions/registry.py (done) — registry + tier system
+- [ ] actions/tier1-6 (skeleton) — action definitions exist but guidance text is placeholder
 
 ### Phase 4: Agents & Prompts
-Depends on: Phase 2 (eval results for Reviewer), Phase 3 (actions for Planner, memory for Planner)
 
-- [ ] agents/llm_backend.py — OpenAI Agents SDK integration (Agent, Runner, function_tool, model config)
-- [ ] prompts/planner/ — system + technique_select
-- [ ] prompts/coder/ — system + implement
-- [ ] prompts/reviewer/ — system + interpret
-- [ ] agents/planner.py — profiling data + memory → structured plan (single-call, no tools)
-- [ ] agents/coder.py — plan + kernel code → optimized kernel (tool-using: compile + correctness check, self-correction loop)
-- [ ] agents/evaluator.py — interprets eval results (Reviewer, single-call, no tools)
+- [ ] agents/llm_backend.py (skeleton) — OpenAI Agents SDK integration
+- [ ] prompts/planner/ (skeleton) — system + technique_select
+- [ ] prompts/coder/ (skeleton) — system + implement
+- [ ] prompts/reviewer/ (skeleton) — system + interpret
+- [ ] agents/planner.py (skeleton) — returns default plan without LLM
+- [ ] agents/coder.py (skeleton) — returns source unchanged without LLM
+- [ ] agents/evaluator.py (skeleton) — returns neutral feedback without LLM
 
 ### Phase 5: Search
-Depends on: Phase 2 (scorer for node evaluation), Phase 4 (agents called during search)
 
-- [ ] search/tree.py — tree search state management
-- [ ] search/beam.py — beam pruning logic
-- [ ] search/orchestrator.py — top-level search loop (3-agent: Planner → Coder → Reviewer)
+- [x] search/tree.py (done) — tree state, path_to_node, checkpoint save/load (atomic)
+- [x] search/beam.py (done) — beam pruning (B3 quality-weighted + B2 diversity-aware, configurable), epsilon-greedy selection
+- [ ] search/orchestrator.py (skeleton) — has real control flow but calls placeholder agents/eval
 
 ### Phase 6: Pipeline & Integration
-Depends on: all previous phases
 
-- [ ] pipeline/optimize.py — main search loop entry point
-- [ ] pipeline/verify.py — post-optimization verification
-- [ ] pipeline/report.py — report generation
-- [ ] benchmarks/sol_execbench/ — SOL-ExecBench problem loader (definition.json, reference.py, workload.jsonl)
-- [ ] benchmarks/sol_execbench/ — Triton baseline generation (Coder one-shot translation + correctness gate)
-- [ ] benchmarks/sol_execbench/ — workload selection (representative subset for iterative benchmarking)
+- [ ] pipeline/optimize.py (skeleton) — has real Phase A flow (two load paths, roofline, workload selection) but calls placeholder baseline generator
+- [ ] pipeline/verify.py (skeleton) — post-optimization verification
+- [ ] pipeline/report.py (skeleton) — report generation
+- [x] benchmark/problem_loader.py (done)
+- [ ] benchmark/baseline_generator.py (skeleton) — Triton baseline generation. Needs Coder agent.
+- [x] benchmark/workload_selector.py (done)
+- [x] benchmark/solution_formatter.py (done)
+- [ ] benchmark/solar_adapter.py (skeleton) — returns synthetic data. Needs SOLAR installed.
 
 ### Future (Post-V1)
 - [ ] Multi-objective optimization (power, energy-latency product)

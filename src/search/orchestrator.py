@@ -31,6 +31,19 @@ class SearchResult:
     termination_reason: str  # "sol_target", "plateau", "budget", "all_dead_end"
 
 
+def detect_plateau(
+    score_history: list[float],
+    window: int,
+    delta: float,
+) -> bool:
+    """Return True if the best score hasn't improved beyond *delta*
+    over the last *window* entries in *score_history*."""
+    if len(score_history) < window:
+        return False
+    recent = score_history[-window:]
+    return max(recent) - min(recent) <= delta + 1e-9
+
+
 class Orchestrator:
     """Deterministic orchestrator managing the tree search loop.
 
@@ -107,6 +120,7 @@ class Orchestrator:
         # Phase B: search loop
         epsilon = self._config.epsilon_start
         decay = (self._config.epsilon_start - self._config.epsilon_end) / max(self._config.max_depth, 1)
+        best_scores: list[float] = []
 
         for iteration in range(self._config.max_depth):
             frontier = tree.frontier()
@@ -159,11 +173,15 @@ class Orchestrator:
             child.branch_quality = feedback.branch_quality
 
             # Beam prune
-            beam_prune(tree, self._config.beam_width)
+            beam_prune(tree, self._config.beam_width, enable_diversity=self._config.beam_diversity)
 
             # Check move-on criteria
             if child.score.sol_score >= self._config.sol_target:
                 return SearchResult(tree.best_node(), iteration + 1, "sol_target")
+
+            best_scores.append(tree.best_node().score.sol_score)
+            if detect_plateau(best_scores, self._config.sol_plateau_window, self._config.sol_plateau_delta):
+                return SearchResult(tree.best_node(), iteration + 1, "plateau")
 
             epsilon = max(self._config.epsilon_end, epsilon - decay)
 
