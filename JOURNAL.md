@@ -31,31 +31,40 @@ Some optimizations require passing through a performance valley (e.g., restructu
 
 ## Agents
 
-### 4 LLM agents + deterministic orchestrator
+### 3 LLM agents + deterministic orchestrator
 
-**Rationale**: After analyzing AccelOpt (2-agent), STARK (3-agent), Astra (5-agent), we chose 4 agents to balance role specialization against communication overhead.
+**Rationale**: After analyzing AccelOpt (2-agent), STARK (3-agent), Astra (5-agent), we initially chose 4 agents (Planner, Coder, Reviewer, Debugger). Revised to 3 agents after deciding to give the Coder compile/correctness tools via the OpenAI Agents SDK — see "Debugger merged into Coder" below.
 
-**Provider-agnostic**: The agent layer abstracts over LLM backends — no dependency on a specific provider's SDK.
+**SDK choice**: OpenAI Agents SDK. Provides `Agent`, `Runner.run`, `function_tool`, structured output parsing, and model-swapping via `OpenAIChatCompletionsModel` (any OpenAI-compatible API works). AccelOpt and Astra both use this SDK. AccelOpt uses it as a thin single-call wrapper; Astra uses it with `function_tool` for compile/benchmark/test tools. ACTS follows Astra's pattern for the Coder (tool-using) and AccelOpt's pattern for Planner/Reviewer (single-call, no tools).
 
-### Why 4 and not 3 (merging Reviewer into Planner)
+### Why not 2 (merging Reviewer into Planner)
 
-| Concern | 3-agent (merged) | 4-agent (separate Reviewer) |
+| Concern | 2-agent (merged) | 3-agent (separate Reviewer) |
 |---------|------------------|-----------------------------|
 | Planner prompt size | Large (profiling data + memory + action library + eval results) | Focused (memory + action library + Reviewer's distilled summary) |
 | Auditability | Hard to tell if bad planning came from bad analysis or bad technique selection | Each agent's reasoning is isolated and inspectable |
 | Model flexibility | Must use expensive model for both | Reviewer can use cheaper model |
 | Extensibility | Adding future metrics requires changing Planner | Reviewer absorbs new metrics; Planner interface unchanged |
 
-### Why 4 and not 5 (Astra-style)
+### Debugger merged into Coder (2026-04-13)
+
+Originally had 4 agents — a separate Debugger that diagnosed compilation/correctness failures and produced fix plans for the Coder. Merged into Coder after deciding to use the OpenAI Agents SDK with `function_tool`.
+
+**Why merge**: If the Coder has compile and correctness-check tools, it can self-correct within its own turn. A compilation typo that previously required Coder → eval (fail) → Debugger → Coder (3 LLM calls, 2 orchestrator round-trips) now resolves in one Coder call with an internal tool loop. The separate Debugger agent added complexity without adding capability.
+
+**Why not keep Debugger as escalation**: If a fresh prompt helps break out of a rut, that's an argument for retrying the Coder with different context, not for a separate agent. The tree search also provides natural recovery — a failed branch is pruned, and the search explores other branches.
+
+**Retry budget**: Coder gets `max_debug_retries` self-correction attempts per iteration. If exhausted, the branch is marked dead.
+
+### Why not 5 (Astra-style)
 
 Astra's Orchestrator agent is unreliable (better as deterministic code). Astra's separate Tester and Benchmarker are wasteful — correctness checking and benchmarking are deterministic operations that don't need LLM agents. Our eval harness runs these as code; the Reviewer interprets the results.
 
 ### Agent model choices
 
 - *Planner*: Strongest reasoning model (planning quality is the bottleneck).
-- *Coder*: Strong code model, speed matters (called every iteration).
+- *Coder*: Strong code + reasoning model (implements plans and self-corrects via tools; called every iteration).
 - *Reviewer*: Can be cheaper model (analysis is easier than planning).
-- *Debugger*: Strong reasoning model (debugging is hard).
 
 ### Future: context-adaptive agent specialization
 
@@ -64,7 +73,7 @@ From advisor discussion: agent specialization should be driven by LLM context wi
 - Medium context (32-128K): 5-6 agents (Reviewer splits into Compute-Reviewer and Memory-Reviewer)
 - Small context (8-32K): 7+ agents (further specialization, higher communication overhead)
 
-**Hierarchical agent capabilities**: Upper-level agents (orchestrator, Planner) should be discriminative. Lower-level agents (Coder, Debugger) should be more capable with more tools.
+**Hierarchical agent capabilities**: Upper-level agents (orchestrator, Planner) should be discriminative. Lower-level agents (Coder) should be more capable with more tools.
 
 ---
 
@@ -97,6 +106,15 @@ Actions themselves don't change when power/ELP modes are added. Only the Planner
 ### Correctness-first, then profiling
 
 **Rationale**: A fast-but-wrong kernel is never benchmarked. robust-kbench showed that KernelBench can be exploited (output caching, precision degradation, tolerance gaming). The 5-stage gate catches all of these.
+
+### Eval harness split: Coder-side vs orchestrator-side (2026-04-13)
+
+After merging the Debugger into the Coder (giving Coder compile + correctness tools), the eval harness naturally splits into two call sites:
+
+- **Coder-side** (via `function_tool`): `compiler.py`, `correctness.py`, `anti_cheat.py`. Run inside the Coder's turn. By the time the Coder returns, the kernel is compiled and correct.
+- **Orchestrator-side**: `benchmark.py`, `profiler.py`, `roofline.py`, `scorer.py`. Run by the orchestrator after the Coder returns. The Coder never sees benchmark/profiling results directly — this prevents the LLM from gaming latency numbers.
+
+**Why not give the Coder benchmark tools too**: The Coder should optimize for correctness, not for benchmark numbers. If the Coder could benchmark, it might overfit to specific input sizes or learn to game the measurement. Keeping benchmark/profiling orchestrator-only maintains the separation: the Coder writes correct code, the eval harness measures it, and the Reviewer interprets the results.
 
 ### Profiling feedback pipeline — full → Reviewer, distilled → Planner
 
@@ -177,6 +195,76 @@ Post-task Distillation     — tree → memory entries + KB entries
 **Update timing**: During a task, experiences live only in search tree. Optimization memory entries come from previous tasks only. Distillation happens once at task end.
 
 **Relationship between stores**: Optimization memory tells Planner *what to do*; Reviewer KB tells Reviewer *what's happening*. Mutually reinforcing — better diagnosis leads to more accurate memory, which leads to better decisions, which produce clearer signals.
+
+---
+
+## Benchmark & Scoring
+
+### SOL-ExecBench as benchmark suite (over KernelBench) (2026-04-14)
+
+**Rationale**: KernelBench (Ouyang et al., 2025) measures speedup over PyTorch eager — a mutable software baseline that tells nothing about proximity to hardware limits. A 10x speedup over PyTorch can still be 100x away from hardware SOL. SOL-ExecBench (NVIDIA, 2026) reframes evaluation around closing the gap to hardware Speed-of-Light, providing 235 problems from 124 production AI models across BF16/FP8/NVFP4 precisions with forward and backward passes.
+
+### HardwareSpec uses SOLAR arch YAML schema directly (2026-04-15)
+
+**Rationale**: SOLAR arch config YAMLs (e.g., `H100_PCIe.yaml`, `B200.yaml`) define hardware in roofline-oriented terms: per-cycle throughput by precision (MAC/cycle for FP32, BF16, FP8, NVFP4, etc.), SRAM/DRAM capacities and bandwidth, and clock frequency. Rather than maintaining a separate `HardwareSpec` schema and translating between the two, `HardwareSpec` uses SOLAR's schema directly. This means:
+
+- `load_hardware_spec(path)` reads a SOLAR YAML into a `HardwareSpec`
+- SOLAR's Python API and ACTS's built-in roofline both consume the same data
+- Derived properties (`peak_flops_fp32`, `peak_memory_bandwidth_gb_s`) are computed from the raw per-cycle fields + frequency, matching the formulas in SOLAR's comments (e.g., `MAC_per_cycle_bf16_tc * freq_GHz * 2` = PFLOPS)
+
+The alternative — a GPU-metadata-oriented schema (SM count, compute capability, peak TFLOPS) — would require translating to/from SOLAR's schema at the boundary, and the "peak TFLOPS" values would need to know which precision to report for. SOLAR's schema is more precise: it distinguishes FP32 SM cores from BF16 Tensor Cores from FP8 Tensor Cores.
+
+### SOLAR for T_SOL derivation (over hand-derived roofline) (2026-04-14)
+
+**Rationale**: Hand-derived roofline (classical `max(FLOPs/throughput, bytes/bandwidth)`) is fragile — it requires manually counting FLOPs and memory traffic per kernel, and naive roofline overestimates achievable performance for kernels with complex data reuse. SOLAR automates this: it traces the PyTorch reference, converts to einsum notation, and derives hardware-grounded bounds that account for cache hierarchy and fusion opportunities.
+
+SOLAR produces three roofline models: unfused, fused, fused_prefetched. We use **fused** (intermediate tensors excluded, per-op roofline) as T_SOL. The fused_prefetched model assumes perfect overlap which is often unreachable in Triton — using it would make SOL scores pessimistic and cause plateau detection to trigger too early.
+
+### Triton baseline via LLM translation (2026-04-14)
+
+**Rationale**: SOL-ExecBench provides only PyTorch references. ACTS optimizes Triton code, so each problem needs a Triton starting point. The Coder agent generates a PyTorch-to-Triton translation at problem load time. This is a well-scoped task: the PyTorch reference defines exact semantics, shapes, and dtypes — the LLM just writes a functionally equivalent Triton kernel.
+
+Correctness is verified against the PyTorch reference before accepting the baseline. The Coder gets up to `max_baseline_retries` attempts since some L2 multi-op fused subgraphs are non-trivial to translate. If all attempts fail, the problem is skipped.
+
+### PyTorch as correctness reference, Triton as scoring baseline (2026-04-14)
+
+**Rationale**: Two distinct roles that must not be conflated:
+
+- **Correctness reference** = PyTorch. Always. The PyTorch `run()` function is the ground-truth specification, validated by the SOL-ExecBench team with human review and execution-based checking. If the Triton baseline had subtle bugs, using it as correctness reference would propagate those bugs as "correct" throughout optimization.
+- **Scoring baseline (T_b)** = Triton baseline latency. T_b defines S=0.5 in the SOL score — the "no improvement" midpoint. Since ACTS optimizes Triton code, the meaningful zero-progress point is the Triton starting point. If the Triton baseline is slower than PyTorch, using PyTorch as T_b would make early iterations look like regressions when they're actually just catching up. The SOL-ExecBench code explicitly allows T_b to be any fast implementation.
+
+### T_b measured once, not recomputed (2026-04-14)
+
+**Rationale**: T_b is a fixed anchor for scoring. Recomputing it each iteration introduces noise to the metric itself, making it hard to distinguish real improvements from measurement jitter. More critically, a non-stationary T_b breaks plateau detection — consecutive SOL score readings become incomparable.
+
+T_b is measured once at startup with generous repetitions (warmup + 100 timed runs), using the mean (consistent with SOL-ExecBench's `do_bench` default). GPU clocks are locked during the entire ACTS run for reproducibility. A periodic "reference health check" (re-measure Triton baseline every N iterations) can flag hardware drift (>5% = abort), but does not update T_b for scoring.
+
+### Workload selection for iterative benchmarking (2026-04-14)
+
+**Rationale**: SOL-ExecBench problems have 7-48 workloads each (different batch sizes, sequence lengths). Running all workloads every iteration is expensive. During the search loop, ACTS benchmarks on 2-3 representative workloads. The full workload suite runs only at final evaluation (Phase C).
+
+### SOL score invariant violations as audit signals (2026-04-15)
+
+**Source**: SOL-ExecBench paper, Section 4.3: *"We assume T_b > T_SOL and T_k ≥ T_SOL... If either assumption is violated in practice, we treat the case as an audit signal and report it for SOLAR bound review and reward-hacking inspection."*
+
+Two violation cases:
+
+- **T_k < T_SOL** (candidate beats speed-of-light): Almost certainly reward hacking — the kernel is exploiting a measurement loophole (concurrency exploits, state caching, environment manipulation per paper Table 3 / Section 4.4.1). `ScoreResult.reward_hack_suspect = True`. The raw SOL score > 1.0 is intentionally not clamped — the anomalous value is itself the signal. Downstream consumers (orchestrator, anti_cheat) should inspect before accepting the node.
+
+- **T_b ≤ T_SOL** (baseline already at or below hardware limit): Either SOLAR's bound is too loose for this problem, or the baseline is exceptionally well-optimized. `ScoreResult.calibration_warning = True`. Score is set to 1.0 (problem already solved). Not necessarily reward hacking — could be legitimate calibration issue.
+
+**Why not clamp to [0, 1]**: Clamping hides the anomaly. The paper treats these as audit signals, not edge cases to suppress. Keeping the raw value lets the anti-cheat module make an informed decision. This also connects `scorer.py` (orchestrator-side eval) to `anti_cheat.py` (currently Coder-side only) — creating a second anti-cheat surface at the performance level, not just the correctness level.
+
+### Dynamic bottleneck reclassification — deferred to profiler implementation (2026-04-15)
+
+**Context**: The orchestrator currently computes bottleneck classification once from the baseline roofline (via SOLAR) and reuses it for all iterations. This is correct for the skeleton phase — `profiler.py` is a placeholder returning zeros. However, the PRD specifies two bottleneck sources:
+
+- **Static** (SOLAR, once at problem load): Is the *problem* fundamentally compute-bound or memory-bound?
+- **Dynamic** (NCU profiling, each iteration): Is the *current candidate kernel* compute-bound or memory-bound?
+
+Optimizations can shift a kernel's bottleneck (e.g., memory optimization moves it from memory-bound to compute-bound). When the real NCU profiler is implemented, the orchestrator loop should call `profile_kernel()` per candidate and pass the dynamic classification to memory retrieval, reviewer feedback, and planning. The static T_SOL remains constant — only the bottleneck classification updates.
+
+**Decision**: Record and defer. No skeleton code change needed — would be routing placeholder data through a dynamic classification path. Wire when `profiler.py` gets real NCU integration.
 
 ---
 

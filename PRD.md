@@ -29,38 +29,37 @@ Best-first tree search with beam constraint.
 
 ---
 
-## Agent Architecture — 4 LLM Agents + Deterministic Orchestrator
+## Agent Architecture — 3 LLM Agents + Deterministic Orchestrator
 
 | Agent | Runs | Role |
 |-------|------|------|
 | **Planner** | Every iteration | Analyzes profiling data + optimization memory, selects technique from structured action library, produces structured plan `{tier, technique, params, target_region, rationale}` |
-| **Coder** | Every iteration | Implements the plan into kernel code; one focused change per iteration |
+| **Coder** | Every iteration | Implements the plan into kernel code; one focused change per iteration. Has compile and correctness-check tools for self-correction within a retry budget. |
 | **Reviewer** | Every iteration (after eval) | Interprets eval results, produces structured feedback `{outcome, metric_deltas, bottleneck_classification, bottleneck_diagnosis, suggestions, branch_quality, conditional_assessment}` |
-| **Debugger** | On failure only | Diagnoses compilation/correctness failures, produces fix plan for Coder; pruned after N retries |
 
 Plus a deterministic orchestrator (code, not LLM) that manages tree state, beam selection, and move-on criteria.
 
-**LLM provider**: Provider-agnostic. The agent layer abstracts over LLM backends — no dependency on a specific provider's SDK.
+**LLM SDK**: Agents are built on the OpenAI Agents SDK. The SDK provides the agent runtime (`Agent`, `Runner.run`, `function_tool`), structured output parsing, and model-swapping via `OpenAIChatCompletionsModel` — any OpenAI-compatible API (DeepSeek, vLLM, etc.) works by changing the base URL. The Coder uses SDK `function_tool` decorators for compile/correctness tools; Planner and Reviewer are single-call agents with no tools.
 
 ### Per-Iteration Communication Flow
 
 ```
-Planner --> Coder --> [deterministic eval] --> Reviewer --> Planner (next iter)
-                             |
-                         (on failure)
-                             |
-                         Debugger --> Coder (retry)
+Planner --> Coder (with compile/correctness tools) --> [deterministic eval] --> Reviewer --> Planner (next iter)
+                  |                                |
+                  +-- self-correction loop ---------+
+                  (up to max_debug_retries attempts)
 ```
+
+On compilation or correctness failure, the Coder's tool loop handles retries internally. If the retry budget is exhausted, the branch is marked dead — no separate Debugger agent.
 
 ### LLM Cost Estimate Per Iteration
 
 | Agent | Calls/iter | Input tokens (est.) | Output tokens (est.) |
 |-------|-----------|--------------------|--------------------|
 | Planner | 1 | ~4K | ~500 |
-| Coder | 1-2 (retry on debug) | ~3K | ~2K |
+| Coder | 1-3 (with tool-use self-correction) | ~3-6K | ~2-4K |
 | Reviewer | 1 | ~2K | ~500 |
-| Debugger | 0-1 (conditional) | ~3K | ~500 |
-| **Total** | **3-5** | **~9-12K** | **~3-4K** |
+| **Total** | **3-5** | **~9-12K** | **~3-5K** |
 
 ~15K tokens per iteration. At beam width 3 and depth 20, ~900K tokens per kernel.
 
@@ -89,21 +88,48 @@ Planner includes a `target_region` field — a natural language pointer to the c
 
 ## Evaluation Harness — Correctness-First, Latency Profiling
 
-Entirely deterministic (no LLM). Two stages:
+Entirely deterministic (no LLM). Split across two call sites:
 
-### Stage 1: 5-Stage Correctness Gate
+### Coder-Side Eval (via function_tools)
+
+Compilation and correctness run inside the Coder's turn. The Coder calls these tools, sees errors, and self-corrects. By the time the Coder returns, the kernel is compiled and correct.
+
+| Module | Called by | Purpose |
+|--------|-----------|---------|
+| `compiler.py` | Coder's `compile_kernel_tool` | Triton compilation |
+| `correctness.py` + `anti_cheat.py` | Coder's `check_correctness_tool` | 5-stage correctness gate |
+
+Note: `anti_cheat.py` has two surfaces. **Correctness-level** (above): randomized inputs, precision checks — runs inside the Coder's turn. **Performance-level**: `scorer.py` flags `reward_hack_suspect` when `T_k < T_SOL` — the orchestrator routes flagged candidates through additional anti-cheat inspection (see SOL Score Invariant Violations).
+
+#### 5-Stage Correctness Gate
 
 | Stage | What | Fail action |
 |-------|------|------------|
-| 1. Smoke test | Single input, check output matches baseline | Reject |
-| 2. Shape sweep | Multiple input sizes (tiny → xlarge) | Reject |
-| 3. Numerical stability | NaN/Inf detection, precision check | Reject |
-| 4. Determinism | Repeated runs must produce identical outputs | Reject |
-| 5. Anti-cheat | Randomized inputs, strict tolerance, no output caching | Reject |
+| 1. Smoke test | Single input, check output matches baseline | Coder self-corrects |
+| 2. Shape sweep | Multiple input sizes (tiny → xlarge) | Coder self-corrects |
+| 3. Numerical stability | NaN/Inf detection, precision check | Coder self-corrects |
+| 4. Determinism | Repeated runs must produce identical outputs | Coder self-corrects |
+| 5. Anti-cheat | Randomized inputs, strict tolerance, no output caching | Coder self-corrects |
 
-Any failure → Debugger invoked. Fast-but-wrong kernels are never benchmarked.
+Any failure → Coder's tool loop retries (up to `max_debug_retries`). If budget exhausted, branch is marked dead. Fast-but-wrong kernels are never benchmarked.
 
-### Stage 2: Latency + Hardware Profiling
+### Problem-Load Eval (once per problem, Phase A)
+
+Run once at startup before the search loop begins. Inputs are static (PyTorch reference + hardware config), so results are constant for the entire optimization.
+
+| Module | Called by | Purpose |
+|--------|-----------|---------|
+| `roofline.py` | Orchestrator (Phase A) | SOLAR integration — derives T_SOL and initial bottleneck classification from PyTorch reference + hardware arch config |
+
+### Orchestrator-Side Eval (after Coder returns, every iteration)
+
+The orchestrator runs benchmarking and profiling on the Coder's output. These are never part of the Coder's tool loop — the Coder should not optimize for benchmark numbers directly.
+
+| Module | Called by | Purpose |
+|--------|-----------|---------|
+| `benchmark.py` | Orchestrator | Latency measurement (CUDA events) |
+| `profiler.py` | Orchestrator | NCU hardware profiling + per-iteration bottleneck classification from candidate kernel metrics |
+| `scorer.py` | Orchestrator | SOL score computation (using static T_SOL from roofline.py) |
 
 | Metric | Tool | Method |
 |--------|------|--------|
@@ -116,28 +142,56 @@ Full profiling → **Reviewer** → distilled summary → **Planner**. Reviewer 
 
 ---
 
+## Benchmark Source — SOL-ExecBench
+
+ACTS uses SOL-ExecBench (NVIDIA, 2026) as its benchmark suite. SOL-ExecBench provides 235 CUDA kernel optimization problems extracted from 124 production AI models, organized into four categories (L1: single-op, L2: multi-op fused, Quant: FP8/NVFP4, FlashInfer-Bench: inference primitives). Each problem includes:
+
+- **Definition** (`definition.json`): Problem name, input/output tensor shapes, dtypes, symbolic axes
+- **Reference** (`reference.py`): PyTorch `run()` function — the ground-truth specification of the computation
+- **Workloads** (`workload.jsonl`): 7-48 concrete shape instantiations per problem (varying batch size, sequence length, etc.)
+
+### Triton Baseline Generation
+
+SOL-ExecBench provides only PyTorch references. Since ACTS optimizes Triton code, each problem requires a Triton baseline as the root of the search tree. The Coder agent generates a one-shot PyTorch-to-Triton translation at problem load time:
+
+1. Coder receives the PyTorch reference and problem definition
+2. Coder produces a functionally equivalent Triton kernel
+3. Correctness is verified against the PyTorch reference (same 5-stage gate)
+4. If correctness fails, Coder retries (up to `max_baseline_retries` attempts)
+5. If all retries fail, the problem is skipped
+
+### Correctness Reference
+
+The PyTorch reference is always the ground truth for correctness checking — both during baseline generation and during the optimization loop. The LLM-generated Triton baseline may have subtle numerical deviations; using it as correctness reference would propagate translation bugs as "correct" throughout optimization.
+
+### SOL Score Baseline (T_b)
+
+`T_b` is derived from the **Triton baseline**, not the PyTorch reference. The SOL score formula anchors S=0.5 at T_b, meaning "no improvement over starting point." Since ACTS optimizes Triton code, the meaningful zero-progress point is the Triton starting point. The SOL-ExecBench `sol_score.py` explicitly allows T_b to be set to any fast implementation.
+
+`T_b` is measured once at problem load time with robust methodology (same warmup + timed iterations as candidate kernels, GPU clocks locked). It remains constant throughout the optimization search — recomputing T_b each iteration would introduce metric noise and break plateau detection.
+
+---
+
 ## Roofline Model & Optimization Headroom
 
 Existing benchmarks (e.g., KernelBench) measure speedup over a mutable software baseline — beating PyTorch eager tells you nothing about how close you are to hardware limits. ACTS uses a roofline-based approach to derive an absolute performance target and measure remaining optimization headroom.
 
-### Roofline Model
+### T_SOL Derivation via SOLAR
 
-The roofline model (Williams et al., 2009) bounds achievable kernel performance by two hardware limits:
+ACTS derives `T_SOL` using SOLAR (NVIDIA, 2026), a pipeline that analytically computes hardware-grounded SOL bounds from PyTorch programs. SOLAR operates in three stages:
 
-```
-T_SOL = max(Total FLOPs / Peak Compute Throughput, Total Fused Bytes / Peak Memory Bandwidth)
-```
+1. **Graph Extractor**: Traces the PyTorch reference to produce an operator graph with tensor shapes and dtypes
+2. **Agentic Einsum Converter**: Translates operators into extended einsum notation, deriving FLOP counts and memory traffic
+3. **SOL Analyzer**: Computes roofline bound against target hardware architecture config
 
-- If `FLOPs / Throughput > Bytes / Bandwidth` → kernel is **compute-bound** (limited by ALU/tensor core throughput)
-- If `Bytes / Bandwidth > FLOPs / Throughput` → kernel is **memory-bound** (limited by DRAM/cache bandwidth)
+SOLAR produces three roofline models with progressively tighter bounds:
+- **Unfused**: Each op in isolation, all tensors from DRAM
+- **Fused**: Per-op roofline, intermediate tensors excluded from memory cost
+- **Fused+Prefetched**: Single roofline for entire graph, perfect overlap assumed
 
-The crossover point is the hardware's **arithmetic intensity threshold** (ops/byte). Kernels above this threshold are compute-bound; below are memory-bound.
+ACTS uses the **fused** model as T_SOL. The fused_prefetched model assumes perfect overlap which is often unreachable in Triton; using it would make SOL scores pessimistic and trigger plateau detection prematurely.
 
 `T_SOL` is the theoretical minimum runtime — no software implementation can run faster than this on the given hardware. It provides a fixed target independent of any software baseline.
-
-### Tighter Bounds via On-Chip Buffer Modeling
-
-Naive roofline can overestimate achievable performance by assuming all data is reused from on-chip caches. ACTS uses Orogenesis-style analysis (Huang et al., 2024) to derive tighter bounds: model off-chip data movement as a function of on-chip buffer capacity, accounting for the reality that not all tensor data can be staged on-chip for full reuse. This prevents falsely classifying a memory-bound kernel as close to its SOL bound when cache capacity is the actual constraint.
 
 ### SOL Score
 
@@ -147,32 +201,48 @@ The SOL Score (SOL-ExecBench, NVIDIA 2026) measures how much of the baseline-to-
 S(T_k) = (T_b - T_SOL) / ((T_k - T_SOL) + (T_b - T_SOL))
 ```
 
-Where `T_b` = baseline runtime, `T_SOL` = roofline-derived hardware limit, `T_k` = candidate kernel runtime.
+Where `T_b` = Triton baseline runtime, `T_SOL` = SOLAR-derived hardware limit, `T_k` = candidate kernel runtime.
 
 | Condition | SOL Score | Meaning |
 |-----------|-----------|---------|
-| `T_k = T_b` | 0.5 | Matches baseline (no improvement) |
+| `T_k = T_b` | 0.5 | Matches Triton baseline (no improvement) |
 | `T_k = T_SOL` | 1.0 | Reaches hardware Speed-of-Light |
 | `T_k → ∞` | → 0 | Regression |
 
 **Properties**:
-- Bounded to [0, 1] — directly comparable across different kernels and problem sizes
+- Bounded to [0, 1] under normal conditions — directly comparable across different kernels and problem sizes
 - Nonlinear — the same ΔT yields a larger score gain near the SOL bound, rewarding diminishing-returns optimization
 - Hardware-grounded — tells you *how much headroom remains* relative to physics, not relative to a mutable baseline
 
+### SOL Score Invariant Violations — Audit Signals
+
+The formula assumes `T_b > T_SOL` and `T_k ≥ T_SOL` (SOL-ExecBench paper, Section 4.3). When either assumption is violated, the scorer flags it as an audit signal rather than silently clamping:
+
+| Violation | Flag | Score | Meaning |
+|-----------|------|-------|---------|
+| `T_k < T_SOL` | `reward_hack_suspect` | > 1.0 (raw, not clamped) | Candidate claims to beat hardware speed-of-light — almost certainly a measurement exploit (concurrency, caching, environment manipulation) |
+| `T_b ≤ T_SOL` | `calibration_warning` | 1.0 | Baseline already at/below hardware limit — SOLAR bound may be too loose, or problem is already solved |
+
+The `reward_hack_suspect` flag connects `scorer.py` to `anti_cheat.py` at the performance level — a second anti-cheat surface beyond the Coder-side correctness gate. The orchestrator should route flagged candidates through additional inspection before accepting.
+
 ### How Roofline Integrates into the Pipeline
 
-1. **At startup**: `config.py` detects hardware specs (peak FLOPS for FP16/BF16/FP32, peak memory bandwidth, cache sizes, SM count).
-2. **At problem load**: `roofline.py` derives `T_SOL` for the kernel from its FLOP count, memory traffic, and hardware specs. Also classifies baseline as compute-bound or memory-bound.
-3. **At each eval iteration**: `scorer.py` computes SOL Score for the candidate kernel. The bottleneck classification may shift (e.g., a memory optimization moves the kernel from memory-bound to compute-bound).
-4. **Reviewer** receives the SOL score, bottleneck classification, and how far `T_k` is from `T_SOL`. Reports remaining headroom.
+1. **At startup**: `config.py` loads `HardwareSpec` from a SOLAR arch config YAML (or detects at runtime). ACTS and SOLAR share the same YAML schema.
+2. **At problem load** (once): `roofline.py` runs SOLAR on the PyTorch reference + hardware arch config. Derives `T_SOL` and initial bottleneck classification (compute-bound or memory-bound via arithmetic intensity vs. ridge point). Both are constant — the PyTorch reference and hardware never change during optimization.
+3. **At each eval iteration**: `profiler.py` classifies the *candidate kernel's* current bottleneck from NCU metrics (this can shift as optimizations change the kernel's behavior). `scorer.py` computes SOL Score using the static `T_SOL` from step 2.
+4. **Reviewer** receives the SOL score, current bottleneck classification (from NCU), and how far `T_k` is from `T_SOL`. Reports remaining headroom.
 5. **Planner** receives distilled summary: "SOL score = 0.72, compute-bound, 28% headroom remaining, tensor core utilization at 60%."
 6. **Move-on criteria**: SOL score plateau (consecutive iterations with < δ improvement) or SOL score > threshold (e.g., 0.95 — within 5% of hardware limit).
 7. **Cross-kernel comparability**: SOL score of 0.9 on matmul is directly comparable to 0.9 on softmax — both are 90% of the way to their respective hardware limits.
 
 ### Bottleneck Classification
 
-The roofline model drives action library tier selection:
+Two sources, two purposes:
+
+- **Static** (from SOLAR, once at problem load): Is the *problem* fundamentally compute-bound or memory-bound? Based on arithmetic intensity of the PyTorch reference. Tells the Planner where to start.
+- **Dynamic** (from NCU profiling, each iteration): Is the *current candidate kernel* compute-bound or memory-bound? Based on actual hardware counters (compute throughput, memory throughput, stall reasons). This can shift as optimizations change the kernel's behavior.
+
+Both use the same classification scheme:
 
 | Classification | Condition | Primary Action Tiers |
 |---------------|-----------|---------------------|
@@ -242,32 +312,74 @@ Triton coverage by tier:
 
 ## Hardware Specification Handling
 
-1. **Detect hardware at startup** — GPU name, SM count, peak FLOPS (FP16/BF16/FP32), peak memory bandwidth, cache sizes, compute capability.
-2. **Use specs internally** — feed into roofline model to derive `T_SOL` bound and bottleneck classification. Compute SOL Score for each candidate kernel.
+`HardwareSpec` uses the SOLAR arch YAML schema directly — both ACTS and SOLAR share the same hardware description format. This eliminates translation between two schemas and ensures roofline analysis uses consistent parameters.
+
+1. **Load hardware spec at startup** — from a SOLAR arch config YAML (e.g., `configs/arch/H100_PCIe.yaml`, `configs/arch/B200.yaml`). The YAML provides per-cycle throughput by precision (MAC/cycle for FP32, BF16, FP8, etc.), memory hierarchy capacities, and clock frequency. Peak TFLOPS and bandwidth are derived properties.
+2. **Use specs internally** — feed hardware spec to SOLAR for `T_SOL` derivation, and to the built-in roofline fallback for bottleneck classification. Compute SOL Score for each candidate kernel.
 3. **Reviewer sees** profiling results + roofline classification + SOL score + remaining headroom.
 4. **Planner sees** Reviewer's distilled summary only. Agents never see raw hardware specs.
+5. **Fallback** — when no arch YAML is provided, `detect_hardware()` queries the CUDA runtime (placeholder in V1).
+
+---
+
+## Configuration
+
+Run parameters are set through `.cfg` files (INI format, parsed via Python's `configparser`). Unspecified values fall back to built-in defaults. Hardware specs are loaded from a SOLAR arch YAML if `arch_config_path` is specified, otherwise detected at runtime.
+
+```ini
+[search]
+beam_width = 3
+max_depth = 20
+epsilon_start = 0.3
+epsilon_end = 0.05
+
+[eval]
+warmup_runs = 20
+timed_runs = 100
+
+[move_on]
+sol_plateau_window = 3
+sol_plateau_delta = 0.01
+sol_target = 0.95
+
+[debug]
+max_debug_retries = 3
+max_baseline_retries = 3
+
+[memory]
+optimization_memory_top_k = 5
+
+[benchmark]
+benchmark_workload_count = 3
+
+[hardware]
+arch_config_path = configs/arch/H100_PCIe.yaml
+```
 
 ---
 
 ## Pipeline Flow
 
 ```
-Phase A: Load Problem (lightweight)
-  KernelBench problem -> load baseline kernel
-  -> compile & verify baseline correctness
-  -> baseline benchmark (latency)
-  -> derive T_SOL via roofline model (FLOP count, memory traffic, hardware specs)
-  -> classify baseline as compute-bound or memory-bound
-  -> compute baseline SOL score (= 0.5 by definition)
+Phase A: Load Problem
+  SOL-ExecBench problem -> parse definition.json, reference.py, workload.jsonl
+  -> derive T_SOL via SOLAR (PyTorch reference + hardware arch config)
+  -> classify kernel as compute-bound or memory-bound
+  -> generate Triton baseline via Coder (PyTorch -> Triton one-shot translation)
+  -> verify Triton baseline correctness against PyTorch reference
+     -> retry up to max_baseline_retries on failure; skip problem if exhausted
+  -> measure T_b (Triton baseline latency, CUDA events, locked clocks)
+  -> select representative workloads for iterative benchmarking (2-3 of 7-48)
+  -> baseline SOL score = 0.5 by definition
 
-Phase B: Search Loop (autonomous, 4-agent)
+Phase B: Search Loop (autonomous, 3-agent)
   orchestrator.py manages tree search:
   -> Retrieve similar past optimizations from memory
   -> PLANNER: profiling data + memory + feedback -> structured plan
-  -> CODER: plan + kernel code -> optimized kernel
-  -> [DETERMINISTIC EVAL]: compile -> 5-stage correctness -> benchmark
-     -> NCU profiler -> roofline classification -> SOL score
-  -> (on failure) DEBUGGER: error + code -> diagnosis -> re-invoke CODER
+  -> CODER (with tools): plan + kernel code -> compile -> correctness check
+     -> correctness always checked against PyTorch reference
+     -> self-correction loop on failure (up to max_debug_retries)
+  -> [DETERMINISTIC EVAL]: benchmark -> NCU profiler -> bottleneck classification -> SOL score
   -> REVIEWER: eval results + SOL score + headroom -> structured feedback + branch_quality
   -> Tree update: add node, score by SOL score, beam prune
   -> Memory update: store experience (including SOL score)
@@ -275,6 +387,7 @@ Phase B: Search Loop (autonomous, 4-agent)
 
 Phase C: Report (autonomous)
   Best kernel selected from tree (highest SOL score)
+  Run full workload suite on best kernel (all workloads, not just representative subset)
   Report: baseline vs best, SOL score progression, bottleneck transitions,
           technique trace, remaining headroom to hardware limit
 ```
@@ -299,7 +412,8 @@ acts-kernel-agent/
 |   |   |-- __init__.py
 |   |   |-- planner.py
 |   |   |-- coder.py
-|   |   +-- evaluator.py
+|   |   |-- evaluator.py
+|   |   +-- llm_backend.py
 |   |
 |   |-- search/
 |   |   |-- __init__.py
@@ -311,7 +425,7 @@ acts-kernel-agent/
 |   |   |-- __init__.py
 |   |   |-- correctness.py
 |   |   |-- benchmark.py
-|   |   |-- power.py
+|   |   |-- (power.py — V2, not in V1)
 |   |   |-- profiler.py
 |   |   |-- roofline.py
 |   |   |-- scorer.py
@@ -360,12 +474,10 @@ acts-kernel-agent/
 |       |-- reviewer/
 |       |   |-- system.md
 |       |   +-- interpret.md
-|       +-- debugger/
-|           |-- system.md
-|           +-- diagnose.md
+|       +-- debugger/           (reserved — Coder handles debugging via tools)
 |
 |-- benchmarks/
-|   |-- kernelbench/
+|   |-- sol_execbench/
 |   +-- custom/
 |
 +-- tests/
@@ -396,6 +508,7 @@ The framework must remain runnable at every development iteration. Unimplemented
 | Actions | Free-form prompts or implicit | Explicit tiered action library |
 | Memory | Per-run only or training data | Persistent cross-run optimization memory |
 | Eval | Correctness only or no anti-cheat | 5-stage + anti-cheat + NCU profiling + roofline |
+| Benchmark | KernelBench PyTorch-to-CUDA | SOL-ExecBench — production AI model subgraphs, SOLAR-derived T_SOL |
 | Scoring | Relative speedup over software baseline | SOL Score — absolute headroom vs. hardware limit |
 | Objective | Latency only | V1: latency. Interface reserves power/ELP |
 | Orchestration | LLM-based or simple loop | Deterministic tree search |
