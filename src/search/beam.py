@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import random
 
-from src.agents.evaluator import BranchQuality
+from src.agents.reviewer import BranchQuality
 from src.search.tree import SearchTree, TreeNode
 
 # B3: branch-quality bonus added to raw SOL score for ranking.

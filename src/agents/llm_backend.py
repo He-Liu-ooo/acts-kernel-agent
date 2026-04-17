@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import random
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -25,6 +27,29 @@ try:
     _SDK_AVAILABLE = True
 except ModuleNotFoundError:  # pragma: no cover
     _SDK_AVAILABLE = False
+
+logger = logging.getLogger(__name__)
+
+# Transient OpenAI errors worth retrying. Permanent failures (auth, schema,
+# programmer bugs) must NOT be retried — they waste wall-clock and hide the
+# real cause. When openai isn't installed (SDK-absent test mode) the tuple
+# is empty, so every exception propagates.
+try:
+    from openai import (  # noqa: I001  — optional dep
+        APIConnectionError,
+        APITimeoutError,
+        InternalServerError,
+        RateLimitError,
+    )
+
+    RETRIABLE_EXCEPTIONS: tuple[type[BaseException], ...] = (
+        APIConnectionError,
+        APITimeoutError,
+        InternalServerError,
+        RateLimitError,
+    )
+except ImportError:  # pragma: no cover
+    RETRIABLE_EXCEPTIONS = ()
 
 
 @dataclass(frozen=True)
@@ -79,22 +104,36 @@ async def run_agent(
     prompt: str,
     run_config: RunConfig | None = None,
     max_retries: int = 3,
-    delay: float = 3.0,
+    initial_delay: float = 1.0,
+    retriable: tuple[type[BaseException], ...] = RETRIABLE_EXCEPTIONS,
 ) -> RunResult | None:
-    """Run an agent with retry logic.
+    """Run an agent with retry on transient OpenAI errors only.
 
-    Retries on transient errors (rate limits, timeouts, server errors).
-    Returns None if all retries are exhausted.
+    Retries on rate limits, timeouts, connection errors, and 5xx responses
+    with exponential backoff + ±25% jitter starting at ``initial_delay``.
+    All other exceptions (auth, schema, programmer bugs) propagate
+    immediately — retrying them wastes time and hides the real failure.
+    Returns ``None`` only when every retriable attempt has been exhausted.
 
-    Pattern from AccelOpt's retry_runner_safer.
+    *retriable* is exposed for tests so they can inject a synthetic
+    exception class without requiring the openai package.
     """
     for attempt in range(1, max_retries + 1):
         try:
             return await Runner.run(agent, prompt, run_config=run_config)
-        except Exception:
+        except retriable as exc:
             if attempt == max_retries:
+                logger.warning(
+                    "LLM retries exhausted after %d attempts (%s): %s",
+                    max_retries, type(exc).__name__, exc,
+                )
                 return None
-            await asyncio.sleep(delay)
+            wait = initial_delay * (2 ** (attempt - 1)) * random.uniform(0.75, 1.25)
+            logger.info(
+                "LLM transient error on attempt %d/%d (%s): %s — retrying in %.2fs",
+                attempt, max_retries, type(exc).__name__, exc, wait,
+            )
+            await asyncio.sleep(wait)
     return None
 
 

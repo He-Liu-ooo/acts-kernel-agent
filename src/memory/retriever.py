@@ -56,11 +56,10 @@ class MemoryRetriever:
         successes.sort(key=key, reverse=True)
         failures.sort(key=key, reverse=True)
 
-        # Reserve failure slots only when top_k is large enough for both pools
-        if self._top_k >= 3 and successes and failures:
-            failure_slots = max(1, self._top_k // 3)
-        elif self._top_k == 2 and successes and failures:
-            failure_slots = 1
+        # Reserve failure slots only when both pools exist and top_k >= 2.
+        # top_k==2 keeps 1 failure; >=3 reserves a third (min 1).
+        if successes and failures and self._top_k >= 2:
+            failure_slots = 1 if self._top_k == 2 else max(1, self._top_k // 3)
         else:
             failure_slots = 0
         picked_failures = failures[:failure_slots]

@@ -30,7 +30,7 @@ async def optimize(
     This is the main entry point:  ``python -m src.pipeline.optimize``
     """
     from src.agents.coder import CoderAgent
-    from src.agents.evaluator import EvaluatorAgent
+    from src.agents.reviewer import ReviewerAgent
     from src.agents.planner import PlannerAgent
     from src.config import ACTSConfig, detect_hardware
     from src.memory.retriever import MemoryRetriever
@@ -57,14 +57,14 @@ async def optimize(
     # Set up agents (placeholder mode — no real model configured)
     planner = PlannerAgent()
     coder = CoderAgent()
-    evaluator = EvaluatorAgent()
+    reviewer = ReviewerAgent()
 
     # Run search
     orchestrator = Orchestrator(
         config=config,
         planner=planner,
         coder=coder,
-        evaluator=evaluator,
+        reviewer=reviewer,
         retriever=retriever,
     )
     return await orchestrator.run(baseline, workloads=workloads, roofline=roofline)

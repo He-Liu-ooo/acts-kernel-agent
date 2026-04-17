@@ -34,7 +34,7 @@ A single *version*: source code + Triton tuning parameters. Every search tree no
 | `num_stages` | int | Triton num_stages for pipelining |
 | `block_size` | dict[str,int] | Block dimensions (e.g., BLOCK_M, BLOCK_N) |
 
-`to_source()` returns the source code string.
+Read `source_code` directly — it's the full Triton source string.
 
 ## Compiler — `compiler.py`
 

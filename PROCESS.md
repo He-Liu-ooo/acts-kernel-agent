@@ -28,12 +28,22 @@
 - [x] search/tree.py — path_to_node, checkpoint save/load (atomic writes)
 - [x] search/beam.py — diversity-aware beam pruning (B2), branch-quality-weighted pruning (B3), configurable diversity (`beam_diversity`)
 - [x] search/orchestrator.py — `detect_plateau` wired into search loop, plateau termination
+- [x] agents/reviewer.py — Pydantic `ReviewerFeedbackOutput`, `build_user_prompt()`, rule-based fallback with `degraded`/`error_reason` surfacing, configurable `prompt_dir` for future Compute/Memory sub-reviewer split
+- [x] prompts/reviewer/ — system.md (diagnostic reasoning) + interpret.md
+- [x] agents/llm_backend.py retry hardening — narrow transient catch, exponential backoff with ±25% jitter, named-logger observability
+- [x] /simplify sweep across all prior commits — whole-repo review for reuse/quality/efficiency; surgical fixes applied, remaining tech-debt recorded in "Deferred Improvements"
 
 ## Next Up
 
-### agents/evaluator.py — Reviewer agent
+### agents/coder.py + prompts/coder/ — Coder agent
 
-Same pattern as Planner: Pydantic `output_type` for structured output, `build_user_prompt()`, LLM call via `run_agent()`, system prompt with diagnostic reasoning. Currently a skeleton returning neutral feedback.
+Coder is the last remaining LLM agent. Same SDK pattern as Planner/Reviewer, but tool-using instead of single-call. Work order:
+
+1. **prompts/coder/system.md** — compile-then-correctness-then-stop recipe, one-focused-change-per-iteration rule, output contract (return modified source), anti-patterns (don't benchmark, don't bypass the correctness tool).
+2. **prompts/coder/implement.md** — document the user-prompt format (current source + `OptimizationPlan` fields + target region).
+3. **agents/coder.py** — replace the placeholder `implement()` with a real `Runner.run()` call. The skeleton already has `@function_tool`-wrapped `compile_kernel_tool` / `check_correctness_tool`; wire them into the real Agent. Mirror Planner's error handling (raise `ImplementationError` on `run_agent() is None`; orchestrator should already surface this as a dead branch via existing retry-exhaustion path).
+
+Once Coder is in, `benchmark/baseline_generator.py` becomes implementable (PyTorch-to-Triton one-shot translation at problem load — uses the Coder).
 
 ## Remaining (dependency-ordered)
 
@@ -64,14 +74,14 @@ Items marked `(skeleton)` have interfaces + placeholder logic that keeps the pip
 
 ### Phase 4: Agents & Prompts
 
-- [x] agents/llm_backend.py (done) — OpenAI Agents SDK integration: ModelConfig, create_model(), run_agent() with retry, make_run_config()
+- [x] agents/llm_backend.py (done) — OpenAI Agents SDK integration: ModelConfig, create_model(), run_agent() with retry (narrow transient catch + exponential backoff w/ jitter), make_run_config()
 - [x] prompts/planner/system.md (done) — bottleneck→technique mapping tables, gain ranges, anti-patterns, decision rules
 - [x] prompts/planner/technique_select.md (done) — documents user prompt format
 - [ ] prompts/coder/ (skeleton) — system + implement
-- [ ] prompts/reviewer/ (skeleton) — system + interpret
+- [x] prompts/reviewer/ (done) — system.md (diagnostic reasoning) + interpret.md
 - [x] agents/planner.py (done) — Pydantic output_type, build_user_prompt(), PlanningError, technique validation
 - [ ] agents/coder.py (skeleton) — returns source unchanged without LLM
-- [ ] agents/evaluator.py (skeleton) — returns neutral feedback without LLM
+- [x] agents/reviewer.py (done) — Pydantic ReviewerFeedbackOutput, build_user_prompt, rule-based fallback (`degraded`/`error_reason`), configurable `prompt_dir`
 
 ### Phase 5: Search
 
@@ -98,3 +108,48 @@ Items marked `(skeleton)` have interfaces + placeholder logic that keeps the pip
 - [ ] Reviewer Knowledge Base architecture
 - [ ] Parallel kernel candidate generation (Coder produces N candidates per plan)
 - [ ] Multi-technique planning (Planner selects multiple complementary techniques)
+
+## Deferred Improvements
+
+Tech-debt items surfaced by review passes but not yet worth fixing. Each has
+a **trigger** — the signal to act. If you find yourself reaching for one of
+these before its trigger fires, re-read the trigger first.
+
+- [ ] **Thread `BottleneckType` end-to-end** — move the enum out of
+  `src/eval/roofline.py` into a shared types module, change
+  `Experience.bottleneck_before/after` and `MemoryRetriever.retrieve` to
+  take the enum, drop the `.value` string hops in orchestrator/retriever.
+  Purely a typing change; prevents a `"memory_bound"` vs `"memory-bound"`
+  drift bug.
+  *Trigger*: before memory is first exercised with a real, scored
+  retrieval run — earlier if a second bottleneck-valued site is added.
+
+- [ ] **`MemoryStore.add()` batched flush** — currently rewrites the full
+  JSON on every add (O(N²) write bytes per session). Split into
+  in-memory `add()` + explicit `flush()` at iteration boundaries.
+  *Trigger*: first end-to-end run where the store grows past ~500
+  experiences, OR if the rewrite shows up in a profile.
+
+- [ ] **Tree serialization via `dataclasses.asdict`** —
+  `src/search/tree.py` has ~100 LOC of hand-rolled `_serialize_*` /
+  `_deserialize_*`. A shared helper with enum/Path coercion would
+  collapse it to ~20 LOC and remove the 3-place change cost when a
+  dataclass field is added (the `.get("reward_hack_suspect", False)` on
+  line 228 already shows the drift cost).
+  *Trigger*: the next time a field is added to `TreeNode`, `Kernel`,
+  `KernelSpec`, or `ScoreResult`. Don't pre-refactor — checkpoint
+  back-compat risk isn't worth paying proactively.
+
+- [ ] **Shared `prompt_sections` helper** — Planner and Reviewer both
+  have `build_user_prompt()` with the same scaffolding (fence escape,
+  optional section, `"\n\n".join`). Only two call sites today.
+  *Trigger*: when `CoderAgent.build_user_prompt()` is implemented —
+  three call sites justifies extraction; two doesn't.
+
+### Skipped (decisions, not tech debt)
+
+- **Tier action files → YAML catalog**: `src/actions/tier{1..6}*.py` are
+  mostly data (~280 LOC). Moving to YAML would trade away type-checking,
+  IDE refactor support, and import-time error detection for slightly
+  fewer lines. Only worth it if non-developers need to edit actions —
+  which isn't the case. Keep as Python.

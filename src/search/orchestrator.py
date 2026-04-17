@@ -7,19 +7,38 @@ The Coder's compile/correctness tools handle self-correction internally.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
+from enum import Enum
 from typing import TYPE_CHECKING
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from src.agents.coder import CoderAgent
-    from src.agents.evaluator import EvaluatorAgent
+    from src.agents.reviewer import ReviewerAgent
     from src.agents.planner import PlannerAgent
     from src.benchmark.problem import Workload
     from src.config import ACTSConfig
     from src.eval.roofline import RooflineResult
     from src.kernels.kernel import Kernel
     from src.memory.retriever import MemoryRetriever
-    from src.search.tree import SearchTree, TreeNode
+    from src.search.tree import TreeNode
+
+# Profiling is not yet wired through the orchestrator. All three places
+# that pass a profiling summary into an agent share this literal so the
+# real summary only needs to replace it once.
+_PLACEHOLDER_PROFILING = "placeholder profiling summary"
+
+
+class TerminationReason(str, Enum):
+    """Why the search loop exited. str-subclass so legacy string comparisons
+    still work during the transition (e.g. existing report/doc consumers)."""
+
+    SOL_TARGET = "sol_target"
+    PLATEAU = "plateau"
+    BUDGET = "budget"
+    ALL_DEAD_END = "all_dead_end"
 
 
 @dataclass
@@ -28,7 +47,7 @@ class SearchResult:
 
     best_node: TreeNode
     total_iterations: int
-    termination_reason: str  # "sol_target", "plateau", "budget", "all_dead_end"
+    termination_reason: TerminationReason
 
 
 def detect_plateau(
@@ -66,13 +85,13 @@ class Orchestrator:
         config: ACTSConfig,
         planner: PlannerAgent,
         coder: CoderAgent,
-        evaluator: EvaluatorAgent,
+        reviewer: ReviewerAgent,
         retriever: MemoryRetriever,
     ) -> None:
         self._config = config
         self._planner = planner
         self._coder = coder
-        self._evaluator = evaluator
+        self._reviewer = reviewer
         self._retriever = retriever
         self._tree: SearchTree | None = None
 
@@ -125,7 +144,7 @@ class Orchestrator:
         for iteration in range(self._config.max_depth):
             frontier = tree.frontier()
             if not frontier:
-                return SearchResult(tree.best_node(), iteration, "all_dead_end")
+                return SearchResult(tree.best_node(), iteration, TerminationReason.ALL_DEAD_END)
 
             parent = select_next(tree, epsilon)
 
@@ -135,18 +154,20 @@ class Orchestrator:
                 roofline.bottleneck.value,
             )
 
-            # Planner
+            # Root-to-parent trajectory — consumed by the Planner so it can
+            # reason about which actions have already been tried on this branch.
             plan = await self._planner.plan(
-                kernel_source=parent.kernel.to_source(),
-                profiling_summary="placeholder profiling summary",
+                kernel_source=parent.kernel.source_code,
+                profiling_summary=_PLACEHOLDER_PROFILING,
                 past_experiences=experiences,
                 available_actions=[],
+                tree_context=tree.render_path(parent.id),
                 reviewer_feedback=None,
             )
 
             # Coder (with tools for self-correction)
             new_source = await self._coder.implement(
-                kernel_source=parent.kernel.to_source(),
+                kernel_source=parent.kernel.source_code,
                 plan=plan,
             )
 
@@ -162,27 +183,39 @@ class Orchestrator:
                 roofline.t_sol_us,
             )
 
-            # Reviewer
-            feedback = await self._evaluator.review(
+            # Reviewer sees the same trajectory as the Planner, extended
+            # through the just-scored child so `prev_sol_score` + the path's
+            # last step let it ground its branch_quality in the real delta.
+            prev_sol = parent.score.sol_score if parent.score is not None else None
+            feedback = await self._reviewer.review(
                 kernel_source=new_source,
-                profiling_summary="placeholder profiling summary",
+                profiling_summary=_PLACEHOLDER_PROFILING,
                 sol_score=child.score.sol_score,
                 headroom_pct=(1.0 - child.score.sol_score) * 100,
                 bottleneck=roofline.bottleneck.value,
+                tree_context=tree.render_path(child.id),
+                prev_sol_score=prev_sol,
             )
+            if feedback.degraded:
+                logger.warning(
+                    "Reviewer degraded at iteration %d (reason=%s) — branch_quality is rule-based.",
+                    iteration + 1,
+                    feedback.error_reason or "unknown",
+                )
             child.branch_quality = feedback.branch_quality
 
             # Beam prune
             beam_prune(tree, self._config.beam_width, enable_diversity=self._config.beam_diversity)
 
-            # Check move-on criteria
+            # Single end-of-iter best scan — reused for target / plateau checks.
+            best = tree.best_node()
             if child.score.sol_score >= self._config.sol_target:
-                return SearchResult(tree.best_node(), iteration + 1, "sol_target")
+                return SearchResult(best, iteration + 1, TerminationReason.SOL_TARGET)
 
-            best_scores.append(tree.best_node().score.sol_score)
+            best_scores.append(best.score.sol_score)
             if detect_plateau(best_scores, self._config.sol_plateau_window, self._config.sol_plateau_delta):
-                return SearchResult(tree.best_node(), iteration + 1, "plateau")
+                return SearchResult(best, iteration + 1, TerminationReason.PLATEAU)
 
             epsilon = max(self._config.epsilon_end, epsilon - decay)
 
-        return SearchResult(tree.best_node(), self._config.max_depth, "budget")
+        return SearchResult(tree.best_node(), self._config.max_depth, TerminationReason.BUDGET)

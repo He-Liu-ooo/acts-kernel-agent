@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from src.agents.evaluator import BranchQuality
+    from src.agents.reviewer import BranchQuality
     from src.eval.scorer import ScoreResult
     from src.kernels.kernel import Kernel
 
@@ -69,7 +69,7 @@ class SearchTree:
 
     def frontier(self) -> list[TreeNode]:
         """Return all expandable frontier nodes (not dead_end)."""
-        from src.agents.evaluator import BranchQuality
+        from src.agents.reviewer import BranchQuality
 
         return [
             n for n in self._nodes.values()
@@ -95,6 +95,33 @@ class SearchTree:
             node = self._nodes[node.parent_id]
         path.reverse()
         return path
+
+    # ── rendering ────────────────────────────────────────────────────────
+
+    def render_path(self, node_id: int) -> str:
+        """Render the root-to-node path as a human-readable trajectory.
+
+        Consumed by the Planner (path-to-parent) and Reviewer
+        (path-to-child) so they can reason about which actions have
+        already been tried on this branch, rather than seeing only the
+        immediate parent's SOL.
+
+        Shape::
+
+            Path (depth D):
+              [0] baseline — SOL 0.300
+              [1] tiling (PROMISING) — SOL 0.600
+              [2] vectorize — SOL 0.800  ← current
+        """
+        path = self.path_to_node(node_id)
+        lines = [f"Path (depth {len(path) - 1}):"]
+        for i, node in enumerate(path):
+            action = node.action_applied or "baseline"
+            sol = f"{node.score.sol_score:.3f}" if node.score is not None else "n/a"
+            quality = f" ({node.branch_quality.value.upper()})" if node.branch_quality else ""
+            cursor = "  ← current" if i == len(path) - 1 else ""
+            lines.append(f"  [{i}] {action}{quality} — SOL {sol}{cursor}")
+        return "\n".join(lines)
 
     # ── checkpointing ────────────────────────────────────────────────────
 
@@ -137,7 +164,7 @@ class SearchTree:
 # ── serialization helpers ────────────────────────────────────────────────────
 
 def _serialize_node(node: TreeNode) -> dict:
-    from src.agents.evaluator import BranchQuality
+    from src.agents.reviewer import BranchQuality
 
     return {
         "id": node.id,
@@ -185,7 +212,7 @@ def _serialize_kernel(kernel: Kernel) -> dict:
 
 
 def _deserialize_node(data: dict) -> TreeNode:
-    from src.agents.evaluator import BranchQuality
+    from src.agents.reviewer import BranchQuality
     from src.eval.scorer import ScoreResult
     from src.kernels.kernel import Kernel, KernelSpec, KernelType
 

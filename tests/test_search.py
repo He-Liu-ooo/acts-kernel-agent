@@ -1,10 +1,11 @@
 """Tests for search/ — tree state management, beam pruning, orchestration."""
 
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from src.agents.evaluator import BranchQuality
+from src.agents.reviewer import BranchQuality
 from src.eval.scorer import ScoreResult
 from src.kernels.kernel import Kernel, KernelSpec, KernelType
 from src.search.tree import SearchTree
@@ -386,3 +387,180 @@ class TestPlateauDetection:
         from src.search.orchestrator import detect_plateau
 
         assert detect_plateau([], window=3, delta=0.01) is False
+
+
+# ── path-context rendering ──────────────────────────────────────────────────
+
+class TestRenderPath:
+    """SearchTree.render_path renders the full root-to-node trajectory —
+    not just the immediate parent — for Planner / Reviewer prompts."""
+
+    def test_root_only_path(self):
+        tree = SearchTree()
+        root = tree.add_root(_make_kernel("root"))
+        root.score = _make_score(0.3)
+
+        ctx = tree.render_path(root.id)
+        assert "depth 0" in ctx
+        assert "[0] baseline" in ctx
+        assert "SOL 0.300" in ctx
+        assert "← current" in ctx
+
+    def test_multi_step_path_includes_all_ancestors(self):
+        """A depth-3 node's context lists every ancestor action and score."""
+        tree = _build_scored_tree()
+        # Node 3 is c: root (baseline, 0.3) -> a (tiling, 0.6) -> c (vectorize, 0.8)
+        ctx = tree.render_path(3)
+        assert "depth 2" in ctx
+        assert "[0] baseline" in ctx
+        assert "[1] tiling" in ctx
+        assert "[2] vectorize" in ctx
+        assert "SOL 0.300" in ctx
+        assert "SOL 0.600" in ctx
+        assert "SOL 0.800" in ctx
+        # Only the current node is marked.
+        assert ctx.count("← current") == 1
+        # Sibling (b, unroll) must not leak into c's path.
+        assert "unroll" not in ctx
+
+    def test_path_includes_branch_quality_when_set(self):
+        tree = _build_scored_tree()
+        tree.get_node(1).branch_quality = BranchQuality.PROMISING
+        ctx = tree.render_path(3)
+        assert "PROMISING" in ctx
+
+
+# ── orchestrator → reviewer context threading ───────────────────────────────
+
+@pytest.fixture
+def _orch_harness():
+    """Reusable single-iteration harness for Orchestrator integration tests.
+
+    Returns a namespace of prebuilt mocks + config. Each test overrides
+    only the reviewer's return_value before invoking `orch.run()`.
+    """
+    from types import SimpleNamespace
+
+    from src.agents.planner import OptimizationPlan
+    from src.config import ACTSConfig, HardwareSpec
+    from src.eval.benchmark import BenchmarkResult
+    from src.eval.roofline import BottleneckType, RooflineResult
+
+    config = ACTSConfig(
+        hardware=HardwareSpec(),
+        max_depth=1,
+        beam_width=3,
+        sol_plateau_window=99,  # disable plateau termination
+    )
+
+    planner = MagicMock()
+    planner.plan = AsyncMock(return_value=OptimizationPlan(
+        tier=1, technique="tiling", params={}, target_region="", rationale=""
+    ))
+    coder = MagicMock()
+    coder.implement = AsyncMock(return_value="# child source")
+    reviewer = MagicMock()
+    reviewer.review = AsyncMock()  # test sets return_value
+    retriever = MagicMock()
+    retriever.retrieve = MagicMock(return_value=[])
+
+    return SimpleNamespace(
+        config=config,
+        planner=planner,
+        coder=coder,
+        reviewer=reviewer,
+        retriever=retriever,
+        baseline=_make_kernel("root"),
+        roofline=RooflineResult(
+            t_sol_us=50.0,
+            arithmetic_intensity=1.0,
+            bottleneck=BottleneckType.MEMORY_BOUND,
+        ),
+        bench=BenchmarkResult(median_latency_us=100.0, timed_runs=1),
+    )
+
+
+async def _run_orch(h):
+    from src.search.orchestrator import Orchestrator
+
+    with patch("src.eval.benchmark.benchmark_kernel", return_value=h.bench):
+        orch = Orchestrator(h.config, h.planner, h.coder, h.reviewer, h.retriever)
+        await orch.run(h.baseline, workloads=None, roofline=h.roofline)
+
+
+class TestOrchestratorReviewerContext:
+    """Orchestrator must thread real parent SOL + tree context into review()
+    so branch_quality is grounded in the actual search state, not defaults."""
+
+    @pytest.mark.asyncio
+    async def test_reviewer_receives_real_prev_and_tree_context(self, _orch_harness):
+        """Per-iteration review() call gets the parent's SOL score and a
+        non-empty tree_context string, not the old defaults."""
+        from src.agents.reviewer import ReviewerFeedback
+
+        h = _orch_harness
+        h.reviewer.review.return_value = ReviewerFeedback(
+            outcome="improved",
+            bottleneck_classification="memory_bound",
+            branch_quality=BranchQuality.PROMISING,
+        )
+        await _run_orch(h)
+
+        # The reviewer must have been called with real path context, not defaults.
+        assert h.reviewer.review.await_count == 1
+        r_kwargs = h.reviewer.review.await_args.kwargs
+        assert r_kwargs["prev_sol_score"] is not None, (
+            "Orchestrator must pass the parent's SOL score, not leave it None"
+        )
+        assert r_kwargs["tree_context"] != "", (
+            "Orchestrator must pass a non-empty tree_context"
+        )
+        # Full root-to-current path, not just parent summary.
+        assert "Path" in r_kwargs["tree_context"]
+        assert "[0] baseline" in r_kwargs["tree_context"], (
+            "tree_context should render the root node as the start of the trajectory"
+        )
+        assert "tiling" in r_kwargs["tree_context"], (
+            "tree_context should mention the applied action so the Reviewer can reason about it"
+        )
+        assert "← current" in r_kwargs["tree_context"], (
+            "The current (child) node should be marked in the path"
+        )
+
+        # The planner must also get the same root-to-parent trajectory so it
+        # can reason about which actions have already been tried on this branch.
+        assert h.planner.plan.await_count == 1
+        p_kwargs = h.planner.plan.await_args.kwargs
+        assert p_kwargs["tree_context"] != ""
+        assert "[0] baseline" in p_kwargs["tree_context"]
+        # Planner sees the path ending at the parent (no child yet).
+        assert "tiling" not in p_kwargs["tree_context"], (
+            "At planning time the new action has not been applied yet — "
+            "the Planner's path should stop at the parent"
+        )
+
+    @pytest.mark.asyncio
+    async def test_orchestrator_logs_when_reviewer_is_degraded(self, _orch_harness, caplog):
+        """When the reviewer returns degraded=True, the orchestrator must
+        surface it via a warning log — silent continuation hides broken runs."""
+        import logging
+
+        from src.agents.reviewer import ReviewerFeedback
+
+        h = _orch_harness
+        h.reviewer.review.return_value = ReviewerFeedback(
+            outcome="neutral",
+            bottleneck_classification="balanced",
+            branch_quality=BranchQuality.BLOCKED_POTENTIAL,
+            degraded=True,
+            error_reason="llm_retries_exhausted",
+        )
+
+        caplog.set_level(logging.WARNING, logger="src.search.orchestrator")
+        await _run_orch(h)
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("degraded" in r.getMessage().lower() for r in warnings), (
+            "Degraded reviewer feedback must produce a warning log"
+        )
+        assert any("llm_retries_exhausted" in r.getMessage() for r in warnings)

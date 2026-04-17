@@ -115,6 +115,24 @@ Adopted a hybrid approach: bottleneck→technique mapping tables from AutoKernel
 
 **Rationale**: Evaluated Chinese model APIs for the LLM backend. Chose DeepSeek V3 as default for all agents. Key factors: strong Triton/CUDA knowledge in pretraining, reliable JSON mode for structured output, ~$0.27/1M input tokens (viable for 100+ iterations), native OpenAI-compatible API. GLM-5.1 (Zhipu) bookmarked for future evaluation — demonstrated strong kernel optimization capability (KernelBench L3: 3.6x, 14h CUDA optimization at 35.7x) but structured output reliability unverified and API not yet stabilized.
 
+### Reviewer: Pydantic output_type, rule-based fallback, explicit degraded signal (2026-04-17)
+
+**Rationale**: Mirrored the Planner's Pydantic structured-output pattern so both single-call agents have the same shape — the SDK enforces schema via constrained decoding, and the Pydantic model (`ReviewerFeedbackOutput`) is converted to an internal dataclass (`ReviewerFeedback`) via `_output_to_feedback()` to keep Pydantic out of the rest of the codebase. Strict `Literal` / enum typing on `bottleneck_classification` and `branch_quality` surfaces hallucinated values as retry-worthy errors inside `run_agent`, rather than silently propagating garbage strings that would break downstream beam weighting.
+
+**Rule-based fallback** exists for two distinct paths: (1) no model configured — expected, quiet fallback; (2) LLM call exhausted retries — unexpected, must be visible. The `degraded` / `error_reason` fields on `ReviewerFeedback` distinguish these: the orchestrator logs a warning when a degraded reviewer drove a branch_quality decision, because a broken reviewer silently pushing PROMISING → PLATEAU would corrupt beam weighting and memory entries across the whole run.
+
+**`prompt_dir` constructor parameter**: reserved for the future Compute-Reviewer / Memory-Reviewer split. A specialized reviewer is one constructor arg away — no subclassing or prompt-string plumbing required.
+
+### LLM backend retry policy: narrow transient catch + jittered backoff + logging (2026-04-17)
+
+**Rationale**: The original `run_agent` caught `Exception` broadly. That conflates two fundamentally different failure modes: **transient** (rate limit, timeout, 5xx — the right response is "wait, try again") and **permanent** (auth error, schema violation, programmer bug — the right response is "fail fast, surface the cause"). Retrying a 401 doesn't fix it; it just wastes wall-clock and hides the real problem in a retry-exhausted warning.
+
+**Narrow catch**: retry only a fixed tuple of `openai` exceptions (`RateLimitError`, `APITimeoutError`, `APIConnectionError`, `InternalServerError`). Every other exception propagates immediately. The `retriable` parameter is exposed so tests can inject a synthetic exception class without requiring the `openai` package installed.
+
+**Exponential backoff with ±25% jitter**: `delay * 2^(attempt-1) * uniform(0.75, 1.25)`. Jitter prevents thundering-herd synchronization when multiple in-flight agents hit the same rate-limit wall at once — all waking up at exactly the same instant would just hit the limit again.
+
+**Named-logger observability**: `logger.info` per retry, `logger.warning` on exhaustion — both include the exception class name. The Reviewer uses this to populate `error_reason` when it falls back, so a downstream operator reading the log can tell "rate-limited 3× then exhausted" from "unreachable endpoint" without reading the code.
+
 ---
 
 ## Action Library

@@ -427,7 +427,7 @@ acts-kernel-agent/
 |   |   |-- __init__.py
 |   |   |-- planner.py
 |   |   |-- coder.py
-|   |   |-- evaluator.py
+|   |   |-- reviewer.py
 |   |   +-- llm_backend.py
 |   |
 |   |-- search/

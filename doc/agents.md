@@ -55,17 +55,25 @@ Tools return error strings to the LLM (Astra pattern), letting the Coder decide 
 
 **Model choice**: Strong code + reasoning model.
 
-## Reviewer (Evaluator) — `evaluator.py`
+## Reviewer — `reviewer.py`
 
 **Role**: Interprets eval results into structured feedback. Acts as intelligent filter between raw profiling data and the Planner.
 
-**SDK pattern**: Single-call. `Agent(name="Reviewer", instructions=..., model=...)` → `Runner.run()`.
+**SDK pattern**: Single-call with Pydantic structured output, same shape as the Planner. `Agent(name="Reviewer", instructions=..., model=..., output_type=ReviewerFeedbackOutput)` → `Runner.run()`. Strict Pydantic validation on `bottleneck_classification` (`Literal["memory_bound", "compute_bound", "balanced"]`) and `branch_quality` (`BranchQuality` enum) surfaces hallucinated values as retry-worthy errors inside `run_agent`.
 
-**Input**: kernel source, profiling summary, SOL score, headroom %, bottleneck classification.
+**Output models**:
+- `ReviewerFeedbackOutput` (Pydantic) — schema sent to the LLM via `output_type`.
+- `ReviewerFeedback` (dataclass) — internal representation. Adds `degraded: bool` and `error_reason: str` so the orchestrator can surface/halt when a run came from retry exhaustion rather than a healthy LLM call. `BranchQuality` is a `str`-subclass enum defined in this module.
 
-**Output**: `ReviewerFeedback` — `{outcome, metric_deltas, bottleneck_classification, bottleneck_diagnosis, suggestions, branch_quality, conditional_assessment}`.
+**Prompt assembly**: `build_user_prompt()` (static method) — sections: Current kernel (with backtick escaping), Profiling summary, Scoring (SOL score, headroom %, current bottleneck), optional Search tree context, optional Knowledge base context. Empty sections are omitted.
+
+**Input** (via orchestrator): `kernel_source`, `profiling_summary`, `sol_score`, `headroom_pct`, `bottleneck`, `tree_context=""` (root-to-child trajectory from `SearchTree.render_path`), `kb_context=""` (reserved for future Reviewer KB), `prev_sol_score=None`.
+
+**Rule-based fallback**: `rule_based_feedback()` derives feedback from the sol delta alone when no LLM is configured **or** when `run_agent` returns `None` (all retries exhausted). In the retry-exhausted path the result is stamped `degraded=True, error_reason="llm_retries_exhausted"` and the orchestrator logs a warning — distinguishing it from the expected "no-LLM" configuration.
 
 **Branch quality values**: `promising`, `blocked_potential`, `plateau`, `dead_end`.
+
+**Specialization hook**: `prompt_dir` is a constructor parameter, so a future Compute-Reviewer / Memory-Reviewer split can swap in specialized system prompts without subclassing.
 
 **Model choice**: Can be cheaper model (analysis is easier than planning).
 

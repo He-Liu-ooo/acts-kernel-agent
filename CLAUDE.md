@@ -11,18 +11,20 @@ Confirm your understanding of the project state and tell me where we left off.
 
 ## Workflow
 
-Each step is user-triggered — Claude does not auto-advance to the next step.
+Each step is user-triggered — Claude does not auto-advance.
 
-1. **Pick feature** — next item from the dependency-ordered list in PROCESS.md
-2. **Design discussion** (if non-trivial) — align on approach before writing code. Use brainstorming skill if the feature has multiple viable approaches.
-3. **Write tests** — test-first. Define expected behavior before implementation.
+1. **Pick feature** — next item from the dependency-ordered list in PROCESS.md.
+2. **Design discussion** (if non-trivial) — align on approach before writing code. Use the brainstorming skill when multiple viable approaches exist.
+3. **Write tests** — test-first; define expected behavior before implementation.
 4. **Write code** — implement to pass the tests.
-5. **Review** — user triggers `code-reviewer` agent for automated first-pass, then asks Codex to review, then reviews themselves. If changes are needed, iterate on steps 3-4 until review passes.
-6. **Update docs** — after review passes:
+5. **Review** — user triggers the `codex:review` agent for an automated first pass, then asks Codex directly, then reviews themselves. Iterate on steps 3–4 until review passes.
+6. **Simplify** — user triggers `simplify`.
+7. **Update docs** — after review passes, verify consistency between src/ and:
    - **doc/** — record the feature's details in the relevant component file
    - **PROCESS.md** — mark feature complete
    - **JOURNAL.md** — record design rationale (if applicable)
-7. **Commit** — user confirms, then commit.
+   - **PRD.md**
+8. **Commit** — user confirms, then commit and update **PROCESS.md** for the next round.
 
 ### Rules
 

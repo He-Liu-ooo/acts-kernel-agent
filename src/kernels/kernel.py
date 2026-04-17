@@ -67,7 +67,3 @@ class Kernel:
     num_warps: int = 4
     num_stages: int = 2
     block_size: dict[str, int] = field(default_factory=dict)
-
-    def to_source(self) -> str:
-        """Return the full Triton source code string."""
-        return self.source_code

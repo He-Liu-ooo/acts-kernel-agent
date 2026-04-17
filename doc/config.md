@@ -9,6 +9,7 @@ Run parameters are set through `.cfg` files (INI format, parsed via `configparse
 ```ini
 [search]
 beam_width = 3
+beam_diversity = true
 max_depth = 20
 epsilon_start = 0.3
 epsilon_end = 0.05
@@ -74,6 +75,7 @@ Mutable dataclass. All parameters for a single optimization run.
 
 **Search parameters** — control tree search in `search/orchestrator.py`:
 - `beam_width` (3): max active frontier nodes after beam pruning.
+- `beam_diversity` (True): enable the diversity-aware rescue pass (B2) in `beam_prune`. Disable for ablation or pure-exploitation runs.
 - `max_depth` (20): max tree depth (longest root-to-leaf path).
 - `epsilon_start` (0.3): initial exploration rate for epsilon-greedy selection.
 - `epsilon_end` (0.05): final exploration rate after decay.
