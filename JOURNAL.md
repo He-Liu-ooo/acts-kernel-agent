@@ -91,12 +91,29 @@ Astra's Orchestrator agent is unreliable (better as deterministic code). Astra's
 
 ### Future: context-adaptive agent specialization
 
-From advisor discussion: agent specialization should be driven by LLM context window capacity as a finite resource. V1 uses 4 agents with large-context model. For smaller-context models, increase specialization:
-- Large context (200K+): 4 agents
+From advisor discussion: agent specialization should be driven by LLM context window capacity as a finite resource. V1 uses 3 agents with large-context model. For smaller-context models, increase specialization:
+- Large context (200K+): 3 agents
 - Medium context (32-128K): 5-6 agents (Reviewer splits into Compute-Reviewer and Memory-Reviewer)
 - Small context (8-32K): 7+ agents (further specialization, higher communication overhead)
 
 **Hierarchical agent capabilities**: Upper-level agents (orchestrator, Planner) should be discriminative. Lower-level agents (Coder) should be more capable with more tools.
+
+### Planner: Pydantic output_type over JSON-mode parsing (2026-04-17)
+
+**Rationale**: Two approaches for structured LLM output: (1) Pydantic `output_type` on the SDK `Agent` — the SDK handles schema enforcement and parsing automatically, (2) JSON-mode with manual `json.loads()` + validation. Chose `output_type` because: the SDK generates the JSON schema from the Pydantic model and enforces it at the API level (constrained decoding), parsing errors are handled by the SDK retry logic, and the output model serves as the contract between agents. The Pydantic model (`OptimizationPlanOutput`) is converted to an internal dataclass (`OptimizationPlan`) via `_output_to_plan()` to keep Pydantic out of the rest of the codebase.
+
+### Planner system prompt design (2026-04-17)
+
+**Rationale**: Analyzed prompt designs from 3 reference repos:
+- AccelOpt: includes NKI API reference + experience feedback loop in system prompt
+- Astra: terse "strategist" prompt, constraint co-location, all agents inline
+- AutoKernel: 700+ line mega-prompt with tiered playbook, anti-patterns, gain ranges
+
+Adopted a hybrid approach: bottleneck→technique mapping tables from AutoKernel's playbook pattern, anti-patterns section (7 rules), expected gains by tier (risk/reward table), experience interpretation guide, and 6 decision rules. Excluded Triton API reference (unlike AccelOpt's NKI reference) since Triton is well-represented in LLM pretraining data.
+
+### LLM backend choice: DeepSeek V3 (2026-04-17)
+
+**Rationale**: Evaluated Chinese model APIs for the LLM backend. Chose DeepSeek V3 as default for all agents. Key factors: strong Triton/CUDA knowledge in pretraining, reliable JSON mode for structured output, ~$0.27/1M input tokens (viable for 100+ iterations), native OpenAI-compatible API. GLM-5.1 (Zhipu) bookmarked for future evaluation — demonstrated strong kernel optimization capability (KernelBench L3: 3.6x, 14h CUDA optimization at 35.7x) but structured output reliability unverified and API not yet stabilized.
 
 ---
 

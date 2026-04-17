@@ -39,7 +39,21 @@ Best-first tree search with beam constraint.
 
 Plus a deterministic orchestrator (code, not LLM) that manages tree state, beam selection, and move-on criteria.
 
-**LLM SDK**: Agents are built on the OpenAI Agents SDK. The SDK provides the agent runtime (`Agent`, `Runner.run`, `function_tool`), structured output parsing, and model-swapping via `OpenAIChatCompletionsModel` — any OpenAI-compatible API (DeepSeek, vLLM, etc.) works by changing the base URL. The Coder uses SDK `function_tool` decorators for compile/correctness tools; Planner and Reviewer are single-call agents with no tools.
+**LLM SDK**: Agents are built on the OpenAI Agents SDK. The SDK provides the agent runtime (`Agent`, `Runner.run`, `function_tool`), structured output parsing via Pydantic `output_type`, and model-swapping via `OpenAIChatCompletionsModel` — any OpenAI-compatible API works by changing the base URL. The Coder uses SDK `function_tool` decorators for compile/correctness tools; Planner and Reviewer are single-call agents with no tools.
+
+**LLM Backend**: Default model is **DeepSeek V3** for all three agents. Selection rationale:
+- Triton/CUDA knowledge is strong and well-represented in pretraining data
+- Reliable JSON mode for Pydantic structured output (critical for agent contracts)
+- ~$0.27/1M input tokens — viable for 100+ planning iterations per kernel optimization
+- Native OpenAI-compatible API — drops directly into `llm_backend.py` with zero adapter code
+- Production-stable API with known reliability characteristics
+
+**Evaluated alternatives**:
+- *DeepSeek R1*: Stronger reasoning but 2x cost and chain-of-thought latency overhead. Overkill for technique selection; may be useful for Coder on complex kernel rewrites. Reserve for per-agent model specialization if V3 proves insufficient.
+- *GLM-5.1 (Zhipu)*: Demonstrated kernel optimization capability (KernelBench L3: 3.6x geometric mean, 14h CUDA optimization reaching 35.7x speedup). SWE-bench Pro #1 (claimed). Open-source, self-hostable via vLLM. However: structured output reliability unverified, no production API pricing yet, new release without independent benchmarks. **Evaluate when API stabilizes** — kernel domain expertise may outperform DeepSeek V3 for the Coder agent.
+- *Qwen2.5-Coder*: Good code generation, OpenAI-compatible. No differentiated kernel optimization capability.
+
+**Model specialization** (future): `llm_backend.py` supports per-agent model configs. If evaluation shows benefit, use a stronger/domain-specialized model for Coder (where kernel expertise matters most) and a cheaper model for Planner/Reviewer (where structured output reliability matters most).
 
 ### Per-Iteration Communication Flow
 
@@ -74,7 +88,7 @@ Each action is a structured record: `{id, tier, name, description, applicable_to
 | 1 | block_size_tuning, grid_shape_optimization, occupancy_maximization | Low | None |
 | 2 | shared_memory_tiling, global_memory_coalescing, register_caching, prefetching, bank_conflict_resolution | Low-Med | Memory bottleneck |
 | 3 | tf32_accumulation, mixed_precision, fused_operations, vectorized_loads, loop_unrolling | Medium | Compute pattern |
-| 4 | split_k_decomposition, persistent_kernel, warp_specialization, cooperative_groups, stream_k | High | Kernel structure |
+| 4 | split_k_decomposition, persistent_kernel, warp_specialization, stream_k | High | Kernel structure |
 | 5 | h100_tma_loads, h100_wgmma, a100_cp_async, hopper_cluster_launch | High | GPU arch |
 | 6 | welford_online_stats, online_softmax, causal_mask_skip, flash_attention_tiling | High | Kernel type |
 
@@ -544,9 +558,17 @@ The framework must remain runnable at every development iteration. Unimplemented
 2. TileLang — tile-centric model
 3. CuteDSL — near-PTX performance
 
+### Parallel Kernel Candidate Generation
+
+Generate multiple kernel candidates per iteration instead of one. The Coder produces N candidates from the same plan (varying implementation details), and all candidates are evaluated in parallel. The best-scoring candidate becomes the tree node. This trades LLM cost for search breadth — useful when a single Coder call has high variance in output quality.
+
+### Multi-Technique Planning
+
+Allow the Planner to select multiple optimization techniques per plan instead of exactly one. The current "one change at a time" constraint simplifies attribution (which technique helped?) but limits the search when techniques are complementary (e.g., shared memory tiling + prefetching). Multi-technique plans would require the Reviewer to decompose attribution across techniques, and the Coder to apply changes in a controlled sequence.
+
 ### Context-Adaptive Agent Specialization
 
-Agent count adapts to LLM context window: 4 agents at 200K+, 5-6 at 32-128K, 7+ at 8-32K.
+Agent count adapts to LLM context window: 3 agents at 200K+, 5-6 at 32-128K, 7+ at 8-32K.
 
 ### Reviewer Knowledge Base Architecture
 

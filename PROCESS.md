@@ -31,9 +31,9 @@
 
 ## Next Up
 
-### agents/llm_backend.py — OpenAI Agents SDK integration
+### agents/evaluator.py — Reviewer agent
 
-Foundation for all three agents. Skeleton currently returns defaults without calling an LLM. Needs: SDK wrapper, model configuration, structured output parsing via `OpenAIChatCompletionsModel`.
+Same pattern as Planner: Pydantic `output_type` for structured output, `build_user_prompt()`, LLM call via `run_agent()`, system prompt with diagnostic reasoning. Currently a skeleton returning neutral feedback.
 
 ## Remaining (dependency-ordered)
 
@@ -64,11 +64,12 @@ Items marked `(skeleton)` have interfaces + placeholder logic that keeps the pip
 
 ### Phase 4: Agents & Prompts
 
-- [ ] agents/llm_backend.py (skeleton) — OpenAI Agents SDK integration
-- [ ] prompts/planner/ (skeleton) — system + technique_select
+- [x] agents/llm_backend.py (done) — OpenAI Agents SDK integration: ModelConfig, create_model(), run_agent() with retry, make_run_config()
+- [x] prompts/planner/system.md (done) — bottleneck→technique mapping tables, gain ranges, anti-patterns, decision rules
+- [x] prompts/planner/technique_select.md (done) — documents user prompt format
 - [ ] prompts/coder/ (skeleton) — system + implement
 - [ ] prompts/reviewer/ (skeleton) — system + interpret
-- [ ] agents/planner.py (skeleton) — returns default plan without LLM
+- [x] agents/planner.py (done) — Pydantic output_type, build_user_prompt(), PlanningError, technique validation
 - [ ] agents/coder.py (skeleton) — returns source unchanged without LLM
 - [ ] agents/evaluator.py (skeleton) — returns neutral feedback without LLM
 
@@ -95,3 +96,5 @@ Items marked `(skeleton)` have interfaces + placeholder logic that keeps the pip
 - [ ] Embedding-based memory retrieval
 - [ ] Context-adaptive agent specialization
 - [ ] Reviewer Knowledge Base architecture
+- [ ] Parallel kernel candidate generation (Coder produces N candidates per plan)
+- [ ] Multi-technique planning (Planner selects multiple complementary techniques)
