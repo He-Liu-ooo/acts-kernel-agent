@@ -187,6 +187,41 @@ async def test_review_calls_llm_and_returns_parsed_feedback():
     assert feedback.branch_quality is BranchQuality.PROMISING
     assert feedback.metric_deltas == {"sol_score": 0.08, "latency_ms": -0.4}
     assert "L2 hit rose to 68%" in feedback.bottleneck_diagnosis
+
+
+@pytest.mark.asyncio
+async def test_review_uses_nonzero_temperature():
+    """Reviewer runs with temperature=0.3 — variance in diagnosis wording;
+    the strict enum fields (branch_quality, bottleneck_classification) stay pinned."""
+    from src.agents.reviewer import ReviewerFeedbackOutput
+
+    mock_output = ReviewerFeedbackOutput(
+        outcome="neutral",
+        bottleneck_classification="memory_bound",
+        branch_quality=BranchQuality.BLOCKED_POTENTIAL,
+    )
+    mock_result = MagicMock()
+    mock_result.final_output = mock_output
+
+    with (
+        patch("src.agents.reviewer.run_agent", new_callable=AsyncMock) as mock_run,
+        patch("src.agents.reviewer.make_run_config") as mock_cfg,
+    ):
+        mock_run.return_value = mock_result
+        mock_cfg.return_value = None
+
+        agent = ReviewerAgent(model=None)
+        agent._agent = MagicMock()
+
+        await agent.review(
+            kernel_source="def k(): pass",
+            profiling_summary="DRAM 60%",
+            sol_score=0.5,
+            headroom_pct=50.0,
+            bottleneck="memory_bound",
+        )
+
+    mock_cfg.assert_called_once_with(temperature=0.3)
     mock_run.assert_awaited_once()
 
 

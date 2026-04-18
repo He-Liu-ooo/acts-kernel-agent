@@ -33,17 +33,27 @@
 - [x] agents/llm_backend.py retry hardening — narrow transient catch, exponential backoff with ±25% jitter, named-logger observability
 - [x] /simplify sweep across all prior commits — whole-repo review for reuse/quality/efficiency; surgical fixes applied, remaining tech-debt recorded in "Deferred Improvements"
 
+### Implemented during Coder phase (real logic, not placeholders)
+
+- [x] agents/coder.py — tool-using Agent with Pydantic `KernelCodeOutput`, `build_user_prompt()`, `ImplementationError`, hardcoded `_MAX_TURNS=7` turn budget (maps to "3 compile+correctness tries"), temperature 0.0 for determinism. Tools `compile_kernel_tool` / `check_correctness_tool` are placeholder stubs returning success strings — real wiring lands with `kernels/compiler.py` + `eval/correctness.py`.
+- [x] prompts/coder/ — system.md (prescribed compile-then-correctness workflow, hard rules, anti-patterns, one sanctioned failure mode: emit last-compiled source on budget exhaustion) + implement.md (user-prompt format doc)
+- [x] agents/llm_backend.py — added optional `max_turns` kwarg to `run_agent()` (threads SDK tool-loop bound) and `render_kernel_section()` helper (replaces triple-duplicated fence+escape logic in coder/planner/reviewer)
+- [x] Planner/Reviewer temperature bumped 0.0 → 0.3 — Coder stays at 0.0 (determinism for code gen), upstream agents get variance for technique exploration / diagnosis wording; strict Pydantic enums still pin schema
+
 ## Next Up
 
-### agents/coder.py + prompts/coder/ — Coder agent
+### benchmark/baseline_generator.py — PyTorch-to-Triton one-shot translation
 
-Coder is the last remaining LLM agent. Same SDK pattern as Planner/Reviewer, but tool-using instead of single-call. Work order:
+Uses the Coder to translate a problem's PyTorch reference into a Triton baseline at problem load time. Depends on:
 
-1. **prompts/coder/system.md** — compile-then-correctness-then-stop recipe, one-focused-change-per-iteration rule, output contract (return modified source), anti-patterns (don't benchmark, don't bypass the correctness tool).
-2. **prompts/coder/implement.md** — document the user-prompt format (current source + `OptimizationPlan` fields + target region).
-3. **agents/coder.py** — replace the placeholder `implement()` with a real `Runner.run()` call. The skeleton already has `@function_tool`-wrapped `compile_kernel_tool` / `check_correctness_tool`; wire them into the real Agent. Mirror Planner's error handling (raise `ImplementationError` on `run_agent() is None`; orchestrator should already surface this as a dead branch via existing retry-exhaustion path).
+- `kernels/compiler.py` (real Triton compilation) — unlocks the Coder's compile tool.
+- `eval/correctness.py` (5-stage correctness gate) — unlocks the Coder's correctness tool and verifies the generated baseline against the PyTorch reference.
 
-Once Coder is in, `benchmark/baseline_generator.py` becomes implementable (PyTorch-to-Triton one-shot translation at problem load — uses the Coder).
+Order of work: `kernels/compiler.py` → `eval/correctness.py` → wire Coder tool stubs to real calls → `benchmark/baseline_generator.py`.
+
+### Orchestrator-side Coder failure handling (deferred — see JOURNAL)
+
+Currently `ImplementationError` propagates out of `Orchestrator.run()`. Design intent: mark branch dead/degraded and continue. Deferred until the orchestrator's per-iteration Coder call site lands real eval/scoring. Tracked here so it isn't forgotten.
 
 ## Remaining (dependency-ordered)
 
@@ -77,10 +87,10 @@ Items marked `(skeleton)` have interfaces + placeholder logic that keeps the pip
 - [x] agents/llm_backend.py (done) — OpenAI Agents SDK integration: ModelConfig, create_model(), run_agent() with retry (narrow transient catch + exponential backoff w/ jitter), make_run_config()
 - [x] prompts/planner/system.md (done) — bottleneck→technique mapping tables, gain ranges, anti-patterns, decision rules
 - [x] prompts/planner/technique_select.md (done) — documents user prompt format
-- [ ] prompts/coder/ (skeleton) — system + implement
+- [x] prompts/coder/ (done) — system.md (prescribed workflow, hard rules, one sanctioned failure mode) + implement.md (user-prompt format)
 - [x] prompts/reviewer/ (done) — system.md (diagnostic reasoning) + interpret.md
 - [x] agents/planner.py (done) — Pydantic output_type, build_user_prompt(), PlanningError, technique validation
-- [ ] agents/coder.py (skeleton) — returns source unchanged without LLM
+- [x] agents/coder.py (done) — tool-using Agent, Pydantic `KernelCodeOutput`, `ImplementationError`, `_MAX_TURNS=7` (see Deferred: config wiring), placeholder tools until compiler/correctness land
 - [x] agents/reviewer.py (done) — Pydantic ReviewerFeedbackOutput, build_user_prompt, rule-based fallback (`degraded`/`error_reason`), configurable `prompt_dir`
 
 ### Phase 5: Search
@@ -140,11 +150,26 @@ these before its trigger fires, re-read the trigger first.
   `KernelSpec`, or `ScoreResult`. Don't pre-refactor — checkpoint
   back-compat risk isn't worth paying proactively.
 
-- [ ] **Shared `prompt_sections` helper** — Planner and Reviewer both
-  have `build_user_prompt()` with the same scaffolding (fence escape,
-  optional section, `"\n\n".join`). Only two call sites today.
-  *Trigger*: when `CoderAgent.build_user_prompt()` is implemented —
-  three call sites justifies extraction; two doesn't.
+- [ ] **Wire `_MAX_TURNS` through config** — Coder currently hardcodes
+  the SDK turn budget as `_MAX_TURNS = 7` (derived from "3 compile+
+  correctness tries"). The existing `ACTSConfig.max_debug_retries=3`
+  captures the same intent at the user-facing level but is not yet
+  read by CoderAgent. Config wiring ties the two together:
+  `_MAX_TURNS = 2 * config.max_debug_retries + 1`.
+  *Trigger*: when `kernels/compiler.py` and `eval/correctness.py` are
+  wired into the Coder's tools — the same increment that turns the
+  placeholder stubs into real compile/correctness calls should accept
+  `ACTSConfig` on `CoderAgent` and drop the module constant.
+
+- [ ] **Coder failure surfacing at the orchestrator** — today
+  `ImplementationError` (transient retry exhaustion) and SDK
+  `MaxTurnsExceeded` (tool-loop budget exhaustion) both unwind
+  `Orchestrator.run()`. Design intent: catch at the orchestrator
+  boundary and mark the branch dead/degraded so one bad branch does
+  not take down the search run.
+  *Trigger*: same increment as above — once compiler/correctness are
+  real, the orchestrator starts seeing genuine Coder failures, and
+  "mark branch dead" has a concrete meaning.
 
 ### Skipped (decisions, not tech debt)
 

@@ -106,6 +106,7 @@ async def run_agent(
     max_retries: int = 3,
     initial_delay: float = 1.0,
     retriable: tuple[type[BaseException], ...] = RETRIABLE_EXCEPTIONS,
+    max_turns: int | None = None,
 ) -> RunResult | None:
     """Run an agent with retry on transient OpenAI errors only.
 
@@ -115,12 +116,18 @@ async def run_agent(
     immediately — retrying them wastes time and hides the real failure.
     Returns ``None`` only when every retriable attempt has been exhausted.
 
+    *max_turns* bounds the agent's internal tool-use loop (used by the Coder
+    to cap self-correction). When ``None``, the SDK default applies.
+
     *retriable* is exposed for tests so they can inject a synthetic
     exception class without requiring the openai package.
     """
+    run_kwargs: dict = {"run_config": run_config}
+    if max_turns is not None:
+        run_kwargs["max_turns"] = max_turns
     for attempt in range(1, max_retries + 1):
         try:
-            return await Runner.run(agent, prompt, run_config=run_config)
+            return await Runner.run(agent, prompt, **run_kwargs)
         except retriable as exc:
             if attempt == max_retries:
                 logger.warning(
@@ -148,3 +155,12 @@ def make_run_config(
             max_tokens=max_tokens,
         ),
     )
+
+
+def render_kernel_section(kernel_source: str) -> str:
+    """Render a kernel source as a fenced markdown ``## Current kernel`` section.
+
+    Triple backticks in the source are escaped so they cannot close the fence.
+    """
+    safe_source = kernel_source.replace("```", r"\`\`\`")
+    return "## Current kernel\n```python\n" + safe_source + "\n```"

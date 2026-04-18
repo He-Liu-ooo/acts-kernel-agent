@@ -199,6 +199,35 @@ async def test_plan_raises_on_llm_failure():
 
 
 @pytest.mark.asyncio
+async def test_plan_uses_nonzero_temperature():
+    """Planner runs with temperature=0.3 — variance in technique exploration."""
+    from src.agents.planner import OptimizationPlanOutput
+
+    mock_output = OptimizationPlanOutput(tier=1, technique="block_size_tuning")
+    mock_result = MagicMock()
+    mock_result.final_output = mock_output
+
+    with (
+        patch("src.agents.planner.run_agent", new_callable=AsyncMock) as mock_run,
+        patch("src.agents.planner.make_run_config") as mock_cfg,
+    ):
+        mock_run.return_value = mock_result
+        mock_cfg.return_value = None
+
+        agent = PlannerAgent(model=None)
+        agent._agent = MagicMock()
+
+        await agent.plan(
+            kernel_source="def k(): pass",
+            profiling_summary="Memory bound",
+            past_experiences=[],
+            available_actions=["block_size_tuning"],
+        )
+
+    mock_cfg.assert_called_once_with(temperature=0.3)
+
+
+@pytest.mark.asyncio
 async def test_plan_rejects_hallucinated_technique():
     """If the LLM returns a technique not in available_actions, raise PlanningError."""
     from src.agents.planner import OptimizationPlanOutput

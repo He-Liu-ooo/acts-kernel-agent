@@ -41,17 +41,30 @@ The deterministic orchestrator controls all flow. Agents are stateless — they 
 
 **Role**: Implements the Planner's plan into kernel code. Self-corrects compilation and correctness errors via tools.
 
-**SDK pattern**: Tool-using. `Agent(name="Coder", ..., tools=[compile_kernel_tool, check_correctness_tool])` → `Runner.run()` with tool loop.
+**SDK pattern**: Tool-using with Pydantic structured output. `Agent(name="Coder", instructions=..., model=..., tools=[compile_kernel_tool, check_correctness_tool], output_type=KernelCodeOutput)` → `Runner.run()` with an internal tool loop bounded by `max_turns`.
 
-**Tools** (decorated with `@function_tool`):
-- `compile_kernel_tool(source_code)` → calls `kernels/compiler.py`, returns success/error string
-- `check_correctness_tool(source_code)` → calls `eval/correctness.py`, returns pass/fail string
+**Output model**:
+- `KernelCodeOutput` (Pydantic) — single field `source_code: str`. The SDK enforces this schema on the LLM's final response. No separate internal dataclass — the kernel source is already the only thing the rest of the pipeline needs.
 
-Tools return error strings to the LLM (Astra pattern), letting the Coder decide how to fix within the same turn. Retry budget: `max_debug_retries` from config.
+**Tools** (decorated with `@function_tool` when the SDK is available):
+- `compile_kernel_tool(source_code)` → will call `kernels/compiler.py`, returns success/error string
+- `check_correctness_tool(source_code)` → will call `eval/correctness.py`, returns pass/fail string
+
+**Current tool state (placeholder)**: both tools are module-level stubs that unconditionally return success strings. They will be wired to `kernels/compiler.py` and `eval/correctness.py` when those modules become real. The Astra pattern — tools return error strings for in-turn self-correction — is already in place; only the bodies are stubbed.
+
+**Prompt assembly**: `build_user_prompt()` (static method) assembles the user prompt from the kernel source and the `OptimizationPlan`. Sections: Current kernel (via shared `render_kernel_section()` helper — backticks escaped), Optimization plan (tier, technique, optional params, target region, rationale). **Reviewer feedback is intentionally not included** — the Planner has already consumed it and distilled its conclusions into the plan, so the Coder works from the plan only.
+
+**Turn budget — `_MAX_TURNS = 7`**: module-level constant. Derivation: "3 compile+correctness tries" × 2 tool turns per cycle + 1 final structured-output turn. The one sanctioned failure mode, spelled out in `system.md`, is emitting the last version that compiled cleanly when the budget runs out without a green correctness run. **Config gap**: `ACTSConfig.max_debug_retries=3` captures the same intent at the user-facing level but is not yet read by `CoderAgent`. Wiring is deferred (see `PROCESS.md` → Deferred Improvements) until compiler/correctness are wired into the tools.
 
 **Input**: kernel source + `OptimizationPlan`.
 
-**Output**: modified kernel source code string.
+**Output**: modified kernel source code string. **May be a degraded best-effort** when the SDK tool loop exhausts `_MAX_TURNS` without a green correctness run — downstream verification/scoring handles that case.
+
+**Error handling**: `ImplementationError` is raised when `run_agent()` returns `None` (transient retry exhaustion). Without a model configured, `implement()` returns the source unchanged (no LLM call). **Deferred**: orchestrator-side handling of `ImplementationError` and SDK `MaxTurnsExceeded` — see `PROCESS.md` → Deferred Improvements.
+
+**Temperature**: 0.0. Determinism is load-bearing for code generation — variance in kernel code is almost always noise, not creativity. Planner/Reviewer use 0.3 for exactly the opposite reason (see Planner / Reviewer sections).
+
+**System prompt** (`prompts/coder/system.md`): prescribed 5-step workflow (apply change → compile → correctness → emit), hard rules (signature invariance, one focused change, no benchmarking, no bypassing correctness, no invented APIs, no precision drop, no stray imports), anti-patterns (rewrites, correctness-before-compile, snippets, prose in final output, multi-change after failure). The hard rule on correctness bypassing explicitly defines the single legal failure-mode output so the prompt and the `KernelCodeOutput` schema never contradict each other.
 
 **Model choice**: Strong code + reasoning model.
 

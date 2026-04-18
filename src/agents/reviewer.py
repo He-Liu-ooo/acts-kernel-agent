@@ -28,7 +28,7 @@ except ModuleNotFoundError:  # pragma: no cover
 if TYPE_CHECKING:
     from agents import Agent, OpenAIChatCompletionsModel, RunResult
 
-from src.agents.llm_backend import make_run_config, run_agent
+from src.agents.llm_backend import make_run_config, render_kernel_section, run_agent
 
 PROMPT_DIR = Path(__file__).resolve().parent.parent / "prompts" / "reviewer"
 
@@ -210,8 +210,7 @@ class ReviewerAgent:
         """Assemble the user prompt from runtime data."""
         sections: list[str] = []
 
-        safe_source = kernel_source.replace("```", r"\`\`\`")
-        sections.append("## Current kernel\n```python\n" + safe_source + "\n```")
+        sections.append(render_kernel_section(kernel_source))
         sections.append("## Profiling summary\n" + profiling_summary)
         sections.append(
             "## Scoring\n"
@@ -268,7 +267,7 @@ class ReviewerAgent:
         result = await run_agent(
             self._agent,
             prompt,
-            run_config=make_run_config(temperature=0.0),
+            run_config=make_run_config(temperature=0.3),
         )
         if result is None:
             # LLM call exhausted retries — do NOT mask as ordinary fallback.

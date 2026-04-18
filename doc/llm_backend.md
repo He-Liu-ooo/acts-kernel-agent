@@ -50,10 +50,15 @@ Async runner with a **narrow** retry policy. Only retries a fixed tuple of trans
 - **Logging**: named logger (`src.agents.llm_backend`). `logger.info` per transient retry; `logger.warning` when retries are exhausted — both include the exception class name so the orchestrator can diagnose.
 - **Return value**: `RunResult` on success, `None` only after all retriable attempts are exhausted.
 - **Test injection**: the `retriable` parameter is exposed so tests can pass a synthetic exception class without requiring the real `openai` package installed.
+- **Optional `max_turns` kwarg**: when not `None`, forwarded to `Runner.run` to bound the SDK's internal tool-use loop. Used by `CoderAgent` to cap self-correction; Planner/Reviewer (single-call, no tools) leave it `None` and use the SDK default.
 
 ### make_run_config(temperature, max_tokens) -> RunConfig
 
 Factory for `RunConfig` + `ModelSettings`.
+
+### render_kernel_section(kernel_source) -> str
+
+Shared helper that renders a kernel source as a fenced `## Current kernel` markdown section. Triple backticks in the source are escaped so they cannot close the fence. Used by Planner, Reviewer, and Coder prompt assembly to avoid triplicating the fence+escape logic.
 
 ## SDK Guard
 

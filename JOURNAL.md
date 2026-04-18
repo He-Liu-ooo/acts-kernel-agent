@@ -77,7 +77,7 @@ Originally had 4 agents — a separate Debugger that diagnosed compilation/corre
 
 **Why not keep Debugger as escalation**: If a fresh prompt helps break out of a rut, that's an argument for retrying the Coder with different context, not for a separate agent. The tree search also provides natural recovery — a failed branch is pruned, and the search explores other branches.
 
-**Retry budget**: Coder gets `max_debug_retries` self-correction attempts per iteration. If exhausted, the branch is marked dead.
+**Retry budget**: Coder gets `max_debug_retries` self-correction attempts per iteration. If exhausted, the branch is marked dead. *Current implementation note (2026-04-18)*: `CoderAgent` hardcodes `_MAX_TURNS = 7` (= 2×3 + 1, derived from 3 compile+correctness tries). `max_debug_retries` from `ACTSConfig` is not yet read by the Coder; wiring is deferred to the same increment that turns the compile/correctness tool stubs into real calls.
 
 ### Why not 5 (Astra-style)
 
@@ -122,6 +122,25 @@ Adopted a hybrid approach: bottleneck→technique mapping tables from AutoKernel
 **Rule-based fallback** exists for two distinct paths: (1) no model configured — expected, quiet fallback; (2) LLM call exhausted retries — unexpected, must be visible. The `degraded` / `error_reason` fields on `ReviewerFeedback` distinguish these: the orchestrator logs a warning when a degraded reviewer drove a branch_quality decision, because a broken reviewer silently pushing PROMISING → PLATEAU would corrupt beam weighting and memory entries across the whole run.
 
 **`prompt_dir` constructor parameter**: reserved for the future Compute-Reviewer / Memory-Reviewer split. A specialized reviewer is one constructor arg away — no subclassing or prompt-string plumbing required.
+
+### Coder: Pydantic output_type, tool placeholders, explicit failure contract (2026-04-18)
+
+**Rationale**: Mirrored the Planner/Reviewer Pydantic structured-output pattern — `KernelCodeOutput(source_code: str)` is sent to the SDK via `output_type`, the tool loop is bounded by `max_turns`, and schema enforcement happens via constrained decoding. One field, no internal dataclass — the kernel source is the only thing the rest of the pipeline needs, so adding a translation layer would be cosmetic overhead.
+
+**Tool placeholders, not scaffolding**: `compile_kernel_tool` and `check_correctness_tool` are module-level stubs returning success strings today. `@function_tool` wrapping, the Astra error-string pattern, and the Coder's workflow prompt are all real — only the tool bodies are stubbed. This lets the Coder land independently of `kernels/compiler.py` and `eval/correctness.py`, and the wiring work is mechanical when those modules arrive.
+
+**Turn budget — `_MAX_TURNS = 7`, hardcoded for now**: derivation is 3 compile+correctness tries × 2 tool turns per cycle + 1 final structured-output turn. User framing: "3 tries means code can fail 2 times" — the third attempt must pass or the agent emits its best compiling effort. `ACTSConfig.max_debug_retries=3` already captures the user-facing concept but is not yet read by the Coder; wiring is deferred until the compiler/correctness integration (same increment that turns the tool stubs real). Recorded in `PROCESS.md` → Deferred Improvements.
+
+**Failure contract — one sanctioned output in every case**:
+- `run_agent()` returns `None` (transient retry exhaustion) → `implement()` raises `ImplementationError`.
+- SDK tool loop hits `_MAX_TURNS` without a green correctness run → the prompt instructs the model to emit "the last version that compiled cleanly" as `source_code`. This is the *only* legal failure output, aligned explicitly with the `KernelCodeOutput` schema (which has no rationale field) and the hard rule that forbids emitting sources that were never compiled. No rationale side-channel, no multi-field schema, no prose stuffed into `source_code`.
+- Without a model configured → returns the source unchanged.
+
+Orchestrator-side handling of `ImplementationError` / `MaxTurnsExceeded` is deferred (same Deferred Improvements entry). Today these propagate and unwind the search run — acceptable while the Coder runs behind tool stubs, unacceptable once real failures are possible.
+
+**No Reviewer feedback in the Coder's user prompt**: the Planner already consumes Reviewer feedback and distills its conclusions into the plan. Injecting feedback again at the Coder level would risk the Coder second-guessing the plan instead of implementing it. `build_user_prompt()` is plan-only (+ current kernel).
+
+**Temperature split — Coder 0.0, Planner/Reviewer 0.3 (2026-04-18)**: determinism is load-bearing for code generation — variance in kernel code is almost always noise, not creativity — so the Coder runs at 0.0. Upstream agents benefit from a small amount of variance: Planner explores technique selection across tiers instead of deterministically picking the highest-ranked option every time, and the Reviewer's diagnosis wording varies slightly without drifting off-schema (strict Pydantic enums on `bottleneck_classification` and `branch_quality` still pin the structure). Pinning tests (`test_plan_uses_nonzero_temperature`, `test_review_uses_nonzero_temperature`) guard against regression to 0.0.
 
 ### LLM backend retry policy: narrow transient catch + jittered backoff + logging (2026-04-17)
 
