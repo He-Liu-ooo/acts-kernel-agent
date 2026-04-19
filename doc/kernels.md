@@ -21,6 +21,7 @@ Static metadata about the kernel *problem* — stays the same across all optimiz
 | `flop_count` | int | `roofline.py` for T_SOL derivation |
 | `memory_bytes` | int | `roofline.py` for T_SOL derivation |
 | `input_shapes` | list[dict] | `correctness.py` for test input generation |
+| `entrypoint` | str | Callable name the compiler resolves via `getattr` (default `"kernel_fn"`). Overridable for fused ops where the launchable symbol is a host wrapper. |
 
 ### Kernel
 
@@ -38,11 +39,11 @@ Read `source_code` directly — it's the full Triton source string.
 
 ## Compiler — `compiler.py`
 
-Called by the Coder's `compile_kernel_tool` during its turn (not by the orchestrator).
+Called by the Coder's `compile_kernel_tool` during its turn, and by `pipeline/verify.py` post-search.
 
-- `compile_kernel(kernel) -> CompilationResult`: Compile Triton source. Returns success/fail + compiled function or error message.
+- `compile_kernel(kernel, cache_dir=None) -> CompilationResult`: Write source to `<cache_dir>/<name>_<hash>.py`, load via `importlib.util.spec_from_file_location` + `exec_module`, resolve `kernel.spec.entrypoint` via `getattr`. Returns success/fail, compiled callable, error traceback, and `source_path` (for traceback fidelity). Defaults to `DEFAULT_CACHE_DIR = Path(".acts_cache/compiled")`.
 
-By the time the Coder returns, compilation is guaranteed.
+Parse-time errors (syntax, imports, missing/non-callable entrypoint) surface as `success=False`. Triton's `@triton.jit` specialization is lazy — shape/dtype-dependent compile errors surface later in `eval/correctness.py`.
 
 ## Starters — `starters/`
 

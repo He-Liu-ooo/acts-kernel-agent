@@ -55,6 +55,10 @@ class KernelSpec:
     definition_path: Path | None = None
     pytorch_reference: str = ""
     t_sol_us: float | None = None
+    # Name of the callable the compiler should resolve from the loaded module.
+    # Matches AutoKernel's convention; overridable for fused ops where the
+    # launchable symbol is a host wrapper around one or more @triton.jit fns.
+    entrypoint: str = "kernel_fn"
 
 
 @dataclass
