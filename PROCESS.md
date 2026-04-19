@@ -35,7 +35,7 @@
 
 ### Implemented during Coder phase (real logic, not placeholders)
 
-- [x] agents/coder.py — tool-using Agent with Pydantic `KernelCodeOutput`, `build_user_prompt()`, `ImplementationError`, hardcoded `_MAX_TURNS=7` turn budget (maps to "3 compile+correctness tries"), temperature 0.0 for determinism. Tools `compile_kernel_tool` / `check_correctness_tool` are placeholder stubs returning success strings — real wiring lands with `kernels/compiler.py` + `eval/correctness.py`.
+- [x] agents/coder.py — tool-using Agent with Pydantic `KernelCodeOutput`, `build_user_prompt()`, `ImplementationError`, `_MAX_TURNS` derived from `ACTSConfig.max_debug_retries` (= 2×n+1, default 7), temperature 0.0 for determinism. Tools wire to real `compile_kernel` / `verify_correctness` via closure-captured `KernelSpec` + `reference_fn` + `input_generator` at `implement()` call time.
 - [x] prompts/coder/ — system.md (prescribed compile-then-correctness workflow, hard rules, anti-patterns, one sanctioned failure mode: emit last-compiled source on budget exhaustion) + implement.md (user-prompt format doc)
 - [x] agents/llm_backend.py — added optional `max_turns` kwarg to `run_agent()` (threads SDK tool-loop bound) and `render_kernel_section()` helper (replaces triple-duplicated fence+escape logic in coder/planner/reviewer)
 - [x] Planner/Reviewer temperature bumped 0.0 → 0.3 — Coder stays at 0.0 (determinism for code gen), upstream agents get variance for technique exploration / diagnosis wording; strict Pydantic enums still pin schema
@@ -44,12 +44,11 @@
 
 ### benchmark/baseline_generator.py — PyTorch-to-Triton one-shot translation
 
-Uses the Coder to translate a problem's PyTorch reference into a Triton baseline at problem load time. Depends on:
+Uses the Coder to translate a problem's PyTorch reference into a Triton baseline at problem load time. Now that `kernels/compiler.py`, `eval/correctness.py`, and the Coder tool wiring are real, the remaining work is:
 
-- `kernels/compiler.py` (real Triton compilation) — unlocks the Coder's compile tool.
-- `eval/correctness.py` (5-stage correctness gate) — unlocks the Coder's correctness tool and verifies the generated baseline against the PyTorch reference.
-
-Order of work: `kernels/compiler.py` → `eval/correctness.py` → wire Coder tool stubs to real calls → `benchmark/baseline_generator.py`.
+1. Build the per-problem `KernelSpec` + `reference_fn` + `input_generator` from a loaded `Problem` (helpers live in `src/eval/inputs.py`).
+2. Drive `CoderAgent.implement()` with a translation plan (Planner-free — this is a fixed "translate PyTorch `run()` to Triton `kernel_fn`" task).
+3. Retry up to `ACTSConfig.max_baseline_retries` attempts; skip the problem if all fail (per `definition.json` → baseline contract).
 
 ### Orchestrator-side Coder failure handling (deferred — see JOURNAL)
 
@@ -63,11 +62,12 @@ Items marked `(skeleton)` have interfaces + placeholder logic that keeps the pip
 
 - [x] config.py (done) — detect_hardware() is placeholder (deferred — YAML loading covers the primary path)
 - [x] kernels/kernel.py (done) — dataclasses complete
-- [ ] kernels/compiler.py (skeleton) — Triton compilation. Needs GPU for real tests.
+- [x] kernels/compiler.py (done) — file-backed importlib load (`spec_from_file_location` + `exec_module`), hash-keyed cache path, resolves `KernelSpec.entrypoint` via `getattr`. GPU-side Triton specialization still happens at launch time in correctness/benchmark runs.
 
 ### Phase 2: Evaluation Harness
 
-- [ ] eval/correctness.py (skeleton) — 5-stage correctness verification. Needs compiler.py + GPU.
+- [x] eval/correctness.py (done) — 5-stage gate (smoke → shape-sweep → numerical stability → determinism → anti-cheat) with short-circuit failure attribution. Injectable `ComparisonPolicy` (torch-free at import); `TorchComparisonPolicy` delegates to `sol_execbench.compute_error_stats` when installed, falls back to `torch.allclose` otherwise.
+- [x] eval/inputs.py (done) — `build_reference_fn` (exec PyTorch reference source, resolve `run`) + `build_input_generator` (wraps SOL's `gen_inputs` with seeding). Torch + sol_execbench lazy-imported.
 - [ ] eval/benchmark.py (skeleton) — latency measurement. Needs compiler.py + GPU.
 - [ ] eval/profiler.py (skeleton) — NCU integration + per-iteration bottleneck classification. Needs GPU. Note: orchestrator must call per candidate and feed dynamic classification to retriever/reviewer/planner (see JOURNAL.md "Dynamic bottleneck reclassification")
 - [x] eval/roofline.py (done) — two clean paths: SOLAR (T_SOL + bottleneck together) or built-in fallback. solar_adapter.py placeholder returns synthetic data until SOLAR is installed.
@@ -102,7 +102,7 @@ Items marked `(skeleton)` have interfaces + placeholder logic that keeps the pip
 ### Phase 6: Pipeline & Integration
 
 - [ ] pipeline/optimize.py (skeleton) — has real Phase A flow (two load paths, roofline, workload selection) but calls placeholder baseline generator
-- [ ] pipeline/verify.py (skeleton) — post-optimization verification
+- [x] pipeline/verify.py (done) — recompiles the winner and reruns the 5-stage correctness gate against the PyTorch reference; compile failures surface as `passed=False` with a compile-phrased detail string
 - [ ] pipeline/report.py (skeleton) — report generation
 - [x] benchmark/problem_loader.py (done)
 - [ ] benchmark/baseline_generator.py (skeleton) — Triton baseline generation. Needs Coder agent.
@@ -150,16 +150,44 @@ these before its trigger fires, re-read the trigger first.
   `KernelSpec`, or `ScoreResult`. Don't pre-refactor — checkpoint
   back-compat risk isn't worth paying proactively.
 
-- [ ] **Wire `_MAX_TURNS` through config** — Coder currently hardcodes
-  the SDK turn budget as `_MAX_TURNS = 7` (derived from "3 compile+
-  correctness tries"). The existing `ACTSConfig.max_debug_retries=3`
-  captures the same intent at the user-facing level but is not yet
-  read by CoderAgent. Config wiring ties the two together:
-  `_MAX_TURNS = 2 * config.max_debug_retries + 1`.
-  *Trigger*: when `kernels/compiler.py` and `eval/correctness.py` are
-  wired into the Coder's tools — the same increment that turns the
-  placeholder stubs into real compile/correctness calls should accept
-  `ACTSConfig` on `CoderAgent` and drop the module constant.
+- [ ] **Adopt SOL-ExecBench `Definition` / `Workload` pydantic models
+  end-to-end (Tier 2)** — today ACTS parses SOL definition.json /
+  workload.jsonl into hand-written dataclasses (`src/benchmark/problem.py`),
+  and `src/eval/inputs.py` round-trips them to dicts to feed SOL's
+  `gen_inputs`. Replacing ACTS's `Problem` / `Workload` with SOL's
+  pydantic models would drop the round-trip, the duplicated schema,
+  and the `_problem_to_sol_dict` / `_workload_to_sol_dict` shims.
+  Also applies to `Trace` / `Correctness` / `Performance` in
+  `solution_formatter.py`.
+  *Trigger*: when `benchmark/baseline_generator.py` lands and starts
+  passing definitions through the full pipeline. At that point the
+  duplicated schema has to travel further and the shim cost shows up;
+  refactor then. Keep in mind future KernelBench support — the Problem
+  abstraction may need to stay benchmark-agnostic, with SOL's pydantic
+  as one backend rather than the universal type.
+
+- [ ] **Subprocess-isolated correctness / benchmark (Tier 3)** —
+  SOL-ExecBench's `driver/templates/eval_driver.py` + `ProblemPackager`
+  runs each submission in a fresh subprocess so kernel crashes, OOMs,
+  or monkey-patch attempts don't take down the harness. Our Coder
+  self-corrects in a tight in-process loop (`compile_kernel` +
+  `verify_correctness` run inline per tool call).
+  *Trigger*: if we start seeing real kernel crashes that kill the
+  orchestrator process, or if we ever accept externally-sourced kernel
+  code (reward-hack threat model). In-process is faster while the
+  search is internal and bounded — don't pay subprocess per-call
+  latency to solve a problem we don't have yet.
+
+- [ ] **Reward-hack detection (Tier 3)** —
+  `sol_execbench.core.bench.reward_hack` catches monkey-patches of
+  torch primitives, thread injection, lazy/deferred outputs, and
+  critical-function tampering. Our current anti-cheat is strict-tolerance
+  comparison only (`eval/correctness.py` Stage 5) plus a
+  performance-side audit flag in `eval/scorer.py`.
+  *Trigger*: when the agent loop runs against a multi-tenant surface
+  or accepts code from outside the controlled search. For a bounded
+  internal search the threat model is empty — adding these checks now
+  would cost CPU and add nothing.
 
 - [ ] **Coder failure surfacing at the orchestrator** — today
   `ImplementationError` (transient retry exhaustion) and SDK
@@ -170,6 +198,53 @@ these before its trigger fires, re-read the trigger first.
   *Trigger*: same increment as above — once compiler/correctness are
   real, the orchestrator starts seeing genuine Coder failures, and
   "mark branch dead" has a concrete meaning.
+
+- [ ] **`CorrectnessContext` dataclass to replace triple-kwarg
+  threading** — `CoderAgent.implement()` and `Orchestrator.run()` both
+  accept `kernel_spec` + `reference_fn` + `input_generator` as three
+  Optional kwargs that are jointly required when a model is configured.
+  The tri-state "all-or-none" validation is parameter sprawl. A small
+  `CorrectnessContext(kernel_spec, reference_fn, input_generator)`
+  dataclass would collapse the trio to one parameter at both call
+  sites and make the "bound oracle for this problem" concept explicit
+  in the type system.
+  *Trigger*: when a fourth field needs to travel alongside the trio
+  (e.g., `device`, `tolerance_override`, or a per-problem `atol`),
+  OR when `benchmark/baseline_generator.py` starts constructing its
+  own context — whichever comes first. Pre-refactor cost is low but
+  the restructure touches `coder.py`, `orchestrator.py`, and their
+  tests, so pay it when there's a concrete second motivation.
+
+- [ ] **`sys.modules` compile cache in `kernels/compiler.py`** —
+  `compile_kernel` writes `<stem>.py` to the cache dir and calls
+  `spec.loader.exec_module()` unconditionally, even when `stem`
+  (source hash prefix) already resolves in `sys.modules`. In the
+  search loop, the Coder's correctness tool compiles each candidate,
+  then `verify_optimized_kernel` recompiles the winner post-loop —
+  guaranteed identical hash, guaranteed cache hit, currently executed
+  twice. Short-circuit via `sys.modules.get(module_name)` +
+  `getattr(module, entrypoint)` would eliminate the double compile.
+  *Trigger*: when a real benchmark shows the double-compile in a
+  profile, OR when we add a third in-process compile site
+  (e.g., benchmark.py runs the winner once more on GPU). Skip until
+  then — the file write + exec_module pair is cheap at current scale
+  and adding the cache introduces a new "stale module in sys.modules
+  after a reload" failure mode that we'd have to reason about.
+
+- [ ] **Parallel beam expansion via `asyncio.gather`** —
+  `Orchestrator.run()` currently expands one frontier node per
+  iteration: select → plan → implement → benchmark → review. Each
+  iteration is bounded by three sequential LLM calls (Planner, Coder,
+  Reviewer). Beam width ≥ k opens the door to `asyncio.gather`-ing
+  the top-k frontier picks per iteration — amortizing LLM latency
+  across the beam.
+  *Trigger*: when wallclock per iteration becomes the dominant cost
+  in a real run (not today — search is LLM-latency-bound only once
+  the full pipeline runs end-to-end). Design pass required before
+  implementation: serial expansion is load-bearing for `beam_prune`
+  + `MemoryStore.add()` + checkpoint writes, all of which assume
+  single-writer semantics on the tree. See JOURNAL → Search →
+  "Serial beam expansion" for the rationale to keep it serial today.
 
 ### Skipped (decisions, not tech debt)
 

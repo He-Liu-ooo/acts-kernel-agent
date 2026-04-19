@@ -50,6 +50,16 @@ Some optimizations require passing through a performance valley (e.g., restructu
 - `"plateau"` — diminishing returns
 - `"dead_end"` — fundamental mismatch, prune immediately
 
+### Serial beam expansion (2026-04-19, /simplify review)
+
+**Rationale**: `Orchestrator.run()` expands one frontier node per iteration despite `beam_width ≥ 1`. Parallelizing via `asyncio.gather` across the top-k picks would amortize three sequential LLM calls (Planner → Coder → Reviewer) across k concurrent branches — the largest wallclock-latency win available. Deliberately deferred because three downstream components assume single-writer semantics on the tree:
+
+- **`beam_prune`**: the diversity-aware pass (see B2 above) ranks the current frontier once per iteration. Concurrent expansion would either need a frontier-snapshot-per-worker (stale rankings) or a post-join re-prune (defeats the parallelism win for small k).
+- **`MemoryStore.add()`**: today a single-file JSON rewrite per add. Concurrent writers would race on the file. The deferred "batched flush" improvement (see `PROCESS.md` → Deferred Improvements) is a prerequisite — not a blocker, but parallelism pulls it onto the critical path.
+- **Checkpoint writes**: atomic temp-file + `os.replace` is correct for one writer; N writers racing on the same checkpoint path would corrupt recovery state even with atomic replace.
+
+**Decision**: keep expansion serial until a real benchmark shows LLM latency is the dominant cost. At that point, design the change as a coordinated restructure — frontier snapshots + batched memory flush + per-worker checkpoint slots — rather than dropping `asyncio.gather` into the hot path. Recorded with its trigger in `PROCESS.md` → Deferred Improvements → "Parallel beam expansion via asyncio.gather".
+
 ---
 
 ## Agents
@@ -127,9 +137,9 @@ Adopted a hybrid approach: bottleneck→technique mapping tables from AutoKernel
 
 **Rationale**: Mirrored the Planner/Reviewer Pydantic structured-output pattern — `KernelCodeOutput(source_code: str)` is sent to the SDK via `output_type`, the tool loop is bounded by `max_turns`, and schema enforcement happens via constrained decoding. One field, no internal dataclass — the kernel source is the only thing the rest of the pipeline needs, so adding a translation layer would be cosmetic overhead.
 
-**Tool placeholders, not scaffolding**: `compile_kernel_tool` and `check_correctness_tool` are module-level stubs returning success strings today. `@function_tool` wrapping, the Astra error-string pattern, and the Coder's workflow prompt are all real — only the tool bodies are stubbed. This lets the Coder land independently of `kernels/compiler.py` and `eval/correctness.py`, and the wiring work is mechanical when those modules arrive.
+**Tool wiring — closure-capture factories (2026-04-18)**: `_make_compile_tool(kernel_spec)` and `_make_correctness_tool(kernel_spec, reference_fn, input_generator)` return plain callables closed over per-problem context. `implement()` wraps them with `function_tool` at call time and builds a fresh `Agent` per invocation. Alternatives considered: SDK `RunContextWrapper` (adds SDK-specific plumbing to tool signatures), module-level mutable state (racy, un-testable). Closure-capture keeps the factories unit-testable without the SDK installed, matches the pattern in Astra/autokernel, and the per-call Agent construction is cheap (no network, no model instantiation — only object wrapping).
 
-**Turn budget — `_MAX_TURNS = 7`, hardcoded for now**: derivation is 3 compile+correctness tries × 2 tool turns per cycle + 1 final structured-output turn. User framing: "3 tries means code can fail 2 times" — the third attempt must pass or the agent emits its best compiling effort. `ACTSConfig.max_debug_retries=3` already captures the user-facing concept but is not yet read by the Coder; wiring is deferred until the compiler/correctness integration (same increment that turns the tool stubs real). Recorded in `PROCESS.md` → Deferred Improvements.
+**Turn budget — `_MAX_TURNS = 2 × config.max_debug_retries + 1` (2026-04-18)**: each self-correction cycle is one `compile` call + one `check_correctness` call, plus a final structured-output turn. Default `ACTSConfig.max_debug_retries = 3` gives 7, matching the original hardcoded constant. User framing: "3 tries means code can fail 2 times" — the third attempt must pass or the agent emits its best compiling effort. `CoderAgent.__init__` now accepts `ACTSConfig` so the budget travels with the run config.
 
 **Failure contract — one sanctioned output in every case**:
 - `run_agent()` returns `None` (transient retry exhaustion) → `implement()` raises `ImplementationError`.
@@ -347,6 +357,27 @@ Two violation cases:
 - **T_b ≤ T_SOL** (baseline already at or below hardware limit): Either SOLAR's bound is too loose for this problem, or the baseline is exceptionally well-optimized. `ScoreResult.calibration_warning = True`. Score is set to 1.0 (problem already solved). Not necessarily reward hacking — could be legitimate calibration issue.
 
 **Why not clamp to [0, 1]**: Clamping hides the anomaly. The paper treats these as audit signals, not edge cases to suppress. Keeping the raw value lets the anti-cheat module make an informed decision. This also connects `scorer.py` (orchestrator-side eval) to `anti_cheat.py` (currently Coder-side only) — creating a second anti-cheat surface at the performance level, not just the correctness level.
+
+### SOL-ExecBench integration — tiered adoption (2026-04-18)
+
+**Context**: SOL-ExecBench (NVIDIA) is the declared benchmark for V1. Its `core/bench` package carries reusable machinery — error-stats computation, input generation, tolerance spec, reward-hack detection, subprocess-isolated eval driver. The framework must eventually support other benchmarks too (KernelBench, etc.), so integration depth is a design choice, not a one-shot.
+
+**Decision**: tiered adoption, scoped by marginal value at each feature.
+
+- **Tier 1 (landed this increment)**:
+  - `TorchComparisonPolicy.compare` delegates to `sol_execbench.compute_error_stats` when importable. Gives us matched-ratio tolerance, separate NaN/Inf flags, and a hard max-error cap for free. Falls back to `torch.allclose` when SOL isn't installed — keeps the module usable for non-SOL benchmarks.
+  - `eval/inputs.build_input_generator` wraps `sol_execbench.core.bench.io.gen_inputs` so real problems get heuristic-aware inputs (probability softmaxing, shape/dtype dispatch) without re-implementing them.
+  - `eval/inputs.build_reference_fn` is pure-Python (exec source into namespace) — torch only loads when the reference actually runs, so the module imports cleanly in torch-less test venvs.
+
+- **Tier 2 (deferred, recorded in PROCESS.md)**: adopting SOL's `Definition` / `Workload` / `Trace` pydantic models end-to-end. Today ACTS parses them into hand-written dataclasses and `eval/inputs.py` round-trips back to dict for SOL's consumers. Refactor trigger: when `benchmark/baseline_generator.py` starts passing definitions through the full pipeline and the duplicated schema has somewhere to spread.
+
+- **Tier 3 (skipped for now, recorded in PROCESS.md)**: subprocess-isolated eval driver (`ProblemPackager` + `eval_driver.py`) and reward-hack detection (`core/bench/reward_hack.py`). Both target threat models our internal bounded search doesn't have — the search runs code ACTS generated itself, on a controlled env. Revisit only if we hit real crashing kernels or accept external code.
+
+  **Correctness reframing (2026-04-18, Codex adversarial review)**: Skipping subprocess isolation is not only a safety trade-off — it's also a correctness trade-off. A candidate whose module-scope code mutates shared modules (e.g. rebinds `torch.matmul`) can silently alter subsequent `reference_fn` calls inside the same process, so later stages of `verify_correctness` compare wrong-against-wrong and return `passed=True`. Codex demonstrated this with a toy candidate. For our threat model (our own LLM, bounded search) the probability is low but the failure is silent. Acceptable for now, but the Tier 3a trigger now includes "silent oracle corruption observed," not only "crashes."
+
+**Why tiered, not all-in**: SOL-ExecBench requires Python ≥3.12, torch ≥2.10, cuTile, CUTLASS DSL. Hard-adopting its models and subprocess harness would force those versions everywhere and couple ACTS to SOL's upgrade cadence. Keeping SOL at the edges (tolerance + input gen) lets ACTS stay benchmark-agnostic for future KernelBench support while getting the high-value pieces today.
+
+**Why not KernelBench yet**: PRD already documents the SOL-over-KernelBench decision (below). Multi-benchmark support stays a V2+ concern — the `ComparisonPolicy` Protocol + callable-based `input_generator` already give us the seams, so the cost of adding KernelBench later is low.
 
 ### Dynamic bottleneck reclassification — deferred to profiler implementation (2026-04-15)
 
