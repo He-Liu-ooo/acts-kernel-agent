@@ -19,6 +19,15 @@ dev = [
     "pytest>=7.0",
     "pytest-asyncio>=0.21",
 ]
+# SOL-ExecBench integration. Installed from repo/benchmark/SOL-ExecBench
+# in dev. Provides Definition / Workload / ToleranceSpec schemas,
+# gen_inputs, and compute_error_stats used by the correctness gate.
+# Kept optional because SOL requires Python 3.12+ / torch 2.10+, which
+# exceeds this project's declared requires-python and torch floors —
+# correctness.py falls back to a local torch.allclose path when absent.
+sol = [
+    "sol-execbench>=1.0.0",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]
