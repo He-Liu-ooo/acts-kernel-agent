@@ -29,6 +29,7 @@ Thumbs.db
 # Project-specific
 others/
 meeting-log.md
+configs/models/
 
 # CUDA / profiling artifacts
 *.ncu-rep
