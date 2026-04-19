@@ -102,7 +102,7 @@ class Orchestrator:
         roofline: RooflineResult | None = None,
         *,
         reference_fn: Callable[..., Any] | None = None,
-        input_generator: Callable[[int], tuple] | None = None,
+        input_generators: list[Callable[[int], tuple]] | None = None,
     ) -> SearchResult:
         """Execute the full search loop from baseline to best kernel.
 
@@ -114,11 +114,12 @@ class Orchestrator:
         When ``None``, falls back to built-in roofline from
         ``KernelSpec.flop_count`` / ``KernelSpec.memory_bytes``.
 
-        *reference_fn* / *input_generator*: the PyTorch oracle and
-        seed→args generator the Coder's correctness tool is bound to.
-        Required when the Coder is LLM-driven; may be ``None`` in the
-        placeholder / no-model path where ``implement()`` returns the
-        source unchanged.
+        *reference_fn* / *input_generators*: the PyTorch oracle and one
+        seed→args generator per selected workload. Threaded verbatim into
+        the Coder's correctness tool so every iteration verifies against
+        the full coverage set. Required when the Coder is LLM-driven; may
+        be ``None`` / empty in the placeholder path where ``implement()``
+        returns the source unchanged.
         """
         from src.eval.benchmark import benchmark_kernel
         from src.eval.profiler import profile_kernel
@@ -175,14 +176,15 @@ class Orchestrator:
             )
 
             # Coder (with tools for self-correction). `kernel_spec` /
-            # `reference_fn` / `input_generator` are threaded into the
-            # compile + correctness tools the Coder binds per call.
+            # `reference_fn` / `input_generators` are threaded into the
+            # compile + correctness tools the Coder binds per call — the
+            # full generator list so cross-workload bugs surface in-turn.
             new_source = await self._coder.implement(
                 kernel_source=parent.kernel.source_code,
                 plan=plan,
                 kernel_spec=baseline.spec,
                 reference_fn=reference_fn,
-                input_generator=input_generator,
+                input_generators=input_generators,
             )
 
             # Build child kernel

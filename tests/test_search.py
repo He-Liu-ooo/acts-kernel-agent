@@ -567,13 +567,13 @@ class TestOrchestratorReviewerContext:
 
 
 class TestOrchestratorCoderContext:
-    """Orchestrator must thread kernel_spec + reference_fn + input_generator
+    """Orchestrator must thread kernel_spec + reference_fn + input_generators
     into coder.implement() — the Coder's tools are bound to these at call time."""
 
     @pytest.mark.asyncio
     async def test_coder_receives_spec_and_correctness_context(self, _orch_harness):
         """Per-iteration implement() call gets the baseline spec and the
-        correctness-context callables threaded through Orchestrator.run()."""
+        full correctness-context callable list threaded through Orchestrator.run()."""
         from src.agents.reviewer import ReviewerFeedback
         from src.search.orchestrator import Orchestrator
 
@@ -585,7 +585,7 @@ class TestOrchestratorCoderContext:
         )
 
         ref_sentinel = lambda *args: 0.0
-        gen_sentinel = lambda seed: (seed,)
+        gens_sentinel = [lambda seed, i=i: (i, seed) for i in range(3)]
 
         with patch("src.eval.benchmark.benchmark_kernel", return_value=h.bench):
             orch = Orchestrator(h.config, h.planner, h.coder, h.reviewer, h.retriever)
@@ -594,7 +594,7 @@ class TestOrchestratorCoderContext:
                 workloads=None,
                 roofline=h.roofline,
                 reference_fn=ref_sentinel,
-                input_generator=gen_sentinel,
+                input_generators=gens_sentinel,
             )
 
         assert h.coder.implement.await_count == 1
@@ -606,13 +606,14 @@ class TestOrchestratorCoderContext:
         assert c_kwargs["reference_fn"] is ref_sentinel, (
             "Orchestrator must forward the PyTorch reference callable verbatim."
         )
-        assert c_kwargs["input_generator"] is gen_sentinel, (
-            "Orchestrator must forward the seed→args generator verbatim."
+        assert c_kwargs["input_generators"] is gens_sentinel, (
+            "Orchestrator must forward every selected workload's generator "
+            "verbatim — collapsing to the primary lets cross-workload bugs slip."
         )
 
     @pytest.mark.asyncio
     async def test_orchestrator_tolerates_missing_correctness_context(self, _orch_harness):
-        """Placeholder/legacy mode: when no reference_fn/input_generator is
+        """Placeholder/legacy mode: when no reference_fn/input_generators are
         threaded in, Orchestrator must still complete without TypeError —
         the Coder's model=None fast-path handles the rest."""
         from src.agents.reviewer import ReviewerFeedback

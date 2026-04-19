@@ -84,18 +84,27 @@ def _make_compile_tool(
 def _make_correctness_tool(
     kernel_spec: KernelSpec,
     reference_fn: Callable[..., Any],
-    input_generator: Callable[[int], tuple],
+    input_generators: list[Callable[[int], tuple]],
     *,
     cache_dir: Path | None = None,
     policy: ComparisonPolicy | None = None,
 ) -> Callable[[str], str]:
-    """Build a correctness tool bound to a KernelSpec + oracle + input generator.
+    """Build a correctness tool bound to a KernelSpec + oracle + workload generators.
 
     The tool recompiles the submitted source (compile is cheap; tools
-    are independent), runs the 5-stage gate, and returns a human-readable
-    pass/fail message. Compile failures are surfaced before attempting
+    are independent), runs the 5-stage gate against *every* generator in
+    order, and returns a human-readable pass/fail message. Short-circuits
+    on the first failing workload so the Coder sees exactly which one
+    broke — so retries can actually correct cross-workload bugs instead
+    of reproducing the same kernel when only the primary workload was
+    exercised. Compile failures are surfaced before attempting
     correctness so the Coder gets the cheaper error first.
     """
+    if not input_generators:
+        raise ValueError(
+            "correctness tool requires at least one input generator — "
+            "got an empty list.",
+        )
 
     def check_correctness_tool(source_code: str) -> str:
         kernel = Kernel(spec=kernel_spec, source_code=source_code)
@@ -105,20 +114,25 @@ def _make_correctness_tool(
                 "Correctness aborted — candidate failed to compile:\n"
                 f"{compiled.error_message}"
             )
-        result = verify_correctness(
-            candidate_fn=compiled.compiled_fn,
-            reference_fn=reference_fn,
-            input_generator=input_generator,
-            policy=policy,
-        )
-        if result.passed:
-            return (
-                f"Correctness verification passed (all 5 stages, "
-                f"max_abs_error={result.max_abs_error:.3e})."
+        total = len(input_generators)
+        max_err = 0.0
+        for idx, gen in enumerate(input_generators):
+            result = verify_correctness(
+                candidate_fn=compiled.compiled_fn,
+                reference_fn=reference_fn,
+                input_generator=gen,
+                policy=policy,
             )
-        stage = result.failed_stage.value if result.failed_stage else "unknown"
+            if not result.passed:
+                stage = result.failed_stage.value if result.failed_stage else "unknown"
+                return (
+                    f"Correctness FAILED on workload {idx + 1}/{total} "
+                    f"at stage [{stage}]:\n{result.error_message}"
+                )
+            max_err = max(max_err, result.max_abs_error)
         return (
-            f"Correctness FAILED at stage [{stage}]:\n{result.error_message}"
+            f"Correctness verification passed on all {total} workloads "
+            f"(5 stages each, max_abs_error={max_err:.3e})."
         )
 
     return check_correctness_tool
@@ -151,9 +165,17 @@ class CoderAgent:
         self._model = model
         cfg = config or ACTSConfig()
         self._max_turns = 2 * cfg.max_debug_retries + 1
-        self._instructions = (
-            (PROMPT_DIR / "system.md").read_text() if model is not None else ""
-        )
+        if model is not None:
+            self._instructions = (PROMPT_DIR / "system.md").read_text()
+            self._translate_instructions = (PROMPT_DIR / "translate.md").read_text()
+        else:
+            self._instructions = ""
+            self._translate_instructions = ""
+
+    @property
+    def has_model(self) -> bool:
+        """True when the agent is backed by a real LLM."""
+        return self._model is not None
 
     @staticmethod
     def build_user_prompt(
@@ -180,52 +202,31 @@ class CoderAgent:
 
         return "\n\n".join(sections)
 
-    async def implement(
+    async def _run_tool_agent(
         self,
-        kernel_source: str,
-        plan: OptimizationPlan,
         *,
-        kernel_spec: KernelSpec | None = None,
-        reference_fn: Callable[..., Any] | None = None,
-        input_generator: Callable[[int], tuple] | None = None,
+        agent_name: str,
+        instructions: str,
+        prompt: str,
+        kernel_spec: KernelSpec,
+        reference_fn: Callable[..., Any],
+        input_generators: list[Callable[[int], tuple]],
     ) -> str:
-        """Apply the optimization plan to the kernel source code.
-
-        Returns the final kernel source from the LLM's structured output.
-        Raises ``ImplementationError`` when the LLM call exhausts retries
-        or when the correctness context (``kernel_spec`` / ``reference_fn``
-        / ``input_generator``) is missing while a model is configured.
-
-        The returned source may be a degraded best-effort if the SDK
-        tool loop exhausted the turn budget without a green correctness
-        run — downstream verification/scoring handles that case.
-        """
-        if self._model is None:
-            return kernel_source
-
-        if kernel_spec is None or reference_fn is None or input_generator is None:
-            raise ImplementationError(
-                "LLM-driven Coder requires kernel_spec, reference_fn, and "
-                "input_generator — its tools are bound to these at call time."
-            )
-
         compile_tool = function_tool(_make_compile_tool(kernel_spec))
         correctness_tool = function_tool(
             _make_correctness_tool(
                 kernel_spec,
                 reference_fn=reference_fn,
-                input_generator=input_generator,
+                input_generators=input_generators,
             )
         )
         agent = Agent(
-            name="Coder",
-            instructions=self._instructions,
+            name=agent_name,
+            instructions=instructions,
             model=self._model,
             tools=[compile_tool, correctness_tool],
             output_type=KernelCodeOutput,
         )
-
-        prompt = self.build_user_prompt(kernel_source=kernel_source, plan=plan)
         result = await run_agent(
             agent,
             prompt,
@@ -234,5 +235,92 @@ class CoderAgent:
         )
         if result is None:
             raise ImplementationError("LLM call failed after all retries.")
-
         return result.final_output.source_code
+
+    async def implement(
+        self,
+        kernel_source: str,
+        plan: OptimizationPlan,
+        *,
+        kernel_spec: KernelSpec | None = None,
+        reference_fn: Callable[..., Any] | None = None,
+        input_generators: list[Callable[[int], tuple]] | None = None,
+    ) -> str:
+        """Apply the optimization plan to the kernel source code.
+
+        Returns the final kernel source from the LLM's structured output.
+        The result may be a degraded best-effort if the SDK tool loop
+        exhausted the turn budget — downstream verification handles that.
+        Raises ``ImplementationError`` when the LLM call exhausts retries
+        or when the correctness context is missing while a model is configured.
+        """
+        if self._model is None:
+            return kernel_source
+
+        if kernel_spec is None or reference_fn is None or not input_generators:
+            raise ImplementationError(
+                "LLM-driven Coder requires kernel_spec, reference_fn, and a "
+                "non-empty input_generators list — its tools are bound to "
+                "these at call time."
+            )
+
+        return await self._run_tool_agent(
+            agent_name="Coder",
+            instructions=self._instructions,
+            prompt=self.build_user_prompt(kernel_source=kernel_source, plan=plan),
+            kernel_spec=kernel_spec,
+            reference_fn=reference_fn,
+            input_generators=input_generators,
+        )
+
+    @staticmethod
+    def build_translate_prompt(
+        reference_source: str,
+        kernel_spec: KernelSpec,
+    ) -> str:
+        """Assemble the user prompt for a one-shot PyTorch→Triton port."""
+        safe_reference = reference_source.replace("```", r"\`\`\`")
+        sections = [
+            "## PyTorch reference\n```python\n" + safe_reference + "\n```",
+            (
+                "## Target kernel\n"
+                f"- Name: {kernel_spec.name}\n"
+                f"- Entrypoint: {kernel_spec.entrypoint}\n"
+                f"- Kernel type: {kernel_spec.kernel_type.value}"
+            ),
+        ]
+        return "\n\n".join(sections)
+
+    async def translate(
+        self,
+        *,
+        reference_source: str,
+        kernel_spec: KernelSpec,
+        reference_fn: Callable[..., Any],
+        input_generators: list[Callable[[int], tuple]],
+    ) -> str:
+        """Port a PyTorch reference into a Triton kernel in one agent run.
+
+        Used at problem-load time by ``benchmark.baseline_generator``.
+        Callers post-verify after translation because the SDK may emit a
+        degraded best-effort when the turn budget is exhausted.
+        Raises ``ImplementationError`` when no model is configured or when
+        the LLM call exhausts its retries.
+        """
+        if self._model is None:
+            raise ImplementationError(
+                "translate() requires a configured model — there is no "
+                "sensible no-op fallback for a from-scratch port."
+            )
+
+        return await self._run_tool_agent(
+            agent_name="Coder-Translator",
+            instructions=self._translate_instructions,
+            prompt=self.build_translate_prompt(
+                reference_source=reference_source,
+                kernel_spec=kernel_spec,
+            ),
+            kernel_spec=kernel_spec,
+            reference_fn=reference_fn,
+            input_generators=input_generators,
+        )
