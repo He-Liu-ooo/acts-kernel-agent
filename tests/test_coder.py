@@ -1,4 +1,12 @@
-"""Tests for agents/coder.py — Coder agent with tool-using LLM loop."""
+"""Tests for agents/coder.py — Coder agent with tool-using LLM loop.
+
+These tests exercise the tool factories and the `implement()` flow
+without requiring `torch` or the OpenAI Agents SDK. The factory
+closures delegate to `src.kernels.compiler.compile_kernel` (already
+covered by `test_compiler.py`) and `src.eval.correctness.verify_correctness`
+(covered by `test_correctness.py`), so tests here focus on wiring and
+error-string shape.
+"""
 
 from __future__ import annotations
 
@@ -10,21 +18,28 @@ from src.agents.coder import (
     CoderAgent,
     ImplementationError,
     KernelCodeOutput,
+    _make_compile_tool,
+    _make_correctness_tool,
 )
 from src.agents.planner import OptimizationPlan
+from src.config import ACTSConfig
+from tests.conftest import (
+    ScalarPolicy as _ScalarPolicy,
+    make_kernel_spec as _make_spec,
+    scalar_gen as _gen,
+    scalar_ref as _ref,
+)
 
 
 # ── Pydantic output model ──────────────────────────────────────────────
 
 
 def test_output_model_accepts_valid_data():
-    """KernelCodeOutput parses valid code."""
     out = KernelCodeOutput(source_code="@triton.jit\ndef k(): pass")
     assert out.source_code.startswith("@triton.jit")
 
 
 def test_output_model_requires_source_code():
-    """KernelCodeOutput rejects missing source_code."""
     from pydantic import ValidationError
 
     with pytest.raises(ValidationError):
@@ -35,7 +50,6 @@ def test_output_model_requires_source_code():
 
 
 def test_build_user_prompt_contains_all_sections():
-    """The assembled user prompt includes the kernel source and all plan fields."""
     plan = OptimizationPlan(
         tier=2,
         technique="t2_shared_memory_tiling",
@@ -57,7 +71,6 @@ def test_build_user_prompt_contains_all_sections():
 
 
 def test_build_user_prompt_omits_empty_params():
-    """Params section is omitted when plan.params is empty."""
     plan = OptimizationPlan(
         tier=1,
         technique="t1_occupancy",
@@ -69,7 +82,6 @@ def test_build_user_prompt_omits_empty_params():
 
 
 def test_build_user_prompt_escapes_backticks_in_kernel_source():
-    """Triple backticks in kernel source are escaped so the fence stays closed."""
     plan = OptimizationPlan(tier=1, technique="t1", rationale="x")
     source = 'def kernel():\n    """```python\n    fake section\n    ```"""\n    pass'
     prompt = CoderAgent.build_user_prompt(kernel_source=source, plan=plan)
@@ -78,24 +90,92 @@ def test_build_user_prompt_escapes_backticks_in_kernel_source():
     assert "```python\nfake section\n```" not in kernel_section
 
 
-# ── tool stubs ──────────────────────────────────────────────────────────
+# ── compile tool factory ────────────────────────────────────────────────
 
 
-def test_compile_tool_placeholder_returns_success_string():
-    """The placeholder compile tool returns a non-error string so the LLM
-    can proceed. Real compilation lands when kernels/compiler.py does."""
-    from src.agents.coder import _compile_kernel_tool
-
-    result = _compile_kernel_tool("@triton.jit\ndef k(): pass")
-    assert "success" in result.lower()
+def test_compile_tool_factory_returns_callable(tmp_path):
+    tool = _make_compile_tool(_make_spec(), cache_dir=tmp_path)
+    assert callable(tool)
 
 
-def test_correctness_tool_placeholder_returns_pass_string():
-    """Placeholder correctness tool returns a pass-ish string."""
-    from src.agents.coder import _check_correctness_tool
+def test_compile_tool_reports_success_on_good_source(tmp_path):
+    tool = _make_compile_tool(_make_spec(), cache_dir=tmp_path)
+    msg = tool("def kernel_fn(x):\n    return x + 1\n")
+    assert "success" in msg.lower()
+    assert "kernel_fn" in msg  # entrypoint surfaced so Coder knows what it resolved
 
-    result = _check_correctness_tool("@triton.jit\ndef k(): pass")
-    assert "pass" in result.lower()
+
+def test_compile_tool_reports_error_on_syntax_error(tmp_path):
+    tool = _make_compile_tool(_make_spec(), cache_dir=tmp_path)
+    msg = tool("def kernel_fn(: invalid\n")
+    assert "fail" in msg.lower() or "error" in msg.lower()
+    assert "SyntaxError" in msg
+
+
+def test_compile_tool_reports_error_on_missing_entrypoint(tmp_path):
+    tool = _make_compile_tool(_make_spec(entrypoint="run"), cache_dir=tmp_path)
+    msg = tool("def kernel_fn(x): return x\n")  # wrong symbol name
+    assert "run" in msg  # the missing entrypoint name
+
+
+# ── correctness tool factory ────────────────────────────────────────────
+
+
+def test_correctness_tool_factory_returns_callable(tmp_path):
+    tool = _make_correctness_tool(
+        _make_spec(),
+        reference_fn=_ref,
+        input_generator=_gen,
+        policy=_ScalarPolicy(),
+        cache_dir=tmp_path,
+    )
+    assert callable(tool)
+
+
+def test_correctness_tool_reports_compile_error_without_running_correctness(tmp_path):
+    """If the candidate source won't compile, surface that — don't try to run it."""
+    calls = {"ref": 0}
+
+    def ref(x):
+        calls["ref"] += 1
+        return x * 2.0
+
+    tool = _make_correctness_tool(
+        _make_spec(),
+        reference_fn=ref,
+        input_generator=_gen,
+        policy=_ScalarPolicy(),
+        cache_dir=tmp_path,
+    )
+    msg = tool("def kernel_fn(: broken\n")
+    assert "compile" in msg.lower()
+    assert calls["ref"] == 0  # reference was never invoked
+
+
+def test_correctness_tool_reports_success_on_matching_candidate(tmp_path):
+    tool = _make_correctness_tool(
+        _make_spec(),
+        reference_fn=_ref,
+        input_generator=_gen,
+        policy=_ScalarPolicy(),
+        cache_dir=tmp_path,
+    )
+    msg = tool("def kernel_fn(x):\n    return x * 2.0\n")
+    assert "pass" in msg.lower()
+
+
+def test_correctness_tool_reports_failure_stage_on_mismatch(tmp_path):
+    """Failure messages surface the failed stage so the Coder can diagnose."""
+    tool = _make_correctness_tool(
+        _make_spec(),
+        reference_fn=_ref,
+        input_generator=_gen,
+        policy=_ScalarPolicy(),
+        cache_dir=tmp_path,
+    )
+    msg = tool("def kernel_fn(x):\n    return x * 3.0\n")
+    assert "fail" in msg.lower()
+    assert "smoke_test" in msg  # first-stage failure for a uniformly-wrong candidate
 
 
 # ── implement() — placeholder path (no model) ───────────────────────────
@@ -103,11 +183,16 @@ def test_correctness_tool_placeholder_returns_pass_string():
 
 @pytest.mark.asyncio
 async def test_implement_without_model_returns_source_unchanged():
-    """Without a configured model, implement() is a no-op — returns input source."""
     agent = CoderAgent(model=None)
     plan = OptimizationPlan(tier=1, technique="t1_occupancy")
     src = "@triton.jit\ndef k(): ..."
-    out = await agent.implement(kernel_source=src, plan=plan)
+    out = await agent.implement(
+        kernel_source=src,
+        plan=plan,
+        kernel_spec=_make_spec(),
+        reference_fn=_ref,
+        input_generator=_gen,
+    )
     assert out == src
 
 
@@ -116,20 +201,20 @@ async def test_implement_without_model_returns_source_unchanged():
 
 @pytest.mark.asyncio
 async def test_implement_calls_llm_and_returns_modified_source():
-    """With a model, implement() calls the LLM and returns final_output.source_code."""
+    """With a model, implement() builds the Agent with bound tools and runs it."""
     mock_output = KernelCodeOutput(source_code="@triton.jit\ndef k(): return 42")
     mock_result = MagicMock()
     mock_result.final_output = mock_output
 
     with (
+        patch("src.agents.coder.Agent") as mock_agent_cls,
         patch("src.agents.coder.run_agent", new_callable=AsyncMock) as mock_run,
         patch("src.agents.coder.make_run_config", return_value=None),
+        patch("src.agents.coder.function_tool", side_effect=lambda f: f),
     ):
         mock_run.return_value = mock_result
 
-        agent = CoderAgent(model=None)
-        agent._agent = MagicMock()  # non-None triggers LLM path
-
+        agent = CoderAgent(model=MagicMock())
         plan = OptimizationPlan(
             tier=1,
             technique="t1_block_size_tuning",
@@ -137,73 +222,118 @@ async def test_implement_calls_llm_and_returns_modified_source():
             target_region="main loop",
             rationale="Bigger tile => more reuse.",
         )
-        result = await agent.implement(kernel_source="original source", plan=plan)
+        result = await agent.implement(
+            kernel_source="original source",
+            plan=plan,
+            kernel_spec=_make_spec(),
+            reference_fn=_ref,
+            input_generator=_gen,
+        )
 
     assert result == "@triton.jit\ndef k(): return 42"
     mock_run.assert_awaited_once()
+    # Agent was constructed with exactly two tools (compile + correctness).
+    kwargs = mock_agent_cls.call_args.kwargs
+    assert len(kwargs["tools"]) == 2
 
 
 @pytest.mark.asyncio
 async def test_implement_raises_on_llm_failure():
     """If run_agent returns None (retries exhausted), raise ImplementationError."""
     with (
+        patch("src.agents.coder.Agent"),
         patch("src.agents.coder.run_agent", new_callable=AsyncMock) as mock_run,
         patch("src.agents.coder.make_run_config", return_value=None),
+        patch("src.agents.coder.function_tool", side_effect=lambda f: f),
     ):
         mock_run.return_value = None
 
-        agent = CoderAgent(model=None)
-        agent._agent = MagicMock()
-
+        agent = CoderAgent(model=MagicMock())
         plan = OptimizationPlan(tier=1, technique="t1")
         with pytest.raises(ImplementationError, match="LLM"):
-            await agent.implement(kernel_source="src", plan=plan)
+            await agent.implement(
+                kernel_source="src",
+                plan=plan,
+                kernel_spec=_make_spec(),
+                reference_fn=_ref,
+                input_generator=_gen,
+            )
 
 
 @pytest.mark.asyncio
-async def test_implement_passes_max_turns_to_bound_self_correction():
-    """Coder passes max_turns=7 so the tool loop can't run unbounded.
-
-    Budget: 3 compile+correctness cycles (2 tool turns each) + 1 final output.
-    """
-    mock_output = KernelCodeOutput(source_code="modified")
+async def test_implement_passes_default_max_turns_when_no_config():
+    """No config → default ACTSConfig.max_debug_retries=3 → max_turns = 2*3+1 = 7."""
     mock_result = MagicMock()
-    mock_result.final_output = mock_output
+    mock_result.final_output = KernelCodeOutput(source_code="ok")
 
     with (
+        patch("src.agents.coder.Agent"),
         patch("src.agents.coder.run_agent", new_callable=AsyncMock) as mock_run,
         patch("src.agents.coder.make_run_config", return_value=None),
+        patch("src.agents.coder.function_tool", side_effect=lambda f: f),
     ):
         mock_run.return_value = mock_result
 
-        agent = CoderAgent(model=None)
-        agent._agent = MagicMock()
+        agent = CoderAgent(model=MagicMock())
+        await agent.implement(
+            kernel_source="src",
+            plan=OptimizationPlan(tier=1, technique="t1"),
+            kernel_spec=_make_spec(),
+            reference_fn=_ref,
+            input_generator=_gen,
+        )
 
-        plan = OptimizationPlan(tier=1, technique="t1")
-        await agent.implement(kernel_source="src", plan=plan)
+    assert mock_run.await_args.kwargs.get("max_turns") == 7
 
-    kwargs = mock_run.await_args.kwargs
-    assert kwargs.get("max_turns") == 7
+
+@pytest.mark.asyncio
+async def test_implement_max_turns_derived_from_config():
+    """max_debug_retries=5 → max_turns = 2*5+1 = 11."""
+    mock_result = MagicMock()
+    mock_result.final_output = KernelCodeOutput(source_code="ok")
+
+    with (
+        patch("src.agents.coder.Agent"),
+        patch("src.agents.coder.run_agent", new_callable=AsyncMock) as mock_run,
+        patch("src.agents.coder.make_run_config", return_value=None),
+        patch("src.agents.coder.function_tool", side_effect=lambda f: f),
+    ):
+        mock_run.return_value = mock_result
+
+        agent = CoderAgent(model=MagicMock(), config=ACTSConfig(max_debug_retries=5))
+        await agent.implement(
+            kernel_source="src",
+            plan=OptimizationPlan(tier=1, technique="t1"),
+            kernel_spec=_make_spec(),
+            reference_fn=_ref,
+            input_generator=_gen,
+        )
+
+    assert mock_run.await_args.kwargs.get("max_turns") == 11
 
 
 @pytest.mark.asyncio
 async def test_implement_uses_zero_temperature():
     """Coder runs with temperature=0.0 — deterministic code generation."""
-    mock_output = KernelCodeOutput(source_code="modified")
     mock_result = MagicMock()
-    mock_result.final_output = mock_output
+    mock_result.final_output = KernelCodeOutput(source_code="ok")
 
     with (
+        patch("src.agents.coder.Agent"),
         patch("src.agents.coder.run_agent", new_callable=AsyncMock) as mock_run,
         patch("src.agents.coder.make_run_config") as mock_cfg,
+        patch("src.agents.coder.function_tool", side_effect=lambda f: f),
     ):
         mock_run.return_value = mock_result
         mock_cfg.return_value = None
 
-        agent = CoderAgent(model=None)
-        agent._agent = MagicMock()
-
-        plan = OptimizationPlan(tier=1, technique="t1")
-        await agent.implement(kernel_source="src", plan=plan)
+        agent = CoderAgent(model=MagicMock())
+        await agent.implement(
+            kernel_source="src",
+            plan=OptimizationPlan(tier=1, technique="t1"),
+            kernel_spec=_make_spec(),
+            reference_fn=_ref,
+            input_generator=_gen,
+        )
 
     mock_cfg.assert_called_once_with(temperature=0.0)
