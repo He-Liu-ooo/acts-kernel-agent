@@ -200,36 +200,44 @@ these before its trigger fires, re-read the trigger first.
   "mark branch dead" has a concrete meaning.
 
 - [ ] **`CorrectnessContext` dataclass to replace triple-kwarg
-  threading** — `CoderAgent.implement()` and `Orchestrator.run()` both
-  accept `kernel_spec` + `reference_fn` + `input_generator` as three
-  Optional kwargs that are jointly required when a model is configured.
-  The tri-state "all-or-none" validation is parameter sprawl. A small
-  `CorrectnessContext(kernel_spec, reference_fn, input_generator)`
-  dataclass would collapse the trio to one parameter at both call
-  sites and make the "bound oracle for this problem" concept explicit
-  in the type system.
-  *Trigger*: when a fourth field needs to travel alongside the trio
+  threading** — `CoderAgent.implement()`, `CoderAgent.translate()`, and
+  `Orchestrator.run()` all accept `kernel_spec` + `reference_fn` +
+  `input_generators` (a list, one entry per selected workload) as three
+  kwargs that are jointly required when a model is configured. The
+  tri-state "all-or-none" validation is parameter sprawl. A small
+  `CorrectnessContext(kernel_spec, reference_fn, input_generators)`
+  dataclass would collapse the trio to one parameter at every call
+  site and make the "bound oracle for this problem" concept explicit.
+  Side benefit: `pipeline/optimize.py::_load_sol_execbench` and
+  `benchmark/baseline_generator.py::generate_triton_baseline` currently
+  each call `build_reference_fn` + `build_input_generator` once,
+  running SOL pydantic validation twice per problem load. Threading
+  one `CorrectnessContext` through instead of rebuilding inside the
+  generator drops the duplicate validation pass.
+  *Trigger*: the "baseline_generator constructs its own context"
+  trigger has fired (as of the Codex-review fix round — see JOURNAL).
+  Defer until a fourth field needs to travel alongside the trio
   (e.g., `device`, `tolerance_override`, or a per-problem `atol`),
-  OR when `benchmark/baseline_generator.py` starts constructing its
-  own context — whichever comes first. Pre-refactor cost is low but
-  the restructure touches `coder.py`, `orchestrator.py`, and their
-  tests, so pay it when there's a concrete second motivation.
+  then do both the type cleanup and the dup-build fix in one pass.
 
 - [ ] **`sys.modules` compile cache in `kernels/compiler.py`** —
   `compile_kernel` writes `<stem>.py` to the cache dir and calls
   `spec.loader.exec_module()` unconditionally, even when `stem`
-  (source hash prefix) already resolves in `sys.modules`. In the
-  search loop, the Coder's correctness tool compiles each candidate,
-  then `verify_optimized_kernel` recompiles the winner post-loop —
-  guaranteed identical hash, guaranteed cache hit, currently executed
-  twice. Short-circuit via `sys.modules.get(module_name)` +
-  `getattr(module, entrypoint)` would eliminate the double compile.
-  *Trigger*: when a real benchmark shows the double-compile in a
-  profile, OR when we add a third in-process compile site
-  (e.g., benchmark.py runs the winner once more on GPU). Skip until
-  then — the file write + exec_module pair is cheap at current scale
-  and adding the cache introduces a new "stale module in sys.modules
-  after a reload" failure mode that we'd have to reason about.
+  (source hash prefix) already resolves in `sys.modules`. Three
+  repeat-compile vectors share this cost: (a) the Coder's correctness
+  tool compiles the candidate; (b) within a single SDK turn loop the
+  same source can be handed to compile + correctness back-to-back, or
+  to correctness twice if the model re-invokes it on unchanged source;
+  (c) `baseline_generator`'s post-verify pass recompiles after
+  `translate()` returns, and `pipeline/verify` recompiles the winner
+  post-search — all guaranteed identical hash, guaranteed cache hit,
+  currently re-executed. Short-circuit via `sys.modules.get(module_name)`
+  + `getattr(module, entrypoint)` would eliminate every repeat.
+  *Trigger*: when a real Triton compile shows up in a profile — likely
+  as soon as `eval/benchmark.py` lands and live SOL problems run. Skip
+  until then; the Python-level file write + exec_module pair is cheap
+  at current scale, and adding the cache introduces a "stale module in
+  sys.modules after reload" failure mode that we'd have to reason about.
 
 - [ ] **Parallel beam expansion via `asyncio.gather`** —
   `Orchestrator.run()` currently expands one frontier node per
