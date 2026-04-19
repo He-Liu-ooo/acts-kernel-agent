@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Callable
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +100,9 @@ class Orchestrator:
         baseline: Kernel,
         workloads: list[Workload] | None = None,
         roofline: RooflineResult | None = None,
+        *,
+        reference_fn: Callable[..., Any] | None = None,
+        input_generator: Callable[[int], tuple] | None = None,
     ) -> SearchResult:
         """Execute the full search loop from baseline to best kernel.
 
@@ -110,6 +113,12 @@ class Orchestrator:
         *roofline*: pre-computed SOLAR result (T_SOL + bottleneck).
         When ``None``, falls back to built-in roofline from
         ``KernelSpec.flop_count`` / ``KernelSpec.memory_bytes``.
+
+        *reference_fn* / *input_generator*: the PyTorch oracle and
+        seed→args generator the Coder's correctness tool is bound to.
+        Required when the Coder is LLM-driven; may be ``None`` in the
+        placeholder / no-model path where ``implement()`` returns the
+        source unchanged.
         """
         from src.eval.benchmark import benchmark_kernel
         from src.eval.profiler import profile_kernel
@@ -165,10 +174,15 @@ class Orchestrator:
                 reviewer_feedback=None,
             )
 
-            # Coder (with tools for self-correction)
+            # Coder (with tools for self-correction). `kernel_spec` /
+            # `reference_fn` / `input_generator` are threaded into the
+            # compile + correctness tools the Coder binds per call.
             new_source = await self._coder.implement(
                 kernel_source=parent.kernel.source_code,
                 plan=plan,
+                kernel_spec=baseline.spec,
+                reference_fn=reference_fn,
+                input_generator=input_generator,
             )
 
             # Build child kernel

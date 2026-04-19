@@ -564,3 +564,69 @@ class TestOrchestratorReviewerContext:
             "Degraded reviewer feedback must produce a warning log"
         )
         assert any("llm_retries_exhausted" in r.getMessage() for r in warnings)
+
+
+class TestOrchestratorCoderContext:
+    """Orchestrator must thread kernel_spec + reference_fn + input_generator
+    into coder.implement() — the Coder's tools are bound to these at call time."""
+
+    @pytest.mark.asyncio
+    async def test_coder_receives_spec_and_correctness_context(self, _orch_harness):
+        """Per-iteration implement() call gets the baseline spec and the
+        correctness-context callables threaded through Orchestrator.run()."""
+        from src.agents.reviewer import ReviewerFeedback
+        from src.search.orchestrator import Orchestrator
+
+        h = _orch_harness
+        h.reviewer.review.return_value = ReviewerFeedback(
+            outcome="improved",
+            bottleneck_classification="memory_bound",
+            branch_quality=BranchQuality.PROMISING,
+        )
+
+        ref_sentinel = lambda *args: 0.0
+        gen_sentinel = lambda seed: (seed,)
+
+        with patch("src.eval.benchmark.benchmark_kernel", return_value=h.bench):
+            orch = Orchestrator(h.config, h.planner, h.coder, h.reviewer, h.retriever)
+            await orch.run(
+                h.baseline,
+                workloads=None,
+                roofline=h.roofline,
+                reference_fn=ref_sentinel,
+                input_generator=gen_sentinel,
+            )
+
+        assert h.coder.implement.await_count == 1
+        c_kwargs = h.coder.implement.await_args.kwargs
+        assert c_kwargs["kernel_spec"] is h.baseline.spec, (
+            "Orchestrator must pass the baseline's spec so the Coder's tools "
+            "can resolve the entrypoint and reuse the same KernelSpec."
+        )
+        assert c_kwargs["reference_fn"] is ref_sentinel, (
+            "Orchestrator must forward the PyTorch reference callable verbatim."
+        )
+        assert c_kwargs["input_generator"] is gen_sentinel, (
+            "Orchestrator must forward the seed→args generator verbatim."
+        )
+
+    @pytest.mark.asyncio
+    async def test_orchestrator_tolerates_missing_correctness_context(self, _orch_harness):
+        """Placeholder/legacy mode: when no reference_fn/input_generator is
+        threaded in, Orchestrator must still complete without TypeError —
+        the Coder's model=None fast-path handles the rest."""
+        from src.agents.reviewer import ReviewerFeedback
+        from src.search.orchestrator import Orchestrator
+
+        h = _orch_harness
+        h.reviewer.review.return_value = ReviewerFeedback(
+            outcome="improved",
+            bottleneck_classification="memory_bound",
+            branch_quality=BranchQuality.PROMISING,
+        )
+
+        with patch("src.eval.benchmark.benchmark_kernel", return_value=h.bench):
+            orch = Orchestrator(h.config, h.planner, h.coder, h.reviewer, h.retriever)
+            await orch.run(h.baseline, workloads=None, roofline=h.roofline)
+
+        assert h.coder.implement.await_count == 1
