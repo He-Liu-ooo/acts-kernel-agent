@@ -25,9 +25,9 @@ Generates `OptimizationReport` from the best node found.
 
 ## verify.py — Post-Optimization Verification
 
-Re-runs the correctness gate on the best kernel to confirm results are reproducible.
+Re-runs the correctness gate on the best kernel to confirm results are reproducible. Recompiles the winner, then delegates to `verify_correctness` against the PyTorch reference. Compile failures surface as `passed=False` with a compile-phrased detail string.
 
-`verify_optimized_kernel(optimized, baseline) -> VerificationResult`
+`verify_optimized_kernel(optimized, *, reference_fn, input_generator, policy=None, cache_dir=None) -> VerificationResult`
 
 ## report.py — Report Generation
 

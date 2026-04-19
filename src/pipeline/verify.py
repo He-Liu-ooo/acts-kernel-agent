@@ -1,11 +1,19 @@
-"""Post-optimization verification."""
+"""Post-optimization verification.
+
+After the search loop picks a best node, we recompile the winner and
+re-run the 5-stage correctness gate — belt-and-braces check before the
+result is declared green. Mirrors the Coder's correctness tool but is
+driven from the pipeline layer, not the SDK tool loop.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Callable
 
 if TYPE_CHECKING:
+    from src.eval.correctness import ComparisonPolicy
     from src.kernels.kernel import Kernel
 
 
@@ -19,21 +27,34 @@ class VerificationResult:
 
 def verify_optimized_kernel(
     optimized: Kernel,
-    baseline: Kernel,
+    *,
+    reference_fn: Callable[..., Any],
+    input_generator: Callable[[int], tuple],
+    policy: ComparisonPolicy | None = None,
+    cache_dir: Path | None = None,
 ) -> VerificationResult:
-    """Re-verify the best kernel found by the search against the baseline.
+    """Re-verify the best kernel found by the search against the PyTorch reference.
 
-    Runs full correctness gate + benchmark to confirm results are
-    reproducible.  Uses the PyTorch reference stored on the spec when
-    available (SOL-ExecBench mode), otherwise falls back to comparing
-    against the baseline kernel directly.
+    Compiles ``optimized`` afresh and runs the 5-stage correctness gate.
+    Returns a ``VerificationResult`` describing the outcome — compile
+    failures surface as ``passed=False`` with a compile-phrased detail
+    string.
     """
     from src.eval.correctness import verify_correctness
+    from src.kernels.compiler import compile_kernel
+
+    compiled = compile_kernel(optimized, cache_dir=cache_dir)
+    if not compiled.success:
+        return VerificationResult(
+            passed=False,
+            details=f"Compilation failed:\n{compiled.error_message}",
+        )
 
     result = verify_correctness(
-        optimized,
-        baseline=baseline,
-        reference_source=optimized.spec.pytorch_reference,
+        candidate_fn=compiled.compiled_fn,
+        reference_fn=reference_fn,
+        input_generator=input_generator,
+        policy=policy,
     )
     return VerificationResult(
         passed=result.passed,
