@@ -47,7 +47,42 @@ Any failure triggers the Coder's self-correction loop (up to `max_debug_retries`
 
 ## Benchmark — `benchmark.py`
 
-Measures kernel latency using CUDA events. Runs `warmup_runs` warmup iterations, then `timed_runs` measured iterations. Returns median, min, max latency in microseconds.
+Measures kernel latency using CUDA events. Called by the orchestrator after the Coder returns a compiled, correct kernel; not part of the Coder's tool loop.
+
+### Per-iteration protocol
+
+Each timed iteration runs: `prepare → flush_l2 → record_start → kernel_fn(*args) → record_end → finalize_ms`. L2 is flushed **before** `record_start` so the kernel sees a cold cache and the flush is excluded from the measurement (KernelBench convention). Inputs are regenerated per iter outside the timing window so in-place kernels don't see degenerate inputs on later iterations.
+
+### `BenchmarkTimer` Protocol
+
+The timer is an injectable `Protocol` (`prepare` / `flush_l2` / `record_start` / `record_end` / `finalize_ms`). Production uses `_TorchCudaTimer` — `torch.cuda.Event` pairs plus a 256MB int64 L2-thrash tensor. Tests inject a `RecordingTimer` that returns a scripted elapsed sequence so dispatch / aggregation / call-order can be verified without torch.
+
+### Multi-workload contract
+
+`benchmark_kernel` accepts parallel lists `workloads: list[Workload]` and `input_generators: list[Callable[[int], tuple]]` (one generator per workload — the Coder's correctness tool uses the same list, see `inputs.py`). A fresh `BenchmarkTimer` is constructed per workload: a CUDA launch/event fault can leave the stream in a sticky error state, and reusing a timer would turn a workload-local failure into order-dependent false failures on subsequent workloads.
+
+### Aggregation
+
+Per workload: median of the timed samples (first `discard_first` dropped). Across workloads: median-of-medians as the scalar `median_latency_us`, with the full per-workload dict preserved on `BenchmarkResult.per_workload_latency_us`.
+
+### Fail-closed semantics
+
+| Failure | Behavior |
+|---------|----------|
+| Per-workload launch failure | Record `math.inf` in `per_workload_latency_us`, reason in `workload_errors` |
+| Fewer than half the workloads survive | Raise `BenchmarkError` |
+| Baseline partial-workload failure (orchestrator) | Abort run — baseline is the SOL-score denominator, partial failures make every downstream child meaningless |
+| Child partial-workload failure (orchestrator) | Mark branch `DEAD_END` — branch-local, search continues |
+
+`BenchmarkResult.is_fully_successful` is the property orchestrator checks (True iff `workload_errors` is empty) — call sites never touch the dict directly.
+
+### Empty-workload sentinel
+
+When both `workloads` and `input_generators` are empty (placeholder CLI path, no SOL problem loaded), `benchmark_kernel` returns a 100us sentinel result. Returning 0.0 would collapse `compute_sol_score` to 1.0 and silently fabricate an optimum.
+
+## Inputs — `inputs.py`
+
+`build_reference_fn(pytorch_source)` execs SOL-ExecBench's PyTorch reference source and resolves the `run` callable. `build_input_generator(workload)` wraps SOL's `gen_inputs` with seeding so the same iteration index yields deterministic arguments. Both torch + sol_execbench imports are lazy so the module loads in the torch-free test venv.
 
 ## Profiler — `profiler.py`
 

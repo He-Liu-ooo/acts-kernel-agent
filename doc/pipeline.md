@@ -75,8 +75,8 @@ Multi-line CLI summary. Skips the scoring block when `baseline_latency_us == 0` 
 
 ## Running the Pipeline
 
-**Placeholder mode** — the default CLI (`python -m src.pipeline.optimize`) runs the matmul starter without GPU, LLM, or SOL-ExecBench. `main()` runs `optimize("placeholder")` and prints `render_report(generate_report(result))`. No model is loaded — every agent stays in no-op mode, the baseline comes from `make_matmul_kernel`, and `eval/benchmark.py` returns synthetic latency so the report emits a scoring block with baseline == best (speedup 1.00x). This only exercises the scaffold end-to-end; it is not a meaningful search result.
+**Placeholder mode** — the default CLI (`python -m src.pipeline.optimize`) runs the matmul starter without GPU, LLM, or SOL-ExecBench. `main()` runs `optimize("placeholder")` and prints `render_report(generate_report(result))`. No model is loaded — every agent stays in no-op mode, the baseline comes from `make_matmul_kernel`, and with no workloads `benchmark_kernel` returns its 100us sentinel so the report emits a scoring block with baseline == best (speedup 1.00x). This only exercises the scaffold end-to-end; it is not a meaningful search result.
 
 **SOL mode** — call `optimize(problem_path=<sol-dir>)` with a SOL-ExecBench problem directory. Requires `configs/models/<provider>.json` (or `$ACTS_MODEL_CONFIG` pointing at one) and the `openai-agents` SDK installed; `generate_triton_baseline` fails closed otherwise with `BaselineGenerationError`.
 
-Phase B is still bounded by placeholder `eval/benchmark.py` / `eval/profiler.py` until those land; everything upstream of scoring now runs on real logic in SOL mode.
+Phase B runs real CUDA-event benchmarking (`eval/benchmark.py`) end-to-end; only `eval/profiler.py` remains a placeholder, so `bottleneck_transitions` stays empty in Phase C reports until it lands.

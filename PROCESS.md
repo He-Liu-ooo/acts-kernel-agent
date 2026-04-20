@@ -52,13 +52,28 @@
 - [x] search/orchestrator.py — `SearchResult` gained a `tree: SearchTree` field so Phase C can reconstruct path-derived views without the orchestrator denormalizing upfront; all four `SearchResult` construction sites updated (ALL_DEAD_END / SOL_TARGET / PLATEAU / BUDGET). Lighter-snapshot alternative tracked as a Deferred Improvement.
 - [x] pipeline/optimize.py — `main()` now prints `render_report(generate_report(result))`.
 
+### Implemented during benchmark phase (real logic, not placeholders)
+
+- [x] eval/benchmark.py — CUDA-event timing via injectable `BenchmarkTimer` Protocol. Production `_TorchCudaTimer` uses `torch.cuda.Event` pairs + 256MB int64 L2 thrasher; tests inject a scripted `RecordingTimer` so dispatch / aggregation / call-order are verifiable without torch. Multi-workload path takes parallel `workloads` / `input_generators` lists, constructs a fresh timer per workload (CUDA sticky-error isolation), aggregates median-of-medians across workloads and preserves `per_workload_latency_us`. Fail-closed: per-workload launch failures record `inf` + reason; <half survive raises `BenchmarkError`; `BenchmarkResult.is_fully_successful` is the orchestrator's partial-failure check. Empty-workload path returns a 100us sentinel so `compute_sol_score` can't silently collapse to 1.0.
+- [x] search/orchestrator.py — baseline partial-workload failure raises `BenchmarkError` (SOL-score denominator must be complete); child partial failure marks branch `DEAD_END` (branch-local); both paths deduplicated through a single `dead_reason` sentinel. Uses `BenchmarkResult.is_fully_successful` instead of reaching into `workload_errors`.
+
 ## Next Up
 
-Phase A, Phase B, and Phase C are wired end-to-end with a real (LLM-driven) Coder, and the doc set has been reconciled against the post-report-wiring src tree (pipeline.md / search.md). The remaining non-GPU work:
+Phase A, Phase B, and Phase C are wired end-to-end with real CUDA-event benchmarking; only `eval/profiler.py` remains a placeholder in Phase B. GPU is available (NVIDIA RTX 6000 Ada, CUDA 12.8).
 
-- **`actions/tier{1..6}` real guidance text** — action-library descriptions are the Planner's fuel. Structure is done; the guidance strings are placeholders. Content-heavy (literature synthesis), high impact on search quality.
+Candidates (pick one before writing code; design-discussion first where called out):
 
-GPU-bound items (`eval/benchmark.py`, `eval/profiler.py`) are blocked on hardware and remain out of scope for this environment.
+- **`eval/profiler.py`** (skeleton → real) — NCU (`ncu --export` / `ncu-cli`) integration + per-iteration bottleneck classification. Feeds dynamic classification to retriever/reviewer/planner (see JOURNAL.md "Dynamic bottleneck reclassification"). Next in dependency order: benchmark gives latency, profiler gives the *why*, which unblocks `bottleneck_transitions` in the Phase C report. **Design discussion warranted** — subprocess vs `nsight-compute` Python API, metric set, parse-from-CSV vs SQLite, how to cache per-kernel results.
+
+- **`actions/tier{1..6}` real guidance text** (non-GPU) — action-library descriptions are the Planner's fuel. Structure is done (`src/actions/tier*_*.py` ~373 LOC total); the guidance strings are placeholders. Content-heavy (literature synthesis from 9-paper KB + AccelOpt/Astra), high impact on search quality but does not require GPU.
+
+- **`config.py::detect_hardware()`** (non-GPU code, uses GPU at runtime) — currently a placeholder returning a zeroed spec. With a live GPU we can wire `torch.cuda`/`pynvml` to populate `HardwareSpec` fields at startup. Small feature, useful for ablation runs that skip the SOLAR arch YAML path.
+
+- **First live GPU run** (integration milestone, not a new module) — now that `benchmark.py` is real, Phase B can produce meaningful SOL scores against a SOL-ExecBench problem. Worth running end-to-end before profiler lands, to surface anything the test venv masked (real Triton specialization, compile latency, sticky-error recovery, timer overhead). Likely trigger for the deferred `sys.modules` compile cache and the `do_bench`-shape rewrite.
+
+Recommended order: `eval/profiler.py` (biggest unlock — dynamic bottleneck reclassification + Phase C `bottleneck_transitions`), then action guidance + `detect_hardware`. Fit the live-GPU run in between whenever the immediate downstream needs it.
+
+Still deferred regardless of GPU: `eval/anti_cheat.py` (Tier 3 — threat model empty for bounded internal search; see Deferred Improvements) and `benchmark/solar_adapter.py` (needs SOLAR package installed).
 
 ## Remaining (dependency-ordered)
 
@@ -66,7 +81,7 @@ Items marked `(skeleton)` have interfaces + placeholder logic that keeps the pip
 
 ### Phase 1: Foundation
 
-- [x] config.py (done) — detect_hardware() is placeholder (deferred — YAML loading covers the primary path)
+- [x] config.py (done) — detect_hardware() is placeholder (deferred — YAML loading covers the primary path; now implementable via torch.cuda/pynvml since GPU is available)
 - [x] kernels/kernel.py (done) — dataclasses complete
 - [x] kernels/compiler.py (done) — file-backed importlib load (`spec_from_file_location` + `exec_module`), hash-keyed cache path, resolves `KernelSpec.entrypoint` via `getattr`. GPU-side Triton specialization still happens at launch time in correctness/benchmark runs.
 
@@ -74,8 +89,8 @@ Items marked `(skeleton)` have interfaces + placeholder logic that keeps the pip
 
 - [x] eval/correctness.py (done) — 5-stage gate (smoke → shape-sweep → numerical stability → determinism → anti-cheat) with short-circuit failure attribution. Injectable `ComparisonPolicy` (torch-free at import); `TorchComparisonPolicy` delegates to `sol_execbench.compute_error_stats` when installed, falls back to `torch.allclose` otherwise.
 - [x] eval/inputs.py (done) — `build_reference_fn` (exec PyTorch reference source, resolve `run`) + `build_input_generator` (wraps SOL's `gen_inputs` with seeding). Torch + sol_execbench lazy-imported.
-- [ ] eval/benchmark.py (skeleton) — latency measurement. Needs compiler.py + GPU.
-- [ ] eval/profiler.py (skeleton) — NCU integration + per-iteration bottleneck classification. Needs GPU. Note: orchestrator must call per candidate and feed dynamic classification to retriever/reviewer/planner (see JOURNAL.md "Dynamic bottleneck reclassification")
+- [x] eval/benchmark.py (done) — CUDA-event timing via injectable `BenchmarkTimer` Protocol; multi-workload parallel-list contract with fresh-timer-per-workload isolation; fail-closed on partial-workload failures (<half survive → `BenchmarkError`; `is_fully_successful` property on result); 100us sentinel on empty-workload path.
+- [ ] eval/profiler.py (skeleton) — NCU integration + per-iteration bottleneck classification. GPU is now available. Orchestrator must call per candidate and feed dynamic classification to retriever/reviewer/planner (see JOURNAL.md "Dynamic bottleneck reclassification").
 - [x] eval/roofline.py (done) — two clean paths: SOLAR (T_SOL + bottleneck together) or built-in fallback. solar_adapter.py placeholder returns synthetic data until SOLAR is installed.
 - [x] eval/scorer.py (done) — SOL Score with audit flags per SOL-ExecBench paper Section 4.3
 - [ ] eval/anti_cheat.py (skeleton) — two surfaces: correctness-level (input randomization, precision checks) + performance-level (T_k < T_SOL flagging from scorer)
@@ -103,11 +118,11 @@ Items marked `(skeleton)` have interfaces + placeholder logic that keeps the pip
 
 - [x] search/tree.py (done) — tree state, path_to_node, checkpoint save/load (atomic)
 - [x] search/beam.py (done) — beam pruning (B3 quality-weighted + B2 diversity-aware, configurable), epsilon-greedy selection
-- [ ] search/orchestrator.py (skeleton) — real control flow + real agents; still calls placeholder `eval/benchmark.py` / `eval/profiler.py` for latency and bottleneck classification
+- [x] search/orchestrator.py (done) — real control flow + real agents + real CUDA-event benchmarking; fail-closed baseline check (aborts run on partial-workload failure), branch-local `DEAD_END` on child partial failure; still calls placeholder `eval/profiler.py` for bottleneck classification
 
 ### Phase 6: Pipeline & Integration
 
-- [x] pipeline/optimize.py Phase A (done) — real two-path load, roofline, workload selection, model-configured `CoderAgent`, and fail-closed `generate_triton_baseline`. Phase B still bounded by placeholder `eval/benchmark.py` / `eval/profiler.py`.
+- [x] pipeline/optimize.py Phase A (done) — real two-path load, roofline, workload selection, model-configured `CoderAgent`, and fail-closed `generate_triton_baseline`. Phase B now runs real CUDA-event benchmarking; only `eval/profiler.py` remains placeholder.
 - [x] pipeline/verify.py (done) — recompiles the winner and reruns the 5-stage correctness gate against the PyTorch reference; compile failures surface as `passed=False` with a compile-phrased detail string
 - [x] pipeline/report.py (done) — `generate_report` + `render_report`; trace via `result.tree.path_to_node`; propagates `reward_hack_suspect` / `calibration_warning`; `bottleneck_transitions` stays empty pending profiler
 - [x] benchmark/problem_loader.py (done)
@@ -171,6 +186,31 @@ these before its trigger fires, re-read the trigger first.
   refactor then. Keep in mind future KernelBench support — the Problem
   abstraction may need to stay benchmark-agnostic, with SOL's pydantic
   as one backend rather than the universal type.
+
+- [ ] **Adopt SOL-ExecBench `do_bench` protocol for `_TorchCudaTimer`** —
+  Current timer reuses one `start` / `end` event pair across every
+  iteration and syncs per-iter (`prepare` → `flush_l2` → `record_start`
+  → `fn` → `record_end` → `finalize_ms`, repeated). SOL-ExecBench's
+  `src/sol_execbench/core/bench/timing.py::do_bench` pre-allocates
+  `rep` start/end event pairs upfront, runs warmup with `_clear_cache`
+  between iters, syncs **once** before each `start.record()` and once
+  globally after the timed loop, then computes
+  `start.elapsed_time(end)` for each pair. Strictly cheaper (one final
+  sync instead of one per iter) and matches KernelBench/Triton
+  convention more faithfully. It also moves the L2-flush / arg-cloning
+  responsibility out of the timer abstraction into `do_bench` /
+  `setup` callbacks, letting us drop the `BenchmarkTimer` Protocol's
+  `prepare` / `flush_l2` / `finalize_ms` methods.
+  *Trigger*: before the first real multi-workload GPU run — the
+  sync-per-iter cost becomes measurable as soon as `rep` is
+  production-sized (100+ iters). Defer adopting now because it
+  requires a `BenchmarkTimer` protocol redesign (the torch-free test
+  seam assumes per-iter `prepare/flush/record/finalize` calls;
+  12 tests in `tests/test_benchmark.py` assert that call order) and a
+  fresh test injection strategy — not a drop-in change. Do it as its
+  own phase with a design discussion on the replacement test seam.
+  See JOURNAL → "SOL-ExecBench benchmarking integration" for the
+  survey that surfaced this option.
 
 - [ ] **Subprocess-isolated correctness / benchmark (Tier 3)** —
   SOL-ExecBench's `driver/templates/eval_driver.py` + `ProblemPackager`
