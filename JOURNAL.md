@@ -203,6 +203,16 @@ After merging the Debugger into the Coder (giving Coder compile + correctness to
 
 **Why not give the Coder benchmark tools too**: The Coder should optimize for correctness, not for benchmark numbers. If the Coder could benchmark, it might overfit to specific input sizes or learn to game the measurement. Keeping benchmark/profiling orchestrator-only maintains the separation: the Coder writes correct code, the eval harness measures it, and the Reviewer interprets the results.
 
+### SOL-ExecBench benchmarking integration — current protocol kept, `do_bench`-shape deferred (2026-04-20)
+
+Surveyed `/home/hel19/workspace/projects/self-evolved-llm/repo/benchmark/SOL-ExecBench` in response to a Codex adversarial review that flagged our per-iteration timing shape as vulnerable to CUDA sticky-error contamination. Their canonical timer (`src/sol_execbench/core/bench/timing.py::do_bench`) pre-allocates `rep` start/end `torch.cuda.Event` pairs upfront, runs the warmup + timed loops with one `torch.cuda.synchronize()` before each `start.record()` and a single global sync after the timed loop, then computes `start.elapsed_time(end)` for each pair. Their isolation model (`src/sol_execbench/driver/templates/eval_driver.py`) is **per-solution subprocess**, not per-workload — inside the subprocess, between workloads they do only `gc.collect()` + `torch.cuda.empty_cache()` + explicit tensor-ref cleanup. Per-workload subprocesses are not their answer to sticky CUDA errors.
+
+**Decision**: Keep the current `BenchmarkTimer` protocol (`prepare` / `flush_l2` / `record_start` / `record_end` / `finalize_ms` per iter) for now, and fix Codex's findings in place (fail-closed on baseline partial-workload failures; fresh timer instance per workload). Defer the `do_bench`-shape rewrite as its own phase item.
+
+**Why defer**: adopting the `do_bench` shape requires redesigning the `BenchmarkTimer` Protocol, since the torch-free test venv injects a `RecordingTimer` that asserts the per-iter call order — 12 tests in `tests/test_benchmark.py` depend on it. The replacement seam (e.g. `BenchmarkTimer.time(fn, setup, warmup, rep) → list[float]`, or a `pre-allocate events + iterate + collect` trio) needs its own design discussion so tests keep a torch-free injection point while matching the upstream shape. The per-iter sync cost we'd save is not yet on-profile — production `rep` counts haven't run against live CUDA. Pay once when GPU runs prove the cost, not proactively.
+
+**Why not subprocess-per-workload** (Codex's recommendation): SOL-ExecBench doesn't do this either. Their answer is subprocess-per-*solution* (belongs at `pipeline/optimize.py` level, already tracked as a deferred Tier 3 item) plus lightweight per-workload cleanup inside the subprocess. Subprocess-per-workload would add hundreds of ms per workload × iterations × candidates — a large architectural cost to solve a problem that currently degrades gracefully (a sticky CUDA fault drops survivors → `BenchmarkError` → child DEAD_END).
+
 ### Profiling feedback pipeline — full → Reviewer, distilled → Planner
 
 Reference frameworks handle this differently:

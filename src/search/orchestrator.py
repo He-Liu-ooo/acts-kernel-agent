@@ -127,7 +127,8 @@ class Orchestrator:
         be ``None`` / empty in the placeholder path where ``implement()``
         returns the source unchanged.
         """
-        from src.eval.benchmark import benchmark_kernel
+        from src.agents.reviewer import BranchQuality
+        from src.eval.benchmark import BenchmarkError, benchmark_kernel
         from src.eval.profiler import profile_kernel
         from src.eval.roofline import compute_roofline
         from src.eval.scorer import compute_sol_score
@@ -138,11 +139,24 @@ class Orchestrator:
         tree = SearchTree()
         self._tree = tree
 
-        # Phase A: baseline evaluation
+        # Phase A: baseline evaluation. Baseline is the SOL-score
+        # denominator, so any partial-workload failure makes every
+        # downstream child score meaningless — fail closed symmetric
+        # with the majority-failure BenchmarkError path.
         root = tree.add_root(baseline)
-        baseline_bench = benchmark_kernel(baseline, self._config, workloads=workloads)
+        baseline_bench = benchmark_kernel(
+            baseline,
+            self._config,
+            workloads=workloads,
+            input_generators=input_generators,
+        )
+        if not baseline_bench.is_fully_successful:
+            raise BenchmarkError(
+                f"baseline benchmark had partial-workload failures "
+                f"(errors={baseline_bench.workload_errors}); "
+                f"SOL scoring requires a complete baseline measurement"
+            )
 
-        # T_SOL + bottleneck: use SOLAR result if provided, else built-in fallback
         if roofline is None:
             roofline = compute_roofline(baseline.spec, self._config.hardware)
 
@@ -197,8 +211,37 @@ class Orchestrator:
             child_kernel = Kernel(spec=baseline.spec, source_code=new_source)
             child = tree.add_child(parent.id, child_kernel, plan.technique)
 
-            # Orchestrator-side eval
-            bench = benchmark_kernel(child_kernel, self._config, workloads=workloads)
+            # Child-benchmark failure is branch-local: BenchmarkError
+            # (majority-failure) and non-empty workload_errors (partial
+            # failure) both mark the child DEAD_END so a kernel that
+            # crashes on a slice of the workload set cannot be scored or
+            # promoted. Baseline failure is not caught — no baseline
+            # means no signal, and the caller is expected to surface it.
+            dead_reason: str | None = None
+            bench = None
+            try:
+                bench = benchmark_kernel(
+                    child_kernel,
+                    self._config,
+                    workloads=workloads,
+                    input_generators=input_generators,
+                )
+            except BenchmarkError as e:
+                dead_reason = f"child benchmark failed ({e})"
+            else:
+                if not bench.is_fully_successful:
+                    dead_reason = (
+                        f"child benchmark had partial-workload failures "
+                        f"(errors={bench.workload_errors})"
+                    )
+
+            if dead_reason is not None:
+                logger.warning("Iteration %d: %s — marking branch dead_end", iteration + 1, dead_reason)
+                child.branch_quality = BranchQuality.DEAD_END
+                beam_prune(tree, self._config.beam_width, enable_diversity=self._config.beam_diversity)
+                epsilon = max(self._config.epsilon_end, epsilon - decay)
+                continue
+
             child.score = compute_sol_score(
                 baseline_bench.median_latency_us,
                 bench.median_latency_us,

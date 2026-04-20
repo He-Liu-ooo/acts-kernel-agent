@@ -631,3 +631,120 @@ class TestOrchestratorCoderContext:
             await orch.run(h.baseline, workloads=None, roofline=h.roofline)
 
         assert h.coder.implement.await_count == 1
+
+
+class TestOrchestratorBenchmarkFailure:
+    """Benchmark-layer failures on a child candidate must mark only that
+    branch dead — never unwind the whole search run. Baseline failures
+    have no recovery and must propagate."""
+
+    @pytest.mark.asyncio
+    async def test_child_benchmark_error_marks_dead_end_and_continues(
+        self, _orch_harness, caplog
+    ):
+        """BenchmarkError on a child → branch marked DEAD_END, reviewer skipped,
+        run completes normally (no exception unwinds run())."""
+        import logging
+
+        from src.eval.benchmark import BenchmarkError, BenchmarkResult
+        from src.search.orchestrator import Orchestrator
+
+        h = _orch_harness
+        baseline_bench = BenchmarkResult(median_latency_us=100.0, timed_runs=1)
+
+        caplog.set_level(logging.WARNING, logger="src.search.orchestrator")
+        with patch(
+            "src.eval.benchmark.benchmark_kernel",
+            side_effect=[
+                baseline_bench,
+                BenchmarkError("only 0/3 workloads survived: launch failed"),
+            ],
+        ):
+            orch = Orchestrator(h.config, h.planner, h.coder, h.reviewer, h.retriever)
+            result = await orch.run(h.baseline, workloads=None, roofline=h.roofline)
+
+        # Reviewer must be skipped when the child's benchmark fails — no
+        # score means nothing to review.
+        assert h.reviewer.review.await_count == 0
+        # The child must be marked DEAD_END so the frontier excludes it.
+        child_ids = [n for n in result.tree._nodes.values() if n.parent_id is not None]
+        assert len(child_ids) == 1
+        assert child_ids[0].branch_quality == BranchQuality.DEAD_END
+        assert child_ids[0].score is None
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("benchmark" in w.lower() and "dead" in w.lower() for w in warnings), (
+            f"Expected a dead-end warning; got: {warnings}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_child_partial_workload_failure_marks_dead_end(self, _orch_harness):
+        """If ≥50% of workloads survive but some failed (workload_errors
+        non-empty), the child is still unsafe to promote — treat as dead."""
+        from src.eval.benchmark import BenchmarkResult
+        from src.search.orchestrator import Orchestrator
+
+        h = _orch_harness
+        baseline_bench = BenchmarkResult(median_latency_us=100.0, timed_runs=1)
+        partial_child = BenchmarkResult(
+            median_latency_us=50.0,
+            timed_runs=1,
+            per_workload_latency_us={"wl1": 50.0, "wl2": float("inf")},
+            workload_errors={"wl2": "RuntimeError: CUDA launch failed"},
+        )
+
+        with patch(
+            "src.eval.benchmark.benchmark_kernel",
+            side_effect=[baseline_bench, partial_child],
+        ):
+            orch = Orchestrator(h.config, h.planner, h.coder, h.reviewer, h.retriever)
+            result = await orch.run(h.baseline, workloads=None, roofline=h.roofline)
+
+        assert h.reviewer.review.await_count == 0, (
+            "Partial-failure kernels must not reach the reviewer"
+        )
+        children = [n for n in result.tree._nodes.values() if n.parent_id is not None]
+        assert len(children) == 1
+        assert children[0].branch_quality == BranchQuality.DEAD_END, (
+            "Child with non-empty workload_errors must be marked DEAD_END "
+            "so it cannot be promoted as the best node"
+        )
+        assert children[0].score is None
+
+    @pytest.mark.asyncio
+    async def test_baseline_partial_workload_failure_fails_closed(self, _orch_harness):
+        """Baseline with any workload_errors must be rejected — the baseline
+        is the SOL-score denominator; a partial measurement would score every
+        downstream child against an incomplete ground truth."""
+        from src.eval.benchmark import BenchmarkError, BenchmarkResult
+        from src.search.orchestrator import Orchestrator
+
+        h = _orch_harness
+        partial_baseline = BenchmarkResult(
+            median_latency_us=100.0,
+            timed_runs=1,
+            per_workload_latency_us={"wl1": 100.0, "wl2": float("inf")},
+            workload_errors={"wl2": "RuntimeError: CUDA launch failed"},
+        )
+        with patch(
+            "src.eval.benchmark.benchmark_kernel",
+            side_effect=[partial_baseline],
+        ):
+            orch = Orchestrator(h.config, h.planner, h.coder, h.reviewer, h.retriever)
+            with pytest.raises(BenchmarkError, match="baseline"):
+                await orch.run(h.baseline, workloads=None, roofline=h.roofline)
+
+    @pytest.mark.asyncio
+    async def test_baseline_benchmark_error_propagates(self, _orch_harness):
+        """Baseline failure is unrecoverable — no signal for any scoring —
+        so the orchestrator must let BenchmarkError propagate to the caller."""
+        from src.eval.benchmark import BenchmarkError
+        from src.search.orchestrator import Orchestrator
+
+        h = _orch_harness
+        with patch(
+            "src.eval.benchmark.benchmark_kernel",
+            side_effect=BenchmarkError("baseline: 0/4 workloads survived"),
+        ):
+            orch = Orchestrator(h.config, h.planner, h.coder, h.reviewer, h.retriever)
+            with pytest.raises(BenchmarkError, match="baseline"):
+                await orch.run(h.baseline, workloads=None, roofline=h.roofline)
