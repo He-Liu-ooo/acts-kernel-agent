@@ -85,4 +85,4 @@ Returns True if the best score hasn't improved beyond `delta` over the last `win
 
 ### SearchResult
 
-Output: `{best_node, total_iterations, termination_reason}`.
+Output: `{best_node, total_iterations, termination_reason, tree}`. `tree` is the full `SearchTree` carried forward so Phase C (`pipeline/report.py`) can reconstruct the root-to-best path for `technique_trace` without the orchestrator having to denormalize every path-derived view upfront. See PROCESS.md → Deferred Improvements (`SearchResult.tree` → lighter path snapshot) for when to swap this for a precomputed `best_path` / `technique_trace`.

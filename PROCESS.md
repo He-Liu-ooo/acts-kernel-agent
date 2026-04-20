@@ -35,24 +35,30 @@
 
 ### Implemented during Coder phase (real logic, not placeholders)
 
-- [x] agents/coder.py — tool-using Agent with Pydantic `KernelCodeOutput`, `build_user_prompt()`, `ImplementationError`, `_MAX_TURNS` derived from `ACTSConfig.max_debug_retries` (= 2×n+1, default 7), temperature 0.0 for determinism. Tools wire to real `compile_kernel` / `verify_correctness` via closure-captured `KernelSpec` + `reference_fn` + `input_generator` at `implement()` call time.
-- [x] prompts/coder/ — system.md (prescribed compile-then-correctness workflow, hard rules, anti-patterns, one sanctioned failure mode: emit last-compiled source on budget exhaustion) + implement.md (user-prompt format doc)
+- [x] agents/coder.py — tool-using Agent with Pydantic `KernelCodeOutput`, `build_user_prompt()`, `ImplementationError`, turn budget `2*max_debug_retries+1` (= 7 by default), temperature 0.0 for determinism. Tools wire to real `compile_kernel` / `verify_correctness` via closure-captured `KernelSpec` + `reference_fn` + **`input_generators` (list, one per selected workload — correctness tool iterates all, short-circuits on first failure)** at call time. Second entry point `translate()` (one-shot PyTorch→Triton port for baseline generation) shares tool wiring with `implement()` via private `_run_tool_agent` helper; `has_model` property for callers that must branch before reaching into internals.
+- [x] prompts/coder/ — system.md (prescribed compile-then-correctness workflow, hard rules, anti-patterns, one sanctioned failure mode) + implement.md (user-prompt format doc) + translate.md (baseline-port system prompt: port PyTorch `run` to Triton `kernel_fn`, signature invariance, no precision drop)
 - [x] agents/llm_backend.py — added optional `max_turns` kwarg to `run_agent()` (threads SDK tool-loop bound) and `render_kernel_section()` helper (replaces triple-duplicated fence+escape logic in coder/planner/reviewer)
 - [x] Planner/Reviewer temperature bumped 0.0 → 0.3 — Coder stays at 0.0 (determinism for code gen), upstream agents get variance for technique exploration / diagnosis wording; strict Pydantic enums still pin schema
 
+### Implemented during baseline-generator phase (real logic, not placeholders)
+
+- [x] benchmark/baseline_generator.py — drives `CoderAgent.translate()`, recompiles the returned source, and reruns the 5-stage correctness gate against every selected workload before accepting a candidate. Post-verify catches SDK best-effort output when the Coder's turn budget is exhausted. Fail-closed: raises typed `BaselineGenerationError` on no-model-configured or retry exhaustion (no stub fallback — search against a fake baseline would look like progress).
+- [x] pipeline/optimize.py Phase A — `_load_model_if_configured` reads `$ACTS_MODEL_CONFIG` / `configs/models/deepseek.json` (TOCTOU-safe via try/except), model load gated on SOL mode so placeholder CLI stays runnable. `_load_sol_execbench` now async: calls `generate_triton_baseline` and returns `reference_fn` + the full `input_generators` list so Phase B's correctness tool binds to every selected workload.
+- [x] search/orchestrator.py — accepts plural `input_generators` and forwards verbatim to `CoderAgent.implement()` every iteration.
+
+### Implemented during report phase (real logic, not placeholders)
+
+- [x] pipeline/report.py — `generate_report(result)` walks `result.tree.path_to_node(best.id)` to build `technique_trace` (root baseline placeholder filtered out), propagates `reward_hack_suspect` / `calibration_warning` from the best node's `ScoreResult`, unwraps `TerminationReason` to a plain string, and defensively handles a `None` score. `render_report` emits a multi-line CLI summary that skips the scoring block when `baseline_latency_us == 0` and surfaces audit flags as explicit `[AUDIT]` lines. `bottleneck_transitions` stays empty pending `eval/profiler.py` (GPU-blocked).
+- [x] search/orchestrator.py — `SearchResult` gained a `tree: SearchTree` field so Phase C can reconstruct path-derived views without the orchestrator denormalizing upfront; all four `SearchResult` construction sites updated (ALL_DEAD_END / SOL_TARGET / PLATEAU / BUDGET). Lighter-snapshot alternative tracked as a Deferred Improvement.
+- [x] pipeline/optimize.py — `main()` now prints `render_report(generate_report(result))`.
+
 ## Next Up
 
-### benchmark/baseline_generator.py — PyTorch-to-Triton one-shot translation
+Phase A, Phase B, and Phase C are wired end-to-end with a real (LLM-driven) Coder, and the doc set has been reconciled against the post-report-wiring src tree (pipeline.md / search.md). The remaining non-GPU work:
 
-Uses the Coder to translate a problem's PyTorch reference into a Triton baseline at problem load time. Now that `kernels/compiler.py`, `eval/correctness.py`, and the Coder tool wiring are real, the remaining work is:
+- **`actions/tier{1..6}` real guidance text** — action-library descriptions are the Planner's fuel. Structure is done; the guidance strings are placeholders. Content-heavy (literature synthesis), high impact on search quality.
 
-1. Build the per-problem `KernelSpec` + `reference_fn` + `input_generator` from a loaded `Problem` (helpers live in `src/eval/inputs.py`).
-2. Drive `CoderAgent.implement()` with a translation plan (Planner-free — this is a fixed "translate PyTorch `run()` to Triton `kernel_fn`" task).
-3. Retry up to `ACTSConfig.max_baseline_retries` attempts; skip the problem if all fail (per `definition.json` → baseline contract).
-
-### Orchestrator-side Coder failure handling (deferred — see JOURNAL)
-
-Currently `ImplementationError` propagates out of `Orchestrator.run()`. Design intent: mark branch dead/degraded and continue. Deferred until the orchestrator's per-iteration Coder call site lands real eval/scoring. Tracked here so it isn't forgotten.
+GPU-bound items (`eval/benchmark.py`, `eval/profiler.py`) are blocked on hardware and remain out of scope for this environment.
 
 ## Remaining (dependency-ordered)
 
@@ -97,15 +103,15 @@ Items marked `(skeleton)` have interfaces + placeholder logic that keeps the pip
 
 - [x] search/tree.py (done) — tree state, path_to_node, checkpoint save/load (atomic)
 - [x] search/beam.py (done) — beam pruning (B3 quality-weighted + B2 diversity-aware, configurable), epsilon-greedy selection
-- [ ] search/orchestrator.py (skeleton) — has real control flow but calls placeholder agents/eval
+- [ ] search/orchestrator.py (skeleton) — real control flow + real agents; still calls placeholder `eval/benchmark.py` / `eval/profiler.py` for latency and bottleneck classification
 
 ### Phase 6: Pipeline & Integration
 
-- [ ] pipeline/optimize.py (skeleton) — has real Phase A flow (two load paths, roofline, workload selection) but calls placeholder baseline generator
+- [x] pipeline/optimize.py Phase A (done) — real two-path load, roofline, workload selection, model-configured `CoderAgent`, and fail-closed `generate_triton_baseline`. Phase B still bounded by placeholder `eval/benchmark.py` / `eval/profiler.py`.
 - [x] pipeline/verify.py (done) — recompiles the winner and reruns the 5-stage correctness gate against the PyTorch reference; compile failures surface as `passed=False` with a compile-phrased detail string
-- [ ] pipeline/report.py (skeleton) — report generation
+- [x] pipeline/report.py (done) — `generate_report` + `render_report`; trace via `result.tree.path_to_node`; propagates `reward_hack_suspect` / `calibration_warning`; `bottleneck_transitions` stays empty pending profiler
 - [x] benchmark/problem_loader.py (done)
-- [ ] benchmark/baseline_generator.py (skeleton) — Triton baseline generation. Needs Coder agent.
+- [x] benchmark/baseline_generator.py (done) — `generate_triton_baseline` drives `CoderAgent.translate` + post-verifies on every selected workload; `BaselineGenerationError` on no-model / retry exhaustion.
 - [x] benchmark/workload_selector.py (done)
 - [x] benchmark/solution_formatter.py (done)
 - [ ] benchmark/solar_adapter.py (skeleton) — returns synthetic data. Needs SOLAR installed.
@@ -238,6 +244,25 @@ these before its trigger fires, re-read the trigger first.
   until then; the Python-level file write + exec_module pair is cheap
   at current scale, and adding the cache introduces a "stale module in
   sys.modules after reload" failure mode that we'd have to reason about.
+
+- [ ] **`SearchResult.tree` → lighter path snapshot** —
+  Phase C currently gets the full `SearchTree` on `SearchResult` so
+  `pipeline/report.py::generate_report` can walk the root-to-best path
+  for `technique_trace`. Keeping the tree around is cheap for the
+  one-shot CLI path (GC'd when `main()` returns) but retains every
+  node's generated source — non-best branches included — until the
+  caller releases `SearchResult`. It also makes Phase C import-coupled
+  to `SearchTree`, which is more surface than it needs. A lighter
+  snapshot — precompute `best_path: list[TreeNode]` (or just
+  `technique_trace: list[str]`) in `Orchestrator` and drop the tree
+  reference — would shrink the retained footprint and narrow the
+  abstraction.
+  *Trigger*: when ACTS runs in a long-lived or batch context
+  (server, multi-problem batch driver) where `SearchResult` outlives a
+  single run, OR when tree retention shows up in a memory profile.
+  Not today — the CLI caller is ephemeral, and keeping the tree lets
+  future report views (per-iter SOL curve, tree depth histogram) grow
+  without another orchestrator round.
 
 - [ ] **Parallel beam expansion via `asyncio.gather`** —
   `Orchestrator.run()` currently expands one frontier node per

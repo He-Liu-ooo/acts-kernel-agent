@@ -8,20 +8,40 @@ End-to-end optimization entry points.
 
 ### Phase A: Load Problem
 
-1. Load baseline kernel (from starters or KernelBench)
-2. Compile and verify baseline correctness
-3. Benchmark baseline latency
-4. Derive T_SOL via roofline model
-5. Classify baseline as compute-bound or memory-bound
-6. Compute baseline SOL score (= 0.5 by definition)
+`optimize()` takes a `problem_path` that is either a SOL-ExecBench problem directory (contains `definition.json` + `workload.jsonl`) or the literal string `"placeholder"` for the built-in matmul demo. SOL mode is the real path; placeholder mode keeps the CLI runnable without an LLM or SOL dependency.
+
+**SOL mode** (`_load_sol_execbench`):
+
+1. `load_problem()` parses the SOL definition + workloads.
+2. `problem_to_kernel_spec()` derives the `KernelSpec` (name, entrypoint, kernel_type).
+3. `derive_t_sol_from_solar()` produces the roofline result; `spec.t_sol_us` is populated when SOLAR returns data.
+4. `select_workloads()` samples `config.benchmark_workload_count` representative workloads.
+5. **`generate_triton_baseline()`** (see `baseline_generator.py` below) drives `CoderAgent.translate()` to port the PyTorch reference into a Triton kernel, post-verifying on every selected workload. The returned `Kernel` is the search-tree root.
+6. `build_reference_fn()` + `build_input_generator()` produce the oracle + one generator per workload; these are forwarded to `Orchestrator.run()` so Phase B's correctness tool binds to every workload the baseline was verified against.
+
+**Model load** (`_load_model_if_configured`): reads `$ACTS_MODEL_CONFIG` or falls back to `configs/models/deepseek.json`. Gated on SOL mode — placeholder mode intentionally runs with `model=None` so the CLI stays executable without credentials. Without an SDK install or without a model config on disk, returns `None` and every agent stays in no-op mode.
+
+**Placeholder mode** (`_load_placeholder`): loads `make_matmul_kernel(1024, 1024, 1024)` directly; no oracle, no workloads, no roofline. Exercises the scaffold end-to-end only.
 
 ### Phase B: Search Loop
 
-Delegates to `Orchestrator.run()`. Runs up to `max_depth` iterations with 3 agents (Planner → Coder → Reviewer).
+Delegates to `Orchestrator.run()`. Runs up to `max_depth` iterations with 3 agents (Planner → Coder → Reviewer). The `reference_fn` + `input_generators` returned by Phase A are forwarded verbatim every iteration so the Coder's correctness tool remains bound to the problem's oracle.
 
 ### Phase C: Report
 
-Generates `OptimizationReport` from the best node found.
+`generate_report(result)` walks the root-to-best path on `result.tree` to build the `technique_trace`, carries the audit flags (`reward_hack_suspect`, `calibration_warning`) off the best node's `ScoreResult`, and unwraps `termination_reason` to a plain string. `render_report` formats the report for the CLI and surfaces audit flags as explicit `[AUDIT]` lines so a flagged run can't be skimmed past.
+
+## baseline_generator.py — Triton Baseline Generation
+
+`generate_triton_baseline(problem, spec, *, coder, workloads, max_retries, cache_dir=None, policy=None) -> Kernel`
+
+Runs at problem-load time. Drives `CoderAgent.translate()` to port the PyTorch reference into Triton, then post-verifies: recompiles the returned source and reruns the 5-stage correctness gate against every workload in *workloads*. The post-verify catches SDK best-effort output when the Coder's turn budget was exhausted. Returns the first candidate that compiles and passes correctness on all workloads.
+
+**Fail-closed contract** — raises `BaselineGenerationError` when:
+- `coder is None` or `coder.has_model is False` (no model configured). Search against a fake baseline would silently look like progress, so there is intentionally no stub fallback.
+- `max_retries` attempts are exhausted without a verified candidate.
+
+`ValueError` is raised for a caller bug — an empty `workloads` list.
 
 ## verify.py — Post-Optimization Verification
 
@@ -31,7 +51,9 @@ Re-runs the correctness gate on the best kernel to confirm results are reproduci
 
 ## report.py — Report Generation
 
-`generate_report(result) -> OptimizationReport`
+`generate_report(result: SearchResult) -> OptimizationReport`
+
+Reads the best node's `ScoreResult` and walks `result.tree.path_to_node(best.id)` to build the root-to-best action sequence. The root's `action_applied` is the empty-string baseline placeholder and is filtered out of the trace. When `best.score is None` (scoring failed), the returned report surfaces only `termination_reason` + `total_iterations` without crashing.
 
 | Field | Description |
 |-------|-------------|
@@ -39,22 +61,22 @@ Re-runs the correctness gate on the best kernel to confirm results are reproduci
 | `best_latency_us` | Best achieved latency |
 | `sol_score` | Final SOL score |
 | `speedup` | Baseline / best |
-| `technique_trace` | Sequence of actions applied |
-| `bottleneck_transitions` | How bottleneck shifted |
-| `remaining_headroom_pct` | Distance to hardware limit |
+| `technique_trace` | Root-to-best action sequence (root baseline filtered out) |
+| `bottleneck_transitions` | Per-iteration bottleneck shift. Stays empty until `eval/profiler.py` lands (GPU-blocked). |
+| `remaining_headroom_pct` | Distance to hardware limit, `(1 - sol_score) * 100` |
 | `total_iterations` | Search iterations run |
-| `termination_reason` | Why search stopped |
+| `termination_reason` | Why search stopped (plain string, unwrapped from `TerminationReason` enum) |
+| `reward_hack_suspect` | Propagated from best node's `ScoreResult` — candidate beats `T_SOL` |
+| `calibration_warning` | Propagated from best node's `ScoreResult` — baseline already at/below `T_SOL` |
+
+`render_report(report: OptimizationReport) -> str`
+
+Multi-line CLI summary. Skips the scoring block when `baseline_latency_us == 0` so a degenerate run (no scored best node) doesn't print misleading "0.00us / 0.00x" lines. When `reward_hack_suspect` / `calibration_warning` are set, emits an `[AUDIT]` line per flag so operators scanning the output can't miss a physics-violating or poorly-calibrated result.
 
 ## Running the Pipeline
 
-The pipeline runs end-to-end in placeholder mode without GPU or LLM:
+**Placeholder mode** — the default CLI (`python -m src.pipeline.optimize`) runs the matmul starter without GPU, LLM, or SOL-ExecBench. `main()` runs `optimize("placeholder")` and prints `render_report(generate_report(result))`. No model is loaded — every agent stays in no-op mode, the baseline comes from `make_matmul_kernel`, and `eval/benchmark.py` returns synthetic latency so the report emits a scoring block with baseline == best (speedup 1.00x). This only exercises the scaffold end-to-end; it is not a meaningful search result.
 
-```
-$ python -m src.pipeline.optimize
-Search completed: budget
-  Iterations: 20
-  Best SOL score: 0.5000
-  Speedup: 1.00x
-```
+**SOL mode** — call `optimize(problem_path=<sol-dir>)` with a SOL-ExecBench problem directory. Requires `configs/models/<provider>.json` (or `$ACTS_MODEL_CONFIG` pointing at one) and the `openai-agents` SDK installed; `generate_triton_baseline` fails closed otherwise with `BaselineGenerationError`.
 
-As modules are implemented, placeholder returns are replaced with real logic.
+Phase B is still bounded by placeholder `eval/benchmark.py` / `eval/profiler.py` until those land; everything upstream of scoring now runs on real logic in SOL mode.

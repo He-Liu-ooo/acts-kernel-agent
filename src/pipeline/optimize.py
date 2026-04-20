@@ -159,12 +159,10 @@ def _load_model_if_configured():
 
 def main() -> None:
     """CLI entry point."""
+    from src.pipeline.report import generate_report, render_report
+
     result = asyncio.run(optimize("placeholder"))
-    print(f"Search completed: {result.termination_reason}")
-    print(f"  Iterations: {result.total_iterations}")
-    if result.best_node.score:
-        print(f"  Best SOL score: {result.best_node.score.sol_score:.4f}")
-        print(f"  Speedup: {result.best_node.score.speedup:.2f}x")
+    print(render_report(generate_report(result)))
 
 
 if __name__ == "__main__":

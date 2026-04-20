@@ -46,21 +46,27 @@ The deterministic orchestrator controls all flow. Agents are stateless — they 
 **Output model**:
 - `KernelCodeOutput` (Pydantic) — single field `source_code: str`. The SDK enforces this schema on the LLM's final response. No separate internal dataclass — the kernel source is already the only thing the rest of the pipeline needs.
 
-**Tools** (decorated with `@function_tool` when the SDK is available):
-- `compile_kernel_tool(source_code)` → will call `kernels/compiler.py`, returns success/error string
-- `check_correctness_tool(source_code)` → will call `eval/correctness.py`, returns pass/fail string
+**Tools** (built per call via `_make_compile_tool` / `_make_correctness_tool`, then wrapped with `@function_tool` at Agent-construction time so the factories stay unit-testable without the SDK):
+- `compile_kernel_tool(source_code)` → calls `kernels/compiler.py::compile_kernel`. Success returns an entrypoint confirmation; failure returns the full compiler traceback so the Coder can read the error and fix it.
+- `check_correctness_tool(source_code)` → recompiles the candidate (compile is cheap) and runs `eval/correctness.py::verify_correctness` against **every** input generator bound at call time, short-circuiting on the first failure. Returns a human-readable pass/fail message that names the failing workload index and stage. Compile failures are surfaced before attempting correctness so the Coder gets the cheaper error first.
 
-**Current tool state (placeholder)**: both tools are module-level stubs that unconditionally return success strings. They will be wired to `kernels/compiler.py` and `eval/correctness.py` when those modules become real. The Astra pattern — tools return error strings for in-turn self-correction — is already in place; only the bodies are stubbed.
+**Per-call binding**: both tools are closures over `(kernel_spec, reference_fn, input_generators)` captured when `implement()` or `translate()` is invoked. A fresh `Agent` is constructed per call — cheap (object construction, no network) and keeps the oracle bound to the right problem.
 
 **Prompt assembly**: `build_user_prompt()` (static method) assembles the user prompt from the kernel source and the `OptimizationPlan`. Sections: Current kernel (via shared `render_kernel_section()` helper — backticks escaped), Optimization plan (tier, technique, optional params, target region, rationale). **Reviewer feedback is intentionally not included** — the Planner has already consumed it and distilled its conclusions into the plan, so the Coder works from the plan only.
 
-**Turn budget — `_MAX_TURNS = 7`**: module-level constant. Derivation: "3 compile+correctness tries" × 2 tool turns per cycle + 1 final structured-output turn. The one sanctioned failure mode, spelled out in `system.md`, is emitting the last version that compiled cleanly when the budget runs out without a green correctness run. **Config gap**: `ACTSConfig.max_debug_retries=3` captures the same intent at the user-facing level but is not yet read by `CoderAgent`. Wiring is deferred (see `PROCESS.md` → Deferred Improvements) until compiler/correctness are wired into the tools.
+**Turn budget**: `self._max_turns = 2 * config.max_debug_retries + 1` — derived at construction time from `ACTSConfig`. Derivation: `max_debug_retries` compile+correctness tries × 2 tool turns per cycle + 1 final structured-output turn. Default config (`max_debug_retries=3`) gives 7. The one sanctioned failure mode, spelled out in `system.md`, is emitting the last version that compiled cleanly when the budget runs out without a green correctness run.
 
-**Input**: kernel source + `OptimizationPlan`.
+**`has_model` property**: `True` when the agent is backed by a real LLM. Callers that must branch before reaching into internals (e.g., `baseline_generator` fail-closing without a model) use this instead of touching `_model` directly.
 
-**Output**: modified kernel source code string. **May be a degraded best-effort** when the SDK tool loop exhausts `_MAX_TURNS` without a green correctness run — downstream verification/scoring handles that case.
+**Entry points**:
 
-**Error handling**: `ImplementationError` is raised when `run_agent()` returns `None` (transient retry exhaustion). Without a model configured, `implement()` returns the source unchanged (no LLM call). **Deferred**: orchestrator-side handling of `ImplementationError` and SDK `MaxTurnsExceeded` — see `PROCESS.md` → Deferred Improvements.
+`implement(kernel_source, plan, *, kernel_spec, reference_fn, input_generators) -> str` — the per-iteration call from the orchestrator. Applies the plan to the current kernel; `kernel_spec` + `reference_fn` + `input_generators` (one generator per selected workload) are jointly required when a model is configured — all three are captured by the tool closures. Without a model configured, returns the source unchanged (no LLM call).
+
+`translate(*, reference_source, kernel_spec, reference_fn, input_generators) -> str` — one-shot PyTorch→Triton port used at problem-load time by `benchmark/baseline_generator.py`. Drives the same tool-loop as `implement()` (shared via `_run_tool_agent`) but under a dedicated system prompt (`prompts/coder/translate.md`) that emphasizes signature invariance and no precision drop. Callers post-verify after translation because the SDK may emit a degraded best-effort when the turn budget is exhausted. No no-op fallback — raises `ImplementationError` when no model is configured, since there is no sensible from-scratch port without an LLM.
+
+**Output**: kernel source code string. **May be a degraded best-effort** when the SDK tool loop exhausts `max_turns` without a green correctness run — downstream verification/scoring (or, for `translate()`, the caller's post-verify pass) handles that case.
+
+**Error handling**: `ImplementationError` is raised when `run_agent()` returns `None` (transient retry exhaustion), when `translate()` is called without a model, or when `implement()` is called with a model but missing correctness context (`kernel_spec` / `reference_fn` / a non-empty `input_generators`). **Deferred**: orchestrator-side handling of `ImplementationError` and SDK `MaxTurnsExceeded` — see `PROCESS.md` → Deferred Improvements.
 
 **Temperature**: 0.0. Determinism is load-bearing for code generation — variance in kernel code is almost always noise, not creativity. Planner/Reviewer use 0.3 for exactly the opposite reason (see Planner / Reviewer sections).
 

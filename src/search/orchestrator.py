@@ -23,7 +23,7 @@ if TYPE_CHECKING:
     from src.eval.roofline import RooflineResult
     from src.kernels.kernel import Kernel
     from src.memory.retriever import MemoryRetriever
-    from src.search.tree import TreeNode
+    from src.search.tree import SearchTree, TreeNode
 
 # Profiling is not yet wired through the orchestrator. All three places
 # that pass a profiling summary into an agent share this literal so the
@@ -43,11 +43,17 @@ class TerminationReason(str, Enum):
 
 @dataclass
 class SearchResult:
-    """Final result of the search process."""
+    """Final result of the search process.
+
+    ``tree`` is carried forward so Phase C (``pipeline/report.py``) can
+    reconstruct the root-to-best path for ``technique_trace`` without the
+    orchestrator having to denormalize every path-derived view upfront.
+    """
 
     best_node: TreeNode
     total_iterations: int
     termination_reason: TerminationReason
+    tree: SearchTree
 
 
 def detect_plateau(
@@ -154,7 +160,7 @@ class Orchestrator:
         for iteration in range(self._config.max_depth):
             frontier = tree.frontier()
             if not frontier:
-                return SearchResult(tree.best_node(), iteration, TerminationReason.ALL_DEAD_END)
+                return SearchResult(tree.best_node(), iteration, TerminationReason.ALL_DEAD_END, tree)
 
             parent = select_next(tree, epsilon)
 
@@ -226,12 +232,12 @@ class Orchestrator:
             # Single end-of-iter best scan — reused for target / plateau checks.
             best = tree.best_node()
             if child.score.sol_score >= self._config.sol_target:
-                return SearchResult(best, iteration + 1, TerminationReason.SOL_TARGET)
+                return SearchResult(best, iteration + 1, TerminationReason.SOL_TARGET, tree)
 
             best_scores.append(best.score.sol_score)
             if detect_plateau(best_scores, self._config.sol_plateau_window, self._config.sol_plateau_delta):
-                return SearchResult(best, iteration + 1, TerminationReason.PLATEAU)
+                return SearchResult(best, iteration + 1, TerminationReason.PLATEAU, tree)
 
             epsilon = max(self._config.epsilon_end, epsilon - decay)
 
-        return SearchResult(tree.best_node(), self._config.max_depth, TerminationReason.BUDGET)
+        return SearchResult(tree.best_node(), self._config.max_depth, TerminationReason.BUDGET, tree)
