@@ -54,6 +54,10 @@ Venv has: pytest, pyyaml. Add new deps to both pyproject.toml AND the venv.
 - `doc/memory.md` — experience, store, retriever
 - `doc/pipeline.md` — optimize, verify, report
 
+### Upstream reference repos
+
+Before designing any new compile, correctness, benchmark, or search surface, skim the equivalent in at least one local upstream repo. The full list of paths + per-repo file pointers is in auto-memory at `reference_upstream_repos.md` (indexed in `MEMORY.md`). SOL-ExecBench is the canonical reference for timing/isolation; AccelOpt/Astra/autokernel are the pattern sources for compile/correctness/search.
+
 ### Don'ts
 
 - Don't read PRD.md or JOURNAL.md in full unless the task requires it.
