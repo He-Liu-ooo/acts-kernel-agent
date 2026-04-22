@@ -30,10 +30,13 @@ from typing import TYPE_CHECKING, Any, Callable
 from pydantic import BaseModel, ValidationError, model_validator
 
 try:
-    from agents import Agent, function_tool
+    from agents import Agent, MaxTurnsExceeded, function_tool
 except ModuleNotFoundError:  # pragma: no cover
     Agent = None  # type: ignore[assignment]
     function_tool = None  # type: ignore[assignment]
+
+    class MaxTurnsExceeded(Exception):  # type: ignore[no-redef]
+        """SDK-absent test stand-in. The real exception lives in ``agents``."""
 
 if TYPE_CHECKING:
     from agents import OpenAIChatCompletionsModel as _Model
@@ -303,12 +306,25 @@ class CoderAgent:
             model=self._model,
             tools=[compile_tool, correctness_tool, submit_tool],
         )
-        result = await run_agent(
-            agent,
-            prompt,
-            run_config=make_run_config(temperature=0.0),
-            max_turns=self._max_turns,
-        )
+        # SDK ``MaxTurnsExceeded`` is converted to ``ImplementationError`` so
+        # callers (orchestrator iteration loop, baseline_generator retry loop)
+        # have a single typed failure to catch. If the LLM submitted a valid
+        # kernel before burning the budget, return that — the run merely went
+        # over budget after the answer was already in hand. (Option γ, 2026-04-22.)
+        try:
+            result = await run_agent(
+                agent,
+                prompt,
+                run_config=make_run_config(temperature=0.0),
+                max_turns=self._max_turns,
+            )
+        except MaxTurnsExceeded as exc:
+            if "output" in captured:
+                return captured["output"]
+            raise ImplementationError(
+                f"Coder exhausted turn budget ({self._max_turns}) without "
+                "calling submit_kernel."
+            ) from exc
         if result is None:
             raise ImplementationError("LLM call failed after all retries.")
         if "output" not in captured:

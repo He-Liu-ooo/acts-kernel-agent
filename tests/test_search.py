@@ -935,3 +935,113 @@ class TestOrchestratorBenchmarkFailure:
             orch = Orchestrator(h.config, h.planner, h.coder, h.reviewer, h.retriever)
             with pytest.raises(BenchmarkError, match="baseline"):
                 await orch.run(h.baseline, workloads=None, roofline=h.roofline)
+
+
+class TestOrchestratorCoderFailure:
+    """Coder-side failures (turn-budget exhaustion, transient retry exhaustion,
+    missing submit_kernel call) are branch-local. Option γ (2026-04-22)
+    converts SDK ``MaxTurnsExceeded`` to ``ImplementationError`` at the
+    Coder boundary and the orchestrator catches it here. Without this, one
+    bad LLM call would unwind the entire search run."""
+
+    @pytest.mark.asyncio
+    async def test_implementation_error_skips_iteration_and_continues(
+        self, _orch_harness, caplog
+    ):
+        """Coder raises ImplementationError → orchestrator logs, decays
+        epsilon, continues to next iteration. No tree node is added (we
+        have no Coder output to materialize)."""
+        import logging
+
+        from src.agents.coder import ImplementationError
+        from src.eval.benchmark import BenchmarkResult
+        from src.search.orchestrator import Orchestrator
+
+        h = _orch_harness
+        # Bump max_depth so we still have iterations after the failure.
+        h.config.max_depth = 2
+
+        # First iteration's implement raises; second succeeds.
+        h.coder.implement = AsyncMock(
+            side_effect=[
+                ImplementationError("Coder exhausted turn budget (8) without calling submit_kernel."),
+                # Reuse the harness's default-shaped output for the second.
+                _coder_output_stub(),
+            ]
+        )
+
+        baseline_bench = BenchmarkResult(median_latency_us=100.0, timed_runs=1)
+        child_bench = BenchmarkResult(median_latency_us=80.0, timed_runs=1)
+
+        caplog.set_level(logging.WARNING, logger="src.search.orchestrator")
+        with patch(
+            "src.eval.benchmark.benchmark_kernel",
+            side_effect=[baseline_bench, child_bench],
+        ):
+            orch = Orchestrator(h.config, h.planner, h.coder, h.reviewer, h.retriever)
+            h.reviewer.review.return_value = _promising_review_stub()
+            result = await orch.run(h.baseline, workloads=None, roofline=h.roofline)
+
+        # Tree should contain root + ONE child (the second iteration's success).
+        # The first iteration left no node behind because implement() raised
+        # before child_kernel could be constructed.
+        assert h.coder.implement.await_count == 2, (
+            "Orchestrator must continue to the next iteration after Coder failure"
+        )
+        children = [n for n in result.tree._nodes.values() if n.parent_id is not None]
+        assert len(children) == 1, (
+            f"Expected exactly one tree node from the successful retry; got {len(children)}"
+        )
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("Coder failed" in w for w in warnings), (
+            f"Expected a Coder-failure warning; got: {warnings}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_implementation_error_on_every_iteration_completes_run_cleanly(
+        self, _orch_harness
+    ):
+        """If every iteration's Coder call fails, the run must still complete
+        without raising (budget exhaustion termination), not unwind the loop."""
+        from src.agents.coder import ImplementationError
+        from src.eval.benchmark import BenchmarkResult
+        from src.search.orchestrator import Orchestrator
+
+        h = _orch_harness
+        h.config.max_depth = 3
+        h.coder.implement = AsyncMock(
+            side_effect=ImplementationError("turn budget exhausted"),
+        )
+
+        baseline_bench = BenchmarkResult(median_latency_us=100.0, timed_runs=1)
+        with patch(
+            "src.eval.benchmark.benchmark_kernel",
+            return_value=baseline_bench,
+        ):
+            orch = Orchestrator(h.config, h.planner, h.coder, h.reviewer, h.retriever)
+            result = await orch.run(h.baseline, workloads=None, roofline=h.roofline)
+
+        # No children created — only the root remains.
+        assert len(result.tree._nodes) == 1
+        assert h.coder.implement.await_count == 3
+
+
+def _coder_output_stub():
+    """Bare-but-valid KernelCodeOutput for orchestrator path tests where the
+    Coder's actual output isn't the focus of the assertion."""
+    from src.agents.coder import KernelCodeOutput
+
+    return KernelCodeOutput.model_construct(
+        source_code="# child source",
+        triton_kernel_name="",
+    )
+
+
+def _promising_review_stub():
+    from src.agents.reviewer import BranchQuality, ReviewerFeedback
+
+    return ReviewerFeedback(
+        outcome="improved",
+        bottleneck_classification="memory_bound",
+        branch_quality=BranchQuality.PROMISING,
+    )

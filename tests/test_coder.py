@@ -612,6 +612,77 @@ async def test_implement_raises_when_agent_terminates_without_submitting():
             )
 
 
+# ── option γ: MaxTurnsExceeded handling ────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_implement_converts_max_turns_exceeded_to_implementation_error():
+    """Option γ invariant: SDK ``MaxTurnsExceeded`` (raised mid-tool-loop
+    when the LLM burns through the budget without ever submitting) must
+    be converted to ``ImplementationError`` at the Coder boundary so the
+    orchestrator / baseline_generator catch sites work uniformly. Without
+    this conversion, the SDK exception propagates straight out of
+    ``optimize()`` and aborts the entire run instead of dead-ending one
+    branch (live-GPU-run #2 trigger, 2026-04-22)."""
+    from src.agents.coder import MaxTurnsExceeded
+
+    with (
+        patch("src.agents.coder.Agent"),
+        patch("src.agents.coder.run_agent", new_callable=AsyncMock) as mock_run,
+        patch("src.agents.coder.make_run_config", return_value=None),
+        patch("src.agents.coder.function_tool", side_effect=lambda f: f),
+    ):
+        mock_run.side_effect = MaxTurnsExceeded("Max turns (8) exceeded")
+
+        agent = CoderAgent(model=MagicMock())
+        with pytest.raises(ImplementationError, match="turn budget"):
+            await agent.implement(
+                kernel_source="src",
+                plan=OptimizationPlan(tier=1, technique="t1"),
+                kernel_spec=_make_spec(),
+                reference_fn=_ref,
+                input_generators=[_gen],
+            )
+
+
+@pytest.mark.asyncio
+async def test_implement_returns_partial_output_when_max_turns_after_submission():
+    """If the LLM submitted a valid kernel before the SDK loop hit max_turns
+    (e.g., it kept calling tools after submit despite the system-prompt rule),
+    treat that submission as the answer rather than raising. The kernel was
+    Pydantic-validated when submit_kernel ran; the run merely went over budget."""
+    from src.agents.coder import MaxTurnsExceeded
+
+    capture_agent, fake_run = _simulate_submission(_VALID_SOURCE, _VALID_NAME)
+
+    async def submit_then_exhaust(agent, prompt, **kwargs):
+        # First simulate a successful submission, then raise as if the
+        # SDK kept spinning after submit and burned the budget.
+        await fake_run(agent, prompt, **kwargs)
+        raise MaxTurnsExceeded("Max turns exceeded")
+
+    with (
+        patch("src.agents.coder.Agent", side_effect=capture_agent),
+        patch("src.agents.coder.run_agent", new_callable=AsyncMock) as mock_run,
+        patch("src.agents.coder.make_run_config", return_value=None),
+        patch("src.agents.coder.function_tool", side_effect=lambda f: f),
+    ):
+        mock_run.side_effect = submit_then_exhaust
+
+        agent = CoderAgent(model=MagicMock())
+        result = await agent.implement(
+            kernel_source="src",
+            plan=OptimizationPlan(tier=1, technique="t1"),
+            kernel_spec=_make_spec(),
+            reference_fn=_ref,
+            input_generators=[_gen],
+        )
+
+    assert isinstance(result, KernelCodeOutput)
+    assert result.source_code == _VALID_SOURCE
+    assert result.triton_kernel_name == _VALID_NAME
+
+
 # ── has_model property ─────────────────────────────────────────────────
 
 

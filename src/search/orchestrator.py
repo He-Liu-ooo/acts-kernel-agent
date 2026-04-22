@@ -199,6 +199,7 @@ class Orchestrator:
         ``baseline.spec.flop_count`` / ``memory_bytes`` — correct for the
         placeholder starter kernels, which populate those fields directly.
         """
+        from src.agents.coder import ImplementationError
         from src.agents.reviewer import BranchQuality
         from src.eval.benchmark import BenchmarkError, benchmark_kernel
         from src.eval.profiler import ProfilerError, profile_kernel
@@ -335,13 +336,29 @@ class Orchestrator:
             # `reference_fn` / `input_generators` are threaded into the
             # compile + correctness tools the Coder binds per call — the
             # full generator list so cross-workload bugs surface in-turn.
-            coder_output = await self._coder.implement(
-                kernel_source=parent.kernel.source_code,
-                plan=plan,
-                kernel_spec=baseline.spec,
-                reference_fn=reference_fn,
-                input_generators=input_generators,
-            )
+            # Coder failure (turn-budget exhaustion, transient retry
+            # exhaustion, missing submit_kernel call) is branch-local:
+            # skip this iteration without adding a tree node and let the
+            # next select_next pick a different parent. The full search
+            # run survives one Coder hiccup the way it survives one
+            # branch's benchmark crash. (Option γ, 2026-04-22 — closes
+            # the "Coder failure surfacing at the orchestrator" Deferred
+            # Improvement.)
+            try:
+                coder_output = await self._coder.implement(
+                    kernel_source=parent.kernel.source_code,
+                    plan=plan,
+                    kernel_spec=baseline.spec,
+                    reference_fn=reference_fn,
+                    input_generators=input_generators,
+                )
+            except ImplementationError as exc:
+                logger.warning(
+                    "Iteration %d: Coder failed (%s) — skipping iteration",
+                    iteration + 1, exc,
+                )
+                epsilon = max(self._config.epsilon_end, epsilon - decay)
+                continue
             new_source = coder_output.source_code
 
             # Build child kernel — carry the Coder's declared
