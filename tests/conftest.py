@@ -6,6 +6,7 @@ import math
 
 import pytest
 
+from src.config import HardwareSpec
 from src.eval.correctness import ComparisonResult
 from src.kernels.kernel import KernelSpec, KernelType
 
@@ -52,3 +53,27 @@ def make_kernel_spec(
         kernel_type=KernelType.ELEMENTWISE,
         entrypoint=entrypoint,
     )
+
+
+def rtx6000_ada_hardware() -> HardwareSpec:
+    """Dev-machine GPU spec — ~64 TFLOPS fp32, ~960 GB/s DRAM, ridge
+    ~66.7 ops/byte. Shared across profiler/orchestrator tests so the
+    roofline math stays consistent across tiers."""
+    return HardwareSpec(
+        name="RTX6000Ada",
+        freq_GHz=2.5,
+        SRAM_capacity=98_304 * 1024,
+        SRAM_byte_per_cycle=4000.0,
+        DRAM_capacity=48 * 1024**3,
+        DRAM_byte_per_cycle=384.0,
+        MAC_per_cycle_fp32_sm=12_800.0,
+        MAC_per_cycle_fp16_tc=512_000.0,
+        MAC_per_cycle_bf16_tc=512_000.0,
+    )
+
+
+@pytest.fixture(name="rtx6000_ada_hardware")
+def rtx6000_ada_hardware_fixture() -> HardwareSpec:
+    """Fixture form of ``rtx6000_ada_hardware()`` for tests that prefer
+    pytest-style injection."""
+    return rtx6000_ada_hardware()
