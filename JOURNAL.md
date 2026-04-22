@@ -133,6 +133,23 @@ Adopted a hybrid approach: bottleneck→technique mapping tables from AutoKernel
 
 **`prompt_dir` constructor parameter**: reserved for the future Compute-Reviewer / Memory-Reviewer split. A specialized reviewer is one constructor arg away — no subclassing or prompt-string plumbing required.
 
+### Multi-turn Reviewer deferred — kept single-call through the profiler PR (2026-04-21)
+
+**Context**: with the profiler landing `ProfilingResult.raw_metrics` (the full NCU dump) alongside the curated `NCUMetrics` subset (occupancy, L2, tensor-core util, top-2 stalls), the obvious follow-up is a Reviewer that can query the raw dump when the curated signals don't match the kernel's real bottleneck signature, or request a re-profile with different `--section` / `--metrics`.
+
+**Decision**: not in this PR. Defer to a follow-up with its own brainstorming + design pass.
+
+**Rationale**:
+1. **Agent-shape change, not a profiler change**. Going from single Pydantic call to tool-using agent (Coder-style) is a contract break, not an incremental tweak — new turn budget, new failure modes when NCU subprocess is mid-query, new prompt contract. Per CLAUDE.md step 2 it warrants `superpowers:brainstorming`, not an inline sketch at the end of a 30-file PR.
+2. **No real-run data on curated-set failures**. We haven't yet seen a Reviewer diagnosis that was wrong because the curated set was too narrow. Building the escape hatch before the pain is visible risks optimizing for the wrong signature — e.g. picking tool variant A (raw-metrics lookup, ~0 cost) when the real need is variant B (on-demand re-profile with different sections, ~30s per query), or vice versa. The first real end-to-end run is the forcing function.
+3. **PR discipline**. The profiler PR already crosses ~30 files (profiler + `BottleneckType` refactor + orchestrator/report/reviewer wiring + GPU tests + cleanup). Folding in a Reviewer agent-shape change dilutes review focus and inflates PR size past the "small PR" rule.
+4. **Two variants with very different cost profiles worth designing separately**:
+   - **Variant A**: tool exposes `raw_metrics` dict already on `ProfilingResult`. No new NCU subprocess. Effectively free.
+   - **Variant B**: tool triggers a fresh `ncu` call with different `--section` / `--metrics` on the same kernel. Expensive (~30s on RTX 6000 Ada), requires cache-key expansion to include the metric set requested, and introduces partial-failure modes mid-review.
+   Variant A is probably the first step — cheap, and its limits will reveal whether B is worth the subprocess latency.
+
+**Trigger for revisiting**: first real end-to-end run where the Reviewer's curated-set-based diagnosis is visibly signal-starved — top-2 stalls + headline metrics don't explain the measured bottleneck, and the LLM or rule-based fallback produces generic / incorrect technique guidance. At that point the failure shape is concrete and we can design the tool around it.
+
 ### Coder: Pydantic output_type, tool placeholders, explicit failure contract (2026-04-18)
 
 **Rationale**: Mirrored the Planner/Reviewer Pydantic structured-output pattern — `KernelCodeOutput(source_code: str)` is sent to the SDK via `output_type`, the tool loop is bounded by `max_turns`, and schema enforcement happens via constrained decoding. One field, no internal dataclass — the kernel source is the only thing the rest of the pipeline needs, so adding a translation layer would be cosmetic overhead.
@@ -233,6 +250,118 @@ Since we target Triton on NVIDIA, we use CUDA Events for latency (lightweight, a
 **Rationale**: No reference framework passes raw hardware specs to the LLM agent. Profiling metrics are more actionable ("L2 cache hit rate = 40%" tells the agent what's wrong) than raw specs ("L2 cache = 50 MB" requires reasoning about working set sizes). LLMs also hallucinate hardware details.
 
 Detection → internal roofline analysis → Reviewer sees profiling + roofline classification → Planner sees Reviewer's distilled summary. Fits the profiling feedback pipeline above.
+
+### Profiler approach: analytical classification + curated NCU section (2026-04-20)
+
+**Context**: `eval/profiler.py` is the next module. PRD §Evaluation Harness specifies NCU with `--set full` per iteration to produce dynamic bottleneck classification + rich metrics (occupancy, stall reasons, cache hit rates, throughputs). Survey of reference repos showed nobody actually runs NCU per candidate:
+
+- **autokernel/bench.py:1072-1082** derives bottleneck analytically: `AI = flops/nbytes`, `ridge = peak_TFLOPS/peak_BW`, classify by `AI < ridge`. Zero-overhead because `flops`/`bytes` and kernel latency are already in hand.
+- **AccelOpt/scripts/planner.py:45-55** runs a domain profiler once per candidate, dumps all metrics to a JSON blob, then applies a **`displayed_profiles` whitelist** when constructing the Planner prompt. Collection is broad, surface is narrow and curated.
+- **Astra / SOL-ExecBench**: no NCU surface at all. SOL-ExecBench is CUDA-event timing only.
+
+**Decision**: Hybrid — analytical classification every iteration (free), plus NCU `--section` with a curated 4-metric set (occupancy, warp stall reasons, L2 hit rate, tensor-core utilization). `--set full` becomes an opt-in debug mode.
+
+**Why (b) curated over (c) full**:
+
+1. **Cost.** NCU uses kernel replay; `--set full` is ~2-5 s per candidate on a Triton kernel. At beam 3 × depth 20 = 60 candidates → 2-5 min of pure NCU overhead per problem, on top of benchmark + 3 LLM calls per iter. Curated `--section` is ~5-10× cheaper for the same action-relevant signal.
+2. **Signal-to-noise.** `--set full` produces 60+ metrics. The PRD itself already routes profiling through the Reviewer as an "intelligent filter" — collecting the full set is work we throw away at the prompt boundary. AccelOpt converged on the same whitelist pattern.
+3. **Action-library alignment.** Every curated metric earns its keep by mapping to a tier: occupancy → Tier 1 (sizing); stall reasons → Tier 2/3 refinement; L2 hit rate → Tier 2 (tiling); tensor-core util → Tier 3 (mixed precision). Metrics without a Planner-visible action don't enter the curated set.
+4. **Graceful degradation.** Analytical classification is computed independently of NCU. If NCU fails (missing `ncu` binary, permissions, subprocess crash, timeout), the Reviewer still gets a bottleneck classification and continues — same fail-closed pattern as `BenchmarkResult.is_fully_successful`.
+
+**Escape hatches**: (a) `ProfilingResult.raw_metrics: dict[str, float]` stores whatever NCU actually returned, so a future Reviewer/prompt can reference a metric without a code change. (b) `ACTS_PROFILER_MODE=full` (or config flag) upgrades a single run to `--set full` — useful when prompt-engineering the Reviewer or investigating a puzzling candidate. (c) Per-source-hash caching (same hash key as `kernels/compiler.py`) — re-profiling the same kernel source is wasteful.
+
+**NCU invocation mechanism — subprocess**. Three options were weighed: (i) `ncu --csv --section <list> --export <out>` subprocess + CSV parse; (ii) `nsight-compute` Python API (in-process); (iii) ship analytical-only, defer NCU. Chose (i) for three reasons:
+1. **Portability + isolation match ACTS's fail-closed design** — an NCU crash, hang, or missing-binary can't take down the orchestrator. SOL-ExecBench's `eval_driver.py` uses the same subprocess-isolation pattern for correctness, so this is a proven shape in this ecosystem.
+2. **CSV output is stable across CUDA versions** in a way the `nsight-compute` Python API isn't; the Python API is NVIDIA-proprietary and moves between CUDA releases.
+3. **Subprocess launch overhead (~100-300 ms) is small compared to replay cost (500-2000 ms)** — the dominant cost is NCU itself, not how we invoke it. Optimizing the wrapper is premature.
+
+(iii) was tempting as a "ship today" move but rejected because the 4 curated metrics (occupancy, stall reasons, L2 hit rate, tensor-core utilization) aren't derivable from anything else — deferring them means the Reviewer never gets the signals that disambiguate Tier 2 from Tier 3 actions.
+
+**Curated metric set — 4 NCU-only signals**. Analytical overlay produces achieved TFLOPs, achieved GB/s, arithmetic intensity, ridge point, and the memory-vs-compute-bound classification (all from SOLAR's `flops`/`bytes` + measured latency, zero NCU cost). NCU is therefore reserved for signals analytical can't derive:
+
+| Bucket | NCU section | Metric | Action tier informed |
+|---|---|---|---|
+| Occupancy | `Occupancy` | `sm__warps_active.avg.pct_of_peak_sustained_active` | Tier 1 (block/grid sizing) — low occupancy → oversized blocks or register pressure |
+| Warp stall reason | `WarpStateStats` | Dominant stall class (`stall_long_sb`, `stall_short_scoreboard`, `stall_no_instruction`, …) | Tier 2 vs Tier 3 disambiguation — memory stall → Tier 2; exec-dependency stall → Tier 3 |
+| L2 hit rate | `MemoryWorkloadAnalysis` | `lts__t_sector_hit_rate.pct` | Tier 2 (tiling, shared-memory caching) — low L2 hit → reuse opportunity |
+| Tensor core utilization | `ComputeWorkloadAnalysis` | `sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active` | Tier 3 (mixed precision) — low TC util on compute-bound → TF32/BF16 headroom |
+
+Three sections total (`Occupancy`, `WarpStateStats`, `MemoryWorkloadAnalysis` + `ComputeWorkloadAnalysis`). Dropped sections: `SchedulerStats`, `SourceCounters`, `InstructionStats` — no direct action-tier mapping. Dropped from the placeholder `ProfilingResult`: `memory_throughput_gb_s` and `compute_throughput_tflops` — moved to analytical, which frees NCU from running duplicative sections.
+
+**Workload scope — representative-in-loop, all-at-terminal**. Benchmark runs multi-workload (median-of-medians across 2-3 SOL workloads) per PRD. Three options for profiler granularity were weighed: (a) profile all selected workloads (matches benchmark; 2-3× NCU cost per candidate); (b) profile one representative workload (cheap but hides shape-dependent bottleneck shifts); (c) representative-in-loop + full-suite at terminal nodes. Chose (c):
+- **In-loop**: profile `workload[0]` only (the representative already chosen for `benchmark[0]`). Keeps per-iteration NCU cost ≤ ~500 ms and matches the fact that search iteration is where cost dominates.
+- **Terminal/Phase C**: when the search terminates, profile the winner on all selected workloads so Phase C's `bottleneck_transitions` is computed from real multi-workload data — same philosophy as Phase C already re-running the full workload suite on the winner.
+
+This matches the cost shape of the rest of the pipeline: cheap per-iteration signal, rich one-shot reporting.
+
+**Failure taxonomy — NCU degrades the signal, analytical failures kill the branch**. Core principle: analytical classification is the floor (required for downstream retriever/reviewer/`bottleneck_transitions`); NCU metrics are the bonus. Failure modes:
+
+| Failure | Cause | Outcome |
+|---|---|---|
+| NCU binary missing | `ncu` not on `$PATH` / CUDA toolkit not installed | Log once at startup, mark profiler NCU-disabled, every candidate gets analytical-only `ProfilingResult`. Orchestrator continues. |
+| NCU subprocess crash / non-zero exit | Segfault, OOM, signal | Per-candidate log, fall back to analytical-only for that candidate. Branch NOT killed — analytical signal is still valid. |
+| NCU subprocess timeout | Hang on malformed kernel | Kill subprocess, log, fall back to analytical-only. Branch NOT killed. |
+| NCU CSV parse failure | Unexpected format (new CUDA version, partial output) | Log, fall back to analytical-only. Branch NOT killed. |
+| Analytical computation failure | Missing `flops`/`bytes` (shouldn't happen post-SOLAR) or zero latency | Branch IS killed — classification is required downstream. Matches `BenchmarkResult.is_fully_successful`'s fail-closed contract. |
+
+Subprocess timeout default: **30 s per candidate** (covers `--section` replay for reasonable kernel sizes; malformed/hung kernels are killed fast enough not to stall the search). Configurable via `profiler_timeout_s`.
+
+**Cache layout — source-hash keyed, no eviction**. Same pattern as `kernels/compiler.py`'s compile cache:
+- Directory: `~/.cache/acts/profiler/` (override via `ACTS_PROFILER_CACHE_DIR`).
+- Key: source hash (reused from the compiler cache) + metric-set version string. The version suffix invalidates stale entries when the curated metric list changes, so a metric table edit auto-busts the cache instead of silently serving old results.
+- Value: JSON-serialized `ProfilingResult`.
+- Eviction: none initially. Each result is ~1 KB; a 10k-candidate history is ~10 MB. Add LRU only if the cache shows up in a profile or on-disk footprint becomes a concern.
+
+**Stall-class extraction — top-1 + runner-up, not top-3**. The `WarpStateStats` section emits ~10 stall classes; only the dominant one drives a concrete action, but borderline cases matter too. Surface:
+- `warp_stall_dominant: str` (e.g., `"stall_long_sb"`) + `warp_stall_dominant_pct: float`
+- `warp_stall_runner_up: str` + `warp_stall_runner_up_pct: float`
+
+Rationale: top-1 tells the Reviewer which tier to target (stall-memory-throttle → Tier 2; stall-exec-dependency → Tier 3); runner-up catches mixed cases ("stall-memory 32%, stall-exec 29%" → don't commit to a single tier). Top-3 adds a metric the Reviewer rarely acts on, dilutes prompt signal, and duplicates information already preserved in `raw_metrics` for anyone who needs it.
+
+**Real-GPU tests required when a GPU is available (process decision, 2026-04-20)**. Fake-`ncu` subprocess tests (shell script on `$PATH`) cover every failure path in the driver cheaply, but they cannot catch (a) NCU metric-name drift between CUDA versions, (b) whether curated sections are available on the target GPU architecture, (c) whether `--kernel-name regex:<entrypoint>` actually matches Triton's mangled kernel names, or (d) whether the subprocess driver imports and launches correctly. On a GPU-equipped dev machine, a "manual smoke script not in CI" is a dodge — if the machine can run the test, the test is required.
+
+**Done gate for `eval/profiler.py`**:
+1. Tier 1 (GPU-free, fake-`ncu`, 5 test files) passes in `/tmp/acts_test_venv`.
+2. Tier 2 (`tests/test_profiler_gpu.py`, `@pytest.mark.gpu`, real `ncu` on the RTX 6000 Ada / CUDA 12.8 host) passes locally.
+3. Codex + user review clean.
+
+Tier 2's test list covers add-kernel + matmul correctness of classification, the Triton kernel-name regex (the single silent-failure risk), cache-hit-skips-ncu, full-mode raw-metrics population, and Phase C multi-workload re-profile.
+
+**Broader principle — applies to all future modules touching GPU/CUDA/NCU**: if the dev machine can run the test, the test is required for "done." `@pytest.mark.gpu` skips cleanly on GPU-less CI but is expected to run locally before commit. This rule is recorded in auto-memory (`feedback_gpu_tests_required.md`) so future modules (`eval/anti_cheat.py`, `benchmark/solar_adapter.py`, first-live-GPU-run) don't get the same dodge attempted.
+
+Updates the design intent referenced in "Dynamic bottleneck reclassification — deferred to profiler implementation (2026-04-15)" below — that entry described *what* to wire dynamically; this one describes *how* the profiler produces the signal. The original standalone design spec (`docs/superpowers/specs/2026-04-20-eval-profiler-design.md`) was deleted after it diverged from the implementation — see "NCU subprocess reality check" below for what was actually built, and "Bottleneck classify-once (2026-04-22)" for why the per-iter reclassification plan was reversed.
+
+### Profiler implementation — NCU/driver divergences from the design spec (2026-04-21)
+
+**Context**: `eval/profiler.py` implementation probed real `ncu` (2025.1.1.0) on RTX 6000 Ada / CUDA 12.8. Several spec assumptions didn't survive first contact. Recording here as first-class facts so the next person touching the profiler doesn't re-discover them, and so the spec's silences aren't re-inherited by future modules that shell out to NCU.
+
+**NCU invocation — command-line shape the spec got wrong**:
+
+1. **Raw metric names require `--print-metric-name=name`**. Default is `label` (human-readable "Achieved Occupancy"), which varies with locale + NCU version. The dotted raw form (`sm__warps_active.avg.pct_of_peak_sustained_active`) — the only form our parser keys off — is emitted only when this flag is passed. The spec's command shape omitted it; a curated-metric mismatch silently degraded every run.
+
+2. **Stall metrics aren't in any `--section`; they must be requested via explicit `--metrics`**. Wildcards (`_*.pct`) do NOT expand — all 18 stall reasons must be enumerated. The correct family is `smsp__average_warp_latency_issue_stalled_<reason>.pct` (singular "warp", not "warps"; "latency" not "latencies"). The spec's `smsp__average_warps_issue_stalled_*` prefix would emit no metrics.
+
+3. **Subprocess must use `sys.executable`, not bare `"python"`**. NCU forks with the caller's environment, but bare `python` PATH-resolves to whichever interpreter is first on `$PATH` — rarely the venv with torch/triton. Failure mode is silent: `ModuleNotFoundError: No module named 'torch'` lands in the driver subprocess stderr, which NCU doesn't capture — the operator sees only `==ERROR== The application returned an error code (1)`. Would have broken every non-system-Python install.
+
+4. **NCU stdout isn't pure CSV**. It's CSV prefixed with `==PROF== Connected...` banner lines and interleaved with the profiled process's own stdout (e.g. `ok\n`). Parser must skip non-CSV lines rather than assume well-formed stdout.
+
+5. **Numeric values can be comma-formatted** (`"5,000.00"`). Parser strips commas before `float()`.
+
+6. **Tensor-core util metric isn't universal**. `sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active` is absent from `ComputeWorkloadAnalysis` for pure-memory kernels on NCU 2025.1.1.0. The spec marked it required — would have crashed every memory-bound candidate. Demoted to `_CURATED_OPTIONAL` (defaults to 0.0 when missing). The other three curated metrics remain required.
+
+7. **Dev-only: `/tmp/nsight-compute-lock` can be owned by another user** on shared hosts with sticky bit on `/tmp`. Workaround: `mkdir -p /tmp/<user>_ncu && TMPDIR=/tmp/<user>_ncu ncu ...`. Not a CI concern (single-user runners); documented for Tier 2 fixture setup.
+
+**Subprocess contract — two-name, self-contained kernel convention**:
+
+8. **`spec.entrypoint` is the host-wrapper name, not the GPU kernel symbol**. Triton's `@triton.jit` function can't be called as `fn(*args)` — it requires `fn[grid](*args)` and raises "Cannot call @triton.jit'd outside of the scope of a kernel" otherwise. Convention: every kernel source exposes `def run(...)` as the host wrapper that builds the grid and launches the JIT'd function. The driver calls `module.run`. Meanwhile NCU's `--kernel-name regex:` targets the *GPU symbol*, extracted from source via `_extract_triton_kernel_name()` (regex against `@triton.jit\s*(?:\(...\))?\s*\n\s*def\s+(\w+)`), falling back to `spec.entrypoint`. Two roles, two names — the KernelSpec didn't need a schema change, but the driver has to keep them separate.
+
+9. **Inputs must be rebuildable from pickle-safe state, not an in-process closure**. The parent's `input_generator` closure can't cross the subprocess boundary — arbitrary closures don't pickle. Driver input-resolution priority: (a) `problem_dir` → `load_problem(dir)` + `build_input_generator(problem, workload)(seed)`; (b) `module.make_inputs(seed)` if the source exposes it; (c) `spec["args"]` as a last-resort literal; (d) `()`. The in-process `input_generator` parameter to `profile_kernel()` is intentionally discarded at the subprocess boundary (documented with `_ = input_generator`) — it's retained in the signature only for API symmetry with the non-subprocess callers. Mirrors Astra/AccelOpt's self-contained-kernel pattern.
+
+10. **`load_problem()` expects a directory, not a file**. A late Codex finding: the spec key `problem_json` implied a JSON file path, and the serializer passed `problem.definition_path` (which points at `definition.json`). But SOL-ExecBench's `load_problem(path)` expects the directory containing `definition.json` + the sibling `workload.jsonl` — it does `path / "definition.json"` internally. Passing the file path made the driver try to open `<definition.json>/definition.json` and every SOL NCU run silently degraded to analytical-only. Fix: renamed the spec key to `problem_dir`, serialize `Path(problem_definition_path).parent`, and added a Tier 2 `test_profile_with_problem_definition_path_is_not_degraded` that would have caught this end-to-end — Tier 1 fake-`ncu` can't, because the fake never execs the driver.
+
+**Cross-cutting lesson**: NCU is a subprocess that forks another Python subprocess (our driver). Two hop points, each with its own environment/argv/stdout discipline; each of the above was a silent failure (degraded run, empty metric set, wrong kernel, wrong file open) rather than a loud crash. Cost-of-detection is exactly why the `feedback_gpu_tests_required.md` rule exists — Tier 1 fake-`ncu` tests green up clean through every one of these bugs. The `@pytest.mark.gpu` suite is the only layer that forces the two hops to actually run end-to-end.
+
+**Spec supersession**: `docs/superpowers/specs/2026-04-20-eval-profiler-design.md` diverged too far from the implementation (items 1-3, 6, 9-10 contradict the spec; item 7 wasn't there). Canonical design rationale lives in this JOURNAL entry + the `Profiler approach` entry above. The spec file is deleted in the same commit — no SUPERSEDED marker, since `docs/superpowers/specs/` has no other residents to preserve a convention for.
 
 ---
 
@@ -399,6 +528,31 @@ Two violation cases:
 Optimizations can shift a kernel's bottleneck (e.g., memory optimization moves it from memory-bound to compute-bound). When the real NCU profiler is implemented, the orchestrator loop should call `profile_kernel()` per candidate and pass the dynamic classification to memory retrieval, reviewer feedback, and planning. The static T_SOL remains constant — only the bottleneck classification updates.
 
 **Decision**: Record and defer. No skeleton code change needed — would be routing placeholder data through a dynamic classification path. Wire when `profiler.py` gets real NCU integration.
+
+**Superseded (2026-04-22)**: See "Bottleneck classify-once" below. The dynamic-per-iter path was not built, because the premise turned out to be wrong for this search shape: classification is invariant per `(problem, representative workload, hardware)` within a run, so a per-iter re-derivation would recompute the same answer every iteration.
+
+### Bottleneck classify-once (2026-04-22)
+
+**Context**: When the real analytical profiler landed (`eval/profiler.py`), the natural next step seemed to be plumbing its per-iter `AnalyticalMetrics.classification` into retriever / planner / reviewer so the search loop could react to a kernel drifting from memory-bound to compute-bound — the "dynamic reclassification" plan from 2026-04-15.
+
+**Why the dynamic plan was wrong**: The profiler's analytical inputs are `(flops, nbytes, latency, hardware)`. For a given search run:
+- `flops` and `nbytes` come from `compute_roofline_inputs(problem, representative_workload)` — invariant (we fix `repr_idx = len(workloads) // 2` once at run start).
+- `hardware` is invariant.
+- Only `latency` changes per iteration.
+
+Bottleneck classification is a function of the ratio `arithmetic_intensity = flops / nbytes` against the hardware ridge point `peak_compute / peak_bw`. *Latency does not enter that ratio.* So per-iter reclassification would literally recompute the same label every iteration. The "dynamic" story was wrong about what varies.
+
+A kernel can shift its effective bottleneck only by changing its data access pattern (shared memory tiling, coalescing, etc.) — but none of those change `flops` or `nbytes` against the representative workload the classifier sees. They change runtime / achieved bandwidth, which are diagnostic, not classificatory.
+
+**Decision**: Classify once per run via a new `classify_run(hardware, roofline, baseline_spec)` helper in `eval/roofline.py`. Thread the `BottleneckType` result through the orchestrator as `SearchResult.run_bottleneck`, past the retriever (replaces a would-be per-iter signal), the Planner (as a dedicated `## Run context` prompt section), and the Reviewer (same). Drop the dead fields that the dynamic plan had added speculatively: `AnalyticalMetrics.classification`, `ProfilingResult.classification`, `Experience.bottleneck_after`.
+
+**Per-workload diagnostics**: The operator can still ask "how do individual workloads land relative to the ridge" — a single representative-workload label can't answer that. Phase C populates `OptimizationReport.winner_per_workload_bottlenecks` via a second helper `classify_workload(problem, workload, hardware)` for every selected workload. This replaces the (also dropped) `OptimizationReport.bottleneck_transitions` field, which was built around the per-iter assumption.
+
+**Typing change bundled in**: The previously-deferred "Thread `BottleneckType` end-to-end" item (PROCESS → Deferred Improvements) rode along — `BottleneckType` moved from `eval/roofline.py` into a leaf `eval/types.py` module (preventing the circular-import headache that would otherwise arise once `memory/experience.py` and `eval/profiler.py` both type-check against it), and every call-site that used `.value` strings now takes the enum directly (Planner / Reviewer / `OptimizationReport.bottleneck` / `winner_per_workload_bottlenecks`).
+
+**Follow-on Codex review fixes** (same PR):
+- `src/pipeline/optimize.py` now applies the zero-peak placeholder hardware substitution to caller-supplied `ACTSConfig` as well, not just the `config is None` path. Without this, `optimize(problem_path, config=ACTSConfig())` would hit the orchestrator's new fail-fast guard and raise before the first iteration.
+- `src/search/orchestrator.py` defers assigning `child.score` + `child.per_workload_latency_us` to the tree node until after the profile DEAD_END gauntlet clears. `SearchTree.best_node()` filters on `score is not None` and ignores `branch_quality`, so a ProfilerError-killed branch with a high benchmark score could otherwise be promoted as the final winner.
 
 ---
 

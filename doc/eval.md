@@ -21,7 +21,7 @@ Run once at startup before the search loop. Results are constant for the entire 
 
 | Module | Purpose |
 |--------|---------|
-| `roofline.py` | T_SOL derivation + initial bottleneck classification (via SOLAR or built-in fallback) |
+| `roofline.py` | T_SOL derivation + once-per-run bottleneck classification (`classify_run`) consumed by retriever / planner / reviewer every iteration |
 
 ### Orchestrator-Side (after Coder returns, every iteration)
 
@@ -30,7 +30,7 @@ Run by the orchestrator. Never part of the Coder's tool loop — prevents the LL
 | Module | Purpose |
 |--------|---------|
 | `benchmark.py` | Latency measurement via CUDA events |
-| `profiler.py` | NCU hardware profiling + per-iteration bottleneck classification |
+| `profiler.py` | Analytical roofline metrics + curated NCU signals (per-iter diagnostics; bottleneck classification is NOT re-derived per iter) |
 | `scorer.py` | SOL score computation (using static T_SOL from roofline.py) |
 
 ## 5-Stage Correctness Gate — `correctness.py`
@@ -86,16 +86,35 @@ When both `workloads` and `input_generators` are empty (placeholder CLI path, no
 
 ## Profiler — `profiler.py`
 
-Runs NCU (`ncu --set full`). Extracts: SM occupancy, memory throughput, compute throughput, L2 cache hit rate, warp stall reasons.
+Per-iteration diagnostic signals for the Reviewer. Two pieces:
+
+- **Analytical (required)** — `_compute_analytical()` derives `AnalyticalMetrics` from `(flops, nbytes, latency_s, HardwareSpec)`: arithmetic intensity, ridge point, achieved TFLOPS + GB/s, pct-of-peak compute + bandwidth. Fails closed with `ProfilerError` on zero-latency or missing peaks (the orchestrator marks the branch DEAD_END).
+- **NCU (best-effort)** — subprocess `ncu --csv --section ...` via a dedicated driver (`_profiler_driver.py`). Extracts curated signals: SM occupancy, L2 hit rate, tensor-core utilization, and the top-2 warp-stall classes with percentages. Failures degrade the result (`ncu=None, degraded=True, degraded_reason=<slug>`) but keep the branch alive — the analytical block still drives the Reviewer's profiling summary.
+
+Returns `ProfilingResult(analytical, ncu, raw_metrics, degraded_reason)`. Bottleneck classification is **not** on `ProfilingResult` — it lives at the run level (see `classify_run` in `roofline.py`) because it's invariant per `(problem, representative workload, hardware)`.
+
+Source-hash-keyed cache avoids re-running NCU on an identical kernel source.
+
+## Types — `types.py`
+
+Shared eval primitives imported across memory / search / pipeline without pulling in the full `roofline.py` / `profiler.py` modules. Hosts `BottleneckType` (`MEMORY_BOUND`, `COMPUTE_BOUND`, `BALANCED`). Kept in a leaf module so `eval/profiler.py` and `memory/experience.py` can both type-check against it without a circular import.
 
 ## Roofline — `roofline.py`
 
-Two paths to T_SOL (each returns both T_SOL and bottleneck classification — no hybrid):
+### Paths to T_SOL
+
+Two paths, each returning both T_SOL and bottleneck classification — no hybrid:
 
 1. **SOLAR** (preferred): `derive_t_sol_from_solar()` calls the SOLAR adapter on the PyTorch reference. SOLAR uses its own arch config internally. Returns tight, hardware-grounded T_SOL + bottleneck.
 2. **Built-in** (fallback): `compute_roofline()` does `T_SOL = max(FLOPs / peak_compute, bytes / peak_bandwidth)` from `KernelSpec` fields + `HardwareSpec` (loaded from SOLAR arch YAML). Used when SOLAR is not installed.
 
 Both classify the kernel as `MEMORY_BOUND`, `COMPUTE_BOUND`, or `BALANCED`.
+
+### Classification helpers
+
+- `classify_bottleneck(arithmetic_intensity, ridge_point) -> BottleneckType` — shared band (BALANCED within a narrow ratio of the ridge, otherwise MEMORY_BOUND / COMPUTE_BOUND). Every classifier funnels through this so the threshold can't drift between callers.
+- `classify_run(hardware, roofline, baseline_spec) -> BottleneckType` — once-per-run classification consumed by retriever / planner / reviewer. Prefers the baseline's shape-derived AI when available; otherwise uses the roofline's AI. Called once by the orchestrator right after roofline resolution.
+- `classify_workload(problem, workload, hardware) -> BottleneckType` — per-workload classification for Phase C's `OptimizationReport.winner_per_workload_bottlenecks`. Derives `(flops, nbytes)` from `compute_roofline_inputs` and feeds `classify_bottleneck`. Raises `ValueError` on no-formula ops or zero-peak hardware.
 
 ## SOL Score — `scorer.py`
 

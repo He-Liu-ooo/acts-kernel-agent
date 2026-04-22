@@ -85,4 +85,10 @@ Returns True if the best score hasn't improved beyond `delta` over the last `win
 
 ### SearchResult
 
-Output: `{best_node, total_iterations, termination_reason, tree}`. `tree` is the full `SearchTree` carried forward so Phase C (`pipeline/report.py`) can reconstruct the root-to-best path for `technique_trace` without the orchestrator having to denormalize every path-derived view upfront. See PROCESS.md → Deferred Improvements (`SearchResult.tree` → lighter path snapshot) for when to swap this for a precomputed `best_path` / `technique_trace`.
+Output: `{best_node, total_iterations, termination_reason, tree, run_bottleneck}`. `tree` is the full `SearchTree` carried forward so Phase C (`pipeline/report.py`) can reconstruct the root-to-best path for `technique_trace` without the orchestrator having to denormalize every path-derived view upfront. See PROCESS.md → Deferred Improvements (`SearchResult.tree` → lighter path snapshot) for when to swap this for a precomputed `best_path` / `technique_trace`.
+
+`run_bottleneck` is the once-per-run `BottleneckType` produced by `eval/roofline.py::classify_run` immediately after roofline resolution. It is the single source of truth for retriever / planner / reviewer across every iteration (per-iter re-classification would only recompute the same answer because the problem + representative workload + hardware don't change within a run). Phase C reads it straight into `OptimizationReport.bottleneck`.
+
+### Score + profile ordering (fail-closed on profile failure)
+
+Within an iteration, the order is `benchmark → profile → commit score + per_workload_latency_us`. The child's `ScoreResult` is **not** written to the node until after the profile gauntlet clears, because `SearchTree.best_node()` filters only on `score is not None` — a `ProfilerError`-killed branch that had already committed a score could be promoted to the final winner. The deferred commit keeps the DEAD_END invariant aligned with promotability.

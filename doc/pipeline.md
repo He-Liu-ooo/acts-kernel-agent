@@ -51,27 +51,33 @@ Re-runs the correctness gate on the best kernel to confirm results are reproduci
 
 ## report.py — Report Generation
 
-`generate_report(result: SearchResult) -> OptimizationReport`
+`generate_report(result, *, workloads=None, input_generators=None, hardware_spec=None, cache_dir=None, problem=None) -> OptimizationReport`
 
 Reads the best node's `ScoreResult` and walks `result.tree.path_to_node(best.id)` to build the root-to-best action sequence. The root's `action_applied` is the empty-string baseline placeholder and is filtered out of the trace. When `best.score is None` (scoring failed), the returned report surfaces only `termination_reason` + `total_iterations` without crashing.
 
-| Field | Description |
-|-------|-------------|
-| `baseline_latency_us` | Starting latency |
-| `best_latency_us` | Best achieved latency |
-| `sol_score` | Final SOL score |
-| `speedup` | Baseline / best |
-| `technique_trace` | Root-to-best action sequence (root baseline filtered out) |
-| `bottleneck_transitions` | Per-iteration bottleneck shift. Stays empty until `eval/profiler.py` lands (GPU-blocked). |
-| `remaining_headroom_pct` | Distance to hardware limit, `(1 - sol_score) * 100` |
-| `total_iterations` | Search iterations run |
-| `termination_reason` | Why search stopped (plain string, unwrapped from `TerminationReason` enum) |
-| `reward_hack_suspect` | Propagated from best node's `ScoreResult` — candidate beats `T_SOL` |
-| `calibration_warning` | Propagated from best node's `ScoreResult` — baseline already at/below `T_SOL` |
+When `workloads` + `hardware_spec` are supplied, `generate_report` iterates the selected workloads once: it calls `classify_bottleneck` to populate `winner_per_workload_bottlenecks`, and (when `input_generators` is also supplied) re-profiles the winning kernel on each workload into `winner_profiling_per_workload`. The two passes are fused so `(flops, nbytes)` are computed once per workload and shared between classification and the re-profile call.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `baseline_latency_us` | float | Starting latency |
+| `best_latency_us` | float | Best achieved latency |
+| `sol_score` | float | Final SOL score |
+| `speedup` | float | Baseline / best |
+| `technique_trace` | `list[str]` | Root-to-best action sequence (root baseline filtered out) |
+| `bottleneck` | `BottleneckType \| None` | Once-per-run classification, copied verbatim from `SearchResult.run_bottleneck` (produced by `classify_run` in `eval/roofline.py`). `None` on the placeholder path that has no roofline. |
+| `winner_per_workload_bottlenecks` | `dict[str, BottleneckType]` | Per-workload shape-derived classification (via `classify_workload`) for every selected workload, keyed by `Workload.uuid`. Populated only when `workloads` + `hardware_spec` are provided. Replaces the removed `bottleneck_transitions` (classification is invariant within a run — the per-workload view is the only non-trivial axis left for diagnostics). |
+| `winner_profiling_per_workload` | `dict[str, ProfilingResult]` | Phase C re-profile of the winning kernel on every selected workload (spec §3.4). Empty when `input_generators` is missing. |
+| `remaining_headroom_pct` | float | Distance to hardware limit, `(1 - sol_score) * 100` |
+| `total_iterations` | int | Search iterations run |
+| `termination_reason` | str | Why search stopped (plain string, unwrapped from `TerminationReason` enum) |
+| `reward_hack_suspect` | bool | Propagated from best node's `ScoreResult` — candidate beats `T_SOL` |
+| `calibration_warning` | bool | Propagated from best node's `ScoreResult` — baseline already at/below `T_SOL` |
 
 `render_report(report: OptimizationReport) -> str`
 
-Multi-line CLI summary. Skips the scoring block when `baseline_latency_us == 0` so a degenerate run (no scored best node) doesn't print misleading "0.00us / 0.00x" lines. When `reward_hack_suspect` / `calibration_warning` are set, emits an `[AUDIT]` line per flag so operators scanning the output can't miss a physics-violating or poorly-calibrated result.
+Multi-line CLI summary. Skips the scoring block when `baseline_latency_us == 0` so a degenerate run (no scored best node) doesn't print misleading "0.00us / 0.00x" lines. Emits `Bottleneck (run): <label>` when `report.bottleneck` is set, and `Bottleneck (per workload): uuid=label, ...` when the per-workload dict is non-empty (enum values are rendered via `.value` at the string boundary). When `reward_hack_suspect` / `calibration_warning` are set, emits an `[AUDIT]` line per flag so operators scanning the output can't miss a physics-violating or poorly-calibrated result.
+
+When `winner_profiling_per_workload` is populated, a "Winner profile (per workload)" block follows, with one analytical line per workload plus optional NCU lines. If every per-workload profile is degraded with `ncu_binary_not_found` (common on machines without the NCU CLI), the NCU block is suppressed to keep the output tidy.
 
 ## Running the Pipeline
 
@@ -79,4 +85,8 @@ Multi-line CLI summary. Skips the scoring block when `baseline_latency_us == 0` 
 
 **SOL mode** — call `optimize(problem_path=<sol-dir>)` with a SOL-ExecBench problem directory. Requires `configs/models/<provider>.json` (or `$ACTS_MODEL_CONFIG` pointing at one) and the `openai-agents` SDK installed; `generate_triton_baseline` fails closed otherwise with `BaselineGenerationError`.
 
-Phase B runs real CUDA-event benchmarking (`eval/benchmark.py`) end-to-end; only `eval/profiler.py` remains a placeholder, so `bottleneck_transitions` stays empty in Phase C reports until it lands.
+Phase B runs real CUDA-event benchmarking (`eval/benchmark.py`) end-to-end. `eval/profiler.py` provides analytical roofline metrics (required, fail-closed) plus a best-effort NCU subprocess for curated signals. Phase C populates `winner_per_workload_bottlenecks` whenever `workloads` + `hardware_spec` reach `generate_report`.
+
+### Hardware-spec fallback in `optimize()`
+
+`optimize()` substitutes a populated placeholder `HardwareSpec` whenever the resolved spec has zero peaks — both for the `config is None` path (where `detect_hardware()` may return zeros) and for caller-supplied configs whose peaks are zero. Without this, the orchestrator's fail-fast guard (`peak_flops_fp32 > 0`, `peak_memory_bandwidth_gb_s > 0`) would kill the run before the first iteration. Substitution uses `dataclasses.replace` so the caller's config object is not mutated.

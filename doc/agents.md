@@ -23,9 +23,9 @@ The deterministic orchestrator controls all flow. Agents are stateless — they 
 - `OptimizationPlanOutput` (Pydantic) — schema sent to the LLM via `output_type`. Fields: `tier` (int), `technique` (str), `params` (dict), `target_region` (str), `rationale` (str).
 - `OptimizationPlan` (dataclass) — internal representation used by the rest of the codebase. Converted from `OptimizationPlanOutput` via `_output_to_plan()`.
 
-**Prompt assembly**: `build_user_prompt()` (static method) assembles the user prompt from runtime data. Sections: Current kernel (with backtick escaping), Profiling summary, Past experiences (with action parameters), Available actions, Search tree context, Reviewer feedback. Empty sections are omitted.
+**Prompt assembly**: `build_user_prompt()` (static method) assembles the user prompt from runtime data. Sections: Current kernel (with backtick escaping), **Run context** (once-per-run bottleneck via shared `render_run_context()` helper — omitted when no `bottleneck` is supplied), Profiling summary, Past experiences (with action parameters), Available actions, Search tree context, Reviewer feedback. Empty sections are omitted.
 
-**Input** (via orchestrator): kernel source, profiling summary (from Reviewer), past experiences (from MemoryRetriever), available actions (from ActionRegistry), tree context.
+**Input** (via orchestrator): kernel source, profiling summary (from Reviewer), past experiences (from MemoryRetriever), available actions (from ActionRegistry), tree context, `bottleneck: BottleneckType | None` (the run-level classification; threaded verbatim from `SearchResult.run_bottleneck`).
 
 **Output**: `OptimizationPlan` — `{tier, technique, params, target_region, rationale}`.
 
@@ -84,9 +84,9 @@ The deterministic orchestrator controls all flow. Agents are stateless — they 
 - `ReviewerFeedbackOutput` (Pydantic) — schema sent to the LLM via `output_type`.
 - `ReviewerFeedback` (dataclass) — internal representation. Adds `degraded: bool` and `error_reason: str` so the orchestrator can surface/halt when a run came from retry exhaustion rather than a healthy LLM call. `BranchQuality` is a `str`-subclass enum defined in this module.
 
-**Prompt assembly**: `build_user_prompt()` (static method) — sections: Current kernel (with backtick escaping), Profiling summary, Scoring (SOL score, headroom %, current bottleneck), optional Search tree context, optional Knowledge base context. Empty sections are omitted.
+**Prompt assembly**: `build_user_prompt()` (static method) — sections: Current kernel (with backtick escaping), **Run context** (once-per-run bottleneck via shared `render_run_context()` helper — always present for the Reviewer, since it's invoked only after the orchestrator has a `run_bottleneck`), Profiling summary, Scoring (SOL score, headroom %), optional Search tree context, optional Knowledge base context. Empty sections are omitted.
 
-**Input** (via orchestrator): `kernel_source`, `profiling_summary`, `sol_score`, `headroom_pct`, `bottleneck`, `tree_context=""` (root-to-child trajectory from `SearchTree.render_path`), `kb_context=""` (reserved for future Reviewer KB), `prev_sol_score=None`.
+**Input** (via orchestrator): `kernel_source`, `profiling_summary`, `sol_score`, `headroom_pct`, `bottleneck: BottleneckType` (once-per-run classification from `classify_run`), `tree_context=""` (root-to-child trajectory from `SearchTree.render_path`), `kb_context=""` (reserved for future Reviewer KB), `prev_sol_score=None`, `profiling: ProfilingResult | None = None` (renders the analytical + NCU blocks in the profiling summary when supplied).
 
 **Rule-based fallback**: `rule_based_feedback()` derives feedback from the sol delta alone when no LLM is configured **or** when `run_agent` returns `None` (all retries exhausted). In the retry-exhausted path the result is stamped `degraded=True, error_reason="llm_retries_exhausted"` and the orchestrator logs a warning — distinguishing it from the expected "no-LLM" configuration.
 

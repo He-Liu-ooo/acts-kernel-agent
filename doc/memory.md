@@ -13,12 +13,11 @@ Dataclass recording what was tried, what happened, and on what hardware.
 | `metrics` | dict | latency, sol_score |
 | `speedup` | float | Baseline / candidate latency |
 | `reviewer_summary` | str | Reviewer's distilled feedback |
-| `bottleneck_before` | str | Bottleneck before action |
-| `bottleneck_after` | str | Bottleneck after action |
+| `bottleneck_before` | `BottleneckType` | Run-level classification (from `classify_run`) at the time the action was tried |
 | `hardware` | str | GPU name |
 | `success` | bool | Whether the action improved performance |
 
-No kernel code stored — only summaries.
+No kernel code stored — only summaries. There is no `bottleneck_after` — classification is invariant per `(problem, representative workload, hardware)` within a run, so a pre/post pair on the same experience would always hold the same value. See JOURNAL → "Bottleneck classify-once (2026-04-22)".
 
 ## MemoryStore — `store.py`
 
@@ -54,7 +53,11 @@ Retrieves relevant past experiences for the Planner.
 
 ```python
 MemoryRetriever(store: MemoryStore, top_k: int = 5)
-    .retrieve(kernel_type: str, current_bottleneck: str, hardware: str = "") -> list[Experience]
+    .retrieve(
+        kernel_type: str,
+        current_bottleneck: BottleneckType,
+        hardware: str = "",
+    ) -> list[Experience]
 ```
 
 `hardware` is optional — the orchestrator currently omits it (skeleton phase). When the orchestrator gets its real implementation, it will pass the hardware identifier from config.

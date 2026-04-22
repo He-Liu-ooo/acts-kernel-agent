@@ -142,13 +142,14 @@ The orchestrator runs benchmarking and profiling on the Coder's output. These ar
 | Module | Called by | Purpose |
 |--------|-----------|---------|
 | `benchmark.py` | Orchestrator | Latency measurement (CUDA events) |
-| `profiler.py` | Orchestrator | NCU hardware profiling + per-iteration bottleneck classification from candidate kernel metrics |
+| `profiler.py` | Orchestrator | Analytical roofline classification (every iter, free) + curated NCU section subprocess for occupancy/L2/TC/stall (every iter, representative workload); full-workload re-profile at Phase C. See JOURNAL "Profiler approach: analytical classification + curated NCU section (2026-04-20)". |
 | `scorer.py` | Orchestrator | SOL score computation (using static T_SOL from roofline.py) |
 
 | Metric | Tool | Method |
 |--------|------|--------|
 | **Latency** | CUDA Events | Median of N trials, 20 warmup + 100 timed |
-| **Hardware profiling** | NCU (`ncu --set full`) | SM occupancy, memory throughput, compute throughput, cache hit rates, warp stall reasons |
+| **Bottleneck classification** | Analytical (free) | `arithmetic_intensity vs ridge_point` from `(flops, bytes, measured latency, hardware_spec)`; yields `memory_bound` / `compute_bound` / `balanced` + achieved TFLOPs + achieved GB·s. Always populated. |
+| **Hardware profiling** | NCU subprocess, curated sections (`Occupancy`, `WarpStateStats`, `MemoryWorkloadAnalysis`, `ComputeWorkloadAnalysis`) | SM occupancy, L2 hit rate, tensor-core utilization, dominant + runner-up warp stall class. Best-effort — NCU failures degrade the signal; analytical classification remains the floor. `ACTS_PROFILER_MODE=full` swaps to `--set full` for debug. |
 
 ### Profiling Feedback Pipeline
 
@@ -242,29 +243,26 @@ The `reward_hack_suspect` flag connects `scorer.py` to `anti_cheat.py` at the pe
 ### How Roofline Integrates into the Pipeline
 
 1. **At startup**: `config.py` loads `HardwareSpec` from a SOLAR arch config YAML (or detects at runtime). ACTS and SOLAR share the same YAML schema.
-2. **At problem load** (once): `roofline.py` runs SOLAR on the PyTorch reference + hardware arch config. Derives `T_SOL` and initial bottleneck classification (compute-bound or memory-bound via arithmetic intensity vs. ridge point). Both are constant — the PyTorch reference and hardware never change during optimization.
-3. **At each eval iteration**: `profiler.py` classifies the *candidate kernel's* current bottleneck from NCU metrics (this can shift as optimizations change the kernel's behavior). `scorer.py` computes SOL Score using the static `T_SOL` from step 2.
-4. **Reviewer** receives the SOL score, current bottleneck classification (from NCU), and how far `T_k` is from `T_SOL`. Reports remaining headroom.
+2. **At problem load** (once): `roofline.py` runs SOLAR on the PyTorch reference + hardware arch config. Derives `T_SOL` and the run-level bottleneck classification via `classify_run`. Both are constant — the problem, representative workload, and hardware never change during optimization, so classifying per-iteration would only recompute the same answer.
+3. **At each eval iteration**: `profiler.py` produces per-iter diagnostic signals — analytical roofline metrics (arithmetic intensity, achieved TFLOPS / GB/s, pct-of-peak) and curated NCU metrics (occupancy, L2 hit rate, tensor-core utilization, top-2 warp stalls). These refine the Reviewer's action-tier choice but do **not** re-classify the bottleneck. `scorer.py` computes SOL Score using the static `T_SOL` from step 2.
+4. **Reviewer** receives the SOL score, the run-level bottleneck (threaded through from step 2), the per-iter analytical + NCU blocks, and how far `T_k` is from `T_SOL`. Reports remaining headroom.
 5. **Planner** receives distilled summary: "SOL score = 0.72, compute-bound, 28% headroom remaining, tensor core utilization at 60%."
 6. **Move-on criteria**: SOL score plateau (consecutive iterations with < δ improvement) or SOL score > threshold (e.g., 0.95 — within 5% of hardware limit).
 7. **Cross-kernel comparability**: SOL score of 0.9 on matmul is directly comparable to 0.9 on softmax — both are 90% of the way to their respective hardware limits.
 
 ### Bottleneck Classification
 
-Two sources, two purposes:
-
-- **Static** (from SOLAR, once at problem load): Is the *problem* fundamentally compute-bound or memory-bound? Based on arithmetic intensity of the PyTorch reference. Tells the Planner where to start.
-- **Dynamic** (from NCU profiling, each iteration): Is the *current candidate kernel* compute-bound or memory-bound? Based on actual hardware counters (compute throughput, memory throughput, stall reasons). This can shift as optimizations change the kernel's behavior.
-
-Both use the same classification scheme:
+Classification is once-per-run (via `classify_run` in `eval/roofline.py`) — invariant per `(problem, representative workload, hardware)`. The `BottleneckType` enum lives in `eval/types.py` so memory / search / pipeline can import it without pulling in the full roofline module:
 
 | Classification | Condition | Primary Action Tiers |
 |---------------|-----------|---------------------|
-| Memory-bound | Arithmetic intensity < hardware threshold | Tier 2 (memory optimization) |
-| Compute-bound | Arithmetic intensity > hardware threshold | Tier 3 (compute optimization) |
+| Memory-bound | Arithmetic intensity < ridge point (outside balanced band) | Tier 2 (memory optimization) |
+| Compute-bound | Arithmetic intensity > ridge point (outside balanced band) | Tier 3 (compute optimization) |
 | Balanced | Near the ridge point | Either tier, guided by NCU sub-metrics |
 
-The Reviewer tracks bottleneck transitions across iterations — a successful Tier 2 optimization can shift a kernel from memory-bound to compute-bound, signaling the Planner to switch to Tier 3 actions.
+The run-level label is threaded into retriever / planner / reviewer every iteration via `SearchResult.run_bottleneck` and surfaces in Phase C as `OptimizationReport.bottleneck`. A separate per-workload view — `OptimizationReport.winner_per_workload_bottlenecks`, populated by `classify_workload` — captures how individual workloads land relative to the ridge, which the single representative workload's label cannot show.
+
+See JOURNAL → "Bottleneck classify-once (2026-04-22)" for why a per-iter dynamic reclassification (earlier design) was dropped.
 
 ---
 
@@ -279,12 +277,13 @@ Experience = {
     metrics: {latency, sol_score},
     speedup: float,
     reviewer_summary: str,
-    bottleneck_before: str,
-    bottleneck_after: str,
+    bottleneck_before: BottleneckType,  # run-level classification; invariant per run
     hardware: str,
     success: bool
 }
 ```
+
+No `bottleneck_after` — classification is once-per-run (invariant per `(problem, representative workload, hardware)`), so a pre/post pair would always carry the same value.
 
 No kernel code stored — only summaries. Both successes and failures stored.
 
@@ -403,8 +402,9 @@ Phase B: Search Loop (autonomous, 3-agent)
 Phase C: Report (autonomous)
   Best kernel selected from tree (highest SOL score)
   Run full workload suite on best kernel (all workloads, not just representative subset)
-  Report: baseline vs best, SOL score progression, bottleneck transitions,
-          technique trace, remaining headroom to hardware limit
+  Report: baseline vs best, SOL score progression, run-level bottleneck,
+          per-workload bottlenecks, technique trace, remaining headroom
+          to hardware limit
 ```
 
 ---
@@ -573,3 +573,7 @@ Agent count adapts to LLM context window: 3 agents at 200K+, 5-6 at 32-128K, 7+ 
 ### Reviewer Knowledge Base Architecture
 
 Three-tier KB: Compute-Reviewer KB, Memory-Reviewer KB, Shared Interaction KB. Two-dimensional retrieval: metric-triggered + action-triggered.
+
+### Multi-Turn Reviewer with On-Demand Profiling Queries
+
+Reviewer upgrades from single-call agent to tool-using agent (Coder-style) with bounded turn budget. Two query shapes: (A) lookup into `ProfilingResult.raw_metrics` for NCU metrics captured in the initial run but outside the curated subset (free, in-memory), and (B) on-demand re-profile with caller-specified `--section` / `--metrics` (expensive subprocess, cache-key expansion to include the metric set requested). Lets the Reviewer recover when the curated signals (occupancy, L2, tensor-core util, top-2 stalls) don't match the kernel's actual bottleneck signature. See JOURNAL → Agents → "Multi-turn Reviewer deferred" for why this is post-V1 and PROCESS.md Deferred Improvements for the trigger.

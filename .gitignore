@@ -37,3 +37,6 @@ configs/models/
 *.ptx
 *.cubin
 *.fatbin
+
+# Compile/profile caches (runtime artifacts)
+.acts_cache/
