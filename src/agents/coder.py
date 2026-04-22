@@ -1,16 +1,25 @@
 """Coder agent — implements optimization plans into kernel code.
 
-Tool-using agent. Has compile and correctness-check tools for
-self-correction within a retry budget. Uses OpenAI Agents SDK
-Agent + Runner.run with @function_tool.
+Tool-using agent. Has compile, correctness-check, and submit tools for
+self-correction and final emission within a retry budget. Uses OpenAI
+Agents SDK Agent + Runner.run with @function_tool.
 
-The two tools close over per-problem context (KernelSpec, reference_fn,
-input_generator) captured at ``implement()`` call time. A fresh Agent
-is built per call — cheap (object construction, no network) and keeps
-the tool closures bound to the right oracle.
+The compile + correctness tools close over per-problem context
+(KernelSpec, reference_fn, input_generators) captured at ``implement()``
+call time. The submit tool closes over a per-call captured dict so the
+LLM's structured submission flows back to the caller. A fresh Agent is
+built per call — cheap (object construction, no network) and keeps the
+tool closures bound to the right oracle and the right capture slot.
 
 Error strings follow Astra's pattern: tools return failure messages
-so the agent can self-correct within the same turn.
+so the agent can self-correct within the same turn. Submission goes
+through a tool call rather than ``output_type=`` Pydantic enforcement
+because reasoning-model providers (DeepSeek-reasoner, etc.) reject the
+``response_format=json_schema`` request the SDK derives from
+``output_type=``; tool-call schemas are universally supported. The
+Pydantic ``KernelCodeOutput`` validator still runs — invoked by the
+submit tool body — so T4's "validation failure → in-loop tool retry"
+guarantee is preserved verbatim.
 """
 
 from __future__ import annotations
@@ -18,7 +27,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, ValidationError, model_validator
 
 try:
     from agents import Agent, function_tool
@@ -169,6 +178,37 @@ def _make_correctness_tool(
     return check_correctness_tool
 
 
+def _make_submit_tool(captured: dict) -> Callable[[str, str], str]:
+    """Build a submit tool that captures the LLM's final ``KernelCodeOutput``.
+
+    The tool runs the same Pydantic validator that ``output_type=KernelCodeOutput``
+    used to trigger inside the SDK. On success it stores the validated output
+    in ``captured["output"]`` and returns a sentinel string instructing the
+    LLM to emit a one-word confirmation so the SDK tool loop terminates.
+    On validation failure it returns the error string — the SDK will hand
+    that back to the LLM as the tool-call response, prompting an in-loop
+    retry within the existing turn budget.
+
+    *captured* is a dict (not a single-element list / nullable variable)
+    because tests construct one per call and assert via ``"output" in captured``.
+    """
+
+    def submit_kernel(source_code: str, triton_kernel_name: str) -> str:
+        try:
+            captured["output"] = KernelCodeOutput(
+                source_code=source_code,
+                triton_kernel_name=triton_kernel_name,
+            )
+        except ValidationError as exc:
+            return f"submit_kernel FAILED:\n{exc}"
+        return (
+            "Kernel submitted. Emit a brief plain-text confirmation now "
+            "(no further tool calls) so the run can terminate."
+        )
+
+    return submit_kernel
+
+
 class CoderAgent:
     """Implements the Planner's structured plan into kernel code.
 
@@ -176,9 +216,10 @@ class CoderAgent:
     for self-correction — compilation/correctness errors are fixed within
     the Coder's own turn, up to a config-derived turn budget.
 
-    Turn budget: ``2 * config.max_debug_retries + 1`` — each retry cycle
-    is one compile call + one correctness call, plus one final output
-    turn. Default config gives 7 (= 2×3 + 1).
+    Turn budget: ``2 * config.max_debug_retries + 2`` — each retry cycle
+    is one compile call + one correctness call, plus one ``submit_kernel``
+    tool call plus one final plain-text confirmation. Default config gives
+    8 (= 2×3 + 2).
 
     If the retry budget is exhausted (tools keep returning errors), the
     SDK returns whatever final_output the agent produced — the orchestrator
@@ -195,7 +236,7 @@ class CoderAgent:
     ) -> None:
         self._model = model
         cfg = config or ACTSConfig()
-        self._max_turns = 2 * cfg.max_debug_retries + 1
+        self._max_turns = 2 * cfg.max_debug_retries + 2
         if model is not None:
             self._instructions = (PROMPT_DIR / "system.md").read_text()
             self._translate_instructions = (PROMPT_DIR / "translate.md").read_text()
@@ -251,12 +292,16 @@ class CoderAgent:
                 input_generators=input_generators,
             )
         )
+        # Per-call capture slot for the submit tool — populated when the
+        # LLM calls ``submit_kernel`` with a Pydantic-valid (source,
+        # triton_kernel_name) pair.
+        captured: dict = {}
+        submit_tool = function_tool(_make_submit_tool(captured))
         agent = Agent(
             name=agent_name,
             instructions=instructions,
             model=self._model,
-            tools=[compile_tool, correctness_tool],
-            output_type=KernelCodeOutput,
+            tools=[compile_tool, correctness_tool, submit_tool],
         )
         result = await run_agent(
             agent,
@@ -266,7 +311,12 @@ class CoderAgent:
         )
         if result is None:
             raise ImplementationError("LLM call failed after all retries.")
-        return result.final_output
+        if "output" not in captured:
+            raise ImplementationError(
+                "Coder did not call submit_kernel before terminating — "
+                "no final kernel was emitted."
+            )
+        return captured["output"]
 
     async def implement(
         self,

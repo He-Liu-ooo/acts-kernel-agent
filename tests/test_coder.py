@@ -31,6 +31,53 @@ from tests.conftest import (
 )
 
 
+# ── test helpers for the option-α submit-tool flow ─────────────────────
+#
+# The Coder used to expose its final answer via Pydantic ``output_type=``
+# enforcement; option α (DeepSeek-reasoner compatibility) routes the same
+# (source, name) pair through a ``submit_kernel`` tool call instead. To
+# simulate the LLM calling that tool inside the SDK loop, tests pair a
+# synthetic ``Agent`` factory that captures the constructed tools list
+# with a synthetic ``run_agent`` that finds ``submit_kernel`` in that
+# list and invokes it directly.
+
+
+def _simulate_submission(source_code: str, triton_kernel_name: str):
+    """Return ``(capture_agent, fake_run_agent)`` patch side-effects that
+    simulate the LLM calling ``submit_kernel(source_code, triton_kernel_name)``
+    once during the agent run.
+
+    The captured tools list survives across both side-effects via closure
+    so the second side-effect can find ``submit_kernel`` even though the
+    test patches ``Agent`` itself out (so ``agent.tools`` on the mock isn't
+    populated).
+    """
+    captured_tools: list[list] = []
+
+    def capture_agent(*args, **kwargs):
+        captured_tools.append(kwargs.get("tools", []))
+        return MagicMock()
+
+    async def fake_run_agent(agent, prompt, **kwargs):
+        for tool in captured_tools[-1]:
+            if getattr(tool, "__name__", "") == "submit_kernel":
+                tool(
+                    source_code=source_code,
+                    triton_kernel_name=triton_kernel_name,
+                )
+                break
+        # The SDK's ``RunResult.final_output`` is a plain text confirmation
+        # under option α — coder.py reads from the captured submission, not
+        # from ``result.final_output``, so its content is irrelevant.
+        return MagicMock(final_output="done")
+
+    return capture_agent, fake_run_agent
+
+
+_VALID_SOURCE = "@triton.jit\ndef k(): pass"
+_VALID_NAME = "k"
+
+
 # ── Pydantic output model ──────────────────────────────────────────────
 
 
@@ -334,21 +381,20 @@ async def test_implement_without_model_returns_source_unchanged():
 
 @pytest.mark.asyncio
 async def test_implement_calls_llm_and_returns_modified_source():
-    """With a model, implement() builds the Agent with bound tools and runs it."""
-    mock_output = KernelCodeOutput(
-        source_code="@triton.jit\ndef k(): return 42",
+    """With a model, implement() builds the Agent with bound tools and runs it.
+    The Coder emits its answer by calling submit_kernel, not via output_type."""
+    capture_agent, fake_run = _simulate_submission(
+        source_code="@triton.jit\ndef k(): pass",
         triton_kernel_name="k",
     )
-    mock_result = MagicMock()
-    mock_result.final_output = mock_output
 
     with (
-        patch("src.agents.coder.Agent") as mock_agent_cls,
+        patch("src.agents.coder.Agent", side_effect=capture_agent) as mock_agent_cls,
         patch("src.agents.coder.run_agent", new_callable=AsyncMock) as mock_run,
         patch("src.agents.coder.make_run_config", return_value=None),
         patch("src.agents.coder.function_tool", side_effect=lambda f: f),
     ):
-        mock_run.return_value = mock_result
+        mock_run.side_effect = fake_run
 
         agent = CoderAgent(model=MagicMock())
         plan = OptimizationPlan(
@@ -367,12 +413,17 @@ async def test_implement_calls_llm_and_returns_modified_source():
         )
 
     assert isinstance(result, KernelCodeOutput)
-    assert result.source_code == "@triton.jit\ndef k(): return 42"
+    assert result.source_code == "@triton.jit\ndef k(): pass"
     assert result.triton_kernel_name == "k"
     mock_run.assert_awaited_once()
-    # Agent was constructed with exactly two tools (compile + correctness).
+    # Agent gets compile + correctness + submit_kernel tools (3) and is built
+    # without ``output_type=`` so the SDK doesn't request response_format=json_schema.
     kwargs = mock_agent_cls.call_args.kwargs
-    assert len(kwargs["tools"]) == 2
+    assert len(kwargs["tools"]) == 3
+    assert "output_type" not in kwargs
+    assert any(
+        getattr(t, "__name__", "") == "submit_kernel" for t in kwargs["tools"]
+    )
 
 
 @pytest.mark.asyncio
@@ -406,7 +457,7 @@ async def test_implement_binds_all_generators_to_correctness_tool():
     """Phase B must bind every selected workload's generator to the correctness
     tool — else a kernel that passes workload 1 but breaks 2..N slips through."""
     gens = [MagicMock(name=f"gen_{i}") for i in range(3)]
-    mock_result = MagicMock(final_output=KernelCodeOutput.model_construct(source_code="ok", triton_kernel_name=""))
+    capture_agent, fake_run = _simulate_submission(_VALID_SOURCE, _VALID_NAME)
 
     captured = {}
     def capture_factory(*args, **kwargs):
@@ -414,13 +465,13 @@ async def test_implement_binds_all_generators_to_correctness_tool():
         return lambda src: "passed"
 
     with (
-        patch("src.agents.coder.Agent"),
+        patch("src.agents.coder.Agent", side_effect=capture_agent),
         patch("src.agents.coder.run_agent", new_callable=AsyncMock) as mock_run,
         patch("src.agents.coder.make_run_config", return_value=None),
         patch("src.agents.coder.function_tool", side_effect=lambda f: f),
         patch("src.agents.coder._make_correctness_tool", side_effect=capture_factory),
     ):
-        mock_run.return_value = mock_result
+        mock_run.side_effect = fake_run
         agent = CoderAgent(model=MagicMock())
         await agent.implement(
             kernel_source="src",
@@ -458,17 +509,18 @@ async def test_implement_raises_on_llm_failure():
 
 @pytest.mark.asyncio
 async def test_implement_passes_default_max_turns_when_no_config():
-    """No config → default ACTSConfig.max_debug_retries=3 → max_turns = 2*3+1 = 7."""
-    mock_result = MagicMock()
-    mock_result.final_output = KernelCodeOutput.model_construct(source_code="ok", triton_kernel_name="")
+    """No config → default ACTSConfig.max_debug_retries=3 → max_turns = 2*3+2 = 8.
+    The +2 (vs. the historical +1) reserves one turn for ``submit_kernel`` and
+    one for the final plain-text confirmation that terminates the SDK loop."""
+    capture_agent, fake_run = _simulate_submission(_VALID_SOURCE, _VALID_NAME)
 
     with (
-        patch("src.agents.coder.Agent"),
+        patch("src.agents.coder.Agent", side_effect=capture_agent),
         patch("src.agents.coder.run_agent", new_callable=AsyncMock) as mock_run,
         patch("src.agents.coder.make_run_config", return_value=None),
         patch("src.agents.coder.function_tool", side_effect=lambda f: f),
     ):
-        mock_run.return_value = mock_result
+        mock_run.side_effect = fake_run
 
         agent = CoderAgent(model=MagicMock())
         await agent.implement(
@@ -479,22 +531,21 @@ async def test_implement_passes_default_max_turns_when_no_config():
             input_generators=[_gen],
         )
 
-    assert mock_run.await_args.kwargs.get("max_turns") == 7
+    assert mock_run.await_args.kwargs.get("max_turns") == 8
 
 
 @pytest.mark.asyncio
 async def test_implement_max_turns_derived_from_config():
-    """max_debug_retries=5 → max_turns = 2*5+1 = 11."""
-    mock_result = MagicMock()
-    mock_result.final_output = KernelCodeOutput.model_construct(source_code="ok", triton_kernel_name="")
+    """max_debug_retries=5 → max_turns = 2*5+2 = 12 (+2 for submit + confirm)."""
+    capture_agent, fake_run = _simulate_submission(_VALID_SOURCE, _VALID_NAME)
 
     with (
-        patch("src.agents.coder.Agent"),
+        patch("src.agents.coder.Agent", side_effect=capture_agent),
         patch("src.agents.coder.run_agent", new_callable=AsyncMock) as mock_run,
         patch("src.agents.coder.make_run_config", return_value=None),
         patch("src.agents.coder.function_tool", side_effect=lambda f: f),
     ):
-        mock_run.return_value = mock_result
+        mock_run.side_effect = fake_run
 
         agent = CoderAgent(model=MagicMock(), config=ACTSConfig(max_debug_retries=5))
         await agent.implement(
@@ -505,22 +556,21 @@ async def test_implement_max_turns_derived_from_config():
             input_generators=[_gen],
         )
 
-    assert mock_run.await_args.kwargs.get("max_turns") == 11
+    assert mock_run.await_args.kwargs.get("max_turns") == 12
 
 
 @pytest.mark.asyncio
 async def test_implement_uses_zero_temperature():
     """Coder runs with temperature=0.0 — deterministic code generation."""
-    mock_result = MagicMock()
-    mock_result.final_output = KernelCodeOutput.model_construct(source_code="ok", triton_kernel_name="")
+    capture_agent, fake_run = _simulate_submission(_VALID_SOURCE, _VALID_NAME)
 
     with (
-        patch("src.agents.coder.Agent"),
+        patch("src.agents.coder.Agent", side_effect=capture_agent),
         patch("src.agents.coder.run_agent", new_callable=AsyncMock) as mock_run,
         patch("src.agents.coder.make_run_config") as mock_cfg,
         patch("src.agents.coder.function_tool", side_effect=lambda f: f),
     ):
-        mock_run.return_value = mock_result
+        mock_run.side_effect = fake_run
         mock_cfg.return_value = None
 
         agent = CoderAgent(model=MagicMock())
@@ -533,6 +583,33 @@ async def test_implement_uses_zero_temperature():
         )
 
     mock_cfg.assert_called_once_with(temperature=0.0)
+
+
+@pytest.mark.asyncio
+async def test_implement_raises_when_agent_terminates_without_submitting():
+    """Option-α invariant: if the LLM exits the tool loop without ever calling
+    submit_kernel, we have no Coder output. Raising ImplementationError lets
+    the caller surface the failure rather than silently treating an empty
+    submission as a degraded best-effort."""
+    # Capture-agent path (no fake_run side_effect that calls submit_kernel) —
+    # mock_run returns a normal RunResult but the captured dict stays empty.
+    with (
+        patch("src.agents.coder.Agent"),
+        patch("src.agents.coder.run_agent", new_callable=AsyncMock) as mock_run,
+        patch("src.agents.coder.make_run_config", return_value=None),
+        patch("src.agents.coder.function_tool", side_effect=lambda f: f),
+    ):
+        mock_run.return_value = MagicMock(final_output="done")
+
+        agent = CoderAgent(model=MagicMock())
+        with pytest.raises(ImplementationError, match="submit_kernel"):
+            await agent.implement(
+                kernel_source="src",
+                plan=OptimizationPlan(tier=1, technique="t1"),
+                kernel_spec=_make_spec(),
+                reference_fn=_ref,
+                input_generators=[_gen],
+            )
 
 
 # ── has_model property ─────────────────────────────────────────────────
@@ -561,21 +638,21 @@ async def test_translate_without_model_raises():
 
 
 @pytest.mark.asyncio
-async def test_translate_builds_agent_with_two_tools_and_returns_source():
-    """translate() constructs a fresh Agent with compile + correctness tools."""
-    mock_output = KernelCodeOutput(
+async def test_translate_builds_agent_with_three_tools_and_returns_source():
+    """translate() constructs a fresh Agent with compile + correctness +
+    submit tools and returns the captured Coder submission."""
+    capture_agent, fake_run = _simulate_submission(
         source_code="@triton.jit\ndef kernel_fn(x): pass",
         triton_kernel_name="kernel_fn",
     )
-    mock_result = MagicMock(final_output=mock_output)
 
     with (
-        patch("src.agents.coder.Agent") as mock_agent_cls,
+        patch("src.agents.coder.Agent", side_effect=capture_agent) as mock_agent_cls,
         patch("src.agents.coder.run_agent", new_callable=AsyncMock) as mock_run,
         patch("src.agents.coder.make_run_config", return_value=None),
         patch("src.agents.coder.function_tool", side_effect=lambda f: f),
     ):
-        mock_run.return_value = mock_result
+        mock_run.side_effect = fake_run
         agent = CoderAgent(model=MagicMock())
         result = await agent.translate(
             reference_source="def run(x):\n    return x * 2.0\n",
@@ -589,20 +666,21 @@ async def test_translate_builds_agent_with_two_tools_and_returns_source():
     assert result.triton_kernel_name == "kernel_fn"
     mock_run.assert_awaited_once()
     kwargs = mock_agent_cls.call_args.kwargs
-    assert len(kwargs["tools"]) == 2  # compile + correctness
+    assert len(kwargs["tools"]) == 3  # compile + correctness + submit
+    assert "output_type" not in kwargs
 
 
 @pytest.mark.asyncio
 async def test_translate_user_prompt_contains_reference_and_entrypoint():
     """Prompt must surface the source to translate and the target entrypoint."""
-    mock_result = MagicMock(final_output=KernelCodeOutput.model_construct(source_code="ok", triton_kernel_name=""))
+    capture_agent, fake_run = _simulate_submission(_VALID_SOURCE, _VALID_NAME)
     with (
-        patch("src.agents.coder.Agent"),
+        patch("src.agents.coder.Agent", side_effect=capture_agent),
         patch("src.agents.coder.run_agent", new_callable=AsyncMock) as mock_run,
         patch("src.agents.coder.make_run_config", return_value=None),
         patch("src.agents.coder.function_tool", side_effect=lambda f: f),
     ):
-        mock_run.return_value = mock_result
+        mock_run.side_effect = fake_run
         agent = CoderAgent(model=MagicMock())
         await agent.translate(
             reference_source="def run(x):\n    return x * 2.0\n",
@@ -619,14 +697,14 @@ async def test_translate_user_prompt_contains_reference_and_entrypoint():
 @pytest.mark.asyncio
 async def test_translate_uses_distinct_translate_instructions():
     """translate() loads translate.md — separate from the optimize system.md."""
-    mock_result = MagicMock(final_output=KernelCodeOutput.model_construct(source_code="ok", triton_kernel_name=""))
+    capture_agent, fake_run = _simulate_submission(_VALID_SOURCE, _VALID_NAME)
     with (
-        patch("src.agents.coder.Agent") as mock_agent_cls,
+        patch("src.agents.coder.Agent", side_effect=capture_agent) as mock_agent_cls,
         patch("src.agents.coder.run_agent", new_callable=AsyncMock) as mock_run,
         patch("src.agents.coder.make_run_config", return_value=None),
         patch("src.agents.coder.function_tool", side_effect=lambda f: f),
     ):
-        mock_run.return_value = mock_result
+        mock_run.side_effect = fake_run
         agent = CoderAgent(model=MagicMock())
         await agent.translate(
             reference_source="def run(x): return x",
@@ -666,14 +744,14 @@ async def test_translate_raises_on_llm_failure():
 @pytest.mark.asyncio
 async def test_translate_uses_zero_temperature():
     """Like implement(), translate() pins temperature=0.0 for determinism."""
-    mock_result = MagicMock(final_output=KernelCodeOutput.model_construct(source_code="ok", triton_kernel_name=""))
+    capture_agent, fake_run = _simulate_submission(_VALID_SOURCE, _VALID_NAME)
     with (
-        patch("src.agents.coder.Agent"),
+        patch("src.agents.coder.Agent", side_effect=capture_agent),
         patch("src.agents.coder.run_agent", new_callable=AsyncMock) as mock_run,
         patch("src.agents.coder.make_run_config") as mock_cfg,
         patch("src.agents.coder.function_tool", side_effect=lambda f: f),
     ):
-        mock_run.return_value = mock_result
+        mock_run.side_effect = fake_run
         mock_cfg.return_value = None
         agent = CoderAgent(model=MagicMock())
         await agent.translate(
@@ -684,3 +762,59 @@ async def test_translate_uses_zero_temperature():
         )
 
     mock_cfg.assert_called_once_with(temperature=0.0)
+
+
+# ── submit-tool factory (option α) ─────────────────────────────────────
+
+
+def test_make_submit_tool_captures_valid_output():
+    """Direct unit test of the submit-tool factory: a valid (source, name)
+    pair populates the captured dict and returns the success sentinel."""
+    from src.agents.coder import _make_submit_tool
+
+    captured: dict = {}
+    submit = _make_submit_tool(captured)
+    msg = submit(
+        source_code="@triton.jit\ndef k(): pass",
+        triton_kernel_name="k",
+    )
+    assert "submitted" in msg.lower()
+    assert "output" in captured
+    assert isinstance(captured["output"], KernelCodeOutput)
+    assert captured["output"].source_code == "@triton.jit\ndef k(): pass"
+    assert captured["output"].triton_kernel_name == "k"
+
+
+def test_make_submit_tool_returns_validation_error_string_on_mismatch():
+    """A name-not-in-source mismatch must NOT raise — instead the tool returns
+    the error string so the SDK hands it back to the LLM as the tool-call
+    response, prompting an in-loop retry within the existing turn budget."""
+    from src.agents.coder import _make_submit_tool
+
+    captured: dict = {}
+    submit = _make_submit_tool(captured)
+    msg = submit(
+        source_code="@triton.jit\ndef actual_name(): pass",
+        triton_kernel_name="claimed_name",
+    )
+    assert "FAILED" in msg
+    assert "claimed_name" in msg
+    # On failure the captured dict stays empty so coder.py raises
+    # ImplementationError after the run if the LLM never recovered.
+    assert "output" not in captured
+
+
+def test_make_submit_tool_returns_error_when_source_lacks_triton_jit():
+    """The Coder writes Triton kernels — pure-PyTorch source is rejected
+    by the same Pydantic validator the old output_type= path used."""
+    from src.agents.coder import _make_submit_tool
+
+    captured: dict = {}
+    submit = _make_submit_tool(captured)
+    msg = submit(
+        source_code="def run(x): return x * 2.0",
+        triton_kernel_name="run",
+    )
+    assert "FAILED" in msg
+    assert "@triton.jit" in msg
+    assert "output" not in captured
