@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -69,16 +70,19 @@ async def optimize(
     from src.search.orchestrator import Orchestrator
 
     if config is None:
-        hw = detect_hardware()
-        if hw.peak_flops_fp32 <= 0 or hw.peak_memory_bandwidth_gb_s <= 0:
-            logger.warning(
-                "detect_hardware() returned a zeroed HardwareSpec — substituting "
-                "a populated placeholder (%s) so the orchestrator's profiler guard "
-                "passes. Load a SOLAR arch YAML for real runs.",
-                _PLACEHOLDER_HARDWARE_SPEC.name,
-            )
-            hw = _PLACEHOLDER_HARDWARE_SPEC
-        config = ACTSConfig(hardware=hw)
+        config = ACTSConfig(hardware=detect_hardware())
+    if (
+        config.hardware.peak_flops_fp32 <= 0
+        or config.hardware.peak_memory_bandwidth_gb_s <= 0
+    ):
+        logger.warning(
+            "HardwareSpec has zero peaks (name=%r) — substituting a populated "
+            "placeholder (%s) so the orchestrator's profiler guard passes. "
+            "Load a SOLAR arch YAML for real runs.",
+            config.hardware.name,
+            _PLACEHOLDER_HARDWARE_SPEC.name,
+        )
+        config = replace(config, hardware=_PLACEHOLDER_HARDWARE_SPEC)
 
     # Gating the model load on SOL mode keeps the placeholder CLI runnable —
     # the placeholder baseline has no oracle, so a model-backed Coder would

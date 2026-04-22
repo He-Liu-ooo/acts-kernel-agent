@@ -152,6 +152,36 @@ async def test_placeholder_substitutes_nonzero_hardware_spec():
 
 
 @pytest.mark.asyncio
+async def test_zero_peak_caller_config_also_gets_placeholder_substituted():
+    """A caller who passes a bare ``ACTSConfig()`` (or any config whose
+    HardwareSpec has zero peaks) must NOT trip the orchestrator's fail-fast
+    guard — the same placeholder substitution that runs for the
+    ``config is None`` path must apply to caller-supplied configs too.
+    Before this fix, the ``config is None`` branch was skipped and the
+    orchestrator raised ``ValueError`` before the first iteration."""
+    baseline = Kernel(spec=_spec(), source_code="src")
+    fake_orch = MagicMock()
+    fake_orch.run = AsyncMock(return_value=MagicMock())
+
+    caller_config = ACTSConfig()  # HardwareSpec() → zero peaks
+
+    with (
+        patch("src.pipeline.optimize._load_model_if_configured", return_value=None),
+        patch("src.search.orchestrator.Orchestrator", return_value=fake_orch) as mock_orch_cls,
+        patch("src.memory.store.MemoryStore", return_value=MagicMock()),
+        patch("src.kernels.starters.matmul.make_matmul_kernel", return_value=baseline),
+    ):
+        await optimize("placeholder", config=caller_config)
+
+    passed = mock_orch_cls.call_args.kwargs["config"]
+    assert passed.hardware.peak_flops_fp32 > 0
+    assert passed.hardware.peak_memory_bandwidth_gb_s > 0
+    # Caller's config object must not be mutated — substitution returns a
+    # new ACTSConfig via ``dataclasses.replace``.
+    assert caller_config.hardware.peak_flops_fp32 == 0
+
+
+@pytest.mark.asyncio
 async def test_populated_hardware_spec_from_caller_preserved():
     """When the caller supplies a populated HardwareSpec via ``config``, the
     placeholder substitution must NOT fire — caller's spec wins."""
