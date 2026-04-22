@@ -48,7 +48,7 @@
 
 ### Implemented during report phase (real logic, not placeholders)
 
-- [x] pipeline/report.py — `generate_report(result)` walks `result.tree.path_to_node(best.id)` to build `technique_trace` (root baseline placeholder filtered out), propagates `reward_hack_suspect` / `calibration_warning` from the best node's `ScoreResult`, unwraps `TerminationReason` to a plain string, and defensively handles a `None` score. `render_report` emits a multi-line CLI summary that skips the scoring block when `baseline_latency_us == 0` and surfaces audit flags as explicit `[AUDIT]` lines. `bottleneck_transitions` stays empty pending `eval/profiler.py` (GPU-blocked).
+- [x] pipeline/report.py — `generate_report(result)` walks `result.tree.path_to_node(best.id)` to build `technique_trace` (root baseline placeholder filtered out), propagates `reward_hack_suspect` / `calibration_warning` from the best node's `ScoreResult`, unwraps `TerminationReason` to a plain string, and defensively handles a `None` score. `render_report` emits a multi-line CLI summary that skips the scoring block when `baseline_latency_us == 0` and surfaces audit flags as explicit `[AUDIT]` lines. Post-refactor (2026-04-22): `report.bottleneck: BottleneckType | None` comes from `SearchResult.run_bottleneck`; `winner_per_workload_bottlenecks: dict[str, BottleneckType]` is populated by a fused pass over selected workloads when `workloads` + `hardware_spec` are supplied, sharing `(flops, nbytes)` with the Phase C re-profile loop.
 - [x] search/orchestrator.py — `SearchResult` gained a `tree: SearchTree` field so Phase C can reconstruct path-derived views without the orchestrator denormalizing upfront; all four `SearchResult` construction sites updated (ALL_DEAD_END / SOL_TARGET / PLATEAU / BUDGET). Lighter-snapshot alternative tracked as a Deferred Improvement.
 - [x] pipeline/optimize.py — `main()` now prints `render_report(generate_report(result))`.
 
@@ -59,19 +59,25 @@
 
 ## Next Up
 
-Phase A, Phase B, and Phase C are wired end-to-end with real CUDA-event benchmarking; only `eval/profiler.py` remains a placeholder in Phase B. GPU is available (NVIDIA RTX 6000 Ada, CUDA 12.8).
+Bottleneck-classify-once refactor just shipped (commits `7d033e9` / `513c64c` / `00e98fc`, 2026-04-22):
+
+- `eval/profiler.py` landed — hybrid analytical (required, fail-closed) + curated NCU (best-effort). Source-hash cache; subprocess driver isolates NCU failures. Tier 1 (fake-ncu) + Tier 2 (`@pytest.mark.gpu`) coverage.
+- Classification moved from per-iter to once-per-run via `eval/roofline.py::classify_run`, threaded through the orchestrator / retriever / planner / reviewer / `SearchResult` / `OptimizationReport`. Rationale: classification inputs `(flops, nbytes, hardware)` are invariant per run, so per-iter reclassification would only recompute the same label (JOURNAL → "Bottleneck classify-once (2026-04-22)").
+- Codex-review fixes bundled: placeholder hardware substitution for caller-supplied zero-peak configs; `child.score` committed only after the profile DEAD_END gauntlet clears.
+
+Phase A, Phase B, Phase C are all wired end-to-end on real CUDA-event benchmarking + real analytical profiling. GPU is available (NVIDIA RTX 6000 Ada, CUDA 12.8).
 
 Candidates (pick one before writing code; design-discussion first where called out):
 
-- **`eval/profiler.py`** (skeleton → real) — NCU (`ncu --export` / `ncu-cli`) integration + per-iteration bottleneck classification. Feeds dynamic classification to retriever/reviewer/planner (see JOURNAL.md "Dynamic bottleneck reclassification"). Next in dependency order: benchmark gives latency, profiler gives the *why*, which unblocks `bottleneck_transitions` in the Phase C report. **Design discussion warranted** — subprocess vs `nsight-compute` Python API, metric set, parse-from-CSV vs SQLite, how to cache per-kernel results.
+- **First live GPU run** (integration milestone, not a new module) — highest-value next step now that every in-loop module is real. Run Phase A → B → C end-to-end against a SOL-ExecBench problem. Surfaces anything the test venv masked: real Triton specialization, compile latency, sticky-error recovery after a crash, NCU subprocess behavior against a production kernel, cache-key stability across rebuilds, stall-class naming drift on RTX 6000 Ada. Likely triggers deferred work — the per-dtype ridge fix (if a tc workload shows up), the `do_bench`-shape timer rewrite (if sync-per-iter cost becomes visible), `detect_hardware()` (if the SOLAR arch YAML path proves inconvenient in practice).
 
-- **`actions/tier{1..6}` real guidance text** (non-GPU) — action-library descriptions are the Planner's fuel. Structure is done (`src/actions/tier*_*.py` ~373 LOC total); the guidance strings are placeholders. Content-heavy (literature synthesis from 9-paper KB + AccelOpt/Astra), high impact on search quality but does not require GPU.
+- **`actions/tier{1..6}` real guidance text** (non-GPU) — action-library descriptions are the Planner's fuel. Structure is done (`src/actions/tier*_*.py` ~373 LOC total); the guidance strings are placeholders. Content-heavy (literature synthesis from 9-paper KB + AccelOpt / Astra), high impact on search quality but does not require GPU. Good parallel track to the live-GPU run — disjoint files.
 
-- **`config.py::detect_hardware()`** (non-GPU code, uses GPU at runtime) — currently a placeholder returning a zeroed spec. With a live GPU we can wire `torch.cuda`/`pynvml` to populate `HardwareSpec` fields at startup. Small feature, useful for ablation runs that skip the SOLAR arch YAML path.
+- **`config.py::detect_hardware()`** (non-GPU code, uses GPU at runtime) — currently a placeholder returning a zeroed spec. Wire `torch.cuda` / `pynvml` to populate `HardwareSpec` fields at startup. `pipeline/optimize.py` already has a placeholder-spec fallback that would become a best-effort warning path once this lands. Small feature, useful for ablation runs that skip the SOLAR arch YAML.
 
-- **First live GPU run** (integration milestone, not a new module) — now that `benchmark.py` is real, Phase B can produce meaningful SOL scores against a SOL-ExecBench problem. Worth running end-to-end before profiler lands, to surface anything the test venv masked (real Triton specialization, compile latency, sticky-error recovery, timer overhead). Likely trigger for the deferred `sys.modules` compile cache and the `do_bench`-shape rewrite.
+- **Codex adversarial review of the refactor PR** — `/codex:adversarial-review` against the three commits above to catch anything the non-adversarial pass missed. Highest-value targets: the deferred-`child.score` invariant (does any other call-site still assume score is populated the moment the benchmark succeeds?), the fused Phase C loop (is `_resolve_workload_roofline`'s `(0, 0)` contract honored at every call site?), and the `dataclasses.replace` in `optimize.py` (does it actually leave the caller's config untouched in every path?).
 
-Recommended order: `eval/profiler.py` (biggest unlock — dynamic bottleneck reclassification + Phase C `bottleneck_transitions`), then action guidance + `detect_hardware`. Fit the live-GPU run in between whenever the immediate downstream needs it.
+Recommended order: **first live GPU run** (end-to-end smoke) → action guidance text + `detect_hardware` in parallel (disjoint files) → adversarial review of the refactor. Defer the Deferred Improvements until their triggers fire during the live run.
 
 Still deferred regardless of GPU: `eval/anti_cheat.py` (Tier 3 — threat model empty for bounded internal search; see Deferred Improvements) and `benchmark/solar_adapter.py` (needs SOLAR package installed).
 
@@ -90,7 +96,7 @@ Items marked `(skeleton)` have interfaces + placeholder logic that keeps the pip
 - [x] eval/correctness.py (done) — 5-stage gate (smoke → shape-sweep → numerical stability → determinism → anti-cheat) with short-circuit failure attribution. Injectable `ComparisonPolicy` (torch-free at import); `TorchComparisonPolicy` delegates to `sol_execbench.compute_error_stats` when installed, falls back to `torch.allclose` otherwise.
 - [x] eval/inputs.py (done) — `build_reference_fn` (exec PyTorch reference source, resolve `run`) + `build_input_generator` (wraps SOL's `gen_inputs` with seeding). Torch + sol_execbench lazy-imported.
 - [x] eval/benchmark.py (done) — CUDA-event timing via injectable `BenchmarkTimer` Protocol; multi-workload parallel-list contract with fresh-timer-per-workload isolation; fail-closed on partial-workload failures (<half survive → `BenchmarkError`; `is_fully_successful` property on result); 100us sentinel on empty-workload path.
-- [ ] eval/profiler.py (skeleton) — NCU integration + per-iteration bottleneck classification. GPU is now available. Orchestrator must call per candidate and feed dynamic classification to retriever/reviewer/planner (see JOURNAL.md "Dynamic bottleneck reclassification").
+- [x] eval/profiler.py (done) — hybrid analytical roofline (required, fail-closed) + curated NCU subprocess (best-effort, degrades on failure). Representative workload per iteration; Phase C re-profiles the winner on every selected workload. Source-hash-keyed cache. Tier 1 fake-ncu unit tests + Tier 2 `@pytest.mark.gpu` real-GPU tests (`tests/test_profiler_gpu.py`). Per-iter signals feed the Reviewer; run-level classification comes from `classify_run` (see JOURNAL.md → "Bottleneck classify-once (2026-04-22)").
 - [x] eval/roofline.py (done) — two clean paths: SOLAR (T_SOL + bottleneck together) or built-in fallback. solar_adapter.py placeholder returns synthetic data until SOLAR is installed.
 - [x] eval/scorer.py (done) — SOL Score with audit flags per SOL-ExecBench paper Section 4.3
 - [ ] eval/anti_cheat.py (skeleton) — two surfaces: correctness-level (input randomization, precision checks) + performance-level (T_k < T_SOL flagging from scorer)
@@ -118,13 +124,13 @@ Items marked `(skeleton)` have interfaces + placeholder logic that keeps the pip
 
 - [x] search/tree.py (done) — tree state, path_to_node, checkpoint save/load (atomic)
 - [x] search/beam.py (done) — beam pruning (B3 quality-weighted + B2 diversity-aware, configurable), epsilon-greedy selection
-- [x] search/orchestrator.py (done) — real control flow + real agents + real CUDA-event benchmarking; fail-closed baseline check (aborts run on partial-workload failure), branch-local `DEAD_END` on child partial failure; still calls placeholder `eval/profiler.py` for bottleneck classification
+- [x] search/orchestrator.py (done) — real control flow + real agents + real CUDA-event benchmarking + real analytical profiling. Fail-closed baseline check (aborts run on partial-workload failure); branch-local `DEAD_END` on child partial failure, profile failure, or missing representative latency. Post-refactor (2026-04-22): calls `classify_run` once after roofline resolution, threads `run_bottleneck` into retriever / planner / reviewer / `SearchResult`; commits `child.score` + `per_workload_latency_us` only after the profile DEAD_END gauntlet clears.
 
 ### Phase 6: Pipeline & Integration
 
-- [x] pipeline/optimize.py Phase A (done) — real two-path load, roofline, workload selection, model-configured `CoderAgent`, and fail-closed `generate_triton_baseline`. Phase B now runs real CUDA-event benchmarking; only `eval/profiler.py` remains placeholder.
+- [x] pipeline/optimize.py Phase A (done) — real two-path load, roofline, workload selection, model-configured `CoderAgent`, and fail-closed `generate_triton_baseline`. Phase B runs real CUDA-event benchmarking + real analytical profiling. Post-refactor (2026-04-22): placeholder hardware substitution also applies to caller-supplied zero-peak configs (not just `config is None`) via `dataclasses.replace`.
 - [x] pipeline/verify.py (done) — recompiles the winner and reruns the 5-stage correctness gate against the PyTorch reference; compile failures surface as `passed=False` with a compile-phrased detail string
-- [x] pipeline/report.py (done) — `generate_report` + `render_report`; trace via `result.tree.path_to_node`; propagates `reward_hack_suspect` / `calibration_warning`; `bottleneck_transitions` stays empty pending profiler
+- [x] pipeline/report.py (done) — `generate_report` + `render_report`; trace via `result.tree.path_to_node`; propagates `reward_hack_suspect` / `calibration_warning`; surfaces run-level `bottleneck` (from `SearchResult.run_bottleneck`) and `winner_per_workload_bottlenecks` (via `classify_workload` on every selected workload, fused with the Phase C re-profile pass)
 - [x] benchmark/problem_loader.py (done)
 - [x] benchmark/baseline_generator.py (done) — `generate_triton_baseline` drives `CoderAgent.translate` + post-verifies on every selected workload; `BaselineGenerationError` on no-model / retry exhaustion.
 - [x] benchmark/workload_selector.py (done)
@@ -146,14 +152,23 @@ Tech-debt items surfaced by review passes but not yet worth fixing. Each has
 a **trigger** — the signal to act. If you find yourself reaching for one of
 these before its trigger fires, re-read the trigger first.
 
-- [ ] **Thread `BottleneckType` end-to-end** — move the enum out of
-  `src/eval/roofline.py` into a shared types module, change
-  `Experience.bottleneck_before/after` and `MemoryRetriever.retrieve` to
-  take the enum, drop the `.value` string hops in orchestrator/retriever.
-  Purely a typing change; prevents a `"memory_bound"` vs `"memory-bound"`
-  drift bug.
-  *Trigger*: before memory is first exercised with a real, scored
-  retrieval run — earlier if a second bottleneck-valued site is added.
+- [ ] **Per-dtype peak in `_compute_analytical()` ridge** — profiler currently
+  uses `hardware_spec.peak_flops_fp32` regardless of workload dtype
+  (`src/eval/profiler.py:186`). For tensor-core workloads (fp16/bf16) the
+  real ridge is much higher, so `classify_workload()` mislabels tc-heavy
+  workloads as compute-bound when they're actually memory-bound (or vice
+  versa). Search loop is unaffected (it uses SOLAR's run-level label, not
+  the analytical per-workload one), so the impact is confined to Phase C
+  diagnostic accuracy in `OptimizationReport.winner_per_workload_bottlenecks`.
+  Fix requires plumbing `Workload.dtype` (or kernel-inspected dtype) into
+  the helper plus a `peak_for_dtype(hw, dtype)` lookup against
+  `HardwareSpec.MAC_per_cycle_{fp32_sm, fp16_tc, bf16_tc}`.
+  *Trigger*: first Phase C report on a tc workload that shows a
+  classification disagreeing with NCU's `tensor_core_util_pct`, OR the
+  first SOL run whose per-workload labels look obviously wrong relative
+  to the kernel's known regime. Don't pre-fix — current SOLAR stub
+  (`solar_adapter.py:69-77`) means run-level labels are also fake, so
+  fixing per-workload accuracy in isolation has no consumer yet.
 
 - [ ] **`MemoryStore.add()` batched flush** — currently rewrites the full
   JSON on every add (O(N²) write bytes per session). Split into
@@ -161,12 +176,14 @@ these before its trigger fires, re-read the trigger first.
   *Trigger*: first end-to-end run where the store grows past ~500
   experiences, OR if the rewrite shows up in a profile.
 
-- [ ] **Tree serialization via `dataclasses.asdict`** —
-  `src/search/tree.py` has ~100 LOC of hand-rolled `_serialize_*` /
-  `_deserialize_*`. A shared helper with enum/Path coercion would
-  collapse it to ~20 LOC and remove the 3-place change cost when a
-  dataclass field is added (the `.get("reward_hack_suspect", False)` on
-  line 228 already shows the drift cost).
+- [ ] **Tree serialization via `dataclasses.asdict`** (partial) —
+  `_serialize_profiling` was switched to `asdict` during the
+  bottleneck-classify-once /simplify pass (2026-04-22), which removed
+  the hand-rolled per-field mirror for `AnalyticalMetrics` + `NCUMetrics`.
+  `_serialize_kernel` / `_serialize_score` still hand-roll their dicts
+  and carry the drift risk — `ScoreResult`'s `.get("reward_hack_suspect",
+  False)` back-compat hook shows the shape of the problem. A shared
+  helper with enum/Path coercion would collapse the remainder.
   *Trigger*: the next time a field is added to `TreeNode`, `Kernel`,
   `KernelSpec`, or `ScoreResult`. Don't pre-refactor — checkpoint
   back-compat risk isn't worth paying proactively.
@@ -318,6 +335,27 @@ these before its trigger fires, re-read the trigger first.
   + `MemoryStore.add()` + checkpoint writes, all of which assume
   single-writer semantics on the tree. See JOURNAL → Search →
   "Serial beam expansion" for the rationale to keep it serial today.
+
+- [ ] **Multi-turn Reviewer with on-demand profiling queries** —
+  today the Reviewer is a single-call agent that receives a curated
+  NCU subset (occupancy, L2, tensor-core util, top-2 stalls). When
+  the curated signals don't match the real bottleneck signature, the
+  Reviewer has no recourse. Future: turn the Reviewer into a
+  tool-using agent (like the Coder) with two query shapes — (A) a
+  lookup into `ProfilingResult.raw_metrics` for metrics the initial
+  NCU run already captured (cheap, in-memory), and (B) an on-demand
+  re-profile with different `--section` / `--metrics` (expensive,
+  ~30s subprocess on RTX 6000 Ada, cache-key expansion).
+  *Trigger*: first real-run iteration where Reviewer feedback is
+  visibly signal-starved — i.e. the top-2 stalls and curated headline
+  metrics don't explain the measured bottleneck, and the rule-based
+  fallback or LLM diagnosis produces generic / wrong guidance. Until
+  we've seen real misses, the curated set's failure modes are
+  unknown and building the tool risks optimizing for the wrong shape.
+  Design pass required before implementation: Reviewer shape change
+  (single Pydantic call → tool loop), turn-budget choice, new failure
+  modes, prompt contract. See JOURNAL → Agents → "Multi-turn Reviewer
+  deferred" for the rationale behind deferring past the profiler PR.
 
 ### Skipped (decisions, not tech debt)
 
