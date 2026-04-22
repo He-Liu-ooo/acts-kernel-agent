@@ -35,3 +35,7 @@ include = ["src*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["tests"]
+markers = [
+    "gpu: real-GPU required — skipped on CPU-only CI",
+]
