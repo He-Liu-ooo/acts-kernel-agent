@@ -300,6 +300,126 @@ def test_cache_key_metric_set_version_bust(
     assert _reads_counter(counter) == 2
 
 
+# ── Codex P2: kernel_name participates in the cache key ────────────────
+
+
+def test_cache_key_distinct_for_different_declared_kernel_names(sample_workload):
+    """Codex P2 fix: two Kernels with identical source but different declared
+    ``triton_kernel_name`` values must produce distinct cache keys. Without
+    this, profiling a fused kernel renamed by the Coder would silently return
+    metrics NCU collected on a different jit'd function in the same source."""
+    from src.eval.profiler import _cache_key
+
+    src = (
+        "@triton.jit\ndef _helper(): pass\n"
+        "@triton.jit\ndef main_kernel(): pass\n"
+    )
+    key_main = _cache_key(src, sample_workload, "curated", "main_kernel")
+    key_helper = _cache_key(src, sample_workload, "curated", "_helper")
+
+    assert key_main != key_helper, (
+        "Same source + workload + mode but different declared kernel names "
+        "must hash to distinct keys — otherwise NCU metrics for one are "
+        "served when the other is requested."
+    )
+
+
+def test_cache_key_distinct_when_legacy_regex_picks_different_first_jit(sample_workload):
+    """Even on the empty-``triton_kernel_name`` legacy path, the resolved
+    name (regex-extracted from source) is what gets baked into the key. Two
+    different sources with different first-jit names produce different keys
+    via the source-hash already, but the explicit kernel-name parameter
+    keeps the chain robust if the Coder declared one name and the source
+    coincidentally contained another (no shared cache namespace)."""
+    from src.eval.profiler import _cache_key
+
+    src = "@triton.jit\ndef foo(): pass\n"
+    key_with_foo = _cache_key(src, sample_workload, "curated", "foo")
+    key_with_bar = _cache_key(src, sample_workload, "curated", "bar")
+    assert key_with_foo != key_with_bar
+
+
+def test_profile_kernel_does_not_serve_cached_helper_metrics_for_main(
+    tmp_path, sample_workload, monkeypatch
+):
+    """End-to-end: caching a profile for a kernel with declared name A, then
+    re-profiling the same source with declared name B, must trigger a fresh
+    NCU subprocess (cache miss). Without P2, the second call would hit the
+    cache key from the first and return wrong-symbol metrics."""
+    from src.eval.profiler import NCUMetrics, profile_kernel
+    from src.kernels.compiler import CompilationResult
+    from src.kernels.kernel import Kernel, KernelSpec, KernelType
+
+    src = (
+        "@triton.jit\ndef _helper(): pass\n"
+        "@triton.jit\ndef main_kernel(): pass\n"
+    )
+    spec = KernelSpec(
+        name="t",
+        kernel_type=KernelType.ELEMENTWISE,
+        entrypoint="run",
+    )
+
+    cache_dir = tmp_path / "cache"
+    fake_source_path = tmp_path / "fake_compiled.py"
+    fake_source_path.write_text("# stub\n")
+
+    def fake_compile_kernel(kernel, cache_dir=None):
+        return CompilationResult(
+            success=True,
+            compiled_fn=lambda *a, **kw: None,
+            source_path=fake_source_path,
+        )
+
+    captured_names: list[str] = []
+    canned_ncu = NCUMetrics(
+        sm_occupancy_pct=55.0,
+        l2_hit_rate_pct=72.0,
+        tensor_core_util_pct=0.0,
+        warp_stall_dominant="long_scoreboard",
+        warp_stall_dominant_pct=42.0,
+        warp_stall_runner_up="wait",
+        warp_stall_runner_up_pct=18.0,
+    )
+
+    def fake_run_ncu(*args, **kwargs):
+        captured_names.append(kwargs["kernel_name"])
+        # Fake stdout that the canned parser would produce — but we'll
+        # short-circuit by patching _parse_ncu_csv too.
+        return "", 0, False, None
+
+    def fake_parse_ncu_csv(stdout, kernel_name):
+        return canned_ncu, {"raw": 1.0}, False, None
+
+    monkeypatch.setattr(profiler_mod, "_discover_ncu_binary", lambda: "/usr/bin/ncu")
+    monkeypatch.setattr(profiler_mod, "_run_ncu", fake_run_ncu)
+    monkeypatch.setattr(profiler_mod, "_parse_ncu_csv", fake_parse_ncu_csv)
+    monkeypatch.setattr(profiler_mod, "compile_kernel", fake_compile_kernel)
+
+    kernel_main = Kernel(spec=spec, source_code=src, triton_kernel_name="main_kernel")
+    kernel_helper = Kernel(spec=spec, source_code=src, triton_kernel_name="_helper")
+
+    profile_kernel(
+        kernel_main, sample_workload, _identity_input_generator,
+        hardware_spec=_rtx6000_ada(),
+        flops=1_000_000, nbytes=4_000_000, latency_s=1e-3,
+        mode="curated", timeout_s=10.0, cache_dir=cache_dir,
+    )
+    profile_kernel(
+        kernel_helper, sample_workload, _identity_input_generator,
+        hardware_spec=_rtx6000_ada(),
+        flops=1_000_000, nbytes=4_000_000, latency_s=1e-3,
+        mode="curated", timeout_s=10.0, cache_dir=cache_dir,
+    )
+
+    # Both runs must have invoked _run_ncu — second call cannot have hit
+    # the first call's cache entry.
+    assert captured_names == ["main_kernel", "_helper"], (
+        f"Expected separate NCU subprocess invocations per declared kernel "
+        f"name; got captured names: {captured_names}"
+    )
+
+
 # ── atomic writes ──────────────────────────────────────────────────────────
 
 

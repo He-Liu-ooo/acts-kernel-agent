@@ -182,7 +182,7 @@ Analytical failures raise `ProfilerError` and kill the branch. NCU failures neve
 
 ### Cache
 
-Source-hash-keyed JSON cache: key = `sha256(source_hash + repr(workload) + mode + _METRIC_SET_VERSION)[:16]`. `_METRIC_SET_VERSION` is bumped when the curated metric map, stall reasons, or parser contract changes so stale entries are unreachable. Writes are atomic (`tempfile.mkstemp` + `os.replace`) and swallow OSError — caching is best-effort, never branch-killing.
+Source-hash-keyed JSON cache: key = `sha256(source_hash + repr(workload) + mode + kernel_name + _METRIC_SET_VERSION)[:16]`. The resolved `kernel_name` (Coder-declared → regex → entrypoint) participates in the key so two `Kernel` objects with identical source but different declared `triton_kernel_name` values can't alias to one entry — without this, a fused output where the Coder renamed the dominant kernel would silently receive cached metrics NCU collected on a helper jit'd function. `_METRIC_SET_VERSION` is bumped when the curated metric map, stall reasons, parser contract, or *cache-key shape* changes so stale entries are unreachable; the v1→v2 bump (Codex P2 fix, 2026-04-22) was the cache-key-shape change that added `kernel_name`. Writes are atomic (`tempfile.mkstemp` + `os.replace`) and swallow OSError — caching is best-effort, never branch-killing.
 
 ### Modes
 
