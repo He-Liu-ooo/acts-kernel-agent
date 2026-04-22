@@ -378,19 +378,15 @@ class Orchestrator:
                 epsilon = max(self._config.epsilon_end, epsilon - decay)
                 continue
 
-            child.score = compute_sol_score(
-                baseline_bench.median_latency_us,
-                bench.median_latency_us,
-                roofline.t_sol_us,
-            )
-            child.per_workload_latency_us = bench.per_workload_latency_us
-
             # Profile the child on the representative workload. Analytical
             # failure (ProfilerError: zero latency, missing peaks) is
             # branch-killing — the latency measurement is meaningless
             # without a basis for roofline comparison. NCU subprocess
             # failure degrades the profile (ncu=None) but the analytical
             # block still drives per-iter metrics and the branch survives.
+            # Score and per-workload latencies are deferred past this
+            # gauntlet so ``best_node()`` (which filters on ``score is not
+            # None``) cannot promote a profile-killed branch.
             profiling = None
             repr_workload_latency_s = _representative_latency_s(
                 bench, workloads, repr_idx
@@ -445,6 +441,12 @@ class Orchestrator:
                     problem.op_type if problem is not None else "<no-problem>",
                 )
             child.profiling = profiling
+            child.score = compute_sol_score(
+                baseline_bench.median_latency_us,
+                bench.median_latency_us,
+                roofline.t_sol_us,
+            )
+            child.per_workload_latency_us = bench.per_workload_latency_us
 
             # Reviewer sees the same trajectory as the Planner, extended
             # through the just-scored child so `prev_sol_score` + the path's

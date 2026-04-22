@@ -220,6 +220,45 @@ class TestProfilerErrorMarksDeadEnd:
         # Reviewer must be skipped when profile fails — no profile to hand it.
         assert harness.reviewer.review.await_count == 0
 
+    @pytest.mark.asyncio
+    async def test_profiler_killed_child_cannot_become_best_node(self, harness):
+        """``SearchTree.best_node()`` filters only on ``score is not None`` —
+        if a ProfilerError-killed child still carried the score its benchmark
+        produced, a branch we declared DEAD_END could be returned as the
+        final winner. Score must only be committed after the profile DEAD_END
+        gauntlet clears."""
+        from src.search.orchestrator import Orchestrator
+
+        # Child's benchmark is faster than the baseline → its SOL score
+        # would beat the root if we let it through.
+        baseline_bench = BenchmarkResult(median_latency_us=100.0, timed_runs=1)
+        faster_child_bench = BenchmarkResult(median_latency_us=40.0, timed_runs=1)
+        profile_fake = MagicMock(
+            side_effect=ProfilerError("latency_s must be positive, got 0.0")
+        )
+
+        with (
+            patch(
+                "src.eval.benchmark.benchmark_kernel",
+                side_effect=[baseline_bench, faster_child_bench],
+            ),
+            patch("src.eval.profiler.profile_kernel", profile_fake),
+        ):
+            orch = Orchestrator(
+                harness.config, harness.planner, harness.coder,
+                harness.reviewer, harness.retriever,
+            )
+            result = await orch.run(harness.baseline, workloads=None, roofline=harness.roofline)
+
+        child = [n for n in result.tree._nodes.values() if n.parent_id is not None][0]
+        assert child.branch_quality is BranchQuality.DEAD_END
+        # Critical: the profile-killed child must carry no score, so
+        # best_node() cannot promote it over the root.
+        assert child.score is None
+        assert result.best_node.id == 0, (
+            "best_node must not return a branch killed by profile failure"
+        )
+
 
 class TestDegradedProfileKeepsBranchAlive:
     @pytest.mark.asyncio
