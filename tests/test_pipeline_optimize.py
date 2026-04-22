@@ -210,6 +210,51 @@ async def test_populated_hardware_spec_from_caller_preserved():
     assert passed.hardware.DRAM_byte_per_cycle == 100.0
 
 
+# ── CLI argument parsing (T2) ─────────────────────────────────────────
+
+
+def test_main_defaults_to_placeholder_when_no_arg():
+    """`python -m src.pipeline.optimize` with no args must keep the historical
+    placeholder smoke-path so existing CI / docs invocations don't break."""
+    from src.pipeline import optimize as opt_mod
+
+    captured: dict = {}
+
+    async def fake_optimize(problem_path, config=None):
+        captured["problem_path"] = problem_path
+        return MagicMock()
+
+    with (
+        patch.object(opt_mod, "optimize", side_effect=fake_optimize),
+        patch("src.pipeline.report.generate_report", return_value=MagicMock()),
+        patch("src.pipeline.report.render_report", return_value=""),
+    ):
+        opt_mod.main([])
+
+    assert captured["problem_path"] == "placeholder"
+
+
+def test_main_forwards_problem_path_to_optimize():
+    """Positional argument selects which SOL-ExecBench problem to run.
+    Forwarded verbatim — the optimize() coroutine handles directory vs literal."""
+    from src.pipeline import optimize as opt_mod
+
+    captured: dict = {}
+
+    async def fake_optimize(problem_path, config=None):
+        captured["problem_path"] = problem_path
+        return MagicMock()
+
+    with (
+        patch.object(opt_mod, "optimize", side_effect=fake_optimize),
+        patch("src.pipeline.report.generate_report", return_value=MagicMock()),
+        patch("src.pipeline.report.render_report", return_value=""),
+    ):
+        opt_mod.main(["repo/benchmark/SOL-ExecBench/examples/triton/rmsnorm"])
+
+    assert captured["problem_path"] == "repo/benchmark/SOL-ExecBench/examples/triton/rmsnorm"
+
+
 @pytest.mark.asyncio
 async def test_placeholder_mode_never_loads_model():
     """Placeholder baseline is a stub. If a model config exists on disk and we

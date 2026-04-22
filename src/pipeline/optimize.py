@@ -195,11 +195,37 @@ def _load_model_if_configured():
     return create_model(config)
 
 
-def main() -> None:
-    """CLI entry point."""
+def main(argv: list[str] | None = None) -> None:
+    """CLI entry point.
+
+    ``argv`` is exposed so unit tests can drive ``main()`` without
+    monkey-patching ``sys.argv`` — production callers (the ``__main__``
+    block) pass ``None`` and argparse reads ``sys.argv[1:]``.
+    """
+    import argparse
+
     from src.pipeline.report import generate_report, render_report
 
-    result = asyncio.run(optimize("placeholder"))
+    parser = argparse.ArgumentParser(
+        prog="python -m src.pipeline.optimize",
+        description=(
+            "Run the ACTS optimization pipeline against a SOL-ExecBench problem "
+            "directory (containing ``definition.json`` + ``workload.jsonl``), "
+            "or the literal string ``placeholder`` for the matmul demo."
+        ),
+    )
+    parser.add_argument(
+        "problem_path",
+        nargs="?",
+        default="placeholder",
+        help=(
+            "Path to a SOL-ExecBench problem directory, or ``placeholder`` "
+            "(default) to exercise the no-LLM matmul smoke path."
+        ),
+    )
+    args = parser.parse_args(argv)
+
+    result = asyncio.run(optimize(args.problem_path))
     print(render_report(generate_report(result)))
 
 
