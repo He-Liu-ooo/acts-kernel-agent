@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from conftest import rtx6000_ada_hardware as _rtx6000_ada
+from src.agents.coder import KernelCodeOutput
 from src.agents.planner import OptimizationPlan
 from src.agents.reviewer import BranchQuality, ReviewerFeedback
 from src.config import ACTSConfig, HardwareSpec
@@ -99,7 +100,12 @@ def harness():
         tier=1, technique="tiling", params={}, target_region="", rationale="",
     ))
     coder = MagicMock()
-    coder.implement = AsyncMock(return_value="# child source")
+    coder.implement = AsyncMock(
+        return_value=KernelCodeOutput.model_construct(
+            source_code="# child source",
+            triton_kernel_name="",
+        )
+    )
     reviewer = MagicMock()
     reviewer.review = AsyncMock(return_value=ReviewerFeedback(
         outcome="improved",

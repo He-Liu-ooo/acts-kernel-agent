@@ -35,8 +35,12 @@ from tests.conftest import (
 
 
 def test_output_model_accepts_valid_data():
-    out = KernelCodeOutput(source_code="@triton.jit\ndef k(): pass")
+    out = KernelCodeOutput(
+        source_code="@triton.jit\ndef k(): pass",
+        triton_kernel_name="k",
+    )
     assert out.source_code.startswith("@triton.jit")
+    assert out.triton_kernel_name == "k"
 
 
 def test_output_model_requires_source_code():
@@ -44,6 +48,70 @@ def test_output_model_requires_source_code():
 
     with pytest.raises(ValidationError):
         KernelCodeOutput()  # type: ignore[call-arg]
+
+
+def test_output_model_requires_triton_kernel_name():
+    """T4: Coder must declare which @triton.jit kernel NCU should profile.
+    Empty / missing triton_kernel_name is a Pydantic validation failure
+    so the SDK's tool loop retries within the existing turn budget."""
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        KernelCodeOutput(source_code="@triton.jit\ndef k(): pass")  # type: ignore[call-arg]
+    with pytest.raises(ValidationError, match="required"):
+        KernelCodeOutput(
+            source_code="@triton.jit\ndef k(): pass",
+            triton_kernel_name="",
+        )
+
+
+def test_output_model_rejects_kernel_name_not_in_source():
+    """The declared kernel name must literally appear in source_code as
+    ``@triton.jit\\ndef <name>``. Mismatch → silent NCU mis-profile in
+    production, so we surface it as a validation failure."""
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="not found"):
+        KernelCodeOutput(
+            source_code="@triton.jit\ndef actual_name(): pass",
+            triton_kernel_name="claimed_name",
+        )
+
+
+def test_output_model_rejects_source_with_no_triton_jit():
+    """The Coder writes Triton kernels — pure-PyTorch source means it
+    skipped its job. Reject before the kernel reaches the orchestrator."""
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="@triton.jit"):
+        KernelCodeOutput(
+            source_code="def run(x):\n    return x * 2.0\n",
+            triton_kernel_name="run",
+        )
+
+
+def test_output_model_accepts_multiple_jit_defs_with_matching_name():
+    """Fused kernels can declare ``@triton.jit`` helpers alongside the main
+    kernel. The Coder picks the dominant-work kernel; we only verify the
+    declared name is one of the jit'd defs (not necessarily the first)."""
+    src = (
+        "@triton.jit\ndef _epilogue(): pass\n"
+        "@triton.jit\ndef main_kernel(): pass\n"
+    )
+    out = KernelCodeOutput(source_code=src, triton_kernel_name="main_kernel")
+    assert out.triton_kernel_name == "main_kernel"
+
+    # The helper is also a valid choice — Coder is the source of truth.
+    out2 = KernelCodeOutput(source_code=src, triton_kernel_name="_epilogue")
+    assert out2.triton_kernel_name == "_epilogue"
+
+
+def test_output_model_jit_decorator_with_args_recognized():
+    """``@triton.jit(do_not_specialize=...)`` should still match — the
+    regex tolerates decorator arguments."""
+    src = "@triton.jit(do_not_specialize=['n'])\ndef tuned_kernel(n): pass"
+    out = KernelCodeOutput(source_code=src, triton_kernel_name="tuned_kernel")
+    assert out.triton_kernel_name == "tuned_kernel"
 
 
 # ── prompt assembly ─────────────────────────────────────────────────────
@@ -254,7 +322,11 @@ async def test_implement_without_model_returns_source_unchanged():
         reference_fn=_ref,
         input_generators=[_gen],
     )
-    assert out == src
+    assert isinstance(out, KernelCodeOutput)
+    assert out.source_code == src
+    # No-model placeholder path can't declare a kernel name (no LLM to ask) —
+    # downstream profiler falls back to source-regex extraction when this is empty.
+    assert out.triton_kernel_name == ""
 
 
 # ── implement() — LLM path (mocked) ─────────────────────────────────────
@@ -263,7 +335,10 @@ async def test_implement_without_model_returns_source_unchanged():
 @pytest.mark.asyncio
 async def test_implement_calls_llm_and_returns_modified_source():
     """With a model, implement() builds the Agent with bound tools and runs it."""
-    mock_output = KernelCodeOutput(source_code="@triton.jit\ndef k(): return 42")
+    mock_output = KernelCodeOutput(
+        source_code="@triton.jit\ndef k(): return 42",
+        triton_kernel_name="k",
+    )
     mock_result = MagicMock()
     mock_result.final_output = mock_output
 
@@ -291,7 +366,9 @@ async def test_implement_calls_llm_and_returns_modified_source():
             input_generators=[_gen],
         )
 
-    assert result == "@triton.jit\ndef k(): return 42"
+    assert isinstance(result, KernelCodeOutput)
+    assert result.source_code == "@triton.jit\ndef k(): return 42"
+    assert result.triton_kernel_name == "k"
     mock_run.assert_awaited_once()
     # Agent was constructed with exactly two tools (compile + correctness).
     kwargs = mock_agent_cls.call_args.kwargs
@@ -329,7 +406,7 @@ async def test_implement_binds_all_generators_to_correctness_tool():
     """Phase B must bind every selected workload's generator to the correctness
     tool — else a kernel that passes workload 1 but breaks 2..N slips through."""
     gens = [MagicMock(name=f"gen_{i}") for i in range(3)]
-    mock_result = MagicMock(final_output=KernelCodeOutput(source_code="ok"))
+    mock_result = MagicMock(final_output=KernelCodeOutput.model_construct(source_code="ok", triton_kernel_name=""))
 
     captured = {}
     def capture_factory(*args, **kwargs):
@@ -383,7 +460,7 @@ async def test_implement_raises_on_llm_failure():
 async def test_implement_passes_default_max_turns_when_no_config():
     """No config → default ACTSConfig.max_debug_retries=3 → max_turns = 2*3+1 = 7."""
     mock_result = MagicMock()
-    mock_result.final_output = KernelCodeOutput(source_code="ok")
+    mock_result.final_output = KernelCodeOutput.model_construct(source_code="ok", triton_kernel_name="")
 
     with (
         patch("src.agents.coder.Agent"),
@@ -409,7 +486,7 @@ async def test_implement_passes_default_max_turns_when_no_config():
 async def test_implement_max_turns_derived_from_config():
     """max_debug_retries=5 → max_turns = 2*5+1 = 11."""
     mock_result = MagicMock()
-    mock_result.final_output = KernelCodeOutput(source_code="ok")
+    mock_result.final_output = KernelCodeOutput.model_construct(source_code="ok", triton_kernel_name="")
 
     with (
         patch("src.agents.coder.Agent"),
@@ -435,7 +512,7 @@ async def test_implement_max_turns_derived_from_config():
 async def test_implement_uses_zero_temperature():
     """Coder runs with temperature=0.0 — deterministic code generation."""
     mock_result = MagicMock()
-    mock_result.final_output = KernelCodeOutput(source_code="ok")
+    mock_result.final_output = KernelCodeOutput.model_construct(source_code="ok", triton_kernel_name="")
 
     with (
         patch("src.agents.coder.Agent"),
@@ -486,7 +563,10 @@ async def test_translate_without_model_raises():
 @pytest.mark.asyncio
 async def test_translate_builds_agent_with_two_tools_and_returns_source():
     """translate() constructs a fresh Agent with compile + correctness tools."""
-    mock_output = KernelCodeOutput(source_code="@triton.jit\ndef kernel_fn(x): pass")
+    mock_output = KernelCodeOutput(
+        source_code="@triton.jit\ndef kernel_fn(x): pass",
+        triton_kernel_name="kernel_fn",
+    )
     mock_result = MagicMock(final_output=mock_output)
 
     with (
@@ -504,7 +584,9 @@ async def test_translate_builds_agent_with_two_tools_and_returns_source():
             input_generators=[_gen],
         )
 
-    assert result == "@triton.jit\ndef kernel_fn(x): pass"
+    assert isinstance(result, KernelCodeOutput)
+    assert result.source_code == "@triton.jit\ndef kernel_fn(x): pass"
+    assert result.triton_kernel_name == "kernel_fn"
     mock_run.assert_awaited_once()
     kwargs = mock_agent_cls.call_args.kwargs
     assert len(kwargs["tools"]) == 2  # compile + correctness
@@ -513,7 +595,7 @@ async def test_translate_builds_agent_with_two_tools_and_returns_source():
 @pytest.mark.asyncio
 async def test_translate_user_prompt_contains_reference_and_entrypoint():
     """Prompt must surface the source to translate and the target entrypoint."""
-    mock_result = MagicMock(final_output=KernelCodeOutput(source_code="ok"))
+    mock_result = MagicMock(final_output=KernelCodeOutput.model_construct(source_code="ok", triton_kernel_name=""))
     with (
         patch("src.agents.coder.Agent"),
         patch("src.agents.coder.run_agent", new_callable=AsyncMock) as mock_run,
@@ -537,7 +619,7 @@ async def test_translate_user_prompt_contains_reference_and_entrypoint():
 @pytest.mark.asyncio
 async def test_translate_uses_distinct_translate_instructions():
     """translate() loads translate.md — separate from the optimize system.md."""
-    mock_result = MagicMock(final_output=KernelCodeOutput(source_code="ok"))
+    mock_result = MagicMock(final_output=KernelCodeOutput.model_construct(source_code="ok", triton_kernel_name=""))
     with (
         patch("src.agents.coder.Agent") as mock_agent_cls,
         patch("src.agents.coder.run_agent", new_callable=AsyncMock) as mock_run,
@@ -584,7 +666,7 @@ async def test_translate_raises_on_llm_failure():
 @pytest.mark.asyncio
 async def test_translate_uses_zero_temperature():
     """Like implement(), translate() pins temperature=0.0 for determinism."""
-    mock_result = MagicMock(final_output=KernelCodeOutput(source_code="ok"))
+    mock_result = MagicMock(final_output=KernelCodeOutput.model_construct(source_code="ok", triton_kernel_name=""))
     with (
         patch("src.agents.coder.Agent"),
         patch("src.agents.coder.run_agent", new_callable=AsyncMock) as mock_run,

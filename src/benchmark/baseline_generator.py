@@ -65,7 +65,7 @@ async def generate_triton_baseline(
 
     for _ in range(max_retries):
         try:
-            source = await coder.translate(
+            output = await coder.translate(
                 reference_source=problem.reference_source,
                 kernel_spec=spec,
                 reference_fn=reference_fn,
@@ -74,7 +74,11 @@ async def generate_triton_baseline(
         except ImplementationError:
             continue
 
-        candidate = Kernel(spec=spec, source_code=source)
+        candidate = Kernel(
+            spec=spec,
+            source_code=output.source_code,
+            triton_kernel_name=output.triton_kernel_name,
+        )
         compiled = compile_kernel(candidate, cache_dir=cache_dir)
         if not compiled.success:
             continue

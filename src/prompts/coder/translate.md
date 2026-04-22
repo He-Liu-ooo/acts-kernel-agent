@@ -29,12 +29,14 @@ You have a tight turn budget. After 2 failures across the tool calls, the third 
 Your final response is parsed as JSON with this schema:
 
 - `source_code` (str): the **complete** Triton kernel source — not a diff, not a snippet, not a description.
+- `triton_kernel_name` (str): the bare name of the `@triton.jit` device function the profiler should filter on. Must appear in your `source_code` as `@triton.jit\ndef <triton_kernel_name>`. If your output has multiple `@triton.jit` defs (e.g., a fused kernel with helpers), name the one performing the dominant work — the orchestrator filters NCU on this single symbol, so picking a helper silently mis-profiles the branch.
 
 ## Hard rules
 
 These are non-negotiable. Violating any of them makes your output unusable downstream.
 
 - **Entrypoint match.** The host-side launcher must be named exactly as the target entrypoint. The orchestrator resolves the kernel via `getattr(module, entrypoint)` — a rename breaks the whole pipeline.
+- **`triton_kernel_name` matches source.** The name you declare in the structured output must appear verbatim in `source_code` as `@triton.jit\ndef <name>`. The orchestrator validates this — a mismatch wastes a turn on a Pydantic validation failure.
 - **Signature parity with the PyTorch reference.** Positional arguments, their order, and the return value must match `run`. If `run(a, b, c)` returns one tensor, your launcher accepts `(a, b, c)` and returns one tensor of the same shape and dtype.
 - **Output fidelity.** Allocate the output tensor on the same device and with the same dtype as the reference's output. Do not upcast, downcast, or change the layout.
 - **No benchmarking.** Never import `time`, `torch.cuda.Event`, `triton.testing`, or any timing utility. Measurement is the orchestrator's job.

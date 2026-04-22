@@ -18,7 +18,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
 try:
     from agents import Agent, function_tool
@@ -34,6 +34,7 @@ if TYPE_CHECKING:
 from src.agents.llm_backend import make_run_config, render_kernel_section, run_agent
 from src.config import ACTSConfig
 from src.eval.correctness import ComparisonPolicy, verify_correctness
+from src.eval.profiler import triton_kernel_names_in
 from src.kernels.compiler import compile_kernel
 from src.kernels.kernel import Kernel, KernelSpec
 
@@ -41,9 +42,39 @@ PROMPT_DIR = Path(__file__).resolve().parent.parent / "prompts" / "coder"
 
 
 class KernelCodeOutput(BaseModel):
-    """Structured output schema enforced on the LLM's final response."""
+    """Structured output schema enforced on the LLM's final response.
+
+    ``triton_kernel_name`` is the bare name of the ``@triton.jit`` device
+    function the profiler should filter NCU on. Cross-validated against
+    ``source_code``: must appear in the source as ``@triton.jit def
+    <name>``. When the kernel is fused (multiple ``@triton.jit`` defs),
+    the Coder names the one performing the dominant work — picking the
+    wrong one silently mis-profiles the branch (T4 design rationale).
+    """
 
     source_code: str
+    triton_kernel_name: str
+
+    @model_validator(mode="after")
+    def _triton_kernel_name_matches_source(self) -> "KernelCodeOutput":
+        names = triton_kernel_names_in(self.source_code)
+        if not names:
+            raise ValueError(
+                "source_code must define at least one ``@triton.jit def`` — "
+                "the Coder writes Triton kernels, not bare PyTorch.",
+            )
+        if not self.triton_kernel_name:
+            raise ValueError(
+                "triton_kernel_name is required and must match one of the "
+                f"@triton.jit defs in source: {names}",
+            )
+        if self.triton_kernel_name not in names:
+            raise ValueError(
+                f"triton_kernel_name={self.triton_kernel_name!r} not found in "
+                f"source as ``@triton.jit def {self.triton_kernel_name}``. "
+                f"Source defines: {names}",
+            )
+        return self
 
 
 class ImplementationError(Exception):
@@ -211,7 +242,7 @@ class CoderAgent:
         kernel_spec: KernelSpec,
         reference_fn: Callable[..., Any],
         input_generators: list[Callable[[int], tuple]],
-    ) -> str:
+    ) -> KernelCodeOutput:
         compile_tool = function_tool(_make_compile_tool(kernel_spec))
         correctness_tool = function_tool(
             _make_correctness_tool(
@@ -235,7 +266,7 @@ class CoderAgent:
         )
         if result is None:
             raise ImplementationError("LLM call failed after all retries.")
-        return result.final_output.source_code
+        return result.final_output
 
     async def implement(
         self,
@@ -245,17 +276,27 @@ class CoderAgent:
         kernel_spec: KernelSpec | None = None,
         reference_fn: Callable[..., Any] | None = None,
         input_generators: list[Callable[[int], tuple]] | None = None,
-    ) -> str:
+    ) -> KernelCodeOutput:
         """Apply the optimization plan to the kernel source code.
 
-        Returns the final kernel source from the LLM's structured output.
-        The result may be a degraded best-effort if the SDK tool loop
-        exhausted the turn budget — downstream verification handles that.
+        Returns the structured Coder output (``source_code`` plus a
+        Pydantic-validated ``triton_kernel_name``) so the caller can
+        thread the declared kernel symbol into a fresh ``Kernel`` for
+        downstream profiling. The result may be a degraded best-effort
+        if the SDK tool loop exhausted the turn budget — downstream
+        verification handles that. In the no-model placeholder path the
+        method returns a stub ``KernelCodeOutput`` with the unchanged
+        source and an empty kernel-name (validation skipped via
+        ``model_construct``); the orchestrator's profiler-resolution
+        chain falls back to source-regex extraction in that case.
         Raises ``ImplementationError`` when the LLM call exhausts retries
         or when the correctness context is missing while a model is configured.
         """
         if self._model is None:
-            return kernel_source
+            return KernelCodeOutput.model_construct(
+                source_code=kernel_source,
+                triton_kernel_name="",
+            )
 
         if kernel_spec is None or reference_fn is None or not input_generators:
             raise ImplementationError(
@@ -298,14 +339,16 @@ class CoderAgent:
         kernel_spec: KernelSpec,
         reference_fn: Callable[..., Any],
         input_generators: list[Callable[[int], tuple]],
-    ) -> str:
+    ) -> KernelCodeOutput:
         """Port a PyTorch reference into a Triton kernel in one agent run.
 
         Used at problem-load time by ``benchmark.baseline_generator``.
-        Callers post-verify after translation because the SDK may emit a
-        degraded best-effort when the turn budget is exhausted.
-        Raises ``ImplementationError`` when no model is configured or when
-        the LLM call exhausts its retries.
+        Returns the structured Coder output so the baseline ``Kernel``
+        carries the Pydantic-validated ``triton_kernel_name`` from the
+        moment it enters the search tree. Callers post-verify after
+        translation because the SDK may emit a degraded best-effort when
+        the turn budget is exhausted. Raises ``ImplementationError`` when
+        no model is configured or when the LLM call exhausts its retries.
         """
         if self._model is None:
             raise ImplementationError(

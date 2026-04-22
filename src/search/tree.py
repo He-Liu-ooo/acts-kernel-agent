@@ -263,6 +263,7 @@ def _serialize_kernel(kernel: Kernel) -> dict:
         "num_warps": kernel.num_warps,
         "num_stages": kernel.num_stages,
         "block_size": kernel.block_size,
+        "triton_kernel_name": kernel.triton_kernel_name,
     }
 
 
@@ -306,6 +307,9 @@ def _deserialize_node(data: dict) -> TreeNode:
         num_warps=k["num_warps"],
         num_stages=k["num_stages"],
         block_size=k["block_size"],
+        # ``.get`` with empty-string default keeps legacy checkpoints
+        # (pre-T4) loadable; the profiler's regex fallback handles them.
+        triton_kernel_name=k.get("triton_kernel_name", ""),
     )
 
     return TreeNode(

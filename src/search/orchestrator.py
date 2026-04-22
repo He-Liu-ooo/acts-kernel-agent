@@ -335,16 +335,23 @@ class Orchestrator:
             # `reference_fn` / `input_generators` are threaded into the
             # compile + correctness tools the Coder binds per call — the
             # full generator list so cross-workload bugs surface in-turn.
-            new_source = await self._coder.implement(
+            coder_output = await self._coder.implement(
                 kernel_source=parent.kernel.source_code,
                 plan=plan,
                 kernel_spec=baseline.spec,
                 reference_fn=reference_fn,
                 input_generators=input_generators,
             )
+            new_source = coder_output.source_code
 
-            # Build child kernel
-            child_kernel = Kernel(spec=baseline.spec, source_code=new_source)
+            # Build child kernel — carry the Coder's declared
+            # ``triton_kernel_name`` so the profiler skips the regex
+            # fallback and filters NCU on the symbol the Coder named.
+            child_kernel = Kernel(
+                spec=baseline.spec,
+                source_code=new_source,
+                triton_kernel_name=coder_output.triton_kernel_name,
+            )
             child = tree.add_child(parent.id, child_kernel, plan.technique)
 
             # Child-benchmark failure is branch-local: BenchmarkError

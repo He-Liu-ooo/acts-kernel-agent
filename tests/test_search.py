@@ -370,6 +370,74 @@ class TestTreeCheckpoint:
         # constructed ProfilingResult.
         assert loaded.get_node(0).profiling is None
 
+    def test_save_load_preserves_triton_kernel_name(self, tmp_path: Path):
+        """T4: ``Kernel.triton_kernel_name`` must round-trip so a checkpointed
+        run keeps profiling the symbol the Coder originally declared. Legacy
+        checkpoints (no field) must rehydrate to ``""`` so the profiler's
+        regex fallback can still attribute the kernel name from source."""
+        tree = SearchTree()
+        named = Kernel(
+            spec=KernelSpec(name="k", kernel_type=KernelType.MATMUL),
+            source_code="@triton.jit\ndef declared_kernel(): pass",
+            triton_kernel_name="declared_kernel",
+        )
+        unnamed = Kernel(
+            spec=KernelSpec(name="legacy", kernel_type=KernelType.MATMUL),
+            source_code="# placeholder",
+        )
+        root = tree.add_root(named)
+        tree.add_child(root.id, unnamed, "fuse")
+        save_path = tmp_path / "tree.json"
+        tree.save(save_path)
+        loaded = SearchTree.load(save_path)
+
+        assert loaded.get_node(root.id).kernel.triton_kernel_name == "declared_kernel"
+        assert loaded.get_node(1).kernel.triton_kernel_name == ""  # default
+
+    def test_load_legacy_checkpoint_without_triton_kernel_name(self, tmp_path: Path):
+        """A pre-T4 checkpoint that was written before the ``triton_kernel_name``
+        field existed must still load cleanly — the profiler's regex fallback
+        is the safety net for legacy state."""
+        import json
+        legacy_payload = {
+            "next_id": 1,
+            "nodes": {
+                "0": {
+                    "id": 0,
+                    "parent_id": None,
+                    "children_ids": [],
+                    "action_applied": "baseline",
+                    "depth": 0,
+                    "branch_quality": None,
+                    "score": None,
+                    "kernel": {
+                        "spec": {
+                            "name": "legacy",
+                            "kernel_type": "matmul",
+                            "flop_count": 0,
+                            "memory_bytes": 0,
+                            "input_shapes": [],
+                            "definition_path": None,
+                            "pytorch_reference": "",
+                            "t_sol_us": None,
+                        },
+                        "source_code": "@triton.jit\ndef k(): pass",
+                        "num_warps": 4,
+                        "num_stages": 2,
+                        "block_size": {},
+                        # No "triton_kernel_name" key — pre-T4 shape.
+                    },
+                    "profiling": None,
+                    "per_workload_latency_us": None,
+                },
+            },
+        }
+        save_path = tmp_path / "legacy.json"
+        save_path.write_text(json.dumps(legacy_payload))
+
+        loaded = SearchTree.load(save_path)
+        assert loaded.get_node(0).kernel.triton_kernel_name == ""
+
     def test_save_load_preserves_per_workload_latency_us(self, tmp_path: Path):
         """``TreeNode.per_workload_latency_us`` is populated from the child
         benchmark so Phase C can re-profile each workload at its *own* latency
@@ -531,8 +599,15 @@ def _orch_harness():
     planner.plan = AsyncMock(return_value=OptimizationPlan(
         tier=1, technique="tiling", params={}, target_region="", rationale=""
     ))
+    from src.agents.coder import KernelCodeOutput
+
     coder = MagicMock()
-    coder.implement = AsyncMock(return_value="# child source")
+    coder.implement = AsyncMock(
+        return_value=KernelCodeOutput.model_construct(
+            source_code="# child source",
+            triton_kernel_name="",
+        )
+    )
     reviewer = MagicMock()
     reviewer.review = AsyncMock()  # test sets return_value
     retriever = MagicMock()

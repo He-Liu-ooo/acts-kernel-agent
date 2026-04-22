@@ -554,6 +554,26 @@ A kernel can shift its effective bottleneck only by changing its data access pat
 - `src/pipeline/optimize.py` now applies the zero-peak placeholder hardware substitution to caller-supplied `ACTSConfig` as well, not just the `config is None` path. Without this, `optimize(problem_path, config=ACTSConfig())` would hit the orchestrator's new fail-fast guard and raise before the first iteration.
 - `src/search/orchestrator.py` defers assigning `child.score` + `child.per_workload_latency_us` to the tree node until after the profile DEAD_END gauntlet clears. `SearchTree.best_node()` filters on `score is not None` and ignores `branch_quality`, so a ProfilerError-killed branch with a high benchmark score could otherwise be promoted as the final winner.
 
+### Coder declares `triton_kernel_name` explicitly (T4, 2026-04-22)
+
+**Context**: Pre-flight for the first live GPU run revealed the profiler's NCU `--kernel-name regex:` filter was sourced via `_extract_triton_kernel_name(source)` — a regex that returns the *first* `@triton.jit def` in the kernel source. For single-kernel modules this is correct. For fused kernels with helper jit functions (`@triton.jit def _epilogue` followed by `@triton.jit def main_kernel`), the regex would silently profile the helper instead of the dominant kernel — bad metrics flowing into Reviewer diagnosis without any visible failure.
+
+**Three options considered**:
+
+- **A — Prompt-only**: Update `prompts/coder/system.md` to mandate the `@triton.jit + host wrapper` convention. Cheap; doesn't address the multi-jit case (still picks first via regex). Failure mode is silent NCU degradation.
+- **B — Prompt + tool-side validation**: Same as A plus a regex check inside `compile_kernel_tool` that asserts at least one `@triton.jit def` exists. Catches "no triton.jit at all" in-loop but does not address the multi-jit ambiguity — still picks first via regex.
+- **C — Pydantic field + explicit declaration**: Add `triton_kernel_name: str` to `KernelCodeOutput` with a `@model_validator(mode="after")` that asserts the declared name appears in source as `@triton.jit def <name>`. Coder is responsible for naming the dominant kernel. Profiler reads `Kernel.triton_kernel_name` first; regex extraction stays as fallback for hand-written starters / test fixtures.
+
+**Decision: C**, despite the wider blast radius. Three reasons:
+
+1. **The worst failure mode of A and B is the worst kind of bug**: silently mis-profiled metrics flowing into the Reviewer's diagnosis. C surfaces the mismatch as a Pydantic validation failure the SDK can retry against, before a single subprocess runs.
+2. **C aligns with the project's existing pattern**: every other agent-orchestrator boundary in the codebase (`PlanOutput`, `ReviewerFeedbackOutput`) already carries explicit Pydantic-validated metadata. The "Coder generates source, profiler regex-extracts the bit it needs" path was the only place where load-bearing metadata travelled via implicit string parsing.
+3. **C moves the source of truth to the right place**. With regex-only extraction, the contract "what NCU profiles" lived in two places: the kernel source string AND the regex in `profiler.py`. If Triton evolves (`@triton.autotune` wrapping `@triton.jit`, future DSL syntax), the regex breaks silently. With C, the contract lives in the schema; regex demotes to defense-in-depth.
+
+**Implementation**: `Kernel.triton_kernel_name` field added (default `""` for back-compat with hand-written kernels and pre-T4 checkpoints). `KernelCodeOutput.triton_kernel_name` is required, cross-validated against `triton_kernel_names_in(source_code)` (the multi-name-returning sibling of `_extract_triton_kernel_name`). `CoderAgent.implement` and `.translate` now return `KernelCodeOutput` (not bare `str`) so callers thread both fields through. `profile_kernel` resolution priority is `kernel.triton_kernel_name → regex fallback → entrypoint last-ditch`. Coder system + translate prompts both gain a Hard Rule documenting the schema.
+
+**What's NOT in scope** (intentional YAGNI): no separate `KernelSpec.host_wrapper_name` field — `entrypoint` already plays that role at the per-problem level. No memory_store migration — the new field is on `Kernel`, not `Experience`. No regex deprecation — kept as fallback for hand-written / test kernels.
+
 ---
 
 ## Backend

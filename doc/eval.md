@@ -160,7 +160,9 @@ NCU wraps a fresh Python subprocess that imports the compiled kernel and launche
 
 Input resolution priority: (1) `problem_dir` → `load_problem(dir)` + `build_input_generator(problem, workload)(seed)` (orchestrator path); (2) `module.make_inputs(seed)` if the source exposes it (self-contained kernel convention — primary Tier 2 path); (3) `spec["args"]` as last-resort literal; (4) `()`.
 
-Host-callable resolution: prefers `module.run` (the Triton host wrapper that launches the JIT'd kernel via `fn[grid](...)`), falls back to `module.<entrypoint>`. `spec.entrypoint` is the host-wrapper name — **not** the GPU kernel symbol NCU filters on. The GPU symbol is extracted from source by `_extract_triton_kernel_name()` (regex against `@triton.jit\s*(?:\(...\))?\s*\n\s*def\s+(\w+)`) and used as `--kernel-name regex:<name>`.
+Host-callable resolution: prefers `module.run` (the Triton host wrapper that launches the JIT'd kernel via `fn[grid](...)`), falls back to `module.<entrypoint>`. `spec.entrypoint` is the host-wrapper name — **not** the GPU kernel symbol NCU filters on.
+
+GPU-symbol resolution priority (T4): (1) `Kernel.triton_kernel_name` declared by the Coder via `KernelCodeOutput` and Pydantic-validated against the source's `@triton.jit def` matches; (2) `_extract_triton_kernel_name(source)` regex fallback (first `@triton.jit def`) — used for hand-written starters and test fixtures whose `Kernel.triton_kernel_name` is empty; (3) `kernel.spec.entrypoint` last-ditch (NCU degrades to `no_matching_kernel` rather than crash). The declared-name path is the load-bearing one for fused outputs with multiple `@triton.jit` defs — picking the first via regex would silently mis-profile a helper rather than the dominant kernel.
 
 Subprocess invocation uses `sys.executable` (not bare `"python"`) so the child inherits the venv with torch/triton installed. `TMPDIR` is redirected to a user-scoped `/tmp/<user>_ncu` so `nsight-compute-lock` files owned by other users on shared hosts can't block the run.
 

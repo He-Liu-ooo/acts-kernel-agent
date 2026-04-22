@@ -539,3 +539,121 @@ def test_problem_definition_path_forwarded_to_run_ncu(
     )
 
     assert captured.get("problem_definition_path") == problem_path
+
+
+# ── T4: kernel_name resolution priority chain ─────────────────────────────
+
+
+def _capture_kernel_name(monkeypatch, tmp_path) -> dict:
+    """Helper: short-circuit ``_run_ncu`` and ``compile_kernel`` so the
+    test can use real-shaped Triton source without needing triton in the
+    Tier 1 venv. Captures the ``kernel_name`` ``profile_kernel`` resolves."""
+    from src.kernels.compiler import CompilationResult
+
+    captured: dict = {}
+
+    def fake_run_ncu(*args, **kwargs):
+        captured.update(kwargs)
+        return "", 0, True, "short-circuit"
+
+    fake_source_path = tmp_path / "fake_compiled.py"
+    fake_source_path.write_text("# fake compiled output — driver short-circuits before exec\n")
+
+    def fake_compile_kernel(kernel, cache_dir=None):
+        return CompilationResult(
+            success=True,
+            compiled_fn=lambda *a, **kw: None,
+            source_path=fake_source_path,
+        )
+
+    monkeypatch.setattr(profiler_mod, "_discover_ncu_binary", lambda: "/usr/bin/ncu")
+    monkeypatch.setattr(profiler_mod, "_run_ncu", fake_run_ncu)
+    monkeypatch.setattr(profiler_mod, "compile_kernel", fake_compile_kernel)
+    return captured
+
+
+def _profile(kernel, workload, sample_workload):
+    return profile_kernel(
+        kernel,
+        sample_workload,
+        _identity_input_generator,
+        hardware_spec=_rtx6000_ada(),
+        flops=1_000_000,
+        nbytes=4_000_000,
+        latency_s=1e-3,
+        mode="curated",
+        timeout_s=10.0,
+        cache_dir=None,
+    )
+
+
+def test_declared_triton_kernel_name_used_directly(
+    tmp_path, sample_workload, monkeypatch
+):
+    """T4: when the Coder declared ``triton_kernel_name``, the profiler
+    must filter NCU on it without re-extracting from source. Source-regex
+    fallback is for hand-written kernels only."""
+    captured = _capture_kernel_name(monkeypatch, tmp_path)
+    kernel = Kernel(
+        spec=KernelSpec(
+            name="t",
+            kernel_type=KernelType.ELEMENTWISE,
+            entrypoint="run",
+        ),
+        # Source has TWO @triton.jit defs — the regex would pick the first
+        # (``_helper``); the declared name picks the second.
+        source_code=(
+            "@triton.jit\ndef _helper(): pass\n"
+            "@triton.jit\ndef main_kernel(): pass\n"
+            "def run(): main_kernel[(1,)]()\n"
+        ),
+        triton_kernel_name="main_kernel",
+    )
+
+    _profile(kernel, sample_workload, sample_workload)
+
+    assert captured.get("kernel_name") == "main_kernel"
+
+
+def test_empty_triton_kernel_name_falls_back_to_source_regex(
+    tmp_path, sample_workload, monkeypatch
+):
+    """Hand-written starters / test fixtures leave ``triton_kernel_name``
+    empty. The profiler falls back to the existing regex extraction so
+    the matmul demo + Tier 1 test kernels keep working."""
+    captured = _capture_kernel_name(monkeypatch, tmp_path)
+    kernel = Kernel(
+        spec=KernelSpec(
+            name="t",
+            kernel_type=KernelType.ELEMENTWISE,
+            entrypoint="run",
+        ),
+        source_code="@triton.jit\ndef extracted_kernel(): pass\ndef run(): pass\n",
+        triton_kernel_name="",
+    )
+
+    _profile(kernel, sample_workload, sample_workload)
+
+    assert captured.get("kernel_name") == "extracted_kernel"
+
+
+def test_no_triton_jit_in_source_falls_back_to_entrypoint(
+    tmp_path, sample_workload, monkeypatch
+):
+    """Last-ditch path: no declared name, no @triton.jit in source. NCU
+    will degrade to ``no_matching_kernel`` rather than crash — preserving
+    today's behavior on pathological inputs."""
+    captured = _capture_kernel_name(monkeypatch, tmp_path)
+    kernel = Kernel(
+        spec=KernelSpec(
+            name="t",
+            kernel_type=KernelType.ELEMENTWISE,
+            entrypoint="bare_entrypoint",
+        ),
+        source_code="def bare_entrypoint(): pass\n",
+        triton_kernel_name="",
+    )
+
+    _profile(kernel, sample_workload, sample_workload)
+
+    assert captured.get("kernel_name") == "bare_entrypoint"

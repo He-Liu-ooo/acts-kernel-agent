@@ -71,3 +71,9 @@ class Kernel:
     num_warps: int = 4
     num_stages: int = 2
     block_size: dict[str, int] = field(default_factory=dict)
+    # Bare name of the ``@triton.jit`` device function the profiler should
+    # filter NCU on. Declared by the Coder via ``KernelCodeOutput`` so the
+    # source-of-truth lives with the kernel that owns it; empty for hand-
+    # written starters / test fixtures, where ``profile_kernel`` falls
+    # back to source-regex extraction.
+    triton_kernel_name: str = ""

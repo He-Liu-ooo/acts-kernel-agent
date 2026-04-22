@@ -106,6 +106,18 @@ def _extract_triton_kernel_name(source: str) -> str | None:
     return match.group(1) if match else None
 
 
+def triton_kernel_names_in(source: str) -> list[str]:
+    """All ``@triton.jit def <name>`` matches in source order.
+
+    Public so the Coder's ``KernelCodeOutput`` validator can cross-check
+    a declared ``triton_kernel_name`` against the actual jit'd functions
+    in the emitted source. Returns an empty list when the source contains
+    no Triton-JIT'd kernel — caller decides whether that's a failure
+    (Coder validation) or a fallback signal (profiler regex extraction).
+    """
+    return _TRITON_JIT_DEF_RE.findall(source)
+
+
 class ProfilerError(Exception):
     """Raised when the analytical path cannot produce a classification.
 
@@ -580,7 +592,16 @@ def profile_kernel(
         raise ProfilerError(
             f"compile_kernel failed before NCU invocation: {compile_result.error_message}"
         )
-    kernel_name = _extract_triton_kernel_name(kernel.source_code) or kernel.spec.entrypoint
+    # Priority: Coder-declared name (validated upstream) →
+    # source-regex fallback (hand-written starters / test fixtures with
+    # an empty declared name) → entrypoint last-ditch (so we degrade to
+    # ``no_matching_kernel`` rather than crash when neither source has
+    # a ``@triton.jit`` def at all).
+    kernel_name = (
+        kernel.triton_kernel_name
+        or _extract_triton_kernel_name(kernel.source_code)
+        or kernel.spec.entrypoint
+    )
 
     stdout, _rc, driver_degraded, driver_reason = _run_ncu(
         kernel,
