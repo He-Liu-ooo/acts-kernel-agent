@@ -4,7 +4,14 @@ End-to-end optimization entry points.
 
 ## optimize.py — Main Entry Point
 
-`python -m src.pipeline.optimize`
+CLI:
+
+```
+python -m src.pipeline.optimize [problem_path] [--trace-dir DIR]
+```
+
+- `problem_path` (positional, optional) — SOL-ExecBench problem directory (contains `definition.json` + `workload.jsonl`), or the literal string `placeholder` for the built-in matmul demo. Default `"placeholder"` preserves the no-LLM smoke path.
+- `--trace-dir DIR` (optional) — directory for per-run JSONL trace files capturing every LLM input/output, tool call, and span via `src.agents.trace_processor.JSONLTraceProcessor`. Defaults to `./traces`. Pass `--trace-dir=` (empty) to disable capture.
 
 ### Phase A: Load Problem
 
@@ -81,9 +88,9 @@ When `winner_profiling_per_workload` is populated, a "Winner profile (per worklo
 
 ## Running the Pipeline
 
-**Placeholder mode** — the default CLI (`python -m src.pipeline.optimize`) runs the matmul starter without GPU, LLM, or SOL-ExecBench. `main()` runs `optimize("placeholder")` and prints `render_report(generate_report(result))`. No model is loaded — every agent stays in no-op mode, the baseline comes from `make_matmul_kernel`, and with no workloads `benchmark_kernel` returns its 100us sentinel so the report emits a scoring block with baseline == best (speedup 1.00x). This only exercises the scaffold end-to-end; it is not a meaningful search result.
+**Placeholder mode** — the default CLI (`python -m src.pipeline.optimize`, no positional arg) runs the matmul starter without GPU, LLM, or SOL-ExecBench. `main()` resolves `args.problem_path == "placeholder"`, runs `optimize("placeholder")`, and prints `render_report(generate_report(result))`. No model is loaded — every agent stays in no-op mode, the baseline comes from `make_matmul_kernel`, and with no workloads `benchmark_kernel` returns its 100us sentinel so the report emits a scoring block with baseline == best (speedup 1.00x). This only exercises the scaffold end-to-end; it is not a meaningful search result.
 
-**SOL mode** — call `optimize(problem_path=<sol-dir>)` with a SOL-ExecBench problem directory. Requires `configs/models/<provider>.json` (or `$ACTS_MODEL_CONFIG` pointing at one) and the `openai-agents` SDK installed; `generate_triton_baseline` fails closed otherwise with `BaselineGenerationError`.
+**SOL mode** — pass a SOL-ExecBench problem directory as the positional argument: `python -m src.pipeline.optimize /abs/path/to/sol/problem/` (or from a Python caller: `optimize(problem_path=<sol-dir>)`). Requires `configs/models/<provider>.json` (or `$ACTS_MODEL_CONFIG` pointing at one) and the `openai-agents` SDK installed; `generate_triton_baseline` fails closed otherwise with `BaselineGenerationError`.
 
 Phase B runs real CUDA-event benchmarking (`eval/benchmark.py`) end-to-end. `eval/profiler.py` provides analytical roofline metrics (required, fail-closed) plus a best-effort NCU subprocess for curated signals. Phase C populates `winner_per_workload_bottlenecks` whenever `workloads` + `hardware_spec` reach `generate_report`.
 

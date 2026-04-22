@@ -34,6 +34,7 @@ A single *version*: source code + Triton tuning parameters. Every search tree no
 | `num_warps` | int | Triton num_warps parameter |
 | `num_stages` | int | Triton num_stages for pipelining |
 | `block_size` | dict[str,int] | Block dimensions (e.g., BLOCK_M, BLOCK_N) |
+| `triton_kernel_name` | str | Bare name of the `@triton.jit` device function the profiler filters NCU on. Defaults to `""` for hand-written starters / test fixtures — the profiler's priority chain (`Kernel.triton_kernel_name` → source-regex → `spec.entrypoint`) handles the empty case via the fallback. Coder-produced kernels populate it via the `submit_kernel` tool's Pydantic-validated argument. |
 
 Read `source_code` directly — it's the full Triton source string.
 

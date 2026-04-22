@@ -35,7 +35,7 @@
 
 ### Implemented during Coder phase (real logic, not placeholders)
 
-- [x] agents/coder.py — tool-using Agent with Pydantic `KernelCodeOutput`, `build_user_prompt()`, `ImplementationError`, turn budget `2*max_debug_retries+1` (= 7 by default), temperature 0.0 for determinism. Tools wire to real `compile_kernel` / `verify_correctness` via closure-captured `KernelSpec` + `reference_fn` + **`input_generators` (list, one per selected workload — correctness tool iterates all, short-circuits on first failure)** at call time. Second entry point `translate()` (one-shot PyTorch→Triton port for baseline generation) shares tool wiring with `implement()` via private `_run_tool_agent` helper; `has_model` property for callers that must branch before reaching into internals.
+- [x] agents/coder.py — tool-using Agent with Pydantic `KernelCodeOutput`, `build_user_prompt()`, `ImplementationError`, turn budget `2*max_debug_retries+2` (= 8 by default — the +2 over 2N reserves the `submit_kernel` tool call and its final plain-text confirmation; see live-GPU-run pre-flight T4 + option-α entries below), temperature 0.0 for determinism. Tools wire to real `compile_kernel` / `verify_correctness` via closure-captured `KernelSpec` + `reference_fn` + **`input_generators` (list, one per selected workload — correctness tool iterates all, short-circuits on first failure)** at call time. Second entry point `translate()` (one-shot PyTorch→Triton port for baseline generation) shares tool wiring with `implement()` via private `_run_tool_agent` helper; `has_model` property for callers that must branch before reaching into internals.
 - [x] prompts/coder/ — system.md (prescribed compile-then-correctness workflow, hard rules, anti-patterns, one sanctioned failure mode) + implement.md (user-prompt format doc) + translate.md (baseline-port system prompt: port PyTorch `run` to Triton `kernel_fn`, signature invariance, no precision drop)
 - [x] agents/llm_backend.py — added optional `max_turns` kwarg to `run_agent()` (threads SDK tool-loop bound) and `render_kernel_section()` helper (replaces triple-duplicated fence+escape logic in coder/planner/reviewer)
 - [x] Planner/Reviewer temperature bumped 0.0 → 0.3 — Coder stays at 0.0 (determinism for code gen), upstream agents get variance for technique exploration / diagnosis wording; strict Pydantic enums still pin schema
@@ -195,7 +195,7 @@ Items marked `(skeleton)` have interfaces + placeholder logic that keeps the pip
 - [x] prompts/coder/ (done) — system.md (prescribed workflow, hard rules, one sanctioned failure mode) + implement.md (user-prompt format)
 - [x] prompts/reviewer/ (done) — system.md (diagnostic reasoning) + interpret.md
 - [x] agents/planner.py (done) — Pydantic output_type, build_user_prompt(), PlanningError, technique validation
-- [x] agents/coder.py (done) — tool-using Agent, Pydantic `KernelCodeOutput`, `ImplementationError`, `_MAX_TURNS=7` (see Deferred: config wiring), placeholder tools until compiler/correctness land
+- [x] agents/coder.py (done) — tool-using Agent, Pydantic `KernelCodeOutput`, `ImplementationError`, `_max_turns = 2*config.max_debug_retries + 2` (= 8 by default; +2 over 2N covers the `submit_kernel` tool call + final plain-text confirmation), placeholder tools until compiler/correctness land
 - [x] agents/reviewer.py (done) — Pydantic ReviewerFeedbackOutput, build_user_prompt, rule-based fallback (`degraded`/`error_reason`), configurable `prompt_dir`
 
 ### Phase 5: Search
