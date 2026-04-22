@@ -56,10 +56,23 @@ def compile_kernel(
     source_hash = hashlib.sha256(source.encode("utf-8")).hexdigest()[:12]
     stem = f"{kernel.spec.name}_{source_hash}"
     source_path = cache_dir / f"{stem}.py"
-    source_path.write_text(source)
-
     entrypoint = kernel.spec.entrypoint
     module_name = f"acts_compiled_{stem}"
+
+    # Source hash pins (name, content) → (path, module_name). If the
+    # module is already imported, Phase C's N re-profiles of the same
+    # winning kernel reuse the exec_module result instead of re-parsing.
+    cached_module = sys.modules.get(module_name)
+    if cached_module is not None and source_path.exists():
+        fn = getattr(cached_module, entrypoint, None)
+        if callable(fn):
+            return CompilationResult(
+                success=True,
+                compiled_fn=fn,
+                source_path=source_path,
+            )
+
+    source_path.write_text(source)
 
     try:
         spec = importlib.util.spec_from_file_location(module_name, source_path)
