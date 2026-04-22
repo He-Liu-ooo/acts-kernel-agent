@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from src.agents.reviewer import BranchQuality
+    from src.eval.profiler import ProfilingResult
     from src.eval.scorer import ScoreResult
     from src.kernels.kernel import Kernel
 
@@ -27,6 +29,16 @@ class TreeNode:
     branch_quality: BranchQuality | None = None
     action_applied: str = ""
     depth: int = 0
+    # Populated after each iteration's profile_kernel call. None for the
+    # root (no profile run at baseline construction) and for children
+    # whose benchmark failed (see orchestrator dead_end path).
+    profiling: ProfilingResult | None = None
+    # Per-workload latency (µs) carried from the child's BenchmarkResult.
+    # Phase C's winner re-profile reads this to drive each workload's
+    # analytical metrics off its *own* latency rather than the aggregate
+    # median. ``None`` on the root and on legacy checkpoints predating
+    # the field; report.py falls back to the aggregate in that case.
+    per_workload_latency_us: dict[str, float] | None = None
 
 
 class SearchTree:
@@ -175,6 +187,49 @@ def _serialize_node(node: TreeNode) -> dict:
         "branch_quality": node.branch_quality.value if isinstance(node.branch_quality, BranchQuality) else None,
         "score": _serialize_score(node.score),
         "kernel": _serialize_kernel(node.kernel),
+        "profiling": _serialize_profiling(node.profiling),
+        "per_workload_latency_us": _serialize_per_workload_latency(node.per_workload_latency_us),
+    }
+
+
+def _serialize_per_workload_latency(
+    per_workload_latency_us: dict[str, float] | None,
+) -> dict[str, float] | None:
+    """``math.inf`` is a legitimate sentinel for "workload crashed" but JSON
+    rejects it — round-trip via the sentinel string ``"inf"``. ``None``
+    passes through unchanged so legacy checkpoints (and the root node) stay
+    distinguishable from "measured, empty"."""
+    if per_workload_latency_us is None:
+        return None
+    return {
+        uuid: ("inf" if math.isinf(v) else v)
+        for uuid, v in per_workload_latency_us.items()
+    }
+
+
+def _deserialize_per_workload_latency(
+    data: dict | None,
+) -> dict[str, float] | None:
+    if data is None:
+        return None
+    return {
+        uuid: (float("inf") if v == "inf" else float(v))
+        for uuid, v in data.items()
+    }
+
+
+def _serialize_profiling(profiling):
+    """Serialize a ProfilingResult for checkpoint. Returns ``None`` when
+    the node has no profile (root, or a branch that died before the
+    profiler ran).
+    """
+    if profiling is None:
+        return None
+    return {
+        "analytical": asdict(profiling.analytical),
+        "ncu": asdict(profiling.ncu) if profiling.ncu is not None else None,
+        "raw_metrics": dict(profiling.raw_metrics),
+        "degraded_reason": profiling.degraded_reason,
     }
 
 
@@ -262,4 +317,47 @@ def _deserialize_node(data: dict) -> TreeNode:
         branch_quality=bq,
         action_applied=data["action_applied"],
         depth=data["depth"],
+        profiling=_deserialize_profiling(data.get("profiling")),
+        per_workload_latency_us=_deserialize_per_workload_latency(
+            data.get("per_workload_latency_us")
+        ),
+    )
+
+
+def _deserialize_profiling(data):
+    """Rehydrate a ``ProfilingResult`` from checkpoint JSON. Returns
+    ``None`` when the node was saved without profile data (old-format
+    checkpoints or nodes that never profiled)."""
+    if data is None:
+        return None
+    from src.eval.profiler import AnalyticalMetrics, NCUMetrics, ProfilingResult
+
+    a = data["analytical"]
+    # Stale ``classification`` keys on legacy checkpoints are silently
+    # ignored — the field lives at the run level now (see ``classify_run``).
+    analytical = AnalyticalMetrics(
+        arithmetic_intensity=a["arithmetic_intensity"],
+        ridge_point=a["ridge_point"],
+        achieved_tflops=a["achieved_tflops"],
+        achieved_bandwidth_gb_s=a["achieved_bandwidth_gb_s"],
+        pct_peak_compute=a["pct_peak_compute"],
+        pct_peak_bandwidth=a["pct_peak_bandwidth"],
+    )
+    ncu = None
+    if data.get("ncu") is not None:
+        n = data["ncu"]
+        ncu = NCUMetrics(
+            sm_occupancy_pct=n["sm_occupancy_pct"],
+            l2_hit_rate_pct=n["l2_hit_rate_pct"],
+            tensor_core_util_pct=n["tensor_core_util_pct"],
+            warp_stall_dominant=n["warp_stall_dominant"],
+            warp_stall_dominant_pct=n["warp_stall_dominant_pct"],
+            warp_stall_runner_up=n["warp_stall_runner_up"],
+            warp_stall_runner_up_pct=n["warp_stall_runner_up_pct"],
+        )
+    return ProfilingResult(
+        analytical=analytical,
+        ncu=ncu,
+        raw_metrics=dict(data.get("raw_metrics") or {}),
+        degraded_reason=data.get("degraded_reason"),
     )

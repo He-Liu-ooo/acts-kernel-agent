@@ -60,6 +60,7 @@ def test_output_model_defaults():
 def test_build_user_prompt_contains_all_sections():
     """The assembled user prompt includes kernel source, profiling,
     experiences, available actions, and reviewer feedback."""
+    from src.eval.types import BottleneckType
     from src.memory.experience import ActionRecord, Experience
 
     agent = PlannerAgent(model=None)
@@ -68,7 +69,7 @@ def test_build_user_prompt_contains_all_sections():
             kernel_type="matmul",
             action_applied=ActionRecord(action_id="tile_sizes", tier=1, name="tile_sizes"),
             speedup=1.3,
-            bottleneck_before="memory_bound",
+            bottleneck_before=BottleneckType.MEMORY_BOUND,
             success=True,
             hardware="H100",
         ),
@@ -93,6 +94,7 @@ def test_build_user_prompt_contains_all_sections():
 def test_build_user_prompt_includes_experience_parameters():
     """Past experiences include action parameters so the Planner can
     distinguish failed parameterizations from untried ones."""
+    from src.eval.types import BottleneckType
     from src.memory.experience import ActionRecord, Experience
 
     agent = PlannerAgent(model=None)
@@ -106,7 +108,7 @@ def test_build_user_prompt_includes_experience_parameters():
                 parameters={"block_size": "128"},
             ),
             speedup=0.9,
-            bottleneck_before="memory_bound",
+            bottleneck_before=BottleneckType.MEMORY_BOUND,
             success=False,
             hardware="H100",
         ),

@@ -15,7 +15,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from src.config import ACTSConfig
+from src.config import ACTSConfig, HardwareSpec
 from src.kernels.kernel import Kernel, KernelSpec, KernelType
 from src.pipeline.optimize import _load_sol_execbench, optimize
 
@@ -121,6 +121,63 @@ async def test_optimize_forwards_correctness_context_to_orchestrator():
     kwargs = fake_orch.run.call_args.kwargs
     assert kwargs["reference_fn"] is ref_fn
     assert kwargs["input_generators"] == gens
+
+
+@pytest.mark.asyncio
+async def test_placeholder_substitutes_nonzero_hardware_spec():
+    """``detect_hardware()`` returns a zeroed HardwareSpec until real detection
+    lands; feeding that into ``Orchestrator.run`` trips the fail-fast guard and
+    the placeholder CLI dies before the first iteration. ``optimize()`` must
+    substitute a populated placeholder so ``python -m src.pipeline.optimize``
+    stays runnable on a machine without an arch YAML."""
+    baseline = Kernel(spec=_spec(), source_code="src")
+    fake_orch = MagicMock()
+    fake_orch.run = AsyncMock(return_value=MagicMock())
+
+    with (
+        patch("src.pipeline.optimize._load_model_if_configured", return_value=None),
+        patch("src.config.detect_hardware", return_value=HardwareSpec()),  # zeros
+        patch("src.search.orchestrator.Orchestrator", return_value=fake_orch) as mock_orch_cls,
+        patch("src.memory.store.MemoryStore", return_value=MagicMock()),
+        patch("src.kernels.starters.matmul.make_matmul_kernel", return_value=baseline),
+    ):
+        await optimize("placeholder")
+
+    config = mock_orch_cls.call_args.kwargs["config"]
+    assert config.hardware.peak_flops_fp32 > 0, (
+        "optimize() must substitute a populated placeholder HardwareSpec when "
+        "detect_hardware() returns zeroed peaks"
+    )
+    assert config.hardware.peak_memory_bandwidth_gb_s > 0
+
+
+@pytest.mark.asyncio
+async def test_populated_hardware_spec_from_caller_preserved():
+    """When the caller supplies a populated HardwareSpec via ``config``, the
+    placeholder substitution must NOT fire — caller's spec wins."""
+    baseline = Kernel(spec=_spec(), source_code="src")
+    fake_orch = MagicMock()
+    fake_orch.run = AsyncMock(return_value=MagicMock())
+    # Non-zero but obviously synthetic peaks so we can detect pass-through.
+    custom_hw = HardwareSpec(
+        name="CustomTest",
+        freq_GHz=1.0,
+        DRAM_byte_per_cycle=100.0,
+        MAC_per_cycle_fp32_sm=50.0,
+    )
+    custom_config = ACTSConfig(hardware=custom_hw)
+
+    with (
+        patch("src.pipeline.optimize._load_model_if_configured", return_value=None),
+        patch("src.search.orchestrator.Orchestrator", return_value=fake_orch) as mock_orch_cls,
+        patch("src.memory.store.MemoryStore", return_value=MagicMock()),
+        patch("src.kernels.starters.matmul.make_matmul_kernel", return_value=baseline),
+    ):
+        await optimize("placeholder", config=custom_config)
+
+    passed = mock_orch_cls.call_args.kwargs["config"]
+    assert passed.hardware.name == "CustomTest"
+    assert passed.hardware.DRAM_byte_per_cycle == 100.0
 
 
 @pytest.mark.asyncio

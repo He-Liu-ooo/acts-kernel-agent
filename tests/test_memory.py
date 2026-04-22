@@ -1,8 +1,10 @@
 """Tests for memory/ — experience storage, retrieval, and ranking."""
 
+import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from src.eval.types import BottleneckType
 from src.memory.experience import ActionRecord, Experience
 from src.memory.store import MemoryStore
 from src.memory.retriever import MemoryRetriever
@@ -10,7 +12,7 @@ from src.memory.retriever import MemoryRetriever
 
 def _exp(
     kernel_type: str = "matmul",
-    bottleneck_before: str = "memory_bound",
+    bottleneck_before: BottleneckType = BottleneckType.MEMORY_BOUND,
     success: bool = True,
     speedup: float = 1.5,
     hardware: str = "H100",
@@ -46,7 +48,7 @@ def test_filters_by_kernel_type():
         _exp(kernel_type="softmax"),
         _exp(kernel_type="matmul"),
     )
-    results = r.retrieve("matmul", "memory_bound")
+    results = r.retrieve("matmul", BottleneckType.MEMORY_BOUND)
     assert len(results) == 2
     assert all(e.kernel_type == "matmul" for e in results)
 
@@ -57,11 +59,11 @@ def test_filters_by_kernel_type():
 def test_bottleneck_match_ranks_higher():
     """Experiences matching current bottleneck rank above non-matching."""
     r = _retriever(
-        _exp(bottleneck_before="compute_bound", speedup=3.0),
-        _exp(bottleneck_before="memory_bound", speedup=1.1),
+        _exp(bottleneck_before=BottleneckType.COMPUTE_BOUND, speedup=3.0),
+        _exp(bottleneck_before=BottleneckType.MEMORY_BOUND, speedup=1.1),
     )
-    results = r.retrieve("matmul", "memory_bound")
-    assert results[0].bottleneck_before == "memory_bound"
+    results = r.retrieve("matmul", BottleneckType.MEMORY_BOUND)
+    assert results[0].bottleneck_before == BottleneckType.MEMORY_BOUND
 
 
 # ── success/failure ranking ──────────────────────────────────────────────
@@ -73,7 +75,7 @@ def test_success_ranks_above_failure_same_bottleneck():
         _exp(success=False, speedup=0.8),
         _exp(success=True, speedup=1.5),
     )
-    results = r.retrieve("matmul", "memory_bound")
+    results = r.retrieve("matmul", BottleneckType.MEMORY_BOUND)
     assert results[0].success is True
 
 
@@ -87,7 +89,7 @@ def test_higher_speedup_ranks_first_among_equals():
         _exp(speedup=2.5),
         _exp(speedup=1.8),
     )
-    results = r.retrieve("matmul", "memory_bound")
+    results = r.retrieve("matmul", BottleneckType.MEMORY_BOUND)
     speedups = [e.speedup for e in results]
     assert speedups == sorted(speedups, reverse=True)
 
@@ -106,7 +108,7 @@ def test_failures_included_via_reserved_slots():
         _exp(success=False, speedup=0.3, action_id="f2"),
         top_k=5,
     )
-    results = r.retrieve("matmul", "memory_bound")
+    results = r.retrieve("matmul", BottleneckType.MEMORY_BOUND)
     failures = [e for e in results if not e.success]
     assert len(failures) >= 1
 
@@ -116,7 +118,7 @@ def test_failure_slots_scale_with_top_k():
     successes = [_exp(success=True, speedup=2.0 + i * 0.1, action_id=f"s{i}") for i in range(7)]
     failures = [_exp(success=False, speedup=0.5 + i * 0.1, action_id=f"f{i}") for i in range(5)]
     r = _retriever(*successes, *failures, top_k=9)
-    results = r.retrieve("matmul", "memory_bound")
+    results = r.retrieve("matmul", BottleneckType.MEMORY_BOUND)
     fail_count = sum(1 for e in results if not e.success)
     assert fail_count >= 3
 
@@ -128,7 +130,7 @@ def test_top_k_1_returns_best_success_not_failure():
         _exp(success=False, speedup=0.5, action_id="f1"),
         top_k=1,
     )
-    results = r.retrieve("matmul", "memory_bound")
+    results = r.retrieve("matmul", BottleneckType.MEMORY_BOUND)
     assert len(results) == 1
     assert results[0].success is True
 
@@ -141,7 +143,7 @@ def test_top_k_2_includes_both_pools():
         _exp(success=False, speedup=0.5, action_id="f1"),
         top_k=2,
     )
-    results = r.retrieve("matmul", "memory_bound")
+    results = r.retrieve("matmul", BottleneckType.MEMORY_BOUND)
     assert len(results) == 2
     successes = [e for e in results if e.success]
     failures = [e for e in results if not e.success]
@@ -160,7 +162,7 @@ def test_all_successes_when_no_failures_exist():
         _exp(success=True, speedup=1.2, action_id="a3"),
         top_k=5,
     )
-    results = r.retrieve("matmul", "memory_bound")
+    results = r.retrieve("matmul", BottleneckType.MEMORY_BOUND)
     assert len(results) == 3
     assert all(e.success for e in results)
 
@@ -172,7 +174,7 @@ def test_all_failures_when_no_successes_exist():
         _exp(success=False, speedup=0.5, action_id="f2"),
         top_k=5,
     )
-    results = r.retrieve("matmul", "memory_bound")
+    results = r.retrieve("matmul", BottleneckType.MEMORY_BOUND)
     assert len(results) == 2
     assert all(not e.success for e in results)
 
@@ -184,7 +186,7 @@ def test_never_exceeds_top_k():
     """Result count is capped at top_k regardless of store size."""
     exps = [_exp(action_id=f"a{i}", speedup=1.0 + i * 0.1) for i in range(20)]
     r = _retriever(*exps, top_k=5)
-    results = r.retrieve("matmul", "memory_bound")
+    results = r.retrieve("matmul", BottleneckType.MEMORY_BOUND)
     assert len(results) <= 5
 
 
@@ -194,7 +196,7 @@ def test_never_exceeds_top_k():
 def test_empty_store_returns_empty():
     """No experiences => empty result."""
     r = _retriever(top_k=5)
-    results = r.retrieve("matmul", "memory_bound")
+    results = r.retrieve("matmul", BottleneckType.MEMORY_BOUND)
     assert results == []
 
 
@@ -209,7 +211,7 @@ def test_prefers_same_hardware():
         _exp(hardware="A100", speedup=2.0, action_id="a3"),
         top_k=2,
     )
-    results = r.retrieve("matmul", "memory_bound", hardware="H100")
+    results = r.retrieve("matmul", BottleneckType.MEMORY_BOUND, hardware="H100")
     assert all(e.hardware == "H100" for e in results)
 
 
@@ -220,7 +222,7 @@ def test_hardware_fallback_when_too_few():
         _exp(hardware="A100", speedup=2.0, action_id="a2"),
         top_k=3,
     )
-    results = r.retrieve("matmul", "memory_bound", hardware="H100")
+    results = r.retrieve("matmul", BottleneckType.MEMORY_BOUND, hardware="H100")
     assert len(results) == 2
     hw = {e.hardware for e in results}
     assert hw == {"H100", "A100"}
@@ -233,7 +235,7 @@ def test_no_hardware_filter_returns_all():
         _exp(hardware="A100", action_id="a2"),
         top_k=5,
     )
-    results = r.retrieve("matmul", "memory_bound")
+    results = r.retrieve("matmul", BottleneckType.MEMORY_BOUND)
     assert len(results) == 2
 
 
@@ -262,3 +264,79 @@ def test_store_empty_load():
         store = MemoryStore(Path(d) / "nope.json")
         store.load()
         assert store.all() == []
+
+
+# ── legacy / malformed bottleneck tolerance ──────────────────────────────
+
+
+def _write_legacy_record(path: Path, bottleneck_before: str, bottleneck_after: str) -> None:
+    """Dump one experience record with the given bottleneck strings.
+
+    The schema matches what older ``MemoryStore.save`` versions produced:
+    ``bottleneck_before`` is still live, while ``bottleneck_after`` is a
+    dead key preserved on-disk from pre-classify-once records. The load
+    path must tolerate both the empty-string default (pre-profiler-PR)
+    and the stale ``bottleneck_after`` key.
+    """
+    path.write_text(json.dumps([{
+        "kernel_type": "matmul",
+        "action_applied": {
+            "action_id": "tile_sizes", "tier": 1, "name": "tile_sizes",
+        },
+        "metrics": {},
+        "speedup": 1.0,
+        "reviewer_summary": "",
+        "bottleneck_before": bottleneck_before,
+        "bottleneck_after": bottleneck_after,
+        "hardware": "H100",
+        "success": True,
+    }]))
+
+
+def test_load_tolerates_legacy_empty_bottleneck_strings():
+    """Older MemoryStore files persisted ``bottleneck_before`` as ``""``.
+    Loading must not crash the store — fall back to ``BALANCED``."""
+    with TemporaryDirectory() as d:
+        path = Path(d) / "mem.json"
+        _write_legacy_record(path, "", "")
+
+        store = MemoryStore(path)
+        store.load()
+        loaded = store.all()
+
+        assert len(loaded) == 1
+        assert loaded[0].bottleneck_before is BottleneckType.BALANCED
+
+
+def test_load_tolerates_unknown_bottleneck_value():
+    """Values not in the enum (e.g. a schema change, a hand-edited file)
+    must fall back to ``BALANCED`` per record rather than aborting load."""
+    with TemporaryDirectory() as d:
+        path = Path(d) / "mem.json"
+        _write_legacy_record(path, "latency_bound", "compute_bound")
+
+        store = MemoryStore(path)
+        store.load()
+        loaded = store.all()
+
+        assert len(loaded) == 1
+        assert loaded[0].bottleneck_before is BottleneckType.BALANCED
+
+
+def test_load_ignores_legacy_bottleneck_after_key():
+    """``bottleneck_after`` is a dead field removed from ``Experience``.
+    Legacy JSON records that still carry the key must load cleanly: the
+    extra key is silently dropped, and the surviving fields parse as usual.
+    """
+    with TemporaryDirectory() as d:
+        path = Path(d) / "mem.json"
+        _write_legacy_record(path, "compute_bound", "memory_bound")
+
+        store = MemoryStore(path)
+        store.load()
+        loaded = store.all()
+
+        assert len(loaded) == 1
+        assert loaded[0].bottleneck_before is BottleneckType.COMPUTE_BOUND
+        # Dead field must not leak back onto the Experience instance.
+        assert not hasattr(loaded[0], "bottleneck_after")

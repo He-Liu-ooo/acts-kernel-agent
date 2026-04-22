@@ -12,6 +12,10 @@ import logging
 import random
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from src.eval.types import BottleneckType
 
 try:
     from agents import (
@@ -164,3 +168,11 @@ def render_kernel_section(kernel_source: str) -> str:
     """
     safe_source = kernel_source.replace("```", r"\`\`\`")
     return "## Current kernel\n```python\n" + safe_source + "\n```"
+
+
+def render_run_context(bottleneck: BottleneckType) -> str:
+    """Render the once-per-run context section shared by Planner and Reviewer
+    prompts. Callers that may not have a bottleneck are expected to gate
+    the call themselves rather than relying on a ``None`` return.
+    """
+    return f"## Run context\n- Bottleneck: {bottleneck.value}"

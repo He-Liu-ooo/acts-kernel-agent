@@ -22,9 +22,15 @@ except ModuleNotFoundError:  # pragma: no cover
 if TYPE_CHECKING:
     from agents import Agent, OpenAIChatCompletionsModel, RunResult
 
+    from src.eval.types import BottleneckType
     from src.memory.experience import Experience
 
-from src.agents.llm_backend import make_run_config, render_kernel_section, run_agent
+from src.agents.llm_backend import (
+    make_run_config,
+    render_kernel_section,
+    render_run_context,
+    run_agent,
+)
 
 PROMPT_DIR = Path(__file__).resolve().parent.parent / "prompts" / "planner"
 
@@ -108,11 +114,20 @@ class PlannerAgent:
         available_actions: list[str],
         tree_context: str = "",
         reviewer_feedback: str | None = None,
+        bottleneck: BottleneckType | None = None,
     ) -> str:
-        """Assemble the user prompt from runtime data."""
+        """Assemble the user prompt from runtime data.
+
+        ``bottleneck`` (when set) is rendered as a dedicated
+        "## Run context" section so the Planner sees the once-per-run
+        classification up front instead of having to reparse it from a
+        profiling summary.
+        """
         sections: list[str] = []
 
         sections.append(render_kernel_section(kernel_source))
+        if bottleneck is not None:
+            sections.append(render_run_context(bottleneck))
         sections.append("## Profiling summary\n" + profiling_summary)
 
         if past_experiences:
@@ -126,7 +141,7 @@ class PlannerAgent:
                 lines.append(
                     f"- {exp.action_applied.name} (tier {exp.action_applied.tier}){params_str}: "
                     f"{status}, speedup {exp.speedup}x, "
-                    f"bottleneck {exp.bottleneck_before} -> {exp.bottleneck_after}"
+                    f"bottleneck_before {exp.bottleneck_before.value}"
                 )
             sections.append("## Past experiences\n" + "\n".join(lines))
 
@@ -152,6 +167,7 @@ class PlannerAgent:
         available_actions: list[str],
         tree_context: str = "",
         reviewer_feedback: str | None = None,
+        bottleneck: BottleneckType | None = None,
     ) -> OptimizationPlan:
         """Generate a structured optimization plan for the next iteration."""
         if self._agent is None:
@@ -164,6 +180,7 @@ class PlannerAgent:
             available_actions=available_actions,
             tree_context=tree_context,
             reviewer_feedback=reviewer_feedback,
+            bottleneck=bottleneck,
         )
         result = await run_agent(
             self._agent,

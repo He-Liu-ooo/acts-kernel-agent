@@ -28,7 +28,16 @@ except ModuleNotFoundError:  # pragma: no cover
 if TYPE_CHECKING:
     from agents import Agent, OpenAIChatCompletionsModel, RunResult
 
-from src.agents.llm_backend import make_run_config, render_kernel_section, run_agent
+from src.agents.llm_backend import (
+    make_run_config,
+    render_kernel_section,
+    render_run_context,
+    run_agent,
+)
+
+if TYPE_CHECKING:
+    from src.eval.profiler import ProfilingResult
+    from src.eval.types import BottleneckType
 
 PROMPT_DIR = Path(__file__).resolve().parent.parent / "prompts" / "reviewer"
 
@@ -94,6 +103,55 @@ class ReviewerFeedback:
     error_reason: str = ""
 
 
+def render_profiling_summary(profiling: "ProfilingResult | None") -> str:
+    """Render a ``ProfilingResult`` into the two-block text the Reviewer
+    prompt expects. Used both by ``ReviewerAgent.build_user_prompt`` and
+    by ``pipeline.report.render_report`` so the format is consistent
+    across the reviewer and the final operator-facing summary.
+
+    When ``profiling`` is ``None``, returns a one-line notice so the
+    Reviewer knows it's operating without profile data (rather than
+    silently reusing stale context).
+    """
+    if profiling is None:
+        return "[no profiling data — profile_kernel did not run]"
+
+    a = profiling.analytical
+    lines = [
+        "### Analytical (roofline)",
+        f"- arithmetic_intensity: {a.arithmetic_intensity:.3f} FLOP/byte",
+        f"- ridge_point: {a.ridge_point:.3f} FLOP/byte",
+        f"- achieved: {a.achieved_tflops:.2f} TFLOPS / {a.achieved_bandwidth_gb_s:.2f} GB/s",
+        f"- pct_peak: compute {a.pct_peak_compute * 100:.1f}% · bw {a.pct_peak_bandwidth * 100:.1f}%",
+    ]
+
+    ncu = profiling.ncu
+    if ncu is not None:
+        lines.extend([
+            "",
+            "### NCU (curated)",
+            f"- sm_occupancy: {ncu.sm_occupancy_pct:.1f}%",
+            f"- l2_hit_rate: {ncu.l2_hit_rate_pct:.1f}%",
+            f"- tensor_core_util: {ncu.tensor_core_util_pct:.1f}%",
+            (
+                f"- top stalls: {ncu.warp_stall_dominant} "
+                f"({ncu.warp_stall_dominant_pct:.1f}%), "
+                f"{ncu.warp_stall_runner_up} "
+                f"({ncu.warp_stall_runner_up_pct:.1f}%)"
+            ),
+        ])
+    elif profiling.degraded:
+        # Surface the failure reason so the reviewer doesn't infer "NCU said
+        # there's no issue" from silence. Matches the DEGRADED notice in
+        # pipeline/report.py::render_report.
+        lines.extend([
+            "",
+            f"[DEGRADED: NCU unavailable — reason={profiling.degraded_reason or 'unknown'}]",
+        ])
+
+    return "\n".join(lines)
+
+
 def _output_to_feedback(out: ReviewerFeedbackOutput) -> ReviewerFeedback:
     """Convert Pydantic output to internal dataclass."""
     return ReviewerFeedback(
@@ -114,7 +172,7 @@ def rule_based_feedback(
     sol_score: float,
     prev_sol_score: float | None,
     headroom_pct: float,
-    bottleneck: str,
+    bottleneck: BottleneckType,
     degraded: bool = False,
     error_reason: str = "",
 ) -> ReviewerFeedback:
@@ -158,7 +216,7 @@ def rule_based_feedback(
     return ReviewerFeedback(
         outcome=outcome,
         metric_deltas={"sol_score": delta} if prev_sol_score is not None else {},
-        bottleneck_classification=bottleneck,
+        bottleneck_classification=bottleneck.value,
         bottleneck_diagnosis=diagnosis,
         branch_quality=branch,
         degraded=degraded,
@@ -203,20 +261,30 @@ class ReviewerAgent:
         profiling_summary: str,
         sol_score: float,
         headroom_pct: float,
-        bottleneck: str,
+        bottleneck: BottleneckType,
         tree_context: str = "",
         kb_context: str = "",
+        profiling: "ProfilingResult | None" = None,
     ) -> str:
-        """Assemble the user prompt from runtime data."""
+        """Assemble the user prompt from runtime data.
+
+        When ``profiling`` is supplied, it takes precedence over the raw
+        ``profiling_summary`` string — the analytical + NCU blocks (and
+        any degradation notice) are rendered from the dataclass so the
+        orchestrator doesn't have to stringify the result itself.
+        """
         sections: list[str] = []
 
         sections.append(render_kernel_section(kernel_source))
-        sections.append("## Profiling summary\n" + profiling_summary)
+        sections.append(render_run_context(bottleneck))
+        if profiling is not None:
+            sections.append("## Profiling summary\n" + render_profiling_summary(profiling))
+        else:
+            sections.append("## Profiling summary\n" + profiling_summary)
         sections.append(
             "## Scoring\n"
             f"- SOL score: {sol_score:.3f}\n"
-            f"- Headroom: {headroom_pct:.1f}%\n"
-            f"- Current bottleneck: {bottleneck}"
+            f"- Headroom: {headroom_pct:.1f}%"
         )
 
         if tree_context:
@@ -235,10 +303,11 @@ class ReviewerAgent:
         profiling_summary: str,
         sol_score: float,
         headroom_pct: float,
-        bottleneck: str,
+        bottleneck: BottleneckType,
         tree_context: str = "",
         kb_context: str = "",
         prev_sol_score: float | None = None,
+        profiling: "ProfilingResult | None" = None,
     ) -> ReviewerFeedback:
         """Interpret eval results into structured Reviewer feedback.
 
@@ -246,6 +315,11 @@ class ReviewerAgent:
         LLM call exhausts all retries. Strict Pydantic validation on the
         output makes hallucinated bottleneck/branch_quality values surface as
         retry-worthy errors inside `run_agent`.
+
+        ``profiling`` (when provided) supplies the analytical + NCU blocks
+        for the prompt. The rule-based fallback's bottleneck label is the
+        caller-provided ``bottleneck`` — the once-per-run classification,
+        invariant across iterations (see ``classify_run``).
         """
         if self._agent is None:
             return rule_based_feedback(
@@ -263,6 +337,7 @@ class ReviewerAgent:
             bottleneck=bottleneck,
             tree_context=tree_context,
             kb_context=kb_context,
+            profiling=profiling,
         )
         result = await run_agent(
             self._agent,

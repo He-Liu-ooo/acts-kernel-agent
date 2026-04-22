@@ -3,16 +3,39 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+from src.config import HardwareSpec
 
 if TYPE_CHECKING:
     from src.agents.coder import CoderAgent
     from src.config import ACTSConfig
     from src.search.orchestrator import SearchResult
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_MODEL_CONFIG_PATH = Path("configs/models/deepseek.json")
+
+# Populated stand-in used when ``detect_hardware()`` still returns a zeroed
+# spec (the placeholder path has no arch YAML on a dev machine). The
+# orchestrator's profiler guard rejects zero peaks, so without this the
+# default ``python -m src.pipeline.optimize`` smoke run would die on the
+# first iteration. Values mirror ``_rtx6000_ada()`` in the Tier 1/2 test
+# fixtures so the placeholder run produces representative roofline math.
+_PLACEHOLDER_HARDWARE_SPEC = HardwareSpec(
+    name="placeholder-RTX6000Ada",
+    freq_GHz=2.5,
+    SRAM_capacity=98_304 * 1024,
+    SRAM_byte_per_cycle=4000.0,
+    DRAM_capacity=48 * 1024**3,
+    DRAM_byte_per_cycle=384.0,
+    MAC_per_cycle_fp32_sm=12_800.0,
+    MAC_per_cycle_fp16_tc=512_000.0,
+    MAC_per_cycle_bf16_tc=512_000.0,
+)
 
 
 async def optimize(
@@ -46,7 +69,16 @@ async def optimize(
     from src.search.orchestrator import Orchestrator
 
     if config is None:
-        config = ACTSConfig(hardware=detect_hardware())
+        hw = detect_hardware()
+        if hw.peak_flops_fp32 <= 0 or hw.peak_memory_bandwidth_gb_s <= 0:
+            logger.warning(
+                "detect_hardware() returned a zeroed HardwareSpec — substituting "
+                "a populated placeholder (%s) so the orchestrator's profiler guard "
+                "passes. Load a SOLAR arch YAML for real runs.",
+                _PLACEHOLDER_HARDWARE_SPEC.name,
+            )
+            hw = _PLACEHOLDER_HARDWARE_SPEC
+        config = ACTSConfig(hardware=hw)
 
     # Gating the model load on SOL mode keeps the placeholder CLI runnable —
     # the placeholder baseline has no oracle, so a model-backed Coder would
@@ -88,6 +120,8 @@ async def optimize(
         roofline=roofline,
         reference_fn=reference_fn,
         input_generators=input_generators,
+        problem_definition_path=(problem.definition_path if problem is not None else None),
+        problem=problem,
     )
 
 

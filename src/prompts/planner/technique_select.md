@@ -8,11 +8,14 @@ The user prompt is assembled programmatically by `PlannerAgent.build_user_prompt
 ## Current kernel
 <kernel source code in a Python code block>
 
+## Run context
+- Bottleneck: <memory_bound | compute_bound | balanced>
+
 ## Profiling summary
-<bottleneck classification and key metrics from the profiler/reviewer>
+<key metrics from the profiler — pct_peak_*, arithmetic_intensity, NCU signals>
 
 ## Past experiences
-- <action_name> (tier <N>) [<param>=<val>, ...]: <success|failure>, speedup <X>x, bottleneck <before> -> <after>
+- <action_name> (tier <N>) [<param>=<val>, ...]: <success|failure>, speedup <X>x, bottleneck_before <label>
 - ...
 (Parameters are included when present, omitted when empty)
 
@@ -27,3 +30,5 @@ The user prompt is assembled programmatically by `PlannerAgent.build_user_prompt
 ## Reviewer feedback
 <reviewer's diagnosis and suggestions — omitted on first iteration>
 ```
+
+`Run context` carries the once-per-run bottleneck (`classify_run`). It is stable across iterations because the problem, representative workload, and hardware do not change within a run — so the Planner can rely on it without having to re-derive it from the per-iter profiling metrics. Past experiences no longer carry a `bottleneck_after` field (experiences store only the pre-iteration classification).

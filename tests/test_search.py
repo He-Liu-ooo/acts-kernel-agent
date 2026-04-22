@@ -326,6 +326,73 @@ class TestTreeCheckpoint:
 
         assert loaded.get_node(2).branch_quality == BranchQuality.DEAD_END
 
+    def test_save_load_preserves_profiling(self, tmp_path: Path):
+        """A node's populated ``ProfilingResult`` (analytical + NCU + raw)
+        must round-trip through save/load. Tree checkpointing is used for
+        mid-search recovery — losing the profile on reload would silently
+        strip the context the reviewer uses to classify branches."""
+        from src.eval.profiler import (
+            AnalyticalMetrics,
+            NCUMetrics,
+            ProfilingResult,
+        )
+        from src.eval.types import BottleneckType
+
+        tree = _build_scored_tree()
+        # Attach a fully-populated ProfilingResult to one node so every
+        # field in the (de)serializer sees a non-default value.
+        tree.get_node(1).profiling = ProfilingResult(
+            analytical=AnalyticalMetrics(
+                arithmetic_intensity=0.25,
+                ridge_point=16.0,
+                achieved_tflops=0.9,
+                achieved_bandwidth_gb_s=450.0,
+                pct_peak_compute=0.08,
+                pct_peak_bandwidth=0.47,
+            ),
+            ncu=NCUMetrics(
+                sm_occupancy_pct=55.0,
+                l2_hit_rate_pct=72.3,
+                tensor_core_util_pct=0.0,
+                warp_stall_dominant="long_scoreboard",
+                warp_stall_dominant_pct=42.1,
+                warp_stall_runner_up="wait",
+                warp_stall_runner_up_pct=18.7,
+            ),
+            raw_metrics={"sm__warps_active.avg.pct_of_peak_sustained_active": 55.0},
+        )
+        save_path = tmp_path / "tree.json"
+        tree.save(save_path)
+        loaded = SearchTree.load(save_path)
+
+        assert loaded.get_node(1).profiling == tree.get_node(1).profiling
+        # Nodes that never profiled must come back as None, not a default-
+        # constructed ProfilingResult.
+        assert loaded.get_node(0).profiling is None
+
+    def test_save_load_preserves_per_workload_latency_us(self, tmp_path: Path):
+        """``TreeNode.per_workload_latency_us`` is populated from the child
+        benchmark so Phase C can re-profile each workload at its *own* latency
+        rather than smearing the aggregate over every one. The field must
+        round-trip through save/load and come back as ``None`` for nodes
+        that never benchmarked."""
+        tree = _build_scored_tree()
+        tree.get_node(1).per_workload_latency_us = {
+            "wl0": 60.0,
+            "wl1": 120.5,
+            "wl2": float("inf"),  # partial-workload failure sentinel
+        }
+        save_path = tmp_path / "tree.json"
+        tree.save(save_path)
+        loaded = SearchTree.load(save_path)
+
+        restored = loaded.get_node(1).per_workload_latency_us
+        assert restored == {"wl0": 60.0, "wl1": 120.5, "wl2": float("inf")}
+        # Nodes that never ran a child benchmark must stay ``None`` — not
+        # an empty dict, so downstream callers can distinguish "unsupported"
+        # (old checkpoint) from "measured, zero results".
+        assert loaded.get_node(0).per_workload_latency_us is None
+
     def test_load_nonexistent_raises(self, tmp_path: Path):
         with pytest.raises(FileNotFoundError):
             SearchTree.load(tmp_path / "nonexistent.json")
@@ -446,8 +513,15 @@ def _orch_harness():
     from src.eval.benchmark import BenchmarkResult
     from src.eval.roofline import BottleneckType, RooflineResult
 
+    # Orchestrator.run fail-fasts on zeroed peaks; these tests exercise
+    # coder / reviewer / benchmark threading, not the analytical path.
     config = ACTSConfig(
-        hardware=HardwareSpec(),
+        hardware=HardwareSpec(
+            name="RTX6000Ada",
+            freq_GHz=2.5,
+            DRAM_byte_per_cycle=384.0,
+            MAC_per_cycle_fp32_sm=12_800.0,
+        ),
         max_depth=1,
         beam_width=3,
         sol_plateau_window=99,  # disable plateau termination
@@ -464,13 +538,27 @@ def _orch_harness():
     retriever = MagicMock()
     retriever.retrieve = MagicMock(return_value=[])
 
+    # Baseline kernel needs nonzero (flop_count, memory_bytes) so the
+    # orchestrator's per-iteration roofline-inputs fallback (when no
+    # `problem` is supplied) yields a profileable kernel and the
+    # reviewer path still runs for these threading tests.
+    baseline = Kernel(
+        spec=KernelSpec(
+            name="root",
+            kernel_type=KernelType.MATMUL,
+            flop_count=1_000_000,
+            memory_bytes=100_000,
+        ),
+        source_code="# placeholder",
+    )
+
     return SimpleNamespace(
         config=config,
         planner=planner,
         coder=coder,
         reviewer=reviewer,
         retriever=retriever,
-        baseline=_make_kernel("root"),
+        baseline=baseline,
         roofline=RooflineResult(
             t_sol_us=50.0,
             arithmetic_intensity=1.0,
@@ -481,9 +569,33 @@ def _orch_harness():
 
 
 async def _run_orch(h):
+    from src.eval.profiler import (
+        AnalyticalMetrics,
+        ProfilingResult,
+    )
     from src.search.orchestrator import Orchestrator
 
-    with patch("src.eval.benchmark.benchmark_kernel", return_value=h.bench):
+    # These tests exercise the orchestrator's threading of context, not
+    # the profiler. Patch profile_kernel so analytical derivation doesn't
+    # need real flops/nbytes/latency. Return a fully-formed result so
+    # child.profiling downstream looks like a real profile to the reviewer
+    # mock.
+    stub_profile = ProfilingResult(
+        analytical=AnalyticalMetrics(
+            arithmetic_intensity=1.0,
+            ridge_point=1.0,
+            achieved_tflops=1.0,
+            achieved_bandwidth_gb_s=1.0,
+            pct_peak_compute=0.5,
+            pct_peak_bandwidth=0.5,
+        ),
+        ncu=None,
+        raw_metrics={},
+    )
+    with (
+        patch("src.eval.benchmark.benchmark_kernel", return_value=h.bench),
+        patch("src.eval.profiler.profile_kernel", return_value=stub_profile),
+    ):
         orch = Orchestrator(h.config, h.planner, h.coder, h.reviewer, h.retriever)
         await orch.run(h.baseline, workloads=None, roofline=h.roofline)
 

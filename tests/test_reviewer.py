@@ -12,6 +12,7 @@ from src.agents.reviewer import (
     ReviewerAgent,
     ReviewerFeedback,
 )
+from src.eval.types import BottleneckType
 
 
 # ── Pydantic output model ──────────────────────────────────────────────
@@ -102,7 +103,7 @@ def test_build_user_prompt_contains_all_sections():
         profiling_summary="DRAM: 78%, ALU: 22%, L2 hit: 55%",
         sol_score=0.62,
         headroom_pct=38.0,
-        bottleneck="memory_bound",
+        bottleneck=BottleneckType.MEMORY_BOUND,
         tree_context="Iteration 3, depth 2, parent SOL 0.55",
         kb_context="Pattern: low L2 hit + high DRAM util -> check blocking.",
     )
@@ -123,7 +124,7 @@ def test_build_user_prompt_omits_empty_optional_sections():
         profiling_summary="Compute bound: 85% ALU",
         sol_score=0.71,
         headroom_pct=29.0,
-        bottleneck="compute_bound",
+        bottleneck=BottleneckType.COMPUTE_BOUND,
     )
     assert "Search tree" not in prompt
     assert "Knowledge base" not in prompt
@@ -138,7 +139,7 @@ def test_build_user_prompt_escapes_backticks_in_kernel_source():
         profiling_summary="Compute bound",
         sol_score=0.5,
         headroom_pct=50.0,
-        bottleneck="compute_bound",
+        bottleneck=BottleneckType.COMPUTE_BOUND,
     )
     sections = prompt.split("## ")
     kernel_section = [s for s in sections if s.startswith("Current kernel")][0]
@@ -178,7 +179,7 @@ async def test_review_calls_llm_and_returns_parsed_feedback():
             profiling_summary="DRAM 78%",
             sol_score=0.62,
             headroom_pct=38.0,
-            bottleneck="memory_bound",
+            bottleneck=BottleneckType.MEMORY_BOUND,
         )
 
     assert isinstance(feedback, ReviewerFeedback)
@@ -218,7 +219,7 @@ async def test_review_uses_nonzero_temperature():
             profiling_summary="DRAM 60%",
             sol_score=0.5,
             headroom_pct=50.0,
-            bottleneck="memory_bound",
+            bottleneck=BottleneckType.MEMORY_BOUND,
         )
 
     mock_cfg.assert_called_once_with(temperature=0.3)
@@ -251,7 +252,7 @@ async def test_review_passes_tree_and_kb_context_to_prompt():
             profiling_summary="Balanced",
             sol_score=0.5,
             headroom_pct=50.0,
-            bottleneck="balanced",
+            bottleneck=BottleneckType.BALANCED,
             tree_context="Depth 4, sibling SOL 0.48",
             kb_context="Entry: plateau often indicates warp-schedule stall.",
         )
@@ -274,7 +275,7 @@ async def test_review_without_model_returns_rule_based_fallback():
         profiling_summary="Unknown",
         sol_score=0.5,
         headroom_pct=50.0,
-        bottleneck="memory_bound",
+        bottleneck=BottleneckType.MEMORY_BOUND,
     )
     assert isinstance(feedback, ReviewerFeedback)
     assert feedback.bottleneck_classification == "memory_bound"
@@ -299,7 +300,7 @@ async def test_review_falls_back_to_rules_when_llm_returns_none():
             profiling_summary="Compute bound: 85% ALU",
             sol_score=0.66,
             headroom_pct=34.0,
-            bottleneck="compute_bound",
+            bottleneck=BottleneckType.COMPUTE_BOUND,
             prev_sol_score=0.60,
         )
 
@@ -325,7 +326,7 @@ async def test_llm_failure_is_flagged_degraded():
             profiling_summary="...",
             sol_score=0.5,
             headroom_pct=50.0,
-            bottleneck="balanced",
+            bottleneck=BottleneckType.BALANCED,
             prev_sol_score=0.5,
         )
 
@@ -344,7 +345,7 @@ async def test_no_model_configured_is_not_degraded():
         profiling_summary="...",
         sol_score=0.5,
         headroom_pct=50.0,
-        bottleneck="balanced",
+        bottleneck=BottleneckType.BALANCED,
     )
     assert feedback.degraded is False
     assert feedback.error_reason == ""
@@ -374,7 +375,7 @@ def test_rule_based_feedback_branch_quality(
         sol_score=sol_score,
         prev_sol_score=prev_sol_score,
         headroom_pct=headroom_pct,
-        bottleneck="memory_bound",
+        bottleneck=BottleneckType.MEMORY_BOUND,
     )
     assert feedback.outcome == expected_outcome
     assert feedback.branch_quality is expected_branch
@@ -390,7 +391,7 @@ def test_rule_based_feedback_handles_missing_prev_score():
         sol_score=0.5,
         prev_sol_score=None,
         headroom_pct=50.0,
-        bottleneck="balanced",
+        bottleneck=BottleneckType.BALANCED,
     )
     assert feedback.outcome == "neutral"
     assert feedback.branch_quality is BranchQuality.BLOCKED_POTENTIAL

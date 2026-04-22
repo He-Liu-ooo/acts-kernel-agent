@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from src.eval.types import BottleneckType
 from src.memory.experience import Experience
 from src.memory.store import MemoryStore
 
@@ -11,7 +12,7 @@ _SUCCESS_BONUS = 3.0
 _SPEEDUP_CAP = 5.0
 
 
-def _score(exp: Experience, current_bottleneck: str) -> float:
+def _score(exp: Experience, current_bottleneck: BottleneckType) -> float:
     """Compute relevance score for a single experience."""
     s = 0.0
     if exp.bottleneck_before == current_bottleneck:
@@ -39,7 +40,7 @@ class MemoryRetriever:
     def retrieve(
         self,
         kernel_type: str,
-        current_bottleneck: str,
+        current_bottleneck: BottleneckType,
         hardware: str = "",
     ) -> list[Experience]:
         """Retrieve the most relevant experiences for a planning step."""

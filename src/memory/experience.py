@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from src.eval.types import BottleneckType
+
 
 @dataclass
 class ActionRecord:
@@ -28,7 +30,6 @@ class Experience:
     metrics: dict[str, float] = field(default_factory=dict)  # latency, sol_score
     speedup: float = 0.0
     reviewer_summary: str = ""
-    bottleneck_before: str = ""
-    bottleneck_after: str = ""
+    bottleneck_before: BottleneckType = BottleneckType.BALANCED
     hardware: str = ""
     success: bool = False

@@ -101,10 +101,14 @@ class TestGenerateReport:
         )
         assert generate_report(result).technique_trace == []
 
-    def test_bottleneck_transitions_empty_pending_profiler(self):
-        """Per-iteration bottleneck classification needs eval/profiler.py,
-        which is GPU-blocked. Until then the field stays empty."""
-        assert generate_report(_build_result()).bottleneck_transitions == []
+    def test_bottleneck_defaults_empty_when_no_run_bottleneck(self):
+        """Placeholder path: SearchResult carries no run_bottleneck, no
+        workloads/problem passed — both bottleneck surfaces stay empty.
+        classify_run only fires inside the orchestrator; generate_report
+        is a pure renderer."""
+        report = generate_report(_build_result())
+        assert report.bottleneck is None
+        assert report.winner_per_workload_bottlenecks == {}
 
     def test_total_iterations_and_termination_reason_passthrough(self):
         report = generate_report(
