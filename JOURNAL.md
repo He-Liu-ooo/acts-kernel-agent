@@ -518,6 +518,129 @@ Two violation cases:
 
 **Why not KernelBench yet**: PRD already documents the SOL-over-KernelBench decision (below). Multi-benchmark support stays a V2+ concern — the `ComparisonPolicy` Protocol + callable-based `input_generator` already give us the seams, so the cost of adding KernelBench later is low.
 
+### SOL integration tightening — CUDA 12.8 plan (2026-04-22)
+
+**Refines the 2026-04-18 "tiered adoption" entry above.** That entry gated deeper
+integration on "hard install coupling to cu13." Investigation 2026-04-22 showed
+that coupling is packaging-only; the triggers on PROCESS.md's Deferred
+entries for "Adopt SOL pydantic end-to-end" and "Adopt `do_bench` protocol"
+are now more attractive to fire than when written.
+
+**Context**: Dev host is Ubuntu 20.04 / CUDA 12.8 / driver 570 / Ada SM_89.
+CUDA 13 is not installable bare-metal on 20.04 (glibc 2.31 floor blocks CUDA
+13's 2.34+ requirement). User constraint: tighten ACTS↔SOL integration so
+SOL-owned functionality is used directly rather than re-implemented, while
+(A) avoiding any cu13-dependent surface and (B) preserving support for
+non-SOL benchmarks (KernelBench, custom).
+
+**Finding**: `src/sol_execbench/**` framework code has **zero runtime imports**
+of `cutlass`, `cuda_tile`, `cudnn_frontend`, `apache_tvm_ffi`, or
+`torch_c_dlpack_ext`. The cu13 coupling lives entirely in:
+
+1. `pyproject.toml` install manifest — pip-resolved but never loaded.
+2. `driver/templates/build_ext.py:44` — `CUTLASS_DIR` for user-solution C++
+   compiles. Only activates when a submitted kernel's language is CUTLASS.
+3. `core/data/solution.py:41-48` — language enum *strings*
+   (`"cutlass"` / `"cute_dsl"` / `"cutile"` / `"cudnn_frontend"`). Labels,
+   not imports.
+4. `tests/docker/dependencies/` — Docker-image smoke tests; not library code.
+5. `examples/cute_dsl/` — sample user solutions; data, not framework.
+
+None of these are reachable from ACTS's use path (ACTS generates Triton,
+consumes SOL as a library, never invokes `sol-execbench` CLI).
+
+**Second finding (benchmark-agnostic posture)**: `Definition` is a
+general-purpose kernel IR — named tensor inputs/outputs, symbolic axes,
+a pure-Python `def run(...)` reference. Nothing in the schema references
+SOL-ExecBench categories, leaderboard, HuggingFace dataset, or scoring
+protocol. The 2026-04-18 entry's hedge ("Problem abstraction may need
+to stay benchmark-agnostic") was over-cautious: `Definition` **is** the
+benchmark-agnostic type. KernelBench plugs in via a converter, not via
+a parallel Problem abstraction.
+
+**Install strategy on cu12.8** (unblocks everything below):
+
+```bash
+sudo add-apt-repository ppa:deadsnakes/ppa
+sudo apt install python3.12 python3.12-venv
+python3.12 -m venv /tmp/acts_run_venv && source /tmp/acts_run_venv/bin/activate
+pip install "torch>=2.10" "torchvision>=0.24" \
+  --index-url https://download.pytorch.org/whl/cu128
+pip install -e /home/hel19/workspace/projects/self-evolved-llm/repo/benchmark/SOL-ExecBench --no-deps
+pip install pydantic safetensors numpy click rich pyyaml \
+  pytest pytest-asyncio triton "openai-agents>=0.1"
+```
+
+Smoke test:
+`python -c "from sol_execbench.core.data import Definition, Workload; from sol_execbench.core.bench.io import gen_inputs; from sol_execbench.core.bench.timing import do_bench; print('ok')"`.
+If this prints `ok`, cu13 packages were never loaded.
+
+**Decision — five-tier integration plan**:
+
+- **Tier 1 — Schema adoption** (biggest LOC reduction). Replace ACTS's
+  hand-written `src/benchmark/problem.py` dataclasses, `problem_loader.py`,
+  and `solution_formatter.py` with direct use of
+  `sol_execbench.core.data.{Definition, Workload, Solution, Trace}`. Drop
+  `_problem_to_sol_dict` / `_workload_to_sol_dict` shims in `eval/inputs.py`.
+  Net: ~-240 LOC + ~+60 thin wrappers = ~-180 LOC. Trigger for
+  PROCESS.md "Adopt SOL pydantic end-to-end" already fired
+  (`baseline_generator.py` landed).
+
+- **Tier 2 — Timing adoption**. Replace `_TorchCudaTimer` in
+  `eval/benchmark.py` with `sol_execbench.core.bench.timing.time_runnable`
+  / `do_bench`. Redesign test seam: swap the per-iter `BenchmarkTimer`
+  Protocol for a `BenchmarkFn = Callable[[fn, setup], float]` type alias;
+  tests inject a mock callable instead of asserting call-order on
+  `prepare/flush/record/finalize`. Net: ~-60 LOC production + ~-120 LOC
+  tests. Trigger for PROCESS.md "Adopt `do_bench` protocol" fires before
+  first live multi-workload run. Do this as its own phase — design
+  discussion required on the replacement test seam.
+
+- **Tier 3 — `sol_score` delegation**. 5-line wrapper in
+  `eval/scorer.py::compute_sol_score` calling
+  `sol_execbench.sol_score.sol_score(t_k, t_p, t_sol)`, then adding
+  `reward_hack_suspect` / `calibration_warning` flags and packing into
+  `ScoreResult`. Keeps the formula canonical.
+
+- **Tier 4 — Optional reward-hack + clock-lock**. Wire
+  `sol_execbench.core.bench.reward_hack.{check_monkey_patch,
+  check_thread_injection, check_result_caching}` into
+  `eval/anti_cheat.py` when threat model justifies. Add
+  `sol_execbench.core.bench.clock_lock.are_clocks_locked` as a startup
+  warning in `pipeline/optimize.py`. Both stay deferred per existing
+  triggers.
+
+- **Tier 5 — Benchmark adapter pattern** (preserves Requirement B).
+  Move SOL-specific loading into `src/benchmarks/sol_execbench/load.py`
+  returning `tuple[Definition, list[Workload]]`. Downstream pipeline
+  consumes those SOL types directly — benchmark-agnostic. Scaffold
+  empty `src/benchmarks/kernelbench/` and `src/benchmarks/custom/`
+  dirs so the contract is visible. KernelBench converter is a future
+  phase when the need lands.
+
+**Execution order**: Env setup → Tier 1 (schemas) as one phase → Tier 3 +
+Tier 5 scaffold as one phase (low-risk, shakes out import paths) →
+Tier 2 (timing) as its own phase with the test-seam design discussion.
+Tier 4 stays deferred.
+
+**What cu12.8 blocks** (bounded blast radius, all off ACTS's path):
+
+| Blocked surface | Why | Impact on ACTS |
+|---|---|---|
+| User-solution compile for CUTLASS / cuTe DSL / cuTile / cuDNN-graph | `build_ext.py` expects cutlass-dsl[cu13] headers | None — ACTS generates Triton. Would matter only if Coder were extended to emit CUTLASS. |
+| Full `sol-execbench` CLI in-process | CLI routes through build_ext → cu13 | None — ACTS's orchestrator owns the eval loop; we're integrating primitives. |
+| `cuda-tile==1.1.0` runtime (Blackwell tile abstractions) | cu13 + SM_100 only | None — Ada is SM_89, blocked by hardware not toolkit. |
+| `nvidia-cutlass-dsl[cu13]` runtime | No cu12 channel | None today. Matters only if ACTS ever imports cuTe DSL as a search target. |
+| `nvidia-cudnn-frontend==1.18.0` (cuDNN 9.x graph API) | Targets cuDNN 9 on cu13 | None — ACTS doesn't use cuDNN graph API. Older cu12-compatible frontend exists if needed later. |
+| SOL's Docker end-to-end harness | Image is Ubuntu 22.04 + cu13 | Runnable with host driver bump to 580+, but not needed for library-level integration. |
+| cu130-only torch features | Any Blackwell-specific torch feature | None for Ada. cu128 wheels have parity for non-Blackwell features. |
+
+**Why not just Docker-everything**: SOL's README recommends Docker for the
+full CLI eval. For ACTS's pattern (SOL-as-library) that's overkill, adds a
+container boundary around what should be a Python import, and doesn't
+solve the host driver bump (580+ still needed even with Docker). Library
+integration on 12.8 is the proportionate answer.
+
 ### Dynamic bottleneck reclassification — deferred to profiler implementation (2026-04-15)
 
 **Context**: The orchestrator currently computes bottleneck classification once from the baseline roofline (via SOLAR) and reuses it for all iterations. This is correct for the skeleton phase — `profiler.py` is a placeholder returning zeros. However, the PRD specifies two bottleneck sources:
