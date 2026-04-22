@@ -223,10 +223,56 @@ def main(argv: list[str] | None = None) -> None:
             "(default) to exercise the no-LLM matmul smoke path."
         ),
     )
+    parser.add_argument(
+        "--trace-dir",
+        type=str,  # str so the empty-string kill-switch is preserved verbatim
+        default="traces",
+        help=(
+            "Directory for per-run JSONL trace files capturing every LLM "
+            "input/output, tool call, and span. Defaults to ./traces. Pass "
+            "an empty value (``--trace-dir=``) to disable capture."
+        ),
+    )
     args = parser.parse_args(argv)
 
-    result = asyncio.run(optimize(args.problem_path))
-    print(render_report(generate_report(result)))
+    trace_processor = _enable_traces_if_possible(args.trace_dir)
+    try:
+        result = asyncio.run(optimize(args.problem_path))
+        print(render_report(generate_report(result)))
+        if trace_processor is not None:
+            print(f"\nLLM trace: {trace_processor.path}")
+    finally:
+        if trace_processor is not None:
+            trace_processor.shutdown()
+
+
+def _enable_traces_if_possible(trace_dir: str):
+    """Wire the local JSONL trace processor when the SDK is installed and
+    the user hasn't disabled it (``--trace-dir=``). Quiet no-op otherwise —
+    diagnostic capture must never block a real run, and the placeholder
+    smoke path doesn't make any LLM calls so traces would be empty anyway.
+
+    ``trace_dir`` stays a string (not ``Path``) through argparse so the
+    empty-string kill-switch survives — ``Path("")`` silently becomes
+    ``Path(".")`` which would look like a legitimate directory.
+
+    Returns the processor (so the caller can ``shutdown()`` and surface
+    ``.path`` in the report) or ``None`` when capture is disabled / SDK
+    is absent.
+    """
+    if not trace_dir:
+        return None
+    from src.agents.llm_backend import _SDK_AVAILABLE
+
+    if not _SDK_AVAILABLE:
+        return None
+    try:
+        from src.agents.trace_processor import enable_local_trace_capture
+
+        return enable_local_trace_capture(Path(trace_dir))
+    except Exception as exc:  # noqa: BLE001 — never fail the run on tracing setup
+        logger.warning("Failed to enable local trace capture: %s", exc)
+        return None
 
 
 if __name__ == "__main__":

@@ -40,3 +40,6 @@ configs/models/
 
 # Compile/profile caches (runtime artifacts)
 .acts_cache/
+
+# Local LLM trace JSONL files (per-run diagnostic capture)
+traces/

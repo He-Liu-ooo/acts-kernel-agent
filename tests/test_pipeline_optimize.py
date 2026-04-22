@@ -255,6 +255,101 @@ def test_main_forwards_problem_path_to_optimize():
     assert captured["problem_path"] == "repo/benchmark/SOL-ExecBench/examples/triton/rmsnorm"
 
 
+# ── trace capture wiring ──────────────────────────────────────────────
+
+
+def test_main_enables_trace_capture_when_sdk_available(tmp_path):
+    """Default ``--trace-dir traces`` should fire ``enable_local_trace_capture``
+    when the SDK is present and shutdown the processor after the run."""
+    from src.pipeline import optimize as opt_mod
+
+    fake_processor = MagicMock()
+    fake_processor.path = tmp_path / "trace.jsonl"
+
+    async def fake_optimize(problem_path, config=None):
+        return MagicMock()
+
+    with (
+        patch.object(opt_mod, "optimize", side_effect=fake_optimize),
+        patch("src.agents.llm_backend._SDK_AVAILABLE", True),
+        patch(
+            "src.agents.trace_processor.enable_local_trace_capture",
+            return_value=fake_processor,
+        ) as mock_enable,
+        patch("src.pipeline.report.generate_report", return_value=MagicMock()),
+        patch("src.pipeline.report.render_report", return_value=""),
+    ):
+        opt_mod.main(["placeholder", "--trace-dir", str(tmp_path)])
+
+    mock_enable.assert_called_once_with(tmp_path)
+    fake_processor.shutdown.assert_called_once()
+
+
+def test_main_skips_trace_capture_when_sdk_absent():
+    """Tier 1 venv has no SDK — capture must silently no-op rather than
+    crash the placeholder smoke path."""
+    from src.pipeline import optimize as opt_mod
+
+    async def fake_optimize(problem_path, config=None):
+        return MagicMock()
+
+    with (
+        patch.object(opt_mod, "optimize", side_effect=fake_optimize),
+        patch("src.agents.llm_backend._SDK_AVAILABLE", False),
+        patch(
+            "src.agents.trace_processor.enable_local_trace_capture",
+        ) as mock_enable,
+        patch("src.pipeline.report.generate_report", return_value=MagicMock()),
+        patch("src.pipeline.report.render_report", return_value=""),
+    ):
+        opt_mod.main([])
+
+    mock_enable.assert_not_called()
+
+
+def test_main_skips_trace_capture_when_disabled_explicitly():
+    """``--trace-dir=`` (empty string) is the user-facing kill-switch."""
+    from src.pipeline import optimize as opt_mod
+
+    async def fake_optimize(problem_path, config=None):
+        return MagicMock()
+
+    with (
+        patch.object(opt_mod, "optimize", side_effect=fake_optimize),
+        patch("src.agents.llm_backend._SDK_AVAILABLE", True),
+        patch(
+            "src.agents.trace_processor.enable_local_trace_capture",
+        ) as mock_enable,
+        patch("src.pipeline.report.generate_report", return_value=MagicMock()),
+        patch("src.pipeline.report.render_report", return_value=""),
+    ):
+        opt_mod.main(["--trace-dir="])
+
+    mock_enable.assert_not_called()
+
+
+def test_main_completes_run_even_if_trace_setup_raises(tmp_path):
+    """Trace capture is best-effort diagnostics — a setup failure must not
+    abort the actual optimization run."""
+    from src.pipeline import optimize as opt_mod
+
+    async def fake_optimize(problem_path, config=None):
+        return MagicMock()
+
+    with (
+        patch.object(opt_mod, "optimize", side_effect=fake_optimize),
+        patch("src.agents.llm_backend._SDK_AVAILABLE", True),
+        patch(
+            "src.agents.trace_processor.enable_local_trace_capture",
+            side_effect=RuntimeError("trace dir not writable"),
+        ),
+        patch("src.pipeline.report.generate_report", return_value=MagicMock()),
+        patch("src.pipeline.report.render_report", return_value=""),
+    ):
+        # Must not raise.
+        opt_mod.main(["placeholder", "--trace-dir", str(tmp_path)])
+
+
 @pytest.mark.asyncio
 async def test_placeholder_mode_never_loads_model():
     """Placeholder baseline is a stub. If a model config exists on disk and we
