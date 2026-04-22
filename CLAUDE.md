@@ -29,7 +29,7 @@ Each step is user-triggered — Claude does not auto-advance.
 ### Rules
 
 - Keep PRs small — each change should be small enough to be reviewed efficiently.
-- Do not commit until both Codex review and user review are complete.
+- **Do not commit until both Codex review and user review are complete.** This is non-negotiable. Even when work is "obviously good" (tests green, scope clean), even mid-session, even when a previous commit in the same session was approved — every new commit needs a fresh user review. The only exception is when the user has explicitly granted a session-window blanket authorization (e.g. "I permit everything" before going AFK); that authorization expires the moment the user is back in the loop. When in doubt, propose the commit split and wait.
 - Do not skip the test-first step for deterministic modules (eval, search, memory, config). For LLM agent modules, mocked tests are acceptable.
 
 ### Commit splits
@@ -66,6 +66,22 @@ Run a consistency check across src/, doc/, PRD.md, JOURNAL.md, and PROCESS.md. V
 Tests run via: `source /tmp/acts_test_venv/bin/activate && python -m pytest tests/ -v`
 
 Venv has: pytest, pyyaml. Add new deps to both pyproject.toml AND the venv.
+
+### Test delegation
+
+- **TDD iteration stays inline.** The write-test → run → fail → write-code → run → pass loop needs fast turnaround on the same context; do not dispatch individual pytest runs to subagents during active iteration on a single module.
+- **Delegate full-suite runs to a subagent.** Once a module's focused tests pass, the post-change `pytest tests/ -v` sweep goes to a subagent so the failure log + tracebacks don't flood the main context. The agent returns a short pass/fail summary with the specific failures.
+- **Delegate Tier 2 GPU runs to a subagent.** `@pytest.mark.gpu` suites are long and log-heavy; always run via subagent with an explicit scope and a short-report instruction.
+
+### Other delegation candidates
+
+Beyond tests, three recurring subtasks in this workflow are read-heavy, have no user-interaction need, and return a short structured output — dispatch them to a subagent with an explicit scope + short-report instruction, same pattern as test delegation.
+
+- **Upstream-repo reconnaissance** (pre-design, per the "Upstream reference repos" rule). Hand the subagent the target surface + the repo list from `reference_upstream_repos.md` auto-memory; it returns a punch list of the relevant files/patterns. Keeps the main context free of the full skim.
+- **Post-change consistency sweep** (the "After any architectural change" rule). Grep/read fan-out across src/ ↔ doc/ ↔ PRD ↔ JOURNAL ↔ PROCESS. Brief the agent with the delta (renamed symbols, changed signatures, new/removed modules); it returns a list of stale references to fix.
+- **Step 7 doc updates** when a change touches multiple `doc/*.md` files. Each doc update is an independent edit sharing one delta brief — dispatch in parallel per the "Parallel execution" gate (disjoint file sets, per-doc scope). Skip for single-doc changes; the cold-start cost isn't amortized.
+
+Keep inline: step 1 (pick feature), step 2 (design discussion / brainstorming), step 8 (commit split), TDD iteration in steps 3–4, and `simplify` — all need either the user in the loop or the main conversation context.
 
 ### Doc mapping
 
