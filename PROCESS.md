@@ -59,25 +59,21 @@
 
 ## Next Up
 
-Bottleneck-classify-once refactor just shipped (commits `7d033e9` / `513c64c` / `00e98fc`, 2026-04-22):
-
-- `eval/profiler.py` landed — hybrid analytical (required, fail-closed) + curated NCU (best-effort). Source-hash cache; subprocess driver isolates NCU failures. Tier 1 (fake-ncu) + Tier 2 (`@pytest.mark.gpu`) coverage.
-- Classification moved from per-iter to once-per-run via `eval/roofline.py::classify_run`, threaded through the orchestrator / retriever / planner / reviewer / `SearchResult` / `OptimizationReport`. Rationale: classification inputs `(flops, nbytes, hardware)` are invariant per run, so per-iter reclassification would only recompute the same label (JOURNAL → "Bottleneck classify-once (2026-04-22)").
-- Codex-review fixes bundled: placeholder hardware substitution for caller-supplied zero-peak configs; `child.score` committed only after the profile DEAD_END gauntlet clears.
-
-Phase A, Phase B, Phase C are all wired end-to-end on real CUDA-event benchmarking + real analytical profiling. GPU is available (NVIDIA RTX 6000 Ada, CUDA 12.8).
+Phase A, Phase B, Phase C are all wired end-to-end on real CUDA-event benchmarking + real analytical profiling. GPU is available (NVIDIA RTX 6000 Ada, CUDA 12.8). For what last shipped, see `git log c912e9a..HEAD` + JOURNAL → "Bottleneck classify-once (2026-04-22)".
 
 Candidates (pick one before writing code; design-discussion first where called out):
 
-- **First live GPU run** (integration milestone, not a new module) — highest-value next step now that every in-loop module is real. Run Phase A → B → C end-to-end against a SOL-ExecBench problem. Surfaces anything the test venv masked: real Triton specialization, compile latency, sticky-error recovery after a crash, NCU subprocess behavior against a production kernel, cache-key stability across rebuilds, stall-class naming drift on RTX 6000 Ada. Likely triggers deferred work — the per-dtype ridge fix (if a tc workload shows up), the `do_bench`-shape timer rewrite (if sync-per-iter cost becomes visible), `detect_hardware()` (if the SOLAR arch YAML path proves inconvenient in practice).
+- **First live GPU run** (integration milestone, not a new module) — highest-value next step now that every in-loop module is real. Run Phase A → B → C end-to-end against a SOL-ExecBench problem. Surfaces anything the test venv masked: real Triton specialization, compile latency, sticky-error recovery after a crash, cache-key stability across rebuilds, metric-name drift on RTX 6000 Ada. Likely triggers deferred work — the per-dtype ridge fix (if a tc workload shows up), the `do_bench`-shape timer rewrite (if sync-per-iter cost becomes visible), `detect_hardware()` (if the SOLAR arch YAML path proves inconvenient in practice).
 
 - **`actions/tier{1..6}` real guidance text** (non-GPU) — action-library descriptions are the Planner's fuel. Structure is done (`src/actions/tier*_*.py` ~373 LOC total); the guidance strings are placeholders. Content-heavy (literature synthesis from 9-paper KB + AccelOpt / Astra), high impact on search quality but does not require GPU. Good parallel track to the live-GPU run — disjoint files.
 
 - **`config.py::detect_hardware()`** (non-GPU code, uses GPU at runtime) — currently a placeholder returning a zeroed spec. Wire `torch.cuda` / `pynvml` to populate `HardwareSpec` fields at startup. `pipeline/optimize.py` already has a placeholder-spec fallback that would become a best-effort warning path once this lands. Small feature, useful for ablation runs that skip the SOLAR arch YAML.
 
-- **Codex adversarial review of the refactor PR** — `/codex:adversarial-review` against the three commits above to catch anything the non-adversarial pass missed. Highest-value targets: the deferred-`child.score` invariant (does any other call-site still assume score is populated the moment the benchmark succeeds?), the fused Phase C loop (is `_resolve_workload_roofline`'s `(0, 0)` contract honored at every call site?), and the `dataclasses.replace` in `optimize.py` (does it actually leave the caller's config untouched in every path?).
+- **Codex adversarial review of the most recent PR** — `/codex:adversarial-review` against `d9e6c4b..dd3220a` to catch anything the non-adversarial pass missed. Highest-value targets: the deferred-`child.score` invariant (does any other call-site still assume score is populated the moment the benchmark succeeds?), the fused Phase C loop (is `_resolve_workload_roofline`'s `(0, 0)` contract honored at every call site?), and the `dataclasses.replace` in `optimize.py` (does it actually leave the caller's config untouched in every path?).
 
-Recommended order: **first live GPU run** (end-to-end smoke) → action guidance text + `detect_hardware` in parallel (disjoint files) → adversarial review of the refactor. Defer the Deferred Improvements until their triggers fire during the live run.
+- **Multi-turn Reviewer with on-demand profiling queries** — turn the Reviewer from a single-call agent into a tool-using agent (same shape as the Coder) with two query shapes: (A) lookup into `ProfilingResult.raw_metrics` for metrics the initial NCU run already captured (cheap, in-memory); (B) on-demand re-profile with different `--section` / `--metrics` (expensive, ~30s subprocess on RTX 6000 Ada, cache-key expansion). Unlocks richer bottleneck diagnosis when the curated NCU subset (occupancy, L2, tensor-core util, top-2 stalls) doesn't explain the measured behavior. **Design discussion required first** — Reviewer shape change (single Pydantic call → tool loop), turn-budget choice, new failure modes, prompt contract. See JOURNAL → Agents → "Multi-turn Reviewer deferred" for the rationale behind the earlier deferral (briefly: without live-run data on how the curated subset actually fails, the tool risks optimizing for the wrong shape).
+
+Recommended order: **first live GPU run** (end-to-end smoke) → action guidance text + `detect_hardware` in parallel (disjoint files) → adversarial review. Multi-turn Reviewer in parallel once its design discussion settles. Defer the remaining Deferred Improvements until their triggers fire during the live run.
 
 Still deferred regardless of GPU: `eval/anti_cheat.py` (Tier 3 — threat model empty for bounded internal search; see Deferred Improvements) and `benchmark/solar_adapter.py` (needs SOLAR package installed).
 
@@ -283,25 +279,6 @@ these before its trigger fires, re-read the trigger first.
   (e.g., `device`, `tolerance_override`, or a per-problem `atol`),
   then do both the type cleanup and the dup-build fix in one pass.
 
-- [ ] **`sys.modules` compile cache in `kernels/compiler.py`** —
-  `compile_kernel` writes `<stem>.py` to the cache dir and calls
-  `spec.loader.exec_module()` unconditionally, even when `stem`
-  (source hash prefix) already resolves in `sys.modules`. Three
-  repeat-compile vectors share this cost: (a) the Coder's correctness
-  tool compiles the candidate; (b) within a single SDK turn loop the
-  same source can be handed to compile + correctness back-to-back, or
-  to correctness twice if the model re-invokes it on unchanged source;
-  (c) `baseline_generator`'s post-verify pass recompiles after
-  `translate()` returns, and `pipeline/verify` recompiles the winner
-  post-search — all guaranteed identical hash, guaranteed cache hit,
-  currently re-executed. Short-circuit via `sys.modules.get(module_name)`
-  + `getattr(module, entrypoint)` would eliminate every repeat.
-  *Trigger*: when a real Triton compile shows up in a profile — likely
-  as soon as `eval/benchmark.py` lands and live SOL problems run. Skip
-  until then; the Python-level file write + exec_module pair is cheap
-  at current scale, and adding the cache introduces a "stale module in
-  sys.modules after reload" failure mode that we'd have to reason about.
-
 - [ ] **`SearchResult.tree` → lighter path snapshot** —
   Phase C currently gets the full `SearchTree` on `SearchResult` so
   `pipeline/report.py::generate_report` can walk the root-to-best path
@@ -335,27 +312,6 @@ these before its trigger fires, re-read the trigger first.
   + `MemoryStore.add()` + checkpoint writes, all of which assume
   single-writer semantics on the tree. See JOURNAL → Search →
   "Serial beam expansion" for the rationale to keep it serial today.
-
-- [ ] **Multi-turn Reviewer with on-demand profiling queries** —
-  today the Reviewer is a single-call agent that receives a curated
-  NCU subset (occupancy, L2, tensor-core util, top-2 stalls). When
-  the curated signals don't match the real bottleneck signature, the
-  Reviewer has no recourse. Future: turn the Reviewer into a
-  tool-using agent (like the Coder) with two query shapes — (A) a
-  lookup into `ProfilingResult.raw_metrics` for metrics the initial
-  NCU run already captured (cheap, in-memory), and (B) an on-demand
-  re-profile with different `--section` / `--metrics` (expensive,
-  ~30s subprocess on RTX 6000 Ada, cache-key expansion).
-  *Trigger*: first real-run iteration where Reviewer feedback is
-  visibly signal-starved — i.e. the top-2 stalls and curated headline
-  metrics don't explain the measured bottleneck, and the rule-based
-  fallback or LLM diagnosis produces generic / wrong guidance. Until
-  we've seen real misses, the curated set's failure modes are
-  unknown and building the tool risks optimizing for the wrong shape.
-  Design pass required before implementation: Reviewer shape change
-  (single Pydantic call → tool loop), turn-budget choice, new failure
-  modes, prompt contract. See JOURNAL → Agents → "Multi-turn Reviewer
-  deferred" for the rationale behind deferring past the profiler PR.
 
 ### Skipped (decisions, not tech debt)
 

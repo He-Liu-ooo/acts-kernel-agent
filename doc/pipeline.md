@@ -90,3 +90,9 @@ Phase B runs real CUDA-event benchmarking (`eval/benchmark.py`) end-to-end. `eva
 ### Hardware-spec fallback in `optimize()`
 
 `optimize()` substitutes a populated placeholder `HardwareSpec` whenever the resolved spec has zero peaks — both for the `config is None` path (where `detect_hardware()` may return zeros) and for caller-supplied configs whose peaks are zero. Without this, the orchestrator's fail-fast guard (`peak_flops_fp32 > 0`, `peak_memory_bandwidth_gb_s > 0`) would kill the run before the first iteration. Substitution uses `dataclasses.replace` so the caller's config object is not mutated.
+
+The stand-in `_PLACEHOLDER_HARDWARE_SPEC` mirrors the Tier 1/2 test-fixture values for the RTX 6000 Ada (`freq_GHz=2.5`, `DRAM_byte_per_cycle=384`, `MAC_per_cycle_fp32_sm=12_800`, `MAC_per_cycle_fp16_tc=MAC_per_cycle_bf16_tc=512_000`) so the placeholder run produces representative roofline math. Real runs should load a SOLAR arch YAML for their target GPU.
+
+### Phase A → B threading
+
+`optimize()` forwards `problem.definition_path` as `problem_definition_path` to `Orchestrator.run()`. The profiler's NCU subprocess driver re-loads the problem directory (`definition.json` + `workload.jsonl`) to rebuild the input generator — closures don't pickle across the subprocess boundary. On the placeholder path `problem` is `None` and the profiler falls back to `module.make_inputs` or `spec['args']`.

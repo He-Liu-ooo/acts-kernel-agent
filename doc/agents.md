@@ -64,6 +64,8 @@ The deterministic orchestrator controls all flow. Agents are stateless — they 
 
 `translate(*, reference_source, kernel_spec, reference_fn, input_generators) -> str` — one-shot PyTorch→Triton port used at problem-load time by `benchmark/baseline_generator.py`. Drives the same tool-loop as `implement()` (shared via `_run_tool_agent`) but under a dedicated system prompt (`prompts/coder/translate.md`) that emphasizes signature invariance and no precision drop. Callers post-verify after translation because the SDK may emit a degraded best-effort when the turn budget is exhausted. No no-op fallback — raises `ImplementationError` when no model is configured, since there is no sensible from-scratch port without an LLM.
 
+**Translate prompt assembly**: `build_translate_prompt(reference_source, kernel_spec)` is a separate static method (backticks in the reference are escaped, target kernel name/entrypoint/kernel-type are surfaced) so the PyTorch→Triton port prompt is distinct from the per-iteration `implement()` prompt format.
+
 **Output**: kernel source code string. **May be a degraded best-effort** when the SDK tool loop exhausts `max_turns` without a green correctness run — downstream verification/scoring (or, for `translate()`, the caller's post-verify pass) handles that case.
 
 **Error handling**: `ImplementationError` is raised when `run_agent()` returns `None` (transient retry exhaustion), when `translate()` is called without a model, or when `implement()` is called with a model but missing correctness context (`kernel_spec` / `reference_fn` / a non-empty `input_generators`). **Deferred**: orchestrator-side handling of `ImplementationError` and SDK `MaxTurnsExceeded` — see `PROCESS.md` → Deferred Improvements.

@@ -23,12 +23,12 @@ No kernel code stored — only summaries. There is no `bottleneck_after` — cla
 
 JSON file backend. Simple, git-friendly, human-readable.
 
-- `load()`: Read experiences from disk.
-- `save()`: Persist to disk.
-- `add(experience)`: Append and persist.
-- `all() -> list[Experience]`: Return all stored.
+- `load()`: Read experiences from disk. Missing file is a no-op (empty store). Legacy records with missing `bottleneck_before` or with an empty/unknown token fall back to `BottleneckType.BALANCED`; unknown tokens log a warning before defaulting so schema drift is visible.
+- `save()`: Persist the full in-memory list to disk (single JSON dump, parent dir created if absent).
+- `add(experience)`: Append and `save()` immediately. **Caveat**: each add rewrites the full file (O(N²) write bytes per session). Tracked as a Deferred Improvement — trigger is "> ~500 experiences in one session OR rewrite shows up in a profile."
+- `all() -> list[Experience]`: Return a shallow copy of the stored list.
 
-This is real implemented logic (JSON serialization via `dataclasses.asdict`).
+Serialization flattens `BottleneckType` to its `.value` (`dataclasses.asdict` would otherwise keep the enum instance, which is not JSON-encodable). Parse on load uses `_parse_bottleneck` so legacy/empty/unknown tokens round-trip safely.
 
 ## MemoryRetriever — `retriever.py`
 

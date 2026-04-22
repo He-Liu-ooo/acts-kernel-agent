@@ -65,23 +65,67 @@ Deterministic orchestrator. Not an LLM — pure Python control flow.
 
 Returns True if the best score hasn't improved beyond `delta` over the last `window` entries. Used for global search termination — distinct from per-branch `BranchQuality.PLATEAU`.
 
+### `Orchestrator.run()` signature
+
+```python
+async def run(
+    baseline: Kernel,
+    workloads: list[Workload] | None = None,
+    roofline: RooflineResult | None = None,
+    *,
+    reference_fn: Callable | None = None,
+    input_generators: list[Callable[[int], tuple]] | None = None,
+    problem_definition_path: Path | None = None,
+    problem: Problem | None = None,
+) -> SearchResult
+```
+
+| Argument | Purpose |
+|----------|---------|
+| `baseline` | Triton baseline kernel — root of the search tree |
+| `workloads` | Representative subset for iterative benchmarking (SOL mode); `None` uses `kernel.spec.input_shapes` (legacy) |
+| `roofline` | Pre-computed SOLAR result; `None` falls back to built-in `compute_roofline()` from `KernelSpec.flop_count` / `memory_bytes` |
+| `reference_fn` | PyTorch oracle (from `definition.json`). Threaded into the Coder's correctness tool. Required when the Coder is LLM-backed |
+| `input_generators` | One seed→args generator per selected workload. Threaded verbatim into the Coder's correctness tool so every iteration verifies on the full coverage set |
+| `problem_definition_path` | SOL-ExecBench `definition.json` path. The profiler subprocess driver re-loads it to rebuild the (unpicklable) input generator. `None` falls back to `module.make_inputs` or `spec['args']` — only safe for Tier 2 self-contained kernels |
+| `problem` | Parsed `Problem` used once per run to derive the hoisted `(flops, nbytes)` for the analytical profiler. `None` falls back to `baseline.spec.flop_count` / `memory_bytes` — correct for placeholder starter kernels |
+
+### Fail-fast hardware guard
+
+`run()` aborts immediately with `ValueError` when `config.hardware.peak_flops_fp32 <= 0` or `peak_memory_bandwidth_gb_s <= 0`. A zeroed `HardwareSpec` (the `detect_hardware()` fallback) would make every analytical profile raise `ProfilerError` and silently DEAD_END every branch — that's a global config error, not a branch event. `pipeline/optimize.py` substitutes `_PLACEHOLDER_HARDWARE_SPEC` (a populated RTX 6000 Ada stand-in) before calling `run()` so the CLI smoke path stays alive.
+
+### Representative-workload hoist
+
+`repr_idx = len(workloads) // 2` (middle of the selected-workload list so large/small-axis outliers don't dominate the profile; `0` when `workloads` is empty or length < 2). The analytical profiler's `(flops, nbytes)` are derived **once** from `(problem, workloads[repr_idx])` via `compute_roofline_inputs` and reused across all iterations — these are invariant per run, so recomputing per-iter would just repeat the same call. `repr_input_generator` and `repr_workload_axes` are captured the same way.
+
 ### Per-Iteration Flow
 
-1. Select node (epsilon-greedy from frontier)
-2. Retrieve past experiences from optimization memory
-3. **Planner**: profiling + memory + feedback → `OptimizationPlan`
-4. **Coder** (with tools): plan + kernel → optimized kernel (self-corrects via compile + correctness tools)
-5. **Orchestrator-side eval**: benchmark → NCU → roofline → SOL score
-6. **Reviewer**: eval results → `ReviewerFeedback` + `branch_quality`
-7. Tree update: add node, score, beam prune
-8. Memory update: store experience
+1. Check frontier — return `ALL_DEAD_END` if empty
+2. Select node (epsilon-greedy from frontier)
+3. Retrieve past experiences from optimization memory (filtered by `run_bottleneck`)
+4. **Planner**: kernel source + profiling summary + memory + `tree_context=render_path(parent.id)` + `bottleneck=run_bottleneck` → `OptimizationPlan`
+5. **Coder** (with tools): plan + kernel + `kernel_spec`/`reference_fn`/`input_generators` → optimized kernel (self-corrects via compile + correctness tools)
+6. Add child node to tree — `child.score` and `per_workload_latency_us` are **not** committed yet
+7. **Benchmark** child — `BenchmarkError` (majority-failure) OR `not is_fully_successful` (partial failure) → mark branch `DEAD_END`, `beam_prune`, next iteration
+8. **Profile** child on representative workload — skip when `repr_workload_latency_s` is None; `ProfilerError` → mark `DEAD_END`, `beam_prune`, next iteration; `(flops, nbytes) == (0, 0)` (no formula for op_type) → keep branch alive but skip profile
+9. Commit `child.profiling`, `child.score` (via `compute_sol_score`), `child.per_workload_latency_us` to the tree node
+10. **Reviewer**: eval results + `run_bottleneck` + live `ProfilingResult` + `tree_context=render_path(child.id)` → `ReviewerFeedback` + `branch_quality`. When profiling was skipped, defaults `branch_quality` to `PROMISING` (keeps the branch alive so `beam_prune` treats it normally)
+11. `beam_prune(tree, beam_width, enable_diversity=config.beam_diversity)`
+12. Termination checks: `sol_target` (child.score ≥ threshold), `plateau` (via `detect_plateau` on `best_scores`), else decay epsilon and continue
+13. Budget exhausted after `max_depth` iterations → `BUDGET`
 
-### Termination
+Baseline benchmark partial failure is **not** caught — no baseline means no signal, and the orchestrator raises `BenchmarkError` so the caller can surface it.
 
-- `sol_target`: SOL score ≥ 0.95 (within 5% of hardware limit)
-- `plateau`: Best score stalled for `sol_plateau_window` iterations (checked via `detect_plateau`)
-- `budget`: `max_depth` iterations exhausted
-- `all_dead_end`: no expandable frontier nodes
+### `TerminationReason`
+
+`str`-subclass enum so legacy string comparisons in downstream consumers still work.
+
+| Value | Meaning |
+|-------|---------|
+| `SOL_TARGET` | `child.score.sol_score ≥ config.sol_target` (default 0.95 — within 5% of hardware limit) |
+| `PLATEAU` | Best score stalled across `sol_plateau_window` iterations, delta ≤ `sol_plateau_delta` |
+| `BUDGET` | `max_depth` iterations exhausted without early termination |
+| `ALL_DEAD_END` | Frontier empty at iteration start — no expandable nodes |
 
 ### SearchResult
 
@@ -92,3 +136,9 @@ Output: `{best_node, total_iterations, termination_reason, tree, run_bottleneck}
 ### Score + profile ordering (fail-closed on profile failure)
 
 Within an iteration, the order is `benchmark → profile → commit score + per_workload_latency_us`. The child's `ScoreResult` is **not** written to the node until after the profile gauntlet clears, because `SearchTree.best_node()` filters only on `score is not None` — a `ProfilerError`-killed branch that had already committed a score could be promoted to the final winner. The deferred commit keeps the DEAD_END invariant aligned with promotability.
+
+### Prompt-side helpers
+
+- `_render_profiling_for_planner(profiling)` — compact comma-separated summary (`pct_peak_compute=..%, pct_peak_bandwidth=..%, ai=..`, plus `sm_occupancy`/`l2_hit_rate`/`dominant_stall` when NCU is present, or `[DEGRADED: <reason>]` otherwise). Feeds the Planner's `Profiling summary` section; the Reviewer builds a richer two-block analytical+NCU view from the `ProfilingResult` dataclass directly (see `reviewer.render_profiling_summary`).
+- `_representative_latency_s(bench, workloads, repr_idx)` — returns the representative workload's latency in seconds, or `None` when that workload failed. Falls back to `bench.median_latency_us / 1e6` on the placeholder path (no SOL workloads).
+- `_NO_PROFILE_SUMMARY` — sentinel string (`"[no profiling data available]"`) threaded into the Planner prompt when profiling is unavailable.

@@ -35,15 +35,41 @@ Run by the orchestrator. Never part of the Coder's tool loop — prevents the LL
 
 ## 5-Stage Correctness Gate — `correctness.py`
 
-| Stage | What | On failure |
-|-------|------|------------|
-| 1. Smoke test | Single input, output matches baseline | Coder self-corrects |
-| 2. Shape sweep | Multiple input sizes (tiny → xlarge) | Coder self-corrects |
-| 3. Numerical stability | NaN/Inf detection, precision check | Coder self-corrects |
-| 4. Determinism | Repeated runs produce identical outputs | Coder self-corrects |
-| 5. Anti-cheat | Randomized inputs, strict tolerance | Coder self-corrects |
+| Stage | What | Seeds | Tolerance | On failure |
+|-------|------|-------|-----------|------------|
+| 1. Smoke test | Single input, output matches oracle | 42 | `atol/rtol` (default `1e-3`) | Coder self-corrects |
+| 2. Shape sweep | N trials with varying seeds | `0..n_sweep_trials-1` (default 5) | `atol/rtol` | Coder self-corrects |
+| 3. Numerical stability | Match oracle **and** output finite (no NaN/Inf) | 7 | `atol/rtol` | Coder self-corrects |
+| 4. Determinism | Match oracle **and** two runs on identical input are bitwise-equal | 11 | `atol/rtol` | Coder self-corrects |
+| 5. Anti-cheat | Randomized inputs under strict tolerance | `1000..1000+n_anti_cheat_trials-1` (default 3) | `strict_atol=1e-5`, `strict_rtol=1e-4` | Coder self-corrects |
 
-Any failure triggers the Coder's self-correction loop (up to `max_debug_retries`). If budget exhausted, branch is marked dead.
+Stages short-circuit on first failure — a failing `CorrectnessResult` carries `failed_stage: CorrectnessStage` and `error_message`. Any failure triggers the Coder's self-correction loop (up to `max_debug_retries`); budget exhaustion marks the branch dead.
+
+Stages 3 and 4 fuse the oracle compare with their domain check so a seed-7 or seed-11 wrong answer can't slip past by passing a pure finite-check or self-equality check.
+
+### `ComparisonPolicy` Protocol
+
+Tensor comparison is abstracted behind a `ComparisonPolicy` protocol (`compare`, `contains_non_finite`, `bitwise_equal`) so the module imports torch-free. Tests inject a scalar-backed policy; production uses `TorchComparisonPolicy`:
+
+- When `sol_execbench` is importable, delegates to `sol_execbench.core.bench.correctness.compute_error_stats` with `ToleranceSpec(max_atol, max_rtol, required_matched_ratio=1.0)`. This gives matched-ratio tolerance, separate NaN/Inf flags, and a hard max-error cap "for free."
+- Falls back to a local `torch.allclose` check when SOL-ExecBench is absent (keeps the module usable for non-SOL benchmarks).
+
+### `verify_correctness` Contract
+
+```python
+verify_correctness(
+    candidate_fn, reference_fn, input_generator,
+    *, policy=None, atol=1e-3, rtol=1e-3,
+    strict_atol=1e-5, strict_rtol=1e-4,
+    n_sweep_trials=5, n_anti_cheat_trials=3,
+) -> CorrectnessResult
+```
+
+`input_generator(seed) -> tuple` produces fresh args for each trial. The Coder's correctness tool iterates over the **full** input-generator list (one per selected workload) and short-circuits on the first failing workload so the Coder sees the offending workload index and stage.
+
+### `anti_cheat.py`
+
+Currently a placeholder (`generate_randomized_inputs`, `strict_tolerance_check`) marked as `skeleton` in PROCESS.md. The correctness-level anti-cheat surface is handled by Stage 5 above; the performance-level `reward_hack_suspect` flag is surfaced by `scorer.py`. The `anti_cheat.py` surface will fill in when the threat model becomes non-empty (see PROCESS.md → Deferred Improvements → "Reward-hack detection").
 
 ## Benchmark — `benchmark.py`
 
@@ -82,18 +108,84 @@ When both `workloads` and `input_generators` are empty (placeholder CLI path, no
 
 ## Inputs — `inputs.py`
 
-`build_reference_fn(pytorch_source)` execs SOL-ExecBench's PyTorch reference source and resolves the `run` callable. `build_input_generator(workload)` wraps SOL's `gen_inputs` with seeding so the same iteration index yields deterministic arguments. Both torch + sol_execbench imports are lazy so the module loads in the torch-free test venv.
+Bridges SOL-ExecBench's `Problem` to the pair of callables `verify_correctness` needs.
+
+- `build_reference_fn(source, entrypoint="run") -> Callable` — execs the PyTorch reference source (from `definition.json`'s `reference` field) into an isolated namespace and resolves the entrypoint symbol. Raises `ReferenceLoadError` when the entrypoint is missing or non-callable; `SyntaxError` / `ImportError` from the source propagate unchanged so the real cause is visible. Pure-Python (no torch import) so the module loads in the test venv.
+- `build_input_generator(problem, workload, *, device="cuda") -> Callable[[int], tuple]` — wraps `sol_execbench.core.bench.io.gen_inputs`. Validates SOL's pydantic `Definition` + `Workload` models **once** at build time so the per-seed call only pays the RNG reset (`set_seed(seed)`) plus input generation. Lazy-imports torch + sol_execbench so the module stays importable without the GPU stack.
+
+`_problem_to_sol_dict` / `_workload_to_sol_dict` shim ACTS's hand-written dataclasses into SOL's pydantic shape; the "adopt SOL pydantic end-to-end" cleanup is tracked as a Deferred Improvement in PROCESS.md.
 
 ## Profiler — `profiler.py`
 
 Per-iteration diagnostic signals for the Reviewer. Two pieces:
 
-- **Analytical (required)** — `_compute_analytical()` derives `AnalyticalMetrics` from `(flops, nbytes, latency_s, HardwareSpec)`: arithmetic intensity, ridge point, achieved TFLOPS + GB/s, pct-of-peak compute + bandwidth. Fails closed with `ProfilerError` on zero-latency or missing peaks (the orchestrator marks the branch DEAD_END).
-- **NCU (best-effort)** — subprocess `ncu --csv --section ...` via a dedicated driver (`_profiler_driver.py`). Extracts curated signals: SM occupancy, L2 hit rate, tensor-core utilization, and the top-2 warp-stall classes with percentages. Failures degrade the result (`ncu=None, degraded=True, degraded_reason=<slug>`) but keep the branch alive — the analytical block still drives the Reviewer's profiling summary.
+- **Analytical (required)** — `_compute_analytical()` derives `AnalyticalMetrics` from `(flops, nbytes, latency_s, HardwareSpec)`: arithmetic intensity, ridge point, achieved TFLOPS + GB/s, pct-of-peak compute + bandwidth. Fails closed with `ProfilerError` on zero-latency, non-positive `nbytes`, negative `flops`, or zero-peak hardware (the orchestrator marks the branch DEAD_END).
+- **NCU (best-effort)** — subprocess `ncu --csv --print-metric-name=name --section ...` via a dedicated driver (`_profiler_driver.py`). Extracts curated signals: SM occupancy, L2 hit rate, tensor-core utilization, and the top-2 warp-stall classes with percentages. Failures degrade the result (`ncu=None, degraded=True, degraded_reason=<slug>`) but keep the branch alive — the analytical block still drives the Reviewer's profiling summary.
 
 Returns `ProfilingResult(analytical, ncu, raw_metrics, degraded_reason)`. Bottleneck classification is **not** on `ProfilingResult` — it lives at the run level (see `classify_run` in `roofline.py`) because it's invariant per `(problem, representative workload, hardware)`.
 
-Source-hash-keyed cache avoids re-running NCU on an identical kernel source.
+### Curated metric set
+
+Required (a missing one degrades the NCU result with `missing_metric:<name>`):
+
+| Raw NCU metric | Field | Section |
+|---|---|---|
+| `sm__warps_active.avg.pct_of_peak_sustained_active` | `sm_occupancy_pct` | `Occupancy` |
+| `lts__t_sector_hit_rate.pct` | `l2_hit_rate_pct` | `MemoryWorkloadAnalysis` |
+
+Optional (defaults to 0.0 when absent — tensor-core metric is missing on NCU 2025.1.1.0 for pure-memory kernels, so it's demoted to avoid killing memory-bound runs):
+
+| Raw NCU metric | Field | Section |
+|---|---|---|
+| `sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active` | `tensor_core_util_pct` | `ComputeWorkloadAnalysis` |
+
+Warp stalls are explicitly enumerated (18 reasons) under the prefix `smsp__average_warp_latency_issue_stalled_<reason>.pct` because NCU does not expand wildcards; top-2 stalls (by percentage, ties broken by reason name) populate `warp_stall_dominant`/`warp_stall_runner_up`.
+
+`raw_metrics` preserves the full parsed NCU metric dict so future Reviewer prompts can reference metrics outside the curated set without a code change.
+
+### NCU subprocess driver — `_profiler_driver.py`
+
+NCU wraps a fresh Python subprocess that imports the compiled kernel and launches it **once** (after one warmup). The driver reads a JSON spec file (path passed as its sole argv) with shape:
+
+```json
+{
+  "kernel_source_path": "<abs path to compiled .py>",
+  "entrypoint": "kernel_fn",
+  "workload": {"uuid": "...", "axes": {...}, "inputs": {...}},
+  "mode": "curated" | "full",
+  "problem_dir": "<abs path to SOL problem dir>",  // optional
+  "seed": 0                                         // optional
+}
+```
+
+Input resolution priority: (1) `problem_dir` → `load_problem(dir)` + `build_input_generator(problem, workload)(seed)` (orchestrator path); (2) `module.make_inputs(seed)` if the source exposes it (self-contained kernel convention — primary Tier 2 path); (3) `spec["args"]` as last-resort literal; (4) `()`.
+
+Host-callable resolution: prefers `module.run` (the Triton host wrapper that launches the JIT'd kernel via `fn[grid](...)`), falls back to `module.<entrypoint>`. `spec.entrypoint` is the host-wrapper name — **not** the GPU kernel symbol NCU filters on. The GPU symbol is extracted from source by `_extract_triton_kernel_name()` (regex against `@triton.jit\s*(?:\(...\))?\s*\n\s*def\s+(\w+)`) and used as `--kernel-name regex:<name>`.
+
+Subprocess invocation uses `sys.executable` (not bare `"python"`) so the child inherits the venv with torch/triton installed. `TMPDIR` is redirected to a user-scoped `/tmp/<user>_ncu` so `nsight-compute-lock` files owned by other users on shared hosts can't block the run.
+
+### Failure taxonomy
+
+| Reason slug | Cause | Behavior |
+|---|---|---|
+| `ncu_binary_not_found` | `ncu` not on `$PATH` | Degraded, no cache write |
+| `ncu_timeout` | Subprocess exceeded `timeout_s` (default 60s) | Degraded, no cache write |
+| `ncu_nonzero_exit:<rc>` | Subprocess returned non-zero | Degraded, no cache write |
+| `csv_parse:<kind>` | Parser couldn't find header / columns | Degraded, no cache write |
+| `no_matching_kernel` | `--kernel-name regex:` matched no row in the NCU CSV | Degraded |
+| `missing_metric:<name>` | Required curated metric absent from CSV | Degraded |
+| `stalls_incomplete` | Fewer than 2 stall metrics parsed | Degraded |
+
+Analytical failures raise `ProfilerError` and kill the branch. NCU failures never raise.
+
+### Cache
+
+Source-hash-keyed JSON cache: key = `sha256(source_hash + repr(workload) + mode + _METRIC_SET_VERSION)[:16]`. `_METRIC_SET_VERSION` is bumped when the curated metric map, stall reasons, or parser contract changes so stale entries are unreachable. Writes are atomic (`tempfile.mkstemp` + `os.replace`) and swallow OSError — caching is best-effort, never branch-killing.
+
+### Modes
+
+- `curated` (default) — `--section Occupancy WarpStateStats MemoryWorkloadAnalysis ComputeWorkloadAnalysis` plus the enumerated stall `--metrics`.
+- `full` — `--set full` for debug; parser still pulls the curated subset, but `raw_metrics` captures everything NCU emitted.
 
 ## Types — `types.py`
 

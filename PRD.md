@@ -387,17 +387,23 @@ Phase A: Load Problem
   -> baseline SOL score = 0.5 by definition
 
 Phase B: Search Loop (autonomous, 3-agent)
-  orchestrator.py manages tree search:
-  -> Retrieve similar past optimizations from memory
-  -> PLANNER: profiling data + memory + feedback -> structured plan
+  orchestrator.py manages tree search. `run_bottleneck` (from Phase A
+  `classify_run`) is threaded through every iteration — there is no
+  per-iter re-classification, because `(flops, nbytes, hardware)` are
+  invariant per run (see JOURNAL → "Bottleneck classify-once").
+  -> Retrieve similar past optimizations from memory (filtered by run_bottleneck)
+  -> PLANNER: profiling data + memory + run_bottleneck + feedback -> structured plan
   -> CODER (with tools): plan + kernel code -> compile -> correctness check
-     -> correctness always checked against PyTorch reference
-     -> self-correction loop on failure (up to max_debug_retries)
-  -> [DETERMINISTIC EVAL]: benchmark -> NCU profiler -> bottleneck classification -> SOL score
-  -> REVIEWER: eval results + SOL score + headroom -> structured feedback + branch_quality
-  -> Tree update: add node, score by SOL score, beam prune
-  -> Memory update: store experience (including SOL score)
-  -> Move-on criteria: SOL plateau or SOL > 0.95
+     -> correctness always checked against PyTorch reference on every selected workload
+     -> self-correction loop on failure (up to max_debug_retries; SDK turn budget 2*N+1)
+  -> [DETERMINISTIC EVAL]: benchmark (CUDA events) -> profiler (analytical roofline
+     per-iter; curated NCU subprocess per-iter on representative workload) -> SOL score
+  -> REVIEWER: eval results + SOL score + headroom + run_bottleneck + live
+               ProfilingResult -> structured feedback + branch_quality
+  -> Tree update: defer committing child.score + per_workload_latency_us until
+               after the profile DEAD_END gauntlet clears; beam prune
+  -> Memory update: store experience (including SOL score and run_bottleneck)
+  -> Move-on criteria: SOL plateau, SOL >= sol_target, all-dead-end, or budget
 
 Phase C: Report (autonomous)
   Best kernel selected from tree (highest SOL score)
