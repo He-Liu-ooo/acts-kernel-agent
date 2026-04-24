@@ -24,6 +24,10 @@ Each step is user-triggered — Claude does not auto-advance.
    - **PROCESS.md** — mark feature complete
    - **JOURNAL.md** — record design rationale (if applicable)
    - **PRD.md**
+
+   **At the start of this step, default to parallel subagent dispatch.** The governance files above (PRD / JOURNAL / PROCESS / doc/*) are almost always disjoint from each other — each agent touches one file with the same delta brief, no data dependencies. One agent per file, dispatched in a single message. Reserve inline edits for the case where only one file truly changes, or for a small touch-up after the main fan-out. If the consistency sweep itself is still needed (the read side — scanning for stale references), run that as a single read-only subagent first, then fan out the write side based on its punch list. See "Parallel execution" below for the disjoint-file-set gate.
+
+   **Retire design specs and implementation plans during this step.** If the feature produced files under `doc/specs/` or `doc/plans/` (the authoring artifacts from `superpowers:brainstorming` / `superpowers:writing-plans`), they're process exhaust once the code lands — git log + the governance docs tell the ongoing story better. Before committing: section-by-section, fold any content that isn't already in JOURNAL / PRD / PROCESS / doc/* into the appropriate file (typical candidates: explicit non-goals list → JOURNAL; operator-visible failure matrix → doc/<module>.md; unique architectural rationale → JOURNAL). Then delete the spec + plan, strip any cross-references to their paths from the remaining docs, and remove the now-empty `doc/specs/` / `doc/plans/` directories if nothing else lives there. Exception: if the feature is multi-phase and later phases will extend the spec, keep the spec until the series completes.
 8. **Commit** — propose the commit split, discuss with the user, wait for approval, then commit and update **PROCESS.md** for the next round.
 
 ### Rules
@@ -90,6 +94,7 @@ Keep inline: step 1 (pick feature), step 2 (design discussion / brainstorming), 
 - `doc/search.md` — tree, beam, orchestrator
 - `doc/memory.md` — experience, store, retriever
 - `doc/pipeline.md` — optimize, verify, report
+- `doc/runtime.md` — run context, events stream, timestamp helpers (src/runtime/)
 
 ### Upstream reference repos
 

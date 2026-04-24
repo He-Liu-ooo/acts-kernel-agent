@@ -13,3 +13,4 @@ Component documentation for implemented features. Updated as each feature is com
 | Actions | [actions.md](actions.md) | Action registry, tier system, recipes |
 | Memory | [memory.md](memory.md) | Optimization memory store, retrieval, experiences |
 | Pipeline | [pipeline.md](pipeline.md) | Search loop entry, verification, reporting |
+| Runtime | [runtime.md](runtime.md) | Per-run context, event stream, timestamp helpers (src/runtime/) |

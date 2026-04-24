@@ -719,3 +719,17 @@ Triton effectively gives us Tiers 1-3.5. CUDA gives all 6 tiers — but the agen
 ### Always-runnable framework
 
 **Rationale**: Prevents the common failure mode of building a large codebase that doesn't run until everything is done. By keeping the framework complete-but-shallow, we test pipeline flow early and catch integration issues before investing in deep implementation.
+
+### Logger system before first live GPU run (2026-04-23)
+
+**Context**: The first multi-minute live run was about to kick off with zero progress signal — every `logger.info`/`logger.warning` was silently dropped (no `basicConfig`), reducing post-mortem to a single final exception line. Wrong forensic surface for a run spanning many LLM calls and GPU subprocesses.
+
+**Three sinks, not one**: `run.log` (human tail-able), `events.jsonl` (structured snapshots for tooling/ablation), `traces/*.jsonl` (per-call SDK records, reusing `JSONLTraceProcessor` from `5281cdf`). Each answers a different question; collapsing them would force each consumer to reparse another's format.
+
+**Coder event truthfulness** (Codex adversarial review catch): originally emitted `coder_compiled(passed=True)` + `coder_correctness(passed=True)` on `implement()` return, but the orchestrator cannot verify those gates from the return value — the SDK's `submit_kernel` validates the structured output, not the gates. Changed to `coder_submitted` (no pass claim) and `coder_failed(reason)`; per-tool-call detail lives in `traces/*.jsonl`.
+
+**Microsecond-precision run-dir names**: second-precision collides when ablation scripts or CI jobs share `--run-dir`. Same format now used by `trace_processor.py`, consolidated via `src/runtime/timefmt.py::filename_ts`.
+
+**RunContext owns trace wiring**: post-review refactor removed `main()`'s `explicit_trace_processor` + `_enable_traces_if_possible` helper. `RunContext.create(trace_dir=...)` now owns default and override paths.
+
+**Deliberately out of scope (v1)**: no Rich/tqdm live terminal UI (plain stdlib + `jq` is enough), no log rotation / disk quota / size caps (one run ≈ a few MB), no remote log shipping (Loki / Datadog), no "resume a run into the same run-dir" (new `main()` always creates a fresh `run_<UTC>/` — resume is a checkpoint concern, not a logger one), no cross-run aggregation index, no per-agent sub-loggers beyond stdlib `getLogger(__name__)`. Revisit triggers: live UX pain during multi-hour batches (→ Rich), disk pressure on long CI (→ rotation), need to compare runs (→ index).

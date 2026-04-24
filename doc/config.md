@@ -90,7 +90,7 @@ Mutable dataclass. All parameters for a single optimization run.
 - `sol_target` (0.95): SOL score threshold for "close enough to hardware limit."
 
 **Other:**
-- `max_debug_retries` (3): Coder's self-correction attempts per iteration. `CoderAgent` reads this field at construction and derives the SDK tool-loop bound as `max_turns = 2 * max_debug_retries + 1` (default 7 = 3 compile+correctness cycles × 2 turns + 1 final output turn).
+- `max_debug_retries` (3): Coder's self-correction attempts per iteration. `CoderAgent` reads this field at construction and derives the SDK tool-loop bound as `max_turns = 2 * max_debug_retries + 2` (default 8 = 3 compile+correctness cycles × 2 turns + 1 `submit_kernel` tool call + 1 final plain-text confirmation). See `doc/agents.md` → "Turn budget" for the full derivation.
 - `max_baseline_retries` (3): Triton baseline generation attempts before skipping problem.
 - `optimization_memory_top_k` (5): past experiences injected into Planner's context.
 - `benchmark_workload_count` (3): representative workloads for iterative benchmarking.

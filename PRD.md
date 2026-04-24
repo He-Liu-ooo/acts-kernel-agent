@@ -485,6 +485,12 @@ acts-kernel-agent/
 |   |   |-- verify.py
 |   |   +-- report.py
 |   |
+|   |-- runtime/
+|   |   |-- __init__.py
+|   |   |-- timefmt.py          (shared UTC timestamp helpers: filename_ts, iso_ts)
+|   |   |-- events.py           (emit/bind/unbind event bus + CORE_EVENT_KINDS + iter constants)
+|   |   +-- run_context.py      (RunContext dataclass + create/close for trace capture)
+|   |
 |   +-- prompts/
 |       |-- planner/
 |       |   |-- system.md
