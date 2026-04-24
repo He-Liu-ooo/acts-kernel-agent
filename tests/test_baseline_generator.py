@@ -392,3 +392,65 @@ async def test_all_attempts_fail_raises_baseline_error(patched_io):
         )
 
     assert coder.translate.await_count == 3
+
+
+# ── event emission ────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_generate_triton_baseline_emits_attempt_events(tmp_path, patched_io):
+    """The retry loop emits one ``baseline_attempt`` per attempt, one
+    ``baseline_failure`` per non-final failure, and exactly one
+    ``baseline_success`` when a verified candidate is returned.
+    """
+    import json
+
+    from src.runtime import events
+
+    workloads = _make_workloads(n=1)
+    coder = CoderAgent(model=MagicMock())
+    # Two transient LLM failures then one good candidate.
+    coder.translate = AsyncMock(
+        side_effect=[
+            ImplementationError("transient 1"),
+            ImplementationError("transient 2"),
+            _coder_output("@triton.jit\ndef kernel_fn(x): pass"),
+        ]
+    )
+
+    fh = (tmp_path / "events.jsonl").open("w", buffering=1)
+    events.bind(fh)
+    try:
+        with (
+            patch(
+                "src.benchmark.baseline_generator.compile_kernel",
+                return_value=_compile_ok(),
+            ),
+            patch(
+                "src.benchmark.baseline_generator.verify_correctness",
+                return_value=_pass(),
+            ),
+        ):
+            await generate_triton_baseline(
+                _make_problem(), _make_spec(),
+                coder=coder, workloads=workloads, max_retries=3,
+            )
+    finally:
+        events.unbind()
+        fh.close()
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "events.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    kinds = [r["kind"] for r in records]
+    assert kinds.count("baseline_attempt") == 3
+    assert kinds.count("baseline_failure") == 2
+    assert kinds.count("baseline_success") == 1
+    # Ordering: each attempt comes before its failure/success marker.
+    assert kinds[0] == "baseline_attempt"
+    assert kinds[-1] == "baseline_success"
+    # Failure records carry the ImplementationError name.
+    failures = [r for r in records if r["kind"] == "baseline_failure"]
+    assert all("ImplementationError" in r["reason"] for r in failures)

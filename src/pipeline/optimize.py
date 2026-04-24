@@ -177,6 +177,19 @@ def _load_placeholder(config: ACTSConfig) -> tuple:
     return baseline, None, None, None
 
 
+def _is_model_configured() -> bool:
+    """True when the LLM model config file is present on disk and the SDK
+    is importable. Used by ``main()`` to populate ``run_start.model_configured``
+    before ``optimize()`` loads the model itself.
+    """
+    from src.agents.llm_backend import _SDK_AVAILABLE
+
+    if not _SDK_AVAILABLE:
+        return False
+    path = Path(os.environ.get("ACTS_MODEL_CONFIG", str(DEFAULT_MODEL_CONFIG_PATH)))
+    return path.exists()
+
+
 def _load_model_if_configured():
     """Load the LLM model from ``$ACTS_MODEL_CONFIG`` or the default path.
 
@@ -203,8 +216,12 @@ def main(argv: list[str] | None = None) -> None:
     block) pass ``None`` and argparse reads ``sys.argv[1:]``.
     """
     import argparse
+    import atexit
+    from datetime import datetime, timezone
 
     from src.pipeline.report import generate_report, render_report
+    from src.runtime.events import emit
+    from src.runtime.run_context import RunContext
 
     parser = argparse.ArgumentParser(
         prog="python -m src.pipeline.optimize",
@@ -224,55 +241,78 @@ def main(argv: list[str] | None = None) -> None:
         ),
     )
     parser.add_argument(
+        "--run-dir",
+        type=Path,
+        default=Path("./runs"),
+        help=(
+            "Root directory for per-invocation run_<UTC>/ subdirectories "
+            "(each containing run.log, events.jsonl, traces/). Defaults to ./runs."
+        ),
+    )
+    parser.add_argument(
         "--trace-dir",
         type=str,  # str so the empty-string kill-switch is preserved verbatim
-        default="traces",
+        default=None,
         help=(
-            "Directory for per-run JSONL trace files capturing every LLM "
-            "input/output, tool call, and span. Defaults to ./traces. Pass "
-            "an empty value (``--trace-dir=``) to disable capture."
+            "Override directory for SDK trace JSONL files. When omitted, "
+            "traces land under <run-dir>/<run_UTC>/traces/. Pass an empty "
+            "value (``--trace-dir=``) to disable capture entirely."
         ),
     )
     args = parser.parse_args(argv)
 
-    trace_processor = _enable_traces_if_possible(args.trace_dir)
+    # Trace-dir tri-state mapped onto RunContext: ``--trace-dir=`` is
+    # the kill switch; any other value (or its absence) is handed to
+    # RunContext which decides default-under-run-dir vs explicit override.
+    ctx = RunContext.create(
+        root=args.run_dir,
+        trace_dir=args.trace_dir if args.trace_dir else None,
+        capture_traces=args.trace_dir != "",
+    )
+    atexit.register(ctx.close)
+
+    model_configured = _is_model_configured()
+    emit(
+        "run_start",
+        problem_path=str(args.problem_path),
+        model_configured=model_configured,
+    )
+    result = None
     try:
-        result = asyncio.run(optimize(args.problem_path))
+        try:
+            result = asyncio.run(optimize(args.problem_path))
+        except Exception:
+            emit(
+                "run_end",
+                termination_reason="ERROR",
+                best_score=0.0,
+                total_iterations=0,
+                wallclock_s=round(
+                    (datetime.now(timezone.utc) - ctx.started_at).total_seconds(), 3
+                ),
+            )
+            raise
+        best_score_val = (
+            result.best_node.score.sol_score
+            if result.best_node is not None and result.best_node.score is not None
+            else 0.0
+        )
+        emit(
+            "run_end",
+            termination_reason=result.termination_reason.value,
+            best_score=best_score_val,
+            total_iterations=result.total_iterations,
+            wallclock_s=round(
+                (datetime.now(timezone.utc) - ctx.started_at).total_seconds(), 3
+            ),
+        )
         print(render_report(generate_report(result)))
-        if trace_processor is not None:
-            print(f"\nLLM trace: {trace_processor.path}")
+        if ctx.trace_processor is not None and hasattr(ctx.trace_processor, "path"):
+            print(f"\nLLM trace: {ctx.trace_processor.path}")
+        if ctx.run_dir is not None:
+            print(f"Run dir: {ctx.run_dir}")
     finally:
-        if trace_processor is not None:
-            trace_processor.shutdown()
-
-
-def _enable_traces_if_possible(trace_dir: str):
-    """Wire the local JSONL trace processor when the SDK is installed and
-    the user hasn't disabled it (``--trace-dir=``). Quiet no-op otherwise —
-    diagnostic capture must never block a real run, and the placeholder
-    smoke path doesn't make any LLM calls so traces would be empty anyway.
-
-    ``trace_dir`` stays a string (not ``Path``) through argparse so the
-    empty-string kill-switch survives — ``Path("")`` silently becomes
-    ``Path(".")`` which would look like a legitimate directory.
-
-    Returns the processor (so the caller can ``shutdown()`` and surface
-    ``.path`` in the report) or ``None`` when capture is disabled / SDK
-    is absent.
-    """
-    if not trace_dir:
-        return None
-    from src.agents.llm_backend import _SDK_AVAILABLE
-
-    if not _SDK_AVAILABLE:
-        return None
-    try:
-        from src.agents.trace_processor import enable_local_trace_capture
-
-        return enable_local_trace_capture(Path(trace_dir))
-    except Exception as exc:  # noqa: BLE001 — never fail the run on tracing setup
-        logger.warning("Failed to enable local trace capture: %s", exc)
-        return None
+        ctx.close()
 
 
 if __name__ == "__main__":

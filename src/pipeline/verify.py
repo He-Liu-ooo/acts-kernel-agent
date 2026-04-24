@@ -12,6 +12,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
+from src.runtime.events import emit
+
 if TYPE_CHECKING:
     from src.eval.correctness import ComparisonPolicy
     from src.kernels.kernel import Kernel
@@ -43,12 +45,13 @@ def verify_optimized_kernel(
     from src.eval.correctness import verify_correctness
     from src.kernels.compiler import compile_kernel
 
+    emit("verify_start")
+
     compiled = compile_kernel(optimized, cache_dir=cache_dir)
     if not compiled.success:
-        return VerificationResult(
-            passed=False,
-            details=f"Compilation failed:\n{compiled.error_message}",
-        )
+        details = f"Compilation failed:\n{compiled.error_message}"
+        emit("verify_done", passed=False, detail_short=details[:200])
+        return VerificationResult(passed=False, details=details)
 
     result = verify_correctness(
         candidate_fn=compiled.compiled_fn,
@@ -56,7 +59,6 @@ def verify_optimized_kernel(
         input_generator=input_generator,
         policy=policy,
     )
-    return VerificationResult(
-        passed=result.passed,
-        details=result.error_message if not result.passed else "Verification passed.",
-    )
+    details = result.error_message if not result.passed else "Verification passed."
+    emit("verify_done", passed=bool(result.passed), detail_short=str(details)[:200])
+    return VerificationResult(passed=result.passed, details=details)

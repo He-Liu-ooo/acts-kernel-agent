@@ -20,6 +20,7 @@ from src.eval.correctness import verify_correctness
 from src.eval.inputs import build_input_generator, build_reference_fn
 from src.kernels.compiler import compile_kernel
 from src.kernels.kernel import Kernel
+from src.runtime.events import emit
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -63,7 +64,8 @@ async def generate_triton_baseline(
     reference_fn = build_reference_fn(problem.reference_source)
     input_generators = [build_input_generator(problem, w) for w in workloads]
 
-    for _ in range(max_retries):
+    for attempt in range(max_retries):
+        emit("baseline_attempt", attempt=attempt + 1, max_attempts=max_retries)
         try:
             output = await coder.translate(
                 reference_source=problem.reference_source,
@@ -71,7 +73,12 @@ async def generate_triton_baseline(
                 reference_fn=reference_fn,
                 input_generators=input_generators,
             )
-        except ImplementationError:
+        except ImplementationError as exc:
+            emit(
+                "baseline_failure",
+                attempt=attempt + 1,
+                reason=f"ImplementationError: {str(exc)[:200]}",
+            )
             continue
 
         candidate = Kernel(
@@ -81,6 +88,11 @@ async def generate_triton_baseline(
         )
         compiled = compile_kernel(candidate, cache_dir=cache_dir)
         if not compiled.success:
+            emit(
+                "baseline_failure",
+                attempt=attempt + 1,
+                reason=f"CompileError: {str(compiled.error_message or '')[:200]}",
+            )
             continue
 
         if all(
@@ -92,7 +104,18 @@ async def generate_triton_baseline(
             ).passed
             for gen in input_generators
         ):
+            emit(
+                "baseline_success",
+                source_bytes=len(output.source_code),
+                triton_kernel_name=output.triton_kernel_name or "",
+            )
             return candidate
+
+        emit(
+            "baseline_failure",
+            attempt=attempt + 1,
+            reason="CorrectnessError: post-verify failed on one or more workloads",
+        )
 
     raise BaselineGenerationError(
         f"Baseline translation for '{problem.name}' failed after "

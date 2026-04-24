@@ -14,6 +14,14 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
+from src.runtime.events import (
+    ITER_ADVANCED,
+    ITER_DEAD_END,
+    ITER_SKIPPED,
+    emit,
+    finite_or_none,
+)
+
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
@@ -111,6 +119,21 @@ def _render_profiling_for_planner(profiling) -> str:
     elif profiling.degraded:
         lines.append(f"[DEGRADED: {profiling.degraded_reason or 'unknown'}]")
     return ", ".join(lines)
+
+
+def _per_workload_us(bench) -> list[float | None]:
+    """Sanitize a benchmark's per-workload latency dict for the event
+    stream. Returns ``[]`` when ``bench`` is ``None``; maps the
+    ``math.inf`` launch-failure sentinel to ``None`` so the payload is
+    RFC-8259 JSON."""
+    if bench is None:
+        return []
+    return [finite_or_none(v) for v in bench.per_workload_latency_us.values()]
+
+
+def _emit_dead_end(iter_no: int, reason: str) -> None:
+    emit("branch_dead_end", iter=iter_no, reason=reason)
+    emit("iter_end", iter=iter_no, outcome=ITER_DEAD_END)
 
 
 def detect_plateau(
@@ -245,6 +268,12 @@ class Orchestrator:
                 f"SOL scoring requires a complete baseline measurement"
             )
 
+        emit(
+            "baseline_ready",
+            latency_us=baseline_bench.median_latency_us,
+            per_workload_latency_us=_per_workload_us(baseline_bench),
+        )
+
         if roofline is None:
             roofline = compute_roofline(baseline.spec, self._config.hardware)
 
@@ -268,6 +297,13 @@ class Orchestrator:
         epsilon = self._config.epsilon_start
         decay = (self._config.epsilon_start - self._config.epsilon_end) / max(self._config.max_depth, 1)
         best_scores: list[float] = []
+
+        # Run-invariant; stringified once so per-iter ``profile_done`` emits
+        # don't re-format the enum each time.
+        run_bottleneck_str = run_bottleneck.value if run_bottleneck is not None else ""
+        # Tracks the best scored-node's sol_score so ``score_computed.is_new_best``
+        # can be computed without an O(N) ``tree.best_node()`` walk every iter.
+        running_best_score = root.score.sol_score
 
         # Representative workload index for per-iteration profiling (spec
         # §3.3). Middle of the selected-workload list so large/small-axis
@@ -294,6 +330,7 @@ class Orchestrator:
         )
 
         for iteration in range(self._config.max_depth):
+            iter_no = iteration + 1
             frontier = tree.frontier()
             if not frontier:
                 return SearchResult(
@@ -305,6 +342,15 @@ class Orchestrator:
                 )
 
             parent = select_next(tree, epsilon)
+
+            parent_score = parent.score.sol_score if parent.score is not None else 0.0
+            emit(
+                "iter_start",
+                iter=iter_no,
+                parent_node_id=str(parent.id),
+                parent_score=parent_score,
+                selected_by="epsilon_greedy",
+            )
 
             # Retriever + Planner + Reviewer all share the run-level
             # bottleneck — classification is invariant per
@@ -331,6 +377,13 @@ class Orchestrator:
                 reviewer_feedback=None,
                 bottleneck=run_bottleneck,
             )
+            emit(
+                "planner_selected",
+                iter=iter_no,
+                technique=plan.technique,
+                tier=plan.tier,
+                rationale_short=plan.rationale[:120],
+            )
 
             # Coder (with tools for self-correction). `kernel_spec` /
             # `reference_fn` / `input_generators` are threaded into the
@@ -355,10 +408,13 @@ class Orchestrator:
             except ImplementationError as exc:
                 logger.warning(
                     "Iteration %d: Coder failed (%s) — skipping iteration",
-                    iteration + 1, exc,
+                    iter_no, exc,
                 )
+                emit("coder_failed", iter=iter_no, reason=str(exc)[:200])
+                emit("iter_end", iter=iter_no, outcome=ITER_SKIPPED)
                 epsilon = max(self._config.epsilon_end, epsilon - decay)
                 continue
+            emit("coder_submitted", iter=iter_no)
             new_source = coder_output.source_code
 
             # Build child kernel — carry the Coder's declared
@@ -396,11 +452,29 @@ class Orchestrator:
                     )
 
             if dead_reason is not None:
-                logger.warning("Iteration %d: %s — marking branch dead_end", iteration + 1, dead_reason)
+                logger.warning("Iteration %d: %s — marking branch dead_end", iter_no, dead_reason)
+                # bench_done fires even on partial-workload failure so the
+                # event log has a row for every benchmark attempt.
+                emit(
+                    "bench_done",
+                    iter=iter_no,
+                    median_us=bench.median_latency_us if bench is not None else 0.0,
+                    per_workload_us=_per_workload_us(bench),
+                    is_fully_successful=False,
+                )
                 child.branch_quality = BranchQuality.DEAD_END
                 beam_prune(tree, self._config.beam_width, enable_diversity=self._config.beam_diversity)
+                _emit_dead_end(iter_no, dead_reason)
                 epsilon = max(self._config.epsilon_end, epsilon - decay)
                 continue
+
+            emit(
+                "bench_done",
+                iter=iter_no,
+                median_us=bench.median_latency_us,
+                per_workload_us=_per_workload_us(bench),
+                is_fully_successful=bench.is_fully_successful,
+            )
 
             # Profile the child on the representative workload. Analytical
             # failure (ProfilerError: zero latency, missing peaks) is
@@ -424,11 +498,12 @@ class Orchestrator:
                 logger.warning(
                     "Iteration %d: representative workload latency unavailable "
                     "— skipping profile (child benchmark: %s)",
-                    iteration + 1,
+                    iter_no,
                     bench.per_workload_latency_us,
                 )
                 child.branch_quality = BranchQuality.DEAD_END
                 beam_prune(tree, self._config.beam_width, enable_diversity=self._config.beam_diversity)
+                _emit_dead_end(iter_no, "repr_workload_latency_unavailable")
                 epsilon = max(self._config.epsilon_end, epsilon - decay)
                 continue
 
@@ -447,11 +522,12 @@ class Orchestrator:
                 except ProfilerError as e:
                     logger.warning(
                         "Iteration %d: profile_kernel failed (%s) — marking branch dead_end",
-                        iteration + 1,
+                        iter_no,
                         e,
                     )
                     child.branch_quality = BranchQuality.DEAD_END
                     beam_prune(tree, self._config.beam_width, enable_diversity=self._config.beam_diversity)
+                    _emit_dead_end(iter_no, f"profiler_error: {str(e)[:120]}")
                     epsilon = max(self._config.epsilon_end, epsilon - decay)
                     continue
             else:
@@ -465,12 +541,44 @@ class Orchestrator:
                     problem.op_type if problem is not None else "<no-problem>",
                 )
             child.profiling = profiling
+            if profiling is not None:
+                ncu = profiling.ncu
+                top_stalls: list[str] = []
+                tc_util = 0.0
+                if ncu is not None:
+                    if ncu.warp_stall_dominant:
+                        top_stalls.append(ncu.warp_stall_dominant)
+                    if ncu.warp_stall_runner_up:
+                        top_stalls.append(ncu.warp_stall_runner_up)
+                    tc_util = ncu.tensor_core_util_pct
+                emit(
+                    "profile_done",
+                    iter=iter_no,
+                    bottleneck=run_bottleneck_str,
+                    top_stalls=top_stalls,
+                    tensor_core_util_pct=tc_util,
+                )
             child.score = compute_sol_score(
                 baseline_bench.median_latency_us,
                 bench.median_latency_us,
                 roofline.t_sol_us,
             )
             child.per_workload_latency_us = bench.per_workload_latency_us
+
+            is_new_best = child.score.sol_score > running_best_score
+            if is_new_best:
+                running_best_score = child.score.sol_score
+            emit(
+                "score_computed",
+                iter=iter_no,
+                score=child.score.sol_score,
+                is_new_best=is_new_best,
+                reward_hack_suspect=child.score.reward_hack_suspect,
+                calibration_warning=child.score.calibration_warning,
+                t_k_us=bench.median_latency_us,
+                t_p_us=baseline_bench.median_latency_us,
+                t_sol_us=roofline.t_sol_us,
+            )
 
             # Reviewer sees the same trajectory as the Planner, extended
             # through the just-scored child so `prev_sol_score` + the path's
@@ -497,20 +605,28 @@ class Orchestrator:
                 if feedback.degraded:
                     logger.warning(
                         "Reviewer degraded at iteration %d (reason=%s) — branch_quality is rule-based.",
-                        iteration + 1,
+                        iter_no,
                         feedback.error_reason or "unknown",
                     )
                 child.branch_quality = feedback.branch_quality
+                emit(
+                    "reviewer_feedback",
+                    iter=iter_no,
+                    verdict=feedback.branch_quality.value,
+                    suggestion_short=feedback.outcome[:120],
+                    degraded=feedback.degraded,
+                )
 
             # Beam prune
             beam_prune(tree, self._config.beam_width, enable_diversity=self._config.beam_diversity)
 
             # Single end-of-iter best scan — reused for target / plateau checks.
             best = tree.best_node()
+            emit("iter_end", iter=iter_no, outcome=ITER_ADVANCED)
             if child.score.sol_score >= self._config.sol_target:
                 return SearchResult(
                     best,
-                    iteration + 1,
+                    iter_no,
                     TerminationReason.SOL_TARGET,
                     tree,
                     run_bottleneck=run_bottleneck,
@@ -520,7 +636,7 @@ class Orchestrator:
             if detect_plateau(best_scores, self._config.sol_plateau_window, self._config.sol_plateau_delta):
                 return SearchResult(
                     best,
-                    iteration + 1,
+                    iter_no,
                     TerminationReason.PLATEAU,
                     tree,
                     run_bottleneck=run_bottleneck,

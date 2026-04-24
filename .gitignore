@@ -43,3 +43,6 @@ configs/models/
 
 # Local LLM trace JSONL files (per-run diagnostic capture)
 traces/
+
+# Per-invocation run directories (run.log + events.jsonl + traces/)
+runs/

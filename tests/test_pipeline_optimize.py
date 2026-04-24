@@ -213,11 +213,12 @@ async def test_populated_hardware_spec_from_caller_preserved():
 # ── CLI argument parsing (T2) ─────────────────────────────────────────
 
 
-def test_main_defaults_to_placeholder_when_no_arg():
+def test_main_defaults_to_placeholder_when_no_arg(tmp_path, monkeypatch):
     """`python -m src.pipeline.optimize` with no args must keep the historical
     placeholder smoke-path so existing CI / docs invocations don't break."""
     from src.pipeline import optimize as opt_mod
 
+    monkeypatch.chdir(tmp_path)
     captured: dict = {}
 
     async def fake_optimize(problem_path, config=None):
@@ -234,11 +235,12 @@ def test_main_defaults_to_placeholder_when_no_arg():
     assert captured["problem_path"] == "placeholder"
 
 
-def test_main_forwards_problem_path_to_optimize():
+def test_main_forwards_problem_path_to_optimize(tmp_path, monkeypatch):
     """Positional argument selects which SOL-ExecBench problem to run.
     Forwarded verbatim — the optimize() coroutine handles directory vs literal."""
     from src.pipeline import optimize as opt_mod
 
+    monkeypatch.chdir(tmp_path)
     captured: dict = {}
 
     async def fake_optimize(problem_path, config=None):
@@ -255,14 +257,196 @@ def test_main_forwards_problem_path_to_optimize():
     assert captured["problem_path"] == "repo/benchmark/SOL-ExecBench/examples/triton/rmsnorm"
 
 
+# ── run directory ─────────────────────────────────────────────────────
+
+
+def test_main_creates_run_dir(tmp_path, monkeypatch):
+    """--run-dir creates a timestamped sub-directory with events.jsonl,
+    run.log, and traces/."""
+    from src.pipeline import optimize as opt_mod
+
+    monkeypatch.chdir(tmp_path)
+
+    async def fake_optimize(problem_path, config=None):
+        return MagicMock()
+
+    with (
+        patch.object(opt_mod, "optimize", side_effect=fake_optimize),
+        patch("src.agents.llm_backend._SDK_AVAILABLE", False),
+        patch("src.pipeline.report.generate_report", return_value=MagicMock()),
+        patch("src.pipeline.report.render_report", return_value=""),
+    ):
+        opt_mod.main(["placeholder", "--run-dir", str(tmp_path / "runs")])
+
+    run_dirs = list((tmp_path / "runs").glob("run_*"))
+    assert len(run_dirs) == 1, run_dirs
+    rd = run_dirs[0]
+    assert (rd / "events.jsonl").exists()
+    assert (rd / "run.log").exists()
+    assert (rd / "traces").is_dir()
+
+
+def test_main_trace_dir_defaults_under_run_dir(tmp_path, monkeypatch):
+    """When --trace-dir is omitted, SDK trace capture targets
+    <run-dir>/traces/ rather than the old ``./traces/`` default."""
+    from src.pipeline import optimize as opt_mod
+
+    monkeypatch.chdir(tmp_path)
+    fake_processor = MagicMock()
+    fake_processor.path = tmp_path / "some" / "trace.jsonl"
+
+    async def fake_optimize(problem_path, config=None):
+        return MagicMock()
+
+    with (
+        patch.object(opt_mod, "optimize", side_effect=fake_optimize),
+        patch("src.agents.llm_backend._SDK_AVAILABLE", True),
+        patch(
+            "src.agents.trace_processor.enable_local_trace_capture",
+            return_value=fake_processor,
+        ) as mock_enable,
+        patch("src.pipeline.report.generate_report", return_value=MagicMock()),
+        patch("src.pipeline.report.render_report", return_value=""),
+    ):
+        opt_mod.main(["placeholder", "--run-dir", str(tmp_path / "runs")])
+
+    # enable_local_trace_capture called with <run-dir>/traces/, not ./traces/
+    mock_enable.assert_called_once()
+    (called_path,) = mock_enable.call_args.args
+    rd = next((tmp_path / "runs").glob("run_*"))
+    assert called_path == rd / "traces"
+
+
+def test_main_emits_run_start_and_run_end(tmp_path, monkeypatch):
+    """main() emits exactly one run_start at entry and one run_end at exit,
+    bracketing the full pipeline in events.jsonl.
+
+    ``run_end`` reads the real ``SearchResult`` field names
+    (``total_iterations``, ``best_node.score.sol_score``) and the
+    ``TerminationReason`` enum's ``.value``. Using ``MagicMock()`` here
+    would silently mask attribute-name bugs (see Codex review 2026-04-23:
+    the earlier version used ``getattr`` with defaults and would emit
+    ``best_score=0.0, total_iters=0`` even after real iterations)."""
+    import json
+    from types import SimpleNamespace
+
+    from src.pipeline import optimize as opt_mod
+    from src.search.orchestrator import TerminationReason
+
+    monkeypatch.chdir(tmp_path)
+
+    # SearchResult-shaped stand-in: exercises the field-name paths that
+    # the real dataclass uses so the event extraction is actually tested.
+    fake_score = SimpleNamespace(sol_score=0.73)
+    fake_best_node = SimpleNamespace(score=fake_score)
+    fake_result = SimpleNamespace(
+        best_node=fake_best_node,
+        total_iterations=5,
+        termination_reason=TerminationReason.BUDGET,
+        tree=MagicMock(),
+    )
+
+    async def fake_optimize(problem_path, config=None):
+        return fake_result
+
+    with (
+        patch.object(opt_mod, "optimize", side_effect=fake_optimize),
+        patch("src.agents.llm_backend._SDK_AVAILABLE", False),
+        patch("src.pipeline.report.generate_report", return_value=MagicMock()),
+        patch("src.pipeline.report.render_report", return_value=""),
+    ):
+        opt_mod.main(["placeholder", "--run-dir", str(tmp_path / "runs")])
+
+    rd = next((tmp_path / "runs").glob("run_*"))
+    lines = [json.loads(line) for line in (rd / "events.jsonl").read_text().splitlines() if line.strip()]
+    kinds = [e["kind"] for e in lines]
+    assert kinds.count("run_start") == 1
+    assert kinds.count("run_end") == 1
+    assert kinds[0] == "run_start"
+    assert kinds[-1] == "run_end"
+    start = lines[0]
+    assert start["problem_path"] == "placeholder"
+    assert "model_configured" in start
+
+    end = lines[-1]
+    # termination_reason uses the enum's .value, not str(enum)
+    assert end["termination_reason"] == "budget", end
+    assert end["best_score"] == 0.73
+    assert end["total_iterations"] == 5
+    # Regression guards against the previous schema drift:
+    assert "total_iters" not in end
+    assert "best_iter" not in end
+
+
+def test_main_emits_run_end_on_exception(tmp_path, monkeypatch):
+    """If optimize() raises, run_end still fires with termination_reason=ERROR
+    so post-mortems can distinguish normal exit from crashes."""
+    import json
+    from src.pipeline import optimize as opt_mod
+
+    monkeypatch.chdir(tmp_path)
+
+    async def raising_optimize(problem_path, config=None):
+        raise RuntimeError("boom")
+
+    with (
+        patch.object(opt_mod, "optimize", side_effect=raising_optimize),
+        patch("src.agents.llm_backend._SDK_AVAILABLE", False),
+    ):
+        with pytest.raises(RuntimeError, match="boom"):
+            opt_mod.main(["placeholder", "--run-dir", str(tmp_path / "runs")])
+
+    rd = next((tmp_path / "runs").glob("run_*"))
+    lines = [json.loads(line) for line in (rd / "events.jsonl").read_text().splitlines() if line.strip()]
+    kinds = [e["kind"] for e in lines]
+    assert "run_end" in kinds
+    end = next(e for e in lines if e["kind"] == "run_end")
+    assert end["termination_reason"] == "ERROR"
+
+
+def test_main_explicit_trace_dir_override(tmp_path, monkeypatch):
+    """--trace-dir <path> still honors the explicit path (escape hatch for
+    users who want traces outside the run-dir)."""
+    from src.pipeline import optimize as opt_mod
+
+    monkeypatch.chdir(tmp_path)
+    external = tmp_path / "external_traces"
+    fake_processor = MagicMock()
+    fake_processor.path = external / "trace.jsonl"
+
+    async def fake_optimize(problem_path, config=None):
+        return MagicMock()
+
+    with (
+        patch.object(opt_mod, "optimize", side_effect=fake_optimize),
+        patch("src.agents.llm_backend._SDK_AVAILABLE", True),
+        patch(
+            "src.agents.trace_processor.enable_local_trace_capture",
+            return_value=fake_processor,
+        ) as mock_enable,
+        patch("src.pipeline.report.generate_report", return_value=MagicMock()),
+        patch("src.pipeline.report.render_report", return_value=""),
+    ):
+        opt_mod.main([
+            "placeholder",
+            "--run-dir", str(tmp_path / "runs"),
+            "--trace-dir", str(external),
+        ])
+
+    # Explicit override wins — RunContext must not have also registered a
+    # second processor under <run-dir>/traces/.
+    mock_enable.assert_called_once_with(external)
+
+
 # ── trace capture wiring ──────────────────────────────────────────────
 
 
-def test_main_enables_trace_capture_when_sdk_available(tmp_path):
-    """Default ``--trace-dir traces`` should fire ``enable_local_trace_capture``
-    when the SDK is present and shutdown the processor after the run."""
+def test_main_enables_trace_capture_when_sdk_available(tmp_path, monkeypatch):
+    """Explicit ``--trace-dir <path>`` fires ``enable_local_trace_capture``
+    when the SDK is present and shuts the processor down after the run."""
     from src.pipeline import optimize as opt_mod
 
+    monkeypatch.chdir(tmp_path)
     fake_processor = MagicMock()
     fake_processor.path = tmp_path / "trace.jsonl"
 
@@ -285,10 +469,12 @@ def test_main_enables_trace_capture_when_sdk_available(tmp_path):
     fake_processor.shutdown.assert_called_once()
 
 
-def test_main_skips_trace_capture_when_sdk_absent():
+def test_main_skips_trace_capture_when_sdk_absent(tmp_path, monkeypatch):
     """Tier 1 venv has no SDK — capture must silently no-op rather than
     crash the placeholder smoke path."""
     from src.pipeline import optimize as opt_mod
+
+    monkeypatch.chdir(tmp_path)
 
     async def fake_optimize(problem_path, config=None):
         return MagicMock()
@@ -307,9 +493,11 @@ def test_main_skips_trace_capture_when_sdk_absent():
     mock_enable.assert_not_called()
 
 
-def test_main_skips_trace_capture_when_disabled_explicitly():
+def test_main_skips_trace_capture_when_disabled_explicitly(tmp_path, monkeypatch):
     """``--trace-dir=`` (empty string) is the user-facing kill-switch."""
     from src.pipeline import optimize as opt_mod
+
+    monkeypatch.chdir(tmp_path)
 
     async def fake_optimize(problem_path, config=None):
         return MagicMock()
@@ -328,10 +516,12 @@ def test_main_skips_trace_capture_when_disabled_explicitly():
     mock_enable.assert_not_called()
 
 
-def test_main_completes_run_even_if_trace_setup_raises(tmp_path):
+def test_main_completes_run_even_if_trace_setup_raises(tmp_path, monkeypatch):
     """Trace capture is best-effort diagnostics — a setup failure must not
     abort the actual optimization run."""
     from src.pipeline import optimize as opt_mod
+
+    monkeypatch.chdir(tmp_path)
 
     async def fake_optimize(problem_path, config=None):
         return MagicMock()
