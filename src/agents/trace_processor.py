@@ -33,21 +33,16 @@ from __future__ import annotations
 
 import json
 import threading
-from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+from src.runtime.timefmt import filename_ts
 
 try:
     from agents.tracing.processor_interface import TracingProcessor
 except ModuleNotFoundError:  # pragma: no cover — Tier 1 venv has no SDK
     class TracingProcessor:  # type: ignore[no-redef]
         """SDK-absent stand-in. Concrete tests subclass this directly."""
-
-
-def _isoformat_utc() -> str:
-    """Filename-safe UTC timestamp; ``:`` is illegal on FAT/Win and noisy
-    in shell completions everywhere else."""
-    return datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
 
 
 class JSONLTraceProcessor(TracingProcessor):
@@ -66,7 +61,7 @@ class JSONLTraceProcessor(TracingProcessor):
 
     def __init__(self, out_dir: Path) -> None:
         out_dir.mkdir(parents=True, exist_ok=True)
-        self.path: Path = out_dir / f"acts_trace_{_isoformat_utc()}.jsonl"
+        self.path: Path = out_dir / f"acts_trace_{filename_ts()}.jsonl"
         # ``buffering=1`` = line-buffered, so each ``write(line)`` is
         # visible to readers (e.g., ``tail -f``) without an explicit flush.
         self._fh = self.path.open("w", buffering=1)
