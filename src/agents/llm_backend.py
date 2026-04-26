@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from pydantic import ValidationError
+
     from src.eval.types import BottleneckType
 
 try:
@@ -159,6 +161,27 @@ def make_run_config(
             max_tokens=max_tokens,
         ),
     )
+
+
+# ── submit-tool helpers (shared by Coder/Planner/Reviewer) ────────────────
+
+
+SUBMIT_OK_SENTINEL = (
+    "Submitted. Emit a brief plain-text confirmation now "
+    "(no further tool calls) so the run can terminate."
+)
+"""Returned by every ``submit_*`` tool on success. The wording is what
+makes the SDK's tool loop terminate cleanly — drift in this string
+silently breaks the loop in whichever agent diverges."""
+
+
+def format_submit_validation_error(tool_name: str, exc: "ValidationError") -> str:
+    """Standard error string returned by submit_* tools on Pydantic
+    validation failure. The SDK hands this back to the LLM as the
+    tool-call response, prompting an in-loop retry within the existing
+    turn budget.
+    """
+    return f"{tool_name} FAILED:\n{exc}"
 
 
 def render_kernel_section(kernel_source: str) -> str:

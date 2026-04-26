@@ -120,3 +120,40 @@ async def test_backoff_is_exponential_with_jitter():
     assert 0.75 <= sleep_calls[0] <= 1.25
     assert 1.50 <= sleep_calls[1] <= 2.50
     assert 3.00 <= sleep_calls[2] <= 5.00
+
+
+# ── submit-tool helpers (shared by all submit_* tool factories) ───────────
+
+
+def test_submit_ok_sentinel_is_terminal_instruction():
+    """The sentinel must instruct the LLM to emit a brief plain-text reply
+    and stop calling tools — that's what terminates the SDK loop cleanly.
+    Drift in this string across agents would silently break the loop in
+    one place but not another."""
+    from src.agents.llm_backend import SUBMIT_OK_SENTINEL
+
+    text = SUBMIT_OK_SENTINEL.lower()
+    assert "submitted" in text
+    assert "plain-text" in text or "plain text" in text
+    assert "no further tool" in text or "no other tool" in text
+
+
+def test_format_submit_validation_error_contains_tool_name_and_exc_message():
+    """Standard error string returned by submit_* tools on Pydantic
+    validation failure. The SDK hands this back to the LLM as the
+    tool-call response so the model can self-correct in-loop."""
+    from pydantic import BaseModel, Field, ValidationError
+
+    from src.agents.llm_backend import format_submit_validation_error
+
+    class Foo(BaseModel):
+        x: int = Field(ge=0)
+
+    try:
+        Foo(x=-1)
+    except ValidationError as exc:
+        msg = format_submit_validation_error("submit_foo", exc)
+        assert msg.startswith("submit_foo FAILED:")
+        assert "x" in msg  # Pydantic includes the offending field name
+    else:
+        raise AssertionError("ValidationError should have been raised")

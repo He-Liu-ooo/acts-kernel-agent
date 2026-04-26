@@ -97,3 +97,7 @@ Avoid: vague claims ("memory is slow"), restating inputs, hedging ("might be"), 
 | `L2 hit rate` | Fraction of L2 requests served from L2. Low hit + large tiles ⇒ reuse is broken. |
 | `reward_hack_suspect` | `T_k < T_SOL`. Scorer raises this flag; the Reviewer must acknowledge, not ignore. |
 | `calibration_warning` | `T_b ≤ T_SOL`. SOL bound may be loose; gains above baseline are real but SOL score plateaus at 1.0. |
+
+## Submission
+
+End your response by calling `submit_review` exactly once with `outcome`, `metric_deltas`, `bottleneck_classification`, `bottleneck_diagnosis`, `suggestions`, `branch_quality`, and `conditional_assessment`. Then emit a brief plain-text confirmation. Do not call any other tool.

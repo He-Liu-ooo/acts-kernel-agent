@@ -239,6 +239,44 @@ async def test_coder_failure_emits_skipped_not_dead_end(tmp_path, harness):
 
 
 @pytest.mark.asyncio
+async def test_planner_failure_emits_skipped_not_dead_end(tmp_path, harness):
+    """PlanningError → planner_failed + iter_end(skipped). Mirrors the
+    Coder skip-iter pattern: a Planner hiccup is branch-local — no tree
+    mutation, no planner_selected/coder_submitted on the failure path,
+    and the next iteration picks a different parent."""
+    from src.agents.planner import PlanningError
+
+    harness.planner.plan = AsyncMock(side_effect=PlanningError("submit_plan missing"))
+
+    fh = (tmp_path / "events.jsonl").open("w", buffering=1)
+    events.bind(fh)
+    try:
+        await _run_orch(harness)
+    finally:
+        events.unbind()
+        fh.close()
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "events.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    kinds = [r["kind"] for r in records]
+
+    assert "planner_failed" in kinds
+    assert "planner_selected" not in kinds  # never reached
+    assert "coder_submitted" not in kinds   # never reached
+    assert "branch_dead_end" not in kinds   # no tree node died
+    end_recs = [r for r in records if r["kind"] == "iter_end"]
+    assert end_recs, kinds
+    assert end_recs[-1]["outcome"] == "skipped"
+    failed = next(r for r in records if r["kind"] == "planner_failed")
+    assert "submit_plan missing" in failed["reason"]
+    # Order: planner_failed must precede the iter_end(skipped).
+    assert kinds.index("planner_failed") < kinds.index("iter_end")
+
+
+@pytest.mark.asyncio
 async def test_dead_end_iteration_event_sequence(tmp_path, harness):
     """Partial-workload bench failure → bench_done(is_fully_successful=False)
     → branch_dead_end → iter_end(dead_end). No score_computed or reviewer

@@ -21,6 +21,10 @@ logger = logging.getLogger(__name__)
 CORE_EVENT_KINDS: frozenset[str] = frozenset({
     "run_start", "baseline_attempt", "baseline_success", "baseline_failure",
     "baseline_ready", "iter_start", "planner_selected",
+    # ``planner_failed`` covers any ``PlanningError`` cause (turn-budget,
+    # missing ``submit_plan``, transient retry exhaustion, available-
+    # actions guard). Mirrors ``coder_failed``.
+    "planner_failed",
     # ``coder_submitted`` marks ``implement()`` returning a kernel — it
     # does NOT prove the compile/correctness tools ran or passed.
     # Ground-truth per-tool-call records are in ``traces/*.jsonl``.

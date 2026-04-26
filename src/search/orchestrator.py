@@ -223,6 +223,7 @@ class Orchestrator:
         placeholder starter kernels, which populate those fields directly.
         """
         from src.agents.coder import ImplementationError
+        from src.agents.planner import PlanningError
         from src.agents.reviewer import BranchQuality
         from src.eval.benchmark import BenchmarkError, benchmark_kernel
         from src.eval.profiler import ProfilerError, profile_kernel
@@ -368,15 +369,30 @@ class Orchestrator:
                 if parent.profiling is not None
                 else _NO_PROFILE_SUMMARY
             )
-            plan = await self._planner.plan(
-                kernel_source=parent.kernel.source_code,
-                profiling_summary=parent_profiling_summary,
-                past_experiences=experiences,
-                available_actions=[],
-                tree_context=tree.render_path(parent.id),
-                reviewer_feedback=None,
-                bottleneck=run_bottleneck,
-            )
+            # Planner failure is branch-local: skip this iteration without
+            # adding a tree node (no plan = no implementation to score) and
+            # let the next select_next pick a different parent. Mirrors the
+            # Coder skip-iter pattern below — a single agent hiccup cannot
+            # kill a multi-iteration run.
+            try:
+                plan = await self._planner.plan(
+                    kernel_source=parent.kernel.source_code,
+                    profiling_summary=parent_profiling_summary,
+                    past_experiences=experiences,
+                    available_actions=[],
+                    tree_context=tree.render_path(parent.id),
+                    reviewer_feedback=None,
+                    bottleneck=run_bottleneck,
+                )
+            except PlanningError as exc:
+                logger.warning(
+                    "Iteration %d: Planner failed (%s) — skipping iteration",
+                    iter_no, exc,
+                )
+                emit("planner_failed", iter=iter_no, reason=str(exc)[:200])
+                emit("iter_end", iter=iter_no, outcome=ITER_SKIPPED)
+                epsilon = max(self._config.epsilon_end, epsilon - decay)
+                continue
             emit(
                 "planner_selected",
                 iter=iter_no,

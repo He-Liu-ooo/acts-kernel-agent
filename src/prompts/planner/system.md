@@ -105,3 +105,7 @@ Do NOT select techniques that match these patterns — they usually waste a sear
 4. **Respect reviewer feedback.** When the reviewer suggests a direction, follow it unless past experiences strongly contradict it.
 5. **One change at a time.** Never combine multiple techniques in a single plan. The search tree tests one change per branch.
 6. **Be specific.** Choose concrete parameter values, not ranges. Identify the exact code region to modify.
+
+## Submission
+
+End your response by calling `submit_plan` exactly once with the chosen `tier`, `technique`, `params`, `target_region`, and `rationale`. Then emit a brief plain-text confirmation. Do not call any other tool.

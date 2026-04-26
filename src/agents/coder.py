@@ -43,7 +43,13 @@ if TYPE_CHECKING:
 
     from src.agents.planner import OptimizationPlan
 
-from src.agents.llm_backend import make_run_config, render_kernel_section, run_agent
+from src.agents.llm_backend import (
+    SUBMIT_OK_SENTINEL,
+    format_submit_validation_error,
+    make_run_config,
+    render_kernel_section,
+    run_agent,
+)
 from src.config import ACTSConfig
 from src.eval.correctness import ComparisonPolicy, verify_correctness
 from src.eval.profiler import triton_kernel_names_in
@@ -203,11 +209,8 @@ def _make_submit_tool(captured: dict) -> Callable[[str, str], str]:
                 triton_kernel_name=triton_kernel_name,
             )
         except ValidationError as exc:
-            return f"submit_kernel FAILED:\n{exc}"
-        return (
-            "Kernel submitted. Emit a brief plain-text confirmation now "
-            "(no further tool calls) so the run can terminate."
-        )
+            return format_submit_validation_error("submit_kernel", exc)
+        return SUBMIT_OK_SENTINEL
 
     return submit_kernel
 

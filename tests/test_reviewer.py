@@ -150,11 +150,43 @@ def test_build_user_prompt_escapes_backticks_in_kernel_source():
 
 
 @pytest.mark.asyncio
-async def test_review_calls_llm_and_returns_parsed_feedback():
-    """With a model configured, review() calls the LLM and parses output."""
-    from src.agents.reviewer import ReviewerFeedbackOutput
+def _simulate_review_submission(**fields):
+    """Test helper: returns (capture_factory, fake_run) that together
+    simulate a submit_review tool call inside Runner.run. Mirrors
+    tests/test_planner.py::_simulate_plan_submission. Use both via patches:
 
-    mock_output = ReviewerFeedbackOutput(
+        capture_factory, fake_run = _simulate_review_submission(outcome=..., ...)
+        with (
+            patch("src.agents.reviewer.Agent"),
+            patch("src.agents.reviewer.run_agent", new_callable=AsyncMock) as mock_run,
+            patch("src.agents.reviewer.make_run_config", return_value=None),
+            patch("src.agents.reviewer.function_tool", side_effect=lambda f: f),
+            patch("src.agents.reviewer._make_submit_review_tool", side_effect=capture_factory),
+        ):
+            mock_run.side_effect = fake_run
+            ...
+    """
+    from src.agents.reviewer import ReviewerFeedbackOutput, _make_submit_review_tool
+
+    captured_holder: list[dict] = []
+
+    def capture_factory(captured_dict: dict):
+        captured_holder.append(captured_dict)
+        return _make_submit_review_tool(captured_dict)
+
+    async def fake_run(agent, prompt, **kwargs):
+        assert captured_holder, "factory should have been called by review()"
+        captured_holder[0]["output"] = ReviewerFeedbackOutput(**fields)
+        return MagicMock(final_output="done")
+
+    return capture_factory, fake_run
+
+
+@pytest.mark.asyncio
+async def test_review_calls_llm_and_returns_parsed_feedback():
+    """With a model configured, review() calls the LLM through the submit_review
+    tool path and parses captured output."""
+    capture_factory, fake_run = _simulate_review_submission(
         outcome="improved",
         metric_deltas={"sol_score": 0.08, "latency_ms": -0.4},
         bottleneck_classification="memory_bound",
@@ -163,17 +195,16 @@ async def test_review_calls_llm_and_returns_parsed_feedback():
         branch_quality=BranchQuality.PROMISING,
         conditional_assessment="Two more tiling steps should hit compute-bound.",
     )
-    mock_result = MagicMock()
-    mock_result.final_output = mock_output
 
     with (
+        patch("src.agents.reviewer.Agent"),
         patch("src.agents.reviewer.run_agent", new_callable=AsyncMock) as mock_run,
         patch("src.agents.reviewer.make_run_config", return_value=None),
+        patch("src.agents.reviewer.function_tool", side_effect=lambda f: f),
+        patch("src.agents.reviewer._make_submit_review_tool", side_effect=capture_factory),
     ):
-        mock_run.return_value = mock_result
-        agent = ReviewerAgent(model=None)
-        agent._agent = MagicMock()  # non-None triggers LLM path
-
+        mock_run.side_effect = fake_run
+        agent = ReviewerAgent(model=MagicMock())
         feedback = await agent.review(
             kernel_source="@triton.jit\ndef kernel(): ...",
             profiling_summary="DRAM 78%",
@@ -194,26 +225,23 @@ async def test_review_calls_llm_and_returns_parsed_feedback():
 async def test_review_uses_nonzero_temperature():
     """Reviewer runs with temperature=0.3 — variance in diagnosis wording;
     the strict enum fields (branch_quality, bottleneck_classification) stay pinned."""
-    from src.agents.reviewer import ReviewerFeedbackOutput
-
-    mock_output = ReviewerFeedbackOutput(
+    capture_factory, fake_run = _simulate_review_submission(
         outcome="neutral",
         bottleneck_classification="memory_bound",
         branch_quality=BranchQuality.BLOCKED_POTENTIAL,
     )
-    mock_result = MagicMock()
-    mock_result.final_output = mock_output
 
     with (
+        patch("src.agents.reviewer.Agent"),
         patch("src.agents.reviewer.run_agent", new_callable=AsyncMock) as mock_run,
         patch("src.agents.reviewer.make_run_config") as mock_cfg,
+        patch("src.agents.reviewer.function_tool", side_effect=lambda f: f),
+        patch("src.agents.reviewer._make_submit_review_tool", side_effect=capture_factory),
     ):
-        mock_run.return_value = mock_result
+        mock_run.side_effect = fake_run
         mock_cfg.return_value = None
 
-        agent = ReviewerAgent(model=None)
-        agent._agent = MagicMock()
-
+        agent = ReviewerAgent(model=MagicMock())
         await agent.review(
             kernel_source="def k(): pass",
             profiling_summary="DRAM 60%",
@@ -229,24 +257,21 @@ async def test_review_uses_nonzero_temperature():
 @pytest.mark.asyncio
 async def test_review_passes_tree_and_kb_context_to_prompt():
     """tree_context and kb_context provided to review() reach the user prompt."""
-    from src.agents.reviewer import ReviewerFeedbackOutput
-
-    mock_output = ReviewerFeedbackOutput(
+    capture_factory, fake_run = _simulate_review_submission(
         outcome="neutral",
         bottleneck_classification="balanced",
         branch_quality=BranchQuality.PLATEAU,
     )
-    mock_result = MagicMock()
-    mock_result.final_output = mock_output
 
     with (
+        patch("src.agents.reviewer.Agent"),
         patch("src.agents.reviewer.run_agent", new_callable=AsyncMock) as mock_run,
         patch("src.agents.reviewer.make_run_config", return_value=None),
+        patch("src.agents.reviewer.function_tool", side_effect=lambda f: f),
+        patch("src.agents.reviewer._make_submit_review_tool", side_effect=capture_factory),
     ):
-        mock_run.return_value = mock_result
-        agent = ReviewerAgent(model=None)
-        agent._agent = MagicMock()
-
+        mock_run.side_effect = fake_run
+        agent = ReviewerAgent(model=MagicMock())
         await agent.review(
             kernel_source="def kernel(): pass",
             profiling_summary="Balanced",
@@ -288,12 +313,13 @@ async def test_review_falls_back_to_rules_when_llm_returns_none():
     """When run_agent returns None (all retries exhausted), review() falls back
     to rule-based feedback — it does NOT raise."""
     with (
+        patch("src.agents.reviewer.Agent"),
         patch("src.agents.reviewer.run_agent", new_callable=AsyncMock) as mock_run,
         patch("src.agents.reviewer.make_run_config", return_value=None),
+        patch("src.agents.reviewer.function_tool", side_effect=lambda f: f),
     ):
         mock_run.return_value = None
-        agent = ReviewerAgent(model=None)
-        agent._agent = MagicMock()  # pretend LLM is configured
+        agent = ReviewerAgent(model=MagicMock())
 
         feedback = await agent.review(
             kernel_source="def kernel(): pass",
@@ -314,12 +340,13 @@ async def test_llm_failure_is_flagged_degraded():
     """run_agent returning None means retries exhausted — feedback must be
     flagged so the orchestrator can distinguish it from an expected fallback."""
     with (
+        patch("src.agents.reviewer.Agent"),
         patch("src.agents.reviewer.run_agent", new_callable=AsyncMock) as mock_run,
         patch("src.agents.reviewer.make_run_config", return_value=None),
+        patch("src.agents.reviewer.function_tool", side_effect=lambda f: f),
     ):
         mock_run.return_value = None
-        agent = ReviewerAgent(model=None)
-        agent._agent = MagicMock()
+        agent = ReviewerAgent(model=MagicMock())
 
         feedback = await agent.review(
             kernel_source="def kernel(): pass",
@@ -441,3 +468,210 @@ def test_parse_feedback_converts_output_to_dataclass():
     assert feedback.outcome == "regressed"
     assert feedback.branch_quality is BranchQuality.DEAD_END
     assert feedback.suggestions == ["Revert last action."]
+
+
+# ── _make_submit_review_tool — direct unit tests ──────────────────────────
+
+
+def test_make_submit_review_tool_captures_valid_output():
+    """A valid review populates the captured dict and returns the success sentinel."""
+    from src.agents.llm_backend import SUBMIT_OK_SENTINEL
+    from src.agents.reviewer import (
+        ReviewerFeedbackOutput,
+        _make_submit_review_tool,
+    )
+
+    captured: dict = {}
+    submit = _make_submit_review_tool(captured)
+    msg = submit(
+        outcome="improved",
+        metric_deltas={"latency_us": -1.5},
+        bottleneck_classification="memory_bound",
+        bottleneck_diagnosis="bandwidth-bound — saturate L2",
+        suggestions=["increase tile size"],
+        branch_quality=BranchQuality.PROMISING,
+        conditional_assessment="",
+    )
+    assert msg == SUBMIT_OK_SENTINEL
+    assert "output" in captured
+    assert isinstance(captured["output"], ReviewerFeedbackOutput)
+    assert captured["output"].metric_deltas == {"latency_us": -1.5}
+
+
+def test_make_submit_review_tool_returns_validation_error_string_on_invalid_branch_quality():
+    """An invalid branch_quality returns the error string for in-loop retry."""
+    from src.agents.reviewer import _make_submit_review_tool
+
+    captured: dict = {}
+    submit = _make_submit_review_tool(captured)
+    msg = submit(
+        outcome="improved",
+        metric_deltas={},
+        bottleneck_classification="memory_bound",
+        bottleneck_diagnosis="",
+        suggestions=[],
+        branch_quality="not_a_real_quality",  # type: ignore[arg-type]
+        conditional_assessment="",
+    )
+    assert msg.startswith("submit_review FAILED:")
+    assert "output" not in captured
+
+
+def test_make_submit_review_tool_handles_empty_metric_deltas_dict():
+    """Empty metric_deltas={} captures cleanly — defends against the
+    dict[str, float] field being the original SDK breakage point."""
+    from src.agents.reviewer import (
+        ReviewerFeedbackOutput,
+        _make_submit_review_tool,
+    )
+
+    captured: dict = {}
+    submit = _make_submit_review_tool(captured)
+    msg = submit(
+        outcome="degraded",
+        metric_deltas={},
+        bottleneck_classification="compute_bound",
+        bottleneck_diagnosis="",
+        suggestions=[],
+        branch_quality=BranchQuality.DEAD_END,
+        conditional_assessment="",
+    )
+    assert "output" in captured
+    assert isinstance(captured["output"], ReviewerFeedbackOutput)
+    assert captured["output"].metric_deltas == {}
+
+
+# ── review() MaxTurnsExceeded + missing-submit handling ──────────────────
+
+
+@pytest.mark.asyncio
+async def test_review_falls_back_to_degraded_when_loop_terminates_without_submitting():
+    """If the LLM exits the tool loop without ever calling submit_review,
+    review() must fall back to the existing rule-based degraded path —
+    Reviewer's failure mode is recoverable (unlike Planner / Coder), so
+    the orchestrator's frontier never starves."""
+    with (
+        patch("src.agents.reviewer.Agent"),
+        patch("src.agents.reviewer.run_agent", new_callable=AsyncMock) as mock_run,
+        patch("src.agents.reviewer.make_run_config", return_value=None),
+        patch("src.agents.reviewer.function_tool", side_effect=lambda f: f),
+    ):
+        mock_run.return_value = MagicMock(final_output="done")
+
+        agent = ReviewerAgent(model=MagicMock())
+        feedback = await agent.review(
+            kernel_source="src",
+            profiling_summary="",
+            sol_score=0.5,
+            headroom_pct=50.0,
+            bottleneck=BottleneckType.MEMORY_BOUND,
+        )
+
+    assert feedback.degraded is True
+    assert feedback.error_reason == "missing_submit_review"
+
+
+@pytest.mark.asyncio
+async def test_review_falls_back_to_degraded_on_max_turns_exceeded():
+    """SDK MaxTurnsExceeded with empty captured falls through to the
+    existing rule-based degraded path with error_reason='max_turns_exceeded'.
+    """
+    from src.agents.reviewer import MaxTurnsExceeded
+
+    with (
+        patch("src.agents.reviewer.Agent"),
+        patch("src.agents.reviewer.run_agent", new_callable=AsyncMock) as mock_run,
+        patch("src.agents.reviewer.make_run_config", return_value=None),
+        patch("src.agents.reviewer.function_tool", side_effect=lambda f: f),
+    ):
+        mock_run.side_effect = MaxTurnsExceeded("Max turns (2) exceeded")
+
+        agent = ReviewerAgent(model=MagicMock())
+        feedback = await agent.review(
+            kernel_source="src",
+            profiling_summary="",
+            sol_score=0.5,
+            headroom_pct=50.0,
+            bottleneck=BottleneckType.MEMORY_BOUND,
+        )
+
+    assert feedback.degraded is True
+    assert feedback.error_reason == "max_turns_exceeded"
+
+
+@pytest.mark.asyncio
+async def test_review_returns_partial_output_when_max_turns_after_submission():
+    """If the LLM submitted a valid review before the SDK loop hit max_turns,
+    return the captured submission rather than falling back to degraded."""
+    from src.agents.reviewer import (
+        MaxTurnsExceeded,
+        ReviewerFeedbackOutput,
+        _make_submit_review_tool,
+    )
+
+    captured_holder: list[dict] = []
+
+    def _capture_factory(captured_dict: dict):
+        captured_holder.append(captured_dict)
+        return _make_submit_review_tool(captured_dict)
+
+    with (
+        patch("src.agents.reviewer.Agent"),
+        patch("src.agents.reviewer.run_agent", new_callable=AsyncMock) as mock_run,
+        patch("src.agents.reviewer.make_run_config", return_value=None),
+        patch("src.agents.reviewer.function_tool", side_effect=lambda f: f),
+        patch("src.agents.reviewer._make_submit_review_tool", side_effect=_capture_factory),
+    ):
+        async def _side_effect(*args, **kwargs):
+            assert captured_holder, "factory should have been called by review()"
+            captured_holder[0]["output"] = ReviewerFeedbackOutput(
+                outcome="improved",
+                metric_deltas={},
+                bottleneck_classification="memory_bound",
+                bottleneck_diagnosis="",
+                suggestions=[],
+                branch_quality=BranchQuality.PROMISING,
+                conditional_assessment="",
+            )
+            raise MaxTurnsExceeded("Max turns (2) exceeded")
+
+        mock_run.side_effect = _side_effect
+
+        agent = ReviewerAgent(model=MagicMock())
+        feedback = await agent.review(
+            kernel_source="src",
+            profiling_summary="",
+            sol_score=0.5,
+            headroom_pct=50.0,
+            bottleneck=BottleneckType.MEMORY_BOUND,
+        )
+
+    assert feedback.degraded is False
+    assert feedback.outcome == "improved"
+    assert feedback.branch_quality == BranchQuality.PROMISING
+
+
+@pytest.mark.asyncio
+async def test_review_uses_degraded_with_existing_error_reason_when_run_agent_returns_none():
+    """The original 'llm_retries_exhausted' degraded path still fires when
+    run_agent returns None — submit-tool migration shouldn't regress
+    existing behavior."""
+    with (
+        patch("src.agents.reviewer.Agent"),
+        patch("src.agents.reviewer.run_agent", new_callable=AsyncMock) as mock_run,
+        patch("src.agents.reviewer.make_run_config", return_value=None),
+        patch("src.agents.reviewer.function_tool", side_effect=lambda f: f),
+    ):
+        mock_run.return_value = None
+
+        agent = ReviewerAgent(model=MagicMock())
+        feedback = await agent.review(
+            kernel_source="src",
+            profiling_summary="",
+            sol_score=0.5,
+            headroom_pct=50.0,
+            bottleneck=BottleneckType.MEMORY_BOUND,
+        )
+
+    assert feedback.degraded is True
+    assert feedback.error_reason == "llm_retries_exhausted"

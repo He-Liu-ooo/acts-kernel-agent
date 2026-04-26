@@ -14,21 +14,29 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Callable, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 try:
-    from agents import Agent, OpenAIChatCompletionsModel
+    from agents import Agent, MaxTurnsExceeded, OpenAIChatCompletionsModel, function_tool
 
     _SDK_AVAILABLE = True
 except ModuleNotFoundError:  # pragma: no cover
+    Agent = None  # type: ignore[assignment]
+    function_tool = None  # type: ignore[assignment]
+
+    class MaxTurnsExceeded(Exception):  # type: ignore[no-redef]
+        """SDK-absent test stand-in. The real exception lives in ``agents``."""
+
     _SDK_AVAILABLE = False
 
 if TYPE_CHECKING:
     from agents import Agent, OpenAIChatCompletionsModel, RunResult
 
 from src.agents.llm_backend import (
+    SUBMIT_OK_SENTINEL,
+    format_submit_validation_error,
     make_run_config,
     render_kernel_section,
     render_run_context,
@@ -224,6 +232,47 @@ def rule_based_feedback(
     )
 
 
+def _make_submit_review_tool(captured: dict) -> Callable[..., str]:
+    """Build a submit tool that captures the LLM's final ``ReviewerFeedbackOutput``.
+
+    Mirrors ``coder._make_submit_tool`` and ``planner._make_submit_plan_tool``:
+    runs Pydantic validation in the tool body, stores the validated output
+    on success, returns the standard error string on failure (which the
+    SDK hands back to the LLM for in-loop retry).
+
+    Tool parameter types are plain ``str`` for ``bottleneck_classification``
+    and ``branch_quality`` rather than the enums, because the SDK's
+    ``function_tool`` derives the JSON schema from Python annotations and
+    enum support is shaky across providers. The Pydantic model accepts
+    the string and validates it against the enum internally.
+    """
+
+    def submit_review(
+        outcome: str,
+        metric_deltas: dict[str, float],
+        bottleneck_classification: str,
+        bottleneck_diagnosis: str,
+        suggestions: list[str],
+        branch_quality: str,
+        conditional_assessment: str,
+    ) -> str:
+        try:
+            captured["output"] = ReviewerFeedbackOutput(
+                outcome=outcome,
+                metric_deltas=metric_deltas,
+                bottleneck_classification=bottleneck_classification,
+                bottleneck_diagnosis=bottleneck_diagnosis,
+                suggestions=suggestions,
+                branch_quality=branch_quality,
+                conditional_assessment=conditional_assessment,
+            )
+        except ValidationError as exc:
+            return format_submit_validation_error("submit_review", exc)
+        return SUBMIT_OK_SENTINEL
+
+    return submit_review
+
+
 # ── Agent ──────────────────────────────────────────────────────────────
 
 
@@ -242,16 +291,17 @@ class ReviewerAgent:
         model: OpenAIChatCompletionsModel | None = None,
         prompt_dir: Path = PROMPT_DIR,
     ) -> None:
+        self._model = model
         self._prompt_dir = prompt_dir
         if model is not None and _SDK_AVAILABLE:
-            self._agent: Agent | None = Agent(
-                name="Reviewer",
-                instructions=(prompt_dir / "system.md").read_text(),
-                model=model,
-                output_type=ReviewerFeedbackOutput,
-            )
+            self._instructions = (prompt_dir / "system.md").read_text()
         else:
-            self._agent = None
+            self._instructions = ""
+
+    @property
+    def has_model(self) -> bool:
+        """True when the agent is backed by a real LLM."""
+        return self._model is not None
 
     # ── prompt assembly ─────────────────────────────────────────────
 
@@ -311,17 +361,21 @@ class ReviewerAgent:
     ) -> ReviewerFeedback:
         """Interpret eval results into structured Reviewer feedback.
 
-        Falls back to rule-based feedback if no model is configured or if the
-        LLM call exhausts all retries. Strict Pydantic validation on the
-        output makes hallucinated bottleneck/branch_quality values surface as
-        retry-worthy errors inside `run_agent`.
+        Submits via a ``submit_review`` tool call so the SDK never sends a
+        ``response_format=json_schema`` (which DeepSeek-reasoner rejects and
+        which the SDK's strict-schema validator rejects on
+        ``metric_deltas: dict[str, float]``). Pydantic validation still
+        runs inside the tool body.
 
-        ``profiling`` (when provided) supplies the analytical + NCU blocks
-        for the prompt. The rule-based fallback's bottleneck label is the
+        Falls back to rule-based degraded feedback when no model is
+        configured, when run_agent returns None (transient retries
+        exhausted), when MaxTurnsExceeded fires with no captured
+        submission, or when the loop ends cleanly without calling
+        submit_review. The rule-based fallback's bottleneck label is the
         caller-provided ``bottleneck`` — the once-per-run classification,
         invariant across iterations (see ``classify_run``).
         """
-        if self._agent is None:
+        if not self.has_model:
             return rule_based_feedback(
                 sol_score=sol_score,
                 prev_sol_score=prev_sol_score,
@@ -339,26 +393,51 @@ class ReviewerAgent:
             kb_context=kb_context,
             profiling=profiling,
         )
-        result = await run_agent(
-            self._agent,
-            prompt,
-            run_config=make_run_config(temperature=0.3),
+
+        captured: dict = {}
+        submit_tool = function_tool(_make_submit_review_tool(captured))
+        agent = Agent(
+            name="Reviewer",
+            instructions=self._instructions,
+            model=self._model,
+            tools=[submit_tool],
         )
-        if result is None:
-            # LLM call exhausted retries — do NOT mask as ordinary fallback.
-            # The orchestrator uses `degraded` to surface/halt on broken runs.
+
+        def _degraded(reason: str) -> ReviewerFeedback:
             return rule_based_feedback(
                 sol_score=sol_score,
                 prev_sol_score=prev_sol_score,
                 headroom_pct=headroom_pct,
                 bottleneck=bottleneck,
                 degraded=True,
-                error_reason="llm_retries_exhausted",
+                error_reason=reason,
             )
 
-        return _output_to_feedback(result.final_output)
+        try:
+            result = await run_agent(
+                agent,
+                prompt,
+                run_config=make_run_config(temperature=0.3),
+                max_turns=2,
+            )
+        except MaxTurnsExceeded:
+            if "output" in captured:
+                return _output_to_feedback(captured["output"])
+            return _degraded("max_turns_exceeded")
+
+        if result is None:
+            return _degraded("llm_retries_exhausted")
+        if "output" not in captured:
+            return _degraded("missing_submit_review")
+        return _output_to_feedback(captured["output"])
 
     @staticmethod
     def parse_feedback(result: RunResult) -> ReviewerFeedback:
-        """Parse the LLM's final_output into ReviewerFeedback."""
+        """Parse the LLM's final_output into ReviewerFeedback.
+
+        Retained for backward compat — the live ``review()`` path no longer
+        relies on this since ``output_type=`` was dropped. ``result`` here
+        must carry a real ``ReviewerFeedbackOutput`` in ``final_output``;
+        not used by production callers.
+        """
         return _output_to_feedback(result.final_output)
