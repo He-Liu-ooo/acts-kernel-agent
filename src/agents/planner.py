@@ -255,7 +255,13 @@ class PlannerAgent:
         )
 
         captured: dict = {}
-        submit_tool = function_tool(_make_submit_plan_tool(captured))
+        # ``strict_mode=False``: the SDK's strict-schema validator rejects
+        # ``dict[str, str]`` (the ``params`` arg) with the same
+        # ``additionalProperties`` error that originally killed the
+        # ``output_type=Pydantic`` path. Pydantic validation still runs
+        # inside the tool body, so end-to-end type safety is preserved;
+        # malformed payloads bounce through the in-loop retry budget.
+        submit_tool = function_tool(_make_submit_plan_tool(captured), strict_mode=False)
         agent = Agent(
             name="Planner",
             instructions=self._instructions,

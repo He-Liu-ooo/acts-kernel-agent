@@ -150,7 +150,7 @@ def _simulate_plan_submission(**fields):
             patch("src.agents.planner.Agent"),
             patch("src.agents.planner.run_agent", new_callable=AsyncMock) as mock_run,
             patch("src.agents.planner.make_run_config", return_value=None),
-            patch("src.agents.planner.function_tool", side_effect=lambda f: f),
+            patch("src.agents.planner.function_tool", side_effect=lambda f, **kw: f),
             patch("src.agents.planner._make_submit_plan_tool", side_effect=capture_factory),
         ):
             mock_run.side_effect = fake_run
@@ -189,7 +189,7 @@ async def test_plan_calls_llm_and_returns_parsed_plan():
         patch("src.agents.planner.Agent"),
         patch("src.agents.planner.run_agent", new_callable=AsyncMock) as mock_run,
         patch("src.agents.planner.make_run_config", return_value=None),
-        patch("src.agents.planner.function_tool", side_effect=lambda f: f),
+        patch("src.agents.planner.function_tool", side_effect=lambda f, **kw: f),
         patch("src.agents.planner._make_submit_plan_tool", side_effect=capture_factory),
     ):
         mock_run.side_effect = fake_run
@@ -218,7 +218,7 @@ async def test_plan_raises_on_llm_failure():
         patch("src.agents.planner.Agent"),
         patch("src.agents.planner.run_agent", new_callable=AsyncMock) as mock_run,
         patch("src.agents.planner.make_run_config", return_value=None),
-        patch("src.agents.planner.function_tool", side_effect=lambda f: f),
+        patch("src.agents.planner.function_tool", side_effect=lambda f, **kw: f),
     ):
         mock_run.return_value = None
 
@@ -245,7 +245,7 @@ async def test_plan_uses_nonzero_temperature():
         patch("src.agents.planner.Agent"),
         patch("src.agents.planner.run_agent", new_callable=AsyncMock) as mock_run,
         patch("src.agents.planner.make_run_config") as mock_cfg,
-        patch("src.agents.planner.function_tool", side_effect=lambda f: f),
+        patch("src.agents.planner.function_tool", side_effect=lambda f, **kw: f),
         patch("src.agents.planner._make_submit_plan_tool", side_effect=capture_factory),
     ):
         mock_run.side_effect = fake_run
@@ -276,7 +276,7 @@ async def test_plan_rejects_hallucinated_technique():
         patch("src.agents.planner.Agent"),
         patch("src.agents.planner.run_agent", new_callable=AsyncMock) as mock_run,
         patch("src.agents.planner.make_run_config", return_value=None),
-        patch("src.agents.planner.function_tool", side_effect=lambda f: f),
+        patch("src.agents.planner.function_tool", side_effect=lambda f, **kw: f),
         patch("src.agents.planner._make_submit_plan_tool", side_effect=capture_factory),
     ):
         mock_run.side_effect = fake_run
@@ -405,7 +405,7 @@ async def test_plan_raises_when_loop_terminates_without_submitting():
         patch("src.agents.planner.Agent"),
         patch("src.agents.planner.run_agent", new_callable=AsyncMock) as mock_run,
         patch("src.agents.planner.make_run_config", return_value=None),
-        patch("src.agents.planner.function_tool", side_effect=lambda f: f),
+        patch("src.agents.planner.function_tool", side_effect=lambda f, **kw: f),
     ):
         mock_run.return_value = MagicMock(final_output="done")
 
@@ -431,7 +431,7 @@ async def test_plan_converts_max_turns_exceeded_to_planning_error():
         patch("src.agents.planner.Agent"),
         patch("src.agents.planner.run_agent", new_callable=AsyncMock) as mock_run,
         patch("src.agents.planner.make_run_config", return_value=None),
-        patch("src.agents.planner.function_tool", side_effect=lambda f: f),
+        patch("src.agents.planner.function_tool", side_effect=lambda f, **kw: f),
     ):
         mock_run.side_effect = MaxTurnsExceeded("Max turns (4) exceeded")
 
@@ -468,7 +468,7 @@ async def test_plan_returns_partial_output_when_max_turns_after_submission():
         patch("src.agents.planner.Agent"),
         patch("src.agents.planner.run_agent", new_callable=AsyncMock) as mock_run,
         patch("src.agents.planner.make_run_config", return_value=None),
-        patch("src.agents.planner.function_tool", side_effect=lambda f: f),
+        patch("src.agents.planner.function_tool", side_effect=lambda f, **kw: f),
         patch("src.agents.planner._make_submit_plan_tool", side_effect=_capture_factory),
     ):
         async def _side_effect(*args, **kwargs):
@@ -516,7 +516,7 @@ async def test_plan_recovers_from_first_invalid_submit_within_turn_budget():
         patch("src.agents.planner.Agent"),
         patch("src.agents.planner.run_agent", new_callable=AsyncMock) as mock_run,
         patch("src.agents.planner.make_run_config", return_value=None),
-        patch("src.agents.planner.function_tool", side_effect=lambda f: f),
+        patch("src.agents.planner.function_tool", side_effect=lambda f, **kw: f),
         patch("src.agents.planner._make_submit_plan_tool", side_effect=_capture_factory),
     ):
         async def _side_effect(*args, **kwargs):
@@ -601,3 +601,38 @@ def test_make_submit_plan_tool_omits_optional_fields_uses_pydantic_defaults():
     assert captured["output"].params == {}
     assert captured["output"].target_region == ""
     assert captured["output"].rationale == ""
+
+
+@pytest.mark.asyncio
+async def test_submit_tool_registered_with_strict_mode_false():
+    """Regression guard: ``submit_plan`` must be registered with
+    ``strict_mode=False``. The SDK's strict-schema validator otherwise
+    rejects the ``params: dict[str, str]`` arg with an
+    ``additionalProperties`` UserError, which is the exact failure the
+    submit-tool migration was meant to fix."""
+    capture_factory, fake_run = _simulate_plan_submission(
+        tier=1, technique="block_size_tuning"
+    )
+    recorded_kwargs: list[dict] = []
+
+    def recording_function_tool(f, **kwargs):
+        recorded_kwargs.append(kwargs)
+        return f
+
+    with (
+        patch("src.agents.planner._SDK_AVAILABLE", True),
+        patch("src.agents.planner.Agent"),
+        patch("src.agents.planner.run_agent", new_callable=AsyncMock) as mock_run,
+        patch("src.agents.planner.make_run_config", return_value=None),
+        patch("src.agents.planner.function_tool", side_effect=recording_function_tool),
+        patch("src.agents.planner._make_submit_plan_tool", side_effect=capture_factory),
+    ):
+        mock_run.side_effect = fake_run
+        await PlannerAgent(model=MagicMock()).plan(
+            kernel_source="@triton.jit\ndef k(): ...",
+            profiling_summary="",
+            past_experiences=[],
+            available_actions=["block_size_tuning"],
+        )
+
+    assert recorded_kwargs == [{"strict_mode": False}]

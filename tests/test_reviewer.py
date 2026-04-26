@@ -161,7 +161,7 @@ def _simulate_review_submission(**fields):
             patch("src.agents.reviewer.Agent"),
             patch("src.agents.reviewer.run_agent", new_callable=AsyncMock) as mock_run,
             patch("src.agents.reviewer.make_run_config", return_value=None),
-            patch("src.agents.reviewer.function_tool", side_effect=lambda f: f),
+            patch("src.agents.reviewer.function_tool", side_effect=lambda f, **kw: f),
             patch("src.agents.reviewer._make_submit_review_tool", side_effect=capture_factory),
         ):
             mock_run.side_effect = fake_run
@@ -202,7 +202,7 @@ async def test_review_calls_llm_and_returns_parsed_feedback():
         patch("src.agents.reviewer.Agent"),
         patch("src.agents.reviewer.run_agent", new_callable=AsyncMock) as mock_run,
         patch("src.agents.reviewer.make_run_config", return_value=None),
-        patch("src.agents.reviewer.function_tool", side_effect=lambda f: f),
+        patch("src.agents.reviewer.function_tool", side_effect=lambda f, **kw: f),
         patch("src.agents.reviewer._make_submit_review_tool", side_effect=capture_factory),
     ):
         mock_run.side_effect = fake_run
@@ -238,7 +238,7 @@ async def test_review_uses_nonzero_temperature():
         patch("src.agents.reviewer.Agent"),
         patch("src.agents.reviewer.run_agent", new_callable=AsyncMock) as mock_run,
         patch("src.agents.reviewer.make_run_config") as mock_cfg,
-        patch("src.agents.reviewer.function_tool", side_effect=lambda f: f),
+        patch("src.agents.reviewer.function_tool", side_effect=lambda f, **kw: f),
         patch("src.agents.reviewer._make_submit_review_tool", side_effect=capture_factory),
     ):
         mock_run.side_effect = fake_run
@@ -271,7 +271,7 @@ async def test_review_passes_tree_and_kb_context_to_prompt():
         patch("src.agents.reviewer.Agent"),
         patch("src.agents.reviewer.run_agent", new_callable=AsyncMock) as mock_run,
         patch("src.agents.reviewer.make_run_config", return_value=None),
-        patch("src.agents.reviewer.function_tool", side_effect=lambda f: f),
+        patch("src.agents.reviewer.function_tool", side_effect=lambda f, **kw: f),
         patch("src.agents.reviewer._make_submit_review_tool", side_effect=capture_factory),
     ):
         mock_run.side_effect = fake_run
@@ -321,7 +321,7 @@ async def test_review_falls_back_to_rules_when_llm_returns_none():
         patch("src.agents.reviewer.Agent"),
         patch("src.agents.reviewer.run_agent", new_callable=AsyncMock) as mock_run,
         patch("src.agents.reviewer.make_run_config", return_value=None),
-        patch("src.agents.reviewer.function_tool", side_effect=lambda f: f),
+        patch("src.agents.reviewer.function_tool", side_effect=lambda f, **kw: f),
     ):
         mock_run.return_value = None
         agent = ReviewerAgent(model=MagicMock())
@@ -349,7 +349,7 @@ async def test_llm_failure_is_flagged_degraded():
         patch("src.agents.reviewer.Agent"),
         patch("src.agents.reviewer.run_agent", new_callable=AsyncMock) as mock_run,
         patch("src.agents.reviewer.make_run_config", return_value=None),
-        patch("src.agents.reviewer.function_tool", side_effect=lambda f: f),
+        patch("src.agents.reviewer.function_tool", side_effect=lambda f, **kw: f),
     ):
         mock_run.return_value = None
         agent = ReviewerAgent(model=MagicMock())
@@ -535,7 +535,7 @@ async def test_review_falls_back_to_degraded_when_loop_terminates_without_submit
         patch("src.agents.reviewer.Agent"),
         patch("src.agents.reviewer.run_agent", new_callable=AsyncMock) as mock_run,
         patch("src.agents.reviewer.make_run_config", return_value=None),
-        patch("src.agents.reviewer.function_tool", side_effect=lambda f: f),
+        patch("src.agents.reviewer.function_tool", side_effect=lambda f, **kw: f),
     ):
         mock_run.return_value = MagicMock(final_output="done")
 
@@ -564,7 +564,7 @@ async def test_review_falls_back_to_degraded_on_max_turns_exceeded():
         patch("src.agents.reviewer.Agent"),
         patch("src.agents.reviewer.run_agent", new_callable=AsyncMock) as mock_run,
         patch("src.agents.reviewer.make_run_config", return_value=None),
-        patch("src.agents.reviewer.function_tool", side_effect=lambda f: f),
+        patch("src.agents.reviewer.function_tool", side_effect=lambda f, **kw: f),
     ):
         mock_run.side_effect = MaxTurnsExceeded("Max turns (4) exceeded")
 
@@ -602,7 +602,7 @@ async def test_review_returns_partial_output_when_max_turns_after_submission():
         patch("src.agents.reviewer.Agent"),
         patch("src.agents.reviewer.run_agent", new_callable=AsyncMock) as mock_run,
         patch("src.agents.reviewer.make_run_config", return_value=None),
-        patch("src.agents.reviewer.function_tool", side_effect=lambda f: f),
+        patch("src.agents.reviewer.function_tool", side_effect=lambda f, **kw: f),
         patch("src.agents.reviewer._make_submit_review_tool", side_effect=_capture_factory),
     ):
         async def _side_effect(*args, **kwargs):
@@ -656,7 +656,7 @@ async def test_review_recovers_from_first_invalid_submit_within_turn_budget():
         patch("src.agents.reviewer.Agent"),
         patch("src.agents.reviewer.run_agent", new_callable=AsyncMock) as mock_run,
         patch("src.agents.reviewer.make_run_config", return_value=None),
-        patch("src.agents.reviewer.function_tool", side_effect=lambda f: f),
+        patch("src.agents.reviewer.function_tool", side_effect=lambda f, **kw: f),
         patch("src.agents.reviewer._make_submit_review_tool", side_effect=_capture_factory),
     ):
         async def _side_effect(*args, **kwargs):
@@ -760,7 +760,7 @@ async def test_review_uses_degraded_with_existing_error_reason_when_run_agent_re
         patch("src.agents.reviewer.Agent"),
         patch("src.agents.reviewer.run_agent", new_callable=AsyncMock) as mock_run,
         patch("src.agents.reviewer.make_run_config", return_value=None),
-        patch("src.agents.reviewer.function_tool", side_effect=lambda f: f),
+        patch("src.agents.reviewer.function_tool", side_effect=lambda f, **kw: f),
     ):
         mock_run.return_value = None
 
@@ -775,3 +775,41 @@ async def test_review_uses_degraded_with_existing_error_reason_when_run_agent_re
 
     assert feedback.degraded is True
     assert feedback.error_reason == "llm_retries_exhausted"
+
+
+@pytest.mark.asyncio
+async def test_submit_tool_registered_with_strict_mode_false():
+    """Regression guard: ``submit_review`` must be registered with
+    ``strict_mode=False``. The SDK's strict-schema validator otherwise
+    rejects the ``metric_deltas: dict[str, float]`` arg with an
+    ``additionalProperties`` UserError, which is the exact failure the
+    submit-tool migration was meant to fix."""
+    capture_factory, fake_run = _simulate_review_submission(
+        outcome="improved",
+        bottleneck_classification="memory_bound",
+        branch_quality=BranchQuality.PROMISING,
+    )
+    recorded_kwargs: list[dict] = []
+
+    def recording_function_tool(f, **kwargs):
+        recorded_kwargs.append(kwargs)
+        return f
+
+    with (
+        patch("src.agents.reviewer._SDK_AVAILABLE", True),
+        patch("src.agents.reviewer.Agent"),
+        patch("src.agents.reviewer.run_agent", new_callable=AsyncMock) as mock_run,
+        patch("src.agents.reviewer.make_run_config", return_value=None),
+        patch("src.agents.reviewer.function_tool", side_effect=recording_function_tool),
+        patch("src.agents.reviewer._make_submit_review_tool", side_effect=capture_factory),
+    ):
+        mock_run.side_effect = fake_run
+        await ReviewerAgent(model=MagicMock()).review(
+            kernel_source="@triton.jit\ndef k(): ...",
+            profiling_summary="",
+            sol_score=0.5,
+            headroom_pct=50.0,
+            bottleneck=BottleneckType.MEMORY_BOUND,
+        )
+
+    assert recorded_kwargs == [{"strict_mode": False}]
