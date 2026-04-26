@@ -32,7 +32,7 @@ except ModuleNotFoundError:  # pragma: no cover
     _SDK_AVAILABLE = False
 
 if TYPE_CHECKING:
-    from agents import Agent, OpenAIChatCompletionsModel, RunResult
+    from agents import Agent, OpenAIChatCompletionsModel
 
 from src.agents.llm_backend import (
     SUBMIT_OK_SENTINEL,
@@ -247,22 +247,27 @@ def _make_submit_review_tool(captured: dict) -> Callable[..., str]:
     the string and validates it against the enum internally.
     """
 
+    # Required vs optional mirrors ``ReviewerFeedbackOutput``'s Pydantic
+    # defaults — required: outcome, bottleneck_classification, branch_quality.
+    # Without optional defaults here the SDK rejects tool calls that omit
+    # any of these fields, even though the Pydantic model itself would
+    # have filled the defaults.
     def submit_review(
         outcome: str,
-        metric_deltas: dict[str, float],
         bottleneck_classification: str,
-        bottleneck_diagnosis: str,
-        suggestions: list[str],
         branch_quality: str,
-        conditional_assessment: str,
+        metric_deltas: dict[str, float] | None = None,
+        bottleneck_diagnosis: str = "",
+        suggestions: list[str] | None = None,
+        conditional_assessment: str = "",
     ) -> str:
         try:
             captured["output"] = ReviewerFeedbackOutput(
                 outcome=outcome,
-                metric_deltas=metric_deltas,
+                metric_deltas=metric_deltas or {},
                 bottleneck_classification=bottleneck_classification,
                 bottleneck_diagnosis=bottleneck_diagnosis,
-                suggestions=suggestions,
+                suggestions=suggestions or [],
                 branch_quality=branch_quality,
                 conditional_assessment=conditional_assessment,
             )
@@ -300,8 +305,10 @@ class ReviewerAgent:
 
     @property
     def has_model(self) -> bool:
-        """True when the agent is backed by a real LLM."""
-        return self._model is not None
+        """True when the agent is backed by a real LLM AND the SDK is
+        importable. See planner.PlannerAgent.has_model for rationale.
+        """
+        return self._model is not None and _SDK_AVAILABLE
 
     # ── prompt assembly ─────────────────────────────────────────────
 
@@ -413,12 +420,16 @@ class ReviewerAgent:
                 error_reason=reason,
             )
 
+        # Turn budget: 2*N + 2 with N=1 in-band validation retry. Mirrors
+        # planner.py — reserves room for one invalid submit + corrected
+        # submit + confirmation, so a single Pydantic slip self-corrects
+        # in-loop instead of degrading to rule-based fallback.
         try:
             result = await run_agent(
                 agent,
                 prompt,
                 run_config=make_run_config(temperature=0.3),
-                max_turns=2,
+                max_turns=4,
             )
         except MaxTurnsExceeded:
             if "output" in captured:
@@ -430,14 +441,3 @@ class ReviewerAgent:
         if "output" not in captured:
             return _degraded("missing_submit_review")
         return _output_to_feedback(captured["output"])
-
-    @staticmethod
-    def parse_feedback(result: RunResult) -> ReviewerFeedback:
-        """Parse the LLM's final_output into ReviewerFeedback.
-
-        Retained for backward compat — the live ``review()`` path no longer
-        relies on this since ``output_type=`` was dropped. ``result`` here
-        must carry a real ``ReviewerFeedbackOutput`` in ``final_output``;
-        not used by production callers.
-        """
-        return _output_to_feedback(result.final_output)

@@ -37,7 +37,7 @@ Fans out each call to two sinks:
 Contract:
 
 - `kind` must be in `CORE_EVENT_KINDS`; other kinds log a warning and are still written (schema drift stays visible, never silent).
-- `iter` is an explicit keyword. It appears on per-iteration events (`iter_start`, `planner_selected`, `coder_submitted`, `coder_failed`, `bench_done`, `profile_done`, `score_computed`, `reviewer_feedback`, `branch_dead_end`, `iter_end`) and is `None` on run-scope events (`run_start`, `baseline_*`, `verify_*`, `run_end`).
+- `iter` is an explicit keyword. It appears on per-iteration events (`iter_start`, `planner_selected`, `planner_failed`, `coder_submitted`, `coder_failed`, `bench_done`, `profile_done`, `score_computed`, `reviewer_feedback`, `branch_dead_end`, `iter_end`) and is `None` on run-scope events (`run_start`, `baseline_*`, `verify_*`, `run_end`).
 - **Never raises.** Serialization failures are caught and logged; file-handle errors during write do not propagate.
 - Skips serialization entirely when `logger.isEnabledFor(INFO)` is false — cheap to leave in hot paths.
 - All additional `**fields` are merged flat into the JSON object. Use `finite_or_none(x)` on any float that could be `inf`/`nan` (e.g. latency after a failed bench) so JSON stays valid.
@@ -52,17 +52,18 @@ Module-level handle registration, guarded by `_lock`. `RunContext.create` calls 
 
 ### Event catalog — `CORE_EVENT_KINDS`
 
-Frozenset of 18 kinds:
+Frozenset of 19 kinds:
 
 **Run scope** — `run_start`, `baseline_attempt`, `baseline_success`, `baseline_failure`, `baseline_ready`, `verify_start`, `verify_done`, `run_end`.
 
-**Per-iteration** — `iter_start`, `planner_selected`, `coder_submitted`, `coder_failed`, `bench_done`, `profile_done`, `score_computed`, `reviewer_feedback`, `branch_dead_end`, `iter_end`.
+**Per-iteration** — `iter_start`, `planner_selected`, `planner_failed`, `coder_submitted`, `coder_failed`, `bench_done`, `profile_done`, `score_computed`, `reviewer_feedback`, `branch_dead_end`, `iter_end`.
 
 Notable semantics:
 
 - `coder_submitted` carries **no pass/fail claim**. The orchestrator cannot verify compile or correctness gates from `CoderAgent.implement()`'s return value alone. Ground-truth per-tool-call records live in `traces/*.jsonl`; cross-reference both streams when auditing.
 - `coder_failed` covers any `ImplementationError` (compile failure, correctness failure, exhausted retries).
-- `iter_end.outcome` is exactly one of three constants: `ITER_ADVANCED` (`"advanced"`), `ITER_DEAD_END` (`"dead_end"`), `ITER_SKIPPED` (`"skipped"`). `skipped` fires only after `coder_failed` and implies no tree mutation.
+- `planner_failed`: any `PlanningError` cause — turn-budget exhaustion, missing `submit_plan` call, transient retry exhaustion, or the available-actions guard rejecting an unknown technique. Carries `iter` and `reason` (truncated exception string ≤ 200 chars). Always followed by `iter_end(outcome="skipped")`; no tree mutation occurs on this path.
+- `iter_end.outcome` is exactly one of three constants: `ITER_ADVANCED` (`"advanced"`), `ITER_DEAD_END` (`"dead_end"`), `ITER_SKIPPED` (`"skipped"`). `skipped` fires only after either `coder_failed` or `planner_failed` and implies no tree mutation.
 
 ## `run_context.py`
 

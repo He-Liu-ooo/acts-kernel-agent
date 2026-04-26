@@ -39,6 +39,18 @@ class TreeNode:
     # median. ``None`` on the root and on legacy checkpoints predating
     # the field; report.py falls back to the aggregate in that case.
     per_workload_latency_us: dict[str, float] | None = None
+    # Counts back-to-back Coder/Planner failures on this parent. Reset
+    # to zero whenever an iteration successfully spawns a child off this
+    # node. ``frontier()`` excludes nodes at or above
+    # ``QUARANTINE_THRESHOLD`` so a deterministically-failing parent
+    # doesn't burn the whole search budget by being re-selected forever.
+    consecutive_agent_failures: int = 0
+
+
+# A parent that has caused this many consecutive Planner/Coder failures
+# is quarantined from ``frontier()``. Two tolerates one transient API
+# blip; raising it loosens the guarantee against deterministic failures.
+QUARANTINE_THRESHOLD: int = 2
 
 
 class SearchTree:
@@ -80,16 +92,26 @@ class SearchTree:
         return self._nodes[node_id]
 
     def frontier(self) -> list[TreeNode]:
-        """Return all expandable frontier nodes (not dead_end)."""
+        """Return all expandable frontier nodes — neither marked dead_end
+        nor quarantined for repeated Planner/Coder failures.
+        """
         from src.agents.reviewer import BranchQuality
 
         return [
             n for n in self._nodes.values()
             if n.branch_quality != BranchQuality.DEAD_END
+            and n.consecutive_agent_failures < QUARANTINE_THRESHOLD
         ]
 
     def best_node(self) -> TreeNode:
-        """Return the node with the highest SOL score."""
+        """Return the node with the highest SOL score.
+
+        Quarantined nodes (``consecutive_agent_failures >= QUARANTINE_THRESHOLD``)
+        are intentionally still candidates here — quarantine prevents a
+        deterministically-failing parent from being re-selected for
+        further expansion, but its own measured score remains a valid
+        final answer if it happens to be the run's best.
+        """
         scored = [n for n in self._nodes.values() if n.score is not None]
         if not scored:
             # Fall back to root
@@ -189,6 +211,7 @@ def _serialize_node(node: TreeNode) -> dict:
         "kernel": _serialize_kernel(node.kernel),
         "profiling": _serialize_profiling(node.profiling),
         "per_workload_latency_us": _serialize_per_workload_latency(node.per_workload_latency_us),
+        "consecutive_agent_failures": node.consecutive_agent_failures,
     }
 
 
@@ -325,6 +348,9 @@ def _deserialize_node(data: dict) -> TreeNode:
         per_workload_latency_us=_deserialize_per_workload_latency(
             data.get("per_workload_latency_us")
         ),
+        # ``.get(..., 0)`` keeps pre-quarantine checkpoints loadable —
+        # legacy nodes default to "no failures recorded yet."
+        consecutive_agent_failures=data.get("consecutive_agent_failures", 0),
     )
 
 

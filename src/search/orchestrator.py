@@ -389,6 +389,11 @@ class Orchestrator:
                     "Iteration %d: Planner failed (%s) — skipping iteration",
                     iter_no, exc,
                 )
+                # Bump the parent's failure counter so a deterministically-
+                # failing parent is quarantined from ``frontier()`` on the
+                # next select_next instead of being re-picked forever and
+                # silently consuming the entire ``max_depth`` budget.
+                parent.consecutive_agent_failures += 1
                 emit("planner_failed", iter=iter_no, reason=str(exc)[:200])
                 emit("iter_end", iter=iter_no, outcome=ITER_SKIPPED)
                 epsilon = max(self._config.epsilon_end, epsilon - decay)
@@ -426,6 +431,8 @@ class Orchestrator:
                     "Iteration %d: Coder failed (%s) — skipping iteration",
                     iter_no, exc,
                 )
+                # See planner_failed branch above for the quarantine rationale.
+                parent.consecutive_agent_failures += 1
                 emit("coder_failed", iter=iter_no, reason=str(exc)[:200])
                 emit("iter_end", iter=iter_no, outcome=ITER_SKIPPED)
                 epsilon = max(self._config.epsilon_end, epsilon - decay)
@@ -442,6 +449,10 @@ class Orchestrator:
                 triton_kernel_name=coder_output.triton_kernel_name,
             )
             child = tree.add_child(parent.id, child_kernel, plan.technique)
+            # Successful child generation clears the parent's counter so
+            # one transient blip earlier in the run doesn't permanently
+            # quarantine an otherwise-productive node.
+            parent.consecutive_agent_failures = 0
 
             # Child-benchmark failure is branch-local: BenchmarkError
             # (majority-failure) and non-empty workload_errors (partial

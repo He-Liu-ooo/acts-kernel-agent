@@ -146,6 +146,7 @@ def _simulate_plan_submission(**fields):
 
         capture_factory, fake_run = _simulate_plan_submission(tier=3, ...)
         with (
+            patch("src.agents.planner._SDK_AVAILABLE", True),
             patch("src.agents.planner.Agent"),
             patch("src.agents.planner.run_agent", new_callable=AsyncMock) as mock_run,
             patch("src.agents.planner.make_run_config", return_value=None),
@@ -184,6 +185,7 @@ async def test_plan_calls_llm_and_returns_parsed_plan():
     )
 
     with (
+        patch("src.agents.planner._SDK_AVAILABLE", True),
         patch("src.agents.planner.Agent"),
         patch("src.agents.planner.run_agent", new_callable=AsyncMock) as mock_run,
         patch("src.agents.planner.make_run_config", return_value=None),
@@ -212,6 +214,7 @@ async def test_plan_calls_llm_and_returns_parsed_plan():
 async def test_plan_raises_on_llm_failure():
     """If run_agent returns None (all retries exhausted), raise PlanningError."""
     with (
+        patch("src.agents.planner._SDK_AVAILABLE", True),
         patch("src.agents.planner.Agent"),
         patch("src.agents.planner.run_agent", new_callable=AsyncMock) as mock_run,
         patch("src.agents.planner.make_run_config", return_value=None),
@@ -238,6 +241,7 @@ async def test_plan_uses_nonzero_temperature():
     )
 
     with (
+        patch("src.agents.planner._SDK_AVAILABLE", True),
         patch("src.agents.planner.Agent"),
         patch("src.agents.planner.run_agent", new_callable=AsyncMock) as mock_run,
         patch("src.agents.planner.make_run_config") as mock_cfg,
@@ -268,6 +272,7 @@ async def test_plan_rejects_hallucinated_technique():
     )
 
     with (
+        patch("src.agents.planner._SDK_AVAILABLE", True),
         patch("src.agents.planner.Agent"),
         patch("src.agents.planner.run_agent", new_callable=AsyncMock) as mock_run,
         patch("src.agents.planner.make_run_config", return_value=None),
@@ -396,6 +401,7 @@ async def test_plan_raises_when_loop_terminates_without_submitting():
     iteration cleanly. Mocked Runner.run returns normally but captured
     dict stays empty."""
     with (
+        patch("src.agents.planner._SDK_AVAILABLE", True),
         patch("src.agents.planner.Agent"),
         patch("src.agents.planner.run_agent", new_callable=AsyncMock) as mock_run,
         patch("src.agents.planner.make_run_config", return_value=None),
@@ -421,12 +427,13 @@ async def test_plan_converts_max_turns_exceeded_to_planning_error():
     from src.agents.planner import MaxTurnsExceeded
 
     with (
+        patch("src.agents.planner._SDK_AVAILABLE", True),
         patch("src.agents.planner.Agent"),
         patch("src.agents.planner.run_agent", new_callable=AsyncMock) as mock_run,
         patch("src.agents.planner.make_run_config", return_value=None),
         patch("src.agents.planner.function_tool", side_effect=lambda f: f),
     ):
-        mock_run.side_effect = MaxTurnsExceeded("Max turns (2) exceeded")
+        mock_run.side_effect = MaxTurnsExceeded("Max turns (4) exceeded")
 
         agent = PlannerAgent(model=MagicMock())
         with pytest.raises(PlanningError, match="turn budget"):
@@ -457,6 +464,7 @@ async def test_plan_returns_partial_output_when_max_turns_after_submission():
         return _make_submit_plan_tool(captured_dict)
 
     with (
+        patch("src.agents.planner._SDK_AVAILABLE", True),
         patch("src.agents.planner.Agent"),
         patch("src.agents.planner.run_agent", new_callable=AsyncMock) as mock_run,
         patch("src.agents.planner.make_run_config", return_value=None),
@@ -468,7 +476,7 @@ async def test_plan_returns_partial_output_when_max_turns_after_submission():
             captured_holder[0]["output"] = OptimizationPlanOutput(
                 tier=2, technique="vectorize", params={}, target_region="", rationale="r",
             )
-            raise MaxTurnsExceeded("Max turns (2) exceeded")
+            raise MaxTurnsExceeded("Max turns (4) exceeded")
 
         mock_run.side_effect = _side_effect
 
@@ -483,3 +491,113 @@ async def test_plan_returns_partial_output_when_max_turns_after_submission():
     assert isinstance(plan, OptimizationPlan)
     assert plan.tier == 2
     assert plan.technique == "vectorize"
+
+
+@pytest.mark.asyncio
+async def test_plan_recovers_from_first_invalid_submit_within_turn_budget():
+    """Validation-retry budget: first submit_plan call returns FAILED (invalid
+    payload), the LLM corrects on the second call, the agent emits the
+    plain-text confirmation, and plan() returns cleanly without going
+    through MaxTurnsExceeded recovery. max_turns=4 must reserve room for
+    this exact path: turn 1 invalid + turn 2 corrected + turn 3 confirmation."""
+    from src.agents.planner import (
+        OptimizationPlanOutput,
+        _make_submit_plan_tool,
+    )
+
+    captured_holder: list[dict] = []
+
+    def _capture_factory(captured_dict: dict):
+        captured_holder.append(captured_dict)
+        return _make_submit_plan_tool(captured_dict)
+
+    with (
+        patch("src.agents.planner._SDK_AVAILABLE", True),
+        patch("src.agents.planner.Agent"),
+        patch("src.agents.planner.run_agent", new_callable=AsyncMock) as mock_run,
+        patch("src.agents.planner.make_run_config", return_value=None),
+        patch("src.agents.planner.function_tool", side_effect=lambda f: f),
+        patch("src.agents.planner._make_submit_plan_tool", side_effect=_capture_factory),
+    ):
+        async def _side_effect(*args, **kwargs):
+            # Simulate the LLM's two-turn validation retry: first invalid
+            # (no capture), then valid (populates captured), then a clean
+            # confirmation that ends the SDK loop without raising.
+            assert captured_holder, "factory should have been called by plan()"
+            captured_holder[0]["output"] = OptimizationPlanOutput(
+                tier=1,
+                technique="block_size_tuning",
+                params={"block_size": "128"},
+                target_region="loop",
+                rationale="recovered after one validation retry",
+            )
+            return MagicMock(final_output="done")
+
+        mock_run.side_effect = _side_effect
+
+        agent = PlannerAgent(model=MagicMock())
+        plan = await agent.plan(
+            kernel_source="src",
+            profiling_summary="",
+            past_experiences=[],
+            available_actions=[],
+        )
+
+    assert isinstance(plan, OptimizationPlan)
+    assert plan.technique == "block_size_tuning"
+    assert "recovered after one validation retry" in plan.rationale
+
+
+# ── SDK-absent fallback (regression guard) ────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_plan_returns_default_when_sdk_absent_even_with_model_arg():
+    """SDK-absent + non-None model arg must NOT take the LLM tool path —
+    Agent and function_tool are None in that environment, so calling
+    them raises TypeError. The pre-migration constructor gated _agent
+    creation on `model is not None and _SDK_AVAILABLE`; the migration
+    must preserve the equivalent fallback via has_model."""
+    with patch("src.agents.planner._SDK_AVAILABLE", False):
+        agent = PlannerAgent(model=MagicMock())
+        plan = await agent.plan(
+            kernel_source="def k(): pass",
+            profiling_summary="",
+            past_experiences=[],
+            available_actions=[],
+        )
+    assert isinstance(plan, OptimizationPlan)
+    assert plan.tier == 1
+    assert plan.technique == "block_size_tuning"  # _DEFAULT_PLAN
+
+
+def test_planner_has_model_false_when_sdk_absent():
+    """``has_model`` must reflect both ``self._model is not None`` AND
+    SDK availability. Without this gate, an SDK-absent test environment
+    that injects a model stub flows into the tool path and crashes."""
+    with patch("src.agents.planner._SDK_AVAILABLE", False):
+        agent = PlannerAgent(model=MagicMock())
+    assert agent.has_model is False
+
+
+# ── _make_submit_plan_tool — defaulted Pydantic fields ────────────────────
+
+
+def test_make_submit_plan_tool_omits_optional_fields_uses_pydantic_defaults():
+    """``OptimizationPlanOutput`` defaults ``params={}``, ``target_region=""``,
+    ``rationale=""``. The tool signature must mark these optional so the
+    SDK doesn't reject a tool call that omits them — the LLM might emit
+    only ``tier`` + ``technique`` for a minimal plan, which the old
+    ``output_type=`` path accepted verbatim."""
+    from src.agents.llm_backend import SUBMIT_OK_SENTINEL
+    from src.agents.planner import OptimizationPlanOutput, _make_submit_plan_tool
+
+    captured: dict = {}
+    submit = _make_submit_plan_tool(captured)
+    msg = submit(tier=2, technique="vectorize")  # only required fields
+    assert msg == SUBMIT_OK_SENTINEL
+    assert "output" in captured
+    assert isinstance(captured["output"], OptimizationPlanOutput)
+    assert captured["output"].params == {}
+    assert captured["output"].target_region == ""
+    assert captured["output"].rationale == ""

@@ -86,6 +86,68 @@ class TestPathToNode:
             tree.path_to_node(999)
 
 
+# ── frontier quarantine ──────────────────────────────────────────────────────
+
+
+class TestFrontierQuarantine:
+    """Repeated agent failures on the same parent must remove that parent
+    from ``frontier()`` so ``select_next`` doesn't re-pick it forever.
+    Without quarantine, a deterministic Planner/Coder failure on the
+    highest-scoring node burns the entire ``max_depth`` budget.
+    """
+
+    def test_node_below_threshold_stays_in_frontier(self):
+        """One agent failure shouldn't remove the node — preserves
+        tolerance for transient API blips."""
+        tree = SearchTree()
+        root = tree.add_root(_make_kernel())
+        root.consecutive_agent_failures = 1
+
+        assert root in tree.frontier()
+
+    def test_node_at_or_above_threshold_excluded_from_frontier(self):
+        """Two consecutive failures on the same parent quarantines it."""
+        from src.search.tree import QUARANTINE_THRESHOLD
+
+        tree = SearchTree()
+        root = tree.add_root(_make_kernel())
+        root.consecutive_agent_failures = QUARANTINE_THRESHOLD
+
+        assert root not in tree.frontier()
+
+    def test_quarantine_threshold_is_two(self):
+        """Pin the threshold value — bumping it loosens the quarantine
+        guarantee silently otherwise."""
+        from src.search.tree import QUARANTINE_THRESHOLD
+
+        assert QUARANTINE_THRESHOLD == 2
+
+    def test_quarantined_node_serializes_and_deserializes(self):
+        """Checkpoints must preserve the failure counter so a resumed
+        run doesn't accidentally re-select a quarantined parent."""
+        from src.search.tree import _deserialize_node, _serialize_node
+
+        tree = SearchTree()
+        root = tree.add_root(_make_kernel())
+        root.consecutive_agent_failures = 3
+
+        rehydrated = _deserialize_node(_serialize_node(root))
+        assert rehydrated.consecutive_agent_failures == 3
+
+    def test_legacy_checkpoint_loads_with_zero_counter(self):
+        """Pre-quarantine checkpoints have no ``consecutive_agent_failures``
+        field. Loading must default to 0 (in-frontier), not crash."""
+        from src.search.tree import _deserialize_node, _serialize_node
+
+        tree = SearchTree()
+        root = tree.add_root(_make_kernel())
+        legacy = _serialize_node(root)
+        legacy.pop("consecutive_agent_failures", None)
+
+        rehydrated = _deserialize_node(legacy)
+        assert rehydrated.consecutive_agent_failures == 0
+
+
 # ── beam pruning: diversity-aware (B2) ───────────────────────────────────────
 
 class TestBeamPruneDiversity:
@@ -1002,13 +1064,18 @@ class TestOrchestratorCoderFailure:
         self, _orch_harness
     ):
         """If every iteration's Coder call fails, the run must still complete
-        without raising (budget exhaustion termination), not unwind the loop."""
+        without raising. With parent quarantine wired in, the failing root
+        is removed from ``frontier()`` after ``QUARANTINE_THRESHOLD``
+        consecutive Coder failures — subsequent iterations terminate via
+        ALL_DEAD_END instead of consuming the rest of ``max_depth`` on a
+        node that will never produce a child."""
         from src.agents.coder import ImplementationError
         from src.eval.benchmark import BenchmarkResult
         from src.search.orchestrator import Orchestrator
+        from src.search.tree import QUARANTINE_THRESHOLD
 
         h = _orch_harness
-        h.config.max_depth = 3
+        h.config.max_depth = QUARANTINE_THRESHOLD + 2
         h.coder.implement = AsyncMock(
             side_effect=ImplementationError("turn budget exhausted"),
         )
@@ -1021,9 +1088,9 @@ class TestOrchestratorCoderFailure:
             orch = Orchestrator(h.config, h.planner, h.coder, h.reviewer, h.retriever)
             result = await orch.run(h.baseline, workloads=None, roofline=h.roofline)
 
-        # No children created — only the root remains.
         assert len(result.tree._nodes) == 1
-        assert h.coder.implement.await_count == 3
+        assert h.coder.implement.await_count == QUARANTINE_THRESHOLD
+        assert result.tree.get_node(0).consecutive_agent_failures >= QUARANTINE_THRESHOLD
 
 
 def _coder_output_stub():

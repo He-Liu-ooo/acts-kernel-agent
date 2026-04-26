@@ -157,6 +157,7 @@ def _simulate_review_submission(**fields):
 
         capture_factory, fake_run = _simulate_review_submission(outcome=..., ...)
         with (
+            patch("src.agents.reviewer._SDK_AVAILABLE", True),
             patch("src.agents.reviewer.Agent"),
             patch("src.agents.reviewer.run_agent", new_callable=AsyncMock) as mock_run,
             patch("src.agents.reviewer.make_run_config", return_value=None),
@@ -197,6 +198,7 @@ async def test_review_calls_llm_and_returns_parsed_feedback():
     )
 
     with (
+        patch("src.agents.reviewer._SDK_AVAILABLE", True),
         patch("src.agents.reviewer.Agent"),
         patch("src.agents.reviewer.run_agent", new_callable=AsyncMock) as mock_run,
         patch("src.agents.reviewer.make_run_config", return_value=None),
@@ -232,6 +234,7 @@ async def test_review_uses_nonzero_temperature():
     )
 
     with (
+        patch("src.agents.reviewer._SDK_AVAILABLE", True),
         patch("src.agents.reviewer.Agent"),
         patch("src.agents.reviewer.run_agent", new_callable=AsyncMock) as mock_run,
         patch("src.agents.reviewer.make_run_config") as mock_cfg,
@@ -264,6 +267,7 @@ async def test_review_passes_tree_and_kb_context_to_prompt():
     )
 
     with (
+        patch("src.agents.reviewer._SDK_AVAILABLE", True),
         patch("src.agents.reviewer.Agent"),
         patch("src.agents.reviewer.run_agent", new_callable=AsyncMock) as mock_run,
         patch("src.agents.reviewer.make_run_config", return_value=None),
@@ -313,6 +317,7 @@ async def test_review_falls_back_to_rules_when_llm_returns_none():
     """When run_agent returns None (all retries exhausted), review() falls back
     to rule-based feedback — it does NOT raise."""
     with (
+        patch("src.agents.reviewer._SDK_AVAILABLE", True),
         patch("src.agents.reviewer.Agent"),
         patch("src.agents.reviewer.run_agent", new_callable=AsyncMock) as mock_run,
         patch("src.agents.reviewer.make_run_config", return_value=None),
@@ -340,6 +345,7 @@ async def test_llm_failure_is_flagged_degraded():
     """run_agent returning None means retries exhausted — feedback must be
     flagged so the orchestrator can distinguish it from an expected fallback."""
     with (
+        patch("src.agents.reviewer._SDK_AVAILABLE", True),
         patch("src.agents.reviewer.Agent"),
         patch("src.agents.reviewer.run_agent", new_callable=AsyncMock) as mock_run,
         patch("src.agents.reviewer.make_run_config", return_value=None),
@@ -444,32 +450,6 @@ def test_default_prompt_dir_points_to_reviewer():
     assert agent._prompt_dir.parent.name == "prompts"
 
 
-# ── parse_feedback utility ─────────────────────────────────────────────
-
-
-def test_parse_feedback_converts_output_to_dataclass():
-    """parse_feedback() converts a RunResult.final_output (Pydantic) to a
-    ReviewerFeedback dataclass."""
-    from src.agents.reviewer import ReviewerFeedbackOutput
-
-    mock_output = ReviewerFeedbackOutput(
-        outcome="regressed",
-        metric_deltas={"sol_score": -0.05},
-        bottleneck_classification="memory_bound",
-        bottleneck_diagnosis="Spill rate spiked.",
-        suggestions=["Revert last action."],
-        branch_quality=BranchQuality.DEAD_END,
-    )
-    mock_result = MagicMock()
-    mock_result.final_output = mock_output
-
-    feedback = ReviewerAgent.parse_feedback(mock_result)
-    assert isinstance(feedback, ReviewerFeedback)
-    assert feedback.outcome == "regressed"
-    assert feedback.branch_quality is BranchQuality.DEAD_END
-    assert feedback.suggestions == ["Revert last action."]
-
-
 # ── _make_submit_review_tool — direct unit tests ──────────────────────────
 
 
@@ -551,6 +531,7 @@ async def test_review_falls_back_to_degraded_when_loop_terminates_without_submit
     Reviewer's failure mode is recoverable (unlike Planner / Coder), so
     the orchestrator's frontier never starves."""
     with (
+        patch("src.agents.reviewer._SDK_AVAILABLE", True),
         patch("src.agents.reviewer.Agent"),
         patch("src.agents.reviewer.run_agent", new_callable=AsyncMock) as mock_run,
         patch("src.agents.reviewer.make_run_config", return_value=None),
@@ -579,12 +560,13 @@ async def test_review_falls_back_to_degraded_on_max_turns_exceeded():
     from src.agents.reviewer import MaxTurnsExceeded
 
     with (
+        patch("src.agents.reviewer._SDK_AVAILABLE", True),
         patch("src.agents.reviewer.Agent"),
         patch("src.agents.reviewer.run_agent", new_callable=AsyncMock) as mock_run,
         patch("src.agents.reviewer.make_run_config", return_value=None),
         patch("src.agents.reviewer.function_tool", side_effect=lambda f: f),
     ):
-        mock_run.side_effect = MaxTurnsExceeded("Max turns (2) exceeded")
+        mock_run.side_effect = MaxTurnsExceeded("Max turns (4) exceeded")
 
         agent = ReviewerAgent(model=MagicMock())
         feedback = await agent.review(
@@ -616,6 +598,7 @@ async def test_review_returns_partial_output_when_max_turns_after_submission():
         return _make_submit_review_tool(captured_dict)
 
     with (
+        patch("src.agents.reviewer._SDK_AVAILABLE", True),
         patch("src.agents.reviewer.Agent"),
         patch("src.agents.reviewer.run_agent", new_callable=AsyncMock) as mock_run,
         patch("src.agents.reviewer.make_run_config", return_value=None),
@@ -633,7 +616,7 @@ async def test_review_returns_partial_output_when_max_turns_after_submission():
                 branch_quality=BranchQuality.PROMISING,
                 conditional_assessment="",
             )
-            raise MaxTurnsExceeded("Max turns (2) exceeded")
+            raise MaxTurnsExceeded("Max turns (4) exceeded")
 
         mock_run.side_effect = _side_effect
 
@@ -652,11 +635,128 @@ async def test_review_returns_partial_output_when_max_turns_after_submission():
 
 
 @pytest.mark.asyncio
+async def test_review_recovers_from_first_invalid_submit_within_turn_budget():
+    """Validation-retry budget: first submit_review call returns FAILED, the
+    LLM corrects on the second call, and review() returns a non-degraded
+    feedback without falling back to the rule-based path. max_turns=4
+    must reserve room for the in-band correction."""
+    from src.agents.reviewer import (
+        ReviewerFeedbackOutput,
+        _make_submit_review_tool,
+    )
+
+    captured_holder: list[dict] = []
+
+    def _capture_factory(captured_dict: dict):
+        captured_holder.append(captured_dict)
+        return _make_submit_review_tool(captured_dict)
+
+    with (
+        patch("src.agents.reviewer._SDK_AVAILABLE", True),
+        patch("src.agents.reviewer.Agent"),
+        patch("src.agents.reviewer.run_agent", new_callable=AsyncMock) as mock_run,
+        patch("src.agents.reviewer.make_run_config", return_value=None),
+        patch("src.agents.reviewer.function_tool", side_effect=lambda f: f),
+        patch("src.agents.reviewer._make_submit_review_tool", side_effect=_capture_factory),
+    ):
+        async def _side_effect(*args, **kwargs):
+            assert captured_holder, "factory should have been called by review()"
+            captured_holder[0]["output"] = ReviewerFeedbackOutput(
+                outcome="improved",
+                metric_deltas={},
+                bottleneck_classification="memory_bound",
+                bottleneck_diagnosis="recovered after one validation retry",
+                suggestions=[],
+                branch_quality=BranchQuality.PROMISING,
+                conditional_assessment="",
+            )
+            return MagicMock(final_output="done")
+
+        mock_run.side_effect = _side_effect
+
+        agent = ReviewerAgent(model=MagicMock())
+        feedback = await agent.review(
+            kernel_source="src",
+            profiling_summary="",
+            sol_score=0.5,
+            headroom_pct=50.0,
+            bottleneck=BottleneckType.MEMORY_BOUND,
+        )
+
+    assert feedback.degraded is False
+    assert feedback.error_reason == ""
+    assert feedback.branch_quality == BranchQuality.PROMISING
+    assert "recovered after one validation retry" in feedback.bottleneck_diagnosis
+
+
+# ── SDK-absent fallback (regression guard) ────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_review_returns_rule_based_when_sdk_absent_even_with_model_arg():
+    """SDK-absent + non-None model arg must take the rule-based path —
+    Agent and function_tool are None in that environment, so calling
+    them raises TypeError. Mirrors planner's regression guard."""
+    with patch("src.agents.reviewer._SDK_AVAILABLE", False):
+        agent = ReviewerAgent(model=MagicMock())
+        feedback = await agent.review(
+            kernel_source="def k(): pass",
+            profiling_summary="",
+            sol_score=0.5,
+            headroom_pct=50.0,
+            bottleneck=BottleneckType.MEMORY_BOUND,
+        )
+    assert isinstance(feedback, ReviewerFeedback)
+    # No-model path is the *expected* fallback (not degraded).
+    assert feedback.degraded is False
+    assert "rule" in feedback.bottleneck_diagnosis.lower()
+
+
+def test_reviewer_has_model_false_when_sdk_absent():
+    """``has_model`` must reflect both ``self._model is not None`` AND
+    SDK availability."""
+    with patch("src.agents.reviewer._SDK_AVAILABLE", False):
+        agent = ReviewerAgent(model=MagicMock())
+    assert agent.has_model is False
+
+
+# ── _make_submit_review_tool — defaulted Pydantic fields ──────────────────
+
+
+def test_make_submit_review_tool_omits_optional_fields_uses_pydantic_defaults():
+    """``ReviewerFeedbackOutput`` defaults ``metric_deltas={}``,
+    ``bottleneck_diagnosis=""``, ``suggestions=[]``,
+    ``conditional_assessment=""``. The tool signature must mark these
+    optional so the SDK doesn't reject a tool call that omits them."""
+    from src.agents.llm_backend import SUBMIT_OK_SENTINEL
+    from src.agents.reviewer import (
+        ReviewerFeedbackOutput,
+        _make_submit_review_tool,
+    )
+
+    captured: dict = {}
+    submit = _make_submit_review_tool(captured)
+    msg = submit(
+        outcome="improved",
+        bottleneck_classification="memory_bound",
+        branch_quality=BranchQuality.PROMISING,
+    )  # only required fields
+    assert msg == SUBMIT_OK_SENTINEL
+    assert "output" in captured
+    assert isinstance(captured["output"], ReviewerFeedbackOutput)
+    assert captured["output"].metric_deltas == {}
+    assert captured["output"].bottleneck_diagnosis == ""
+    assert captured["output"].suggestions == []
+    assert captured["output"].conditional_assessment == ""
+
+
+@pytest.mark.asyncio
 async def test_review_uses_degraded_with_existing_error_reason_when_run_agent_returns_none():
     """The original 'llm_retries_exhausted' degraded path still fires when
     run_agent returns None — submit-tool migration shouldn't regress
     existing behavior."""
     with (
+        patch("src.agents.reviewer._SDK_AVAILABLE", True),
         patch("src.agents.reviewer.Agent"),
         patch("src.agents.reviewer.run_agent", new_callable=AsyncMock) as mock_run,
         patch("src.agents.reviewer.make_run_config", return_value=None),

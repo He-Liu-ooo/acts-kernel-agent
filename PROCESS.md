@@ -64,7 +64,7 @@
 
 ### Implemented during logger-system phase (real logic, not placeholders)
 
-- [x] src/runtime/{__init__,timefmt,events,run_context}.py — new package. `RunContext.create(root, *, trace_dir=None, capture_traces=True)` owns per-invocation lifecycle: creates `./runs/run_<UTC>/` with microsecond-precision filename (collision-safe for parallel invocations), configures stdlib `FileHandler` + `StreamHandler` on the root logger, silences `httpx`/`openai`/`agents` to WARNING, binds `events.jsonl`, and wires the SDK trace processor under `<run-dir>/traces/` (or an explicit `--trace-dir` override). `close()` is idempotent; `atexit` + `finally` wired so crashed runs still flush. `_NullRunContext` fallback on any OSError during setup keeps `emit()` in logger-only mode. `events.emit(kind, *, iter, **fields)` fans out to both sinks with `never-raise` discipline; 18 `CORE_EVENT_KINDS` in the catalog. `finite_or_none()` sanitizes `inf`/`nan` benchmark sentinels so `events.jsonl` stays RFC-8259 valid. See `doc/runtime.md` for the full reference + JOURNAL → "Logger system before first live GPU run (2026-04-23)" for design rationale.
+- [x] src/runtime/{__init__,timefmt,events,run_context}.py — new package. `RunContext.create(root, *, trace_dir=None, capture_traces=True)` owns per-invocation lifecycle: creates `./runs/run_<UTC>/` with microsecond-precision filename (collision-safe for parallel invocations), configures stdlib `FileHandler` + `StreamHandler` on the root logger, silences `httpx`/`openai`/`agents` to WARNING, binds `events.jsonl`, and wires the SDK trace processor under `<run-dir>/traces/` (or an explicit `--trace-dir` override). `close()` is idempotent; `atexit` + `finally` wired so crashed runs still flush. `_NullRunContext` fallback on any OSError during setup keeps `emit()` in logger-only mode. `events.emit(kind, *, iter, **fields)` fans out to both sinks with `never-raise` discipline; 19 `CORE_EVENT_KINDS` in the catalog. `finite_or_none()` sanitizes `inf`/`nan` benchmark sentinels so `events.jsonl` stays RFC-8259 valid. See `doc/runtime.md` for the full reference + JOURNAL → "Logger system before first live GPU run (2026-04-23)" for design rationale.
 - [x] pipeline/optimize.py — added `--run-dir` CLI flag (default `./runs`); changed `--trace-dir` default from `"traces"` to `None` (routes through RunContext); deleted `_enable_traces_if_possible` helper (replaced by `RunContext._wire_trace_capture`). `main()` wraps body in RunContext + `atexit.register(ctx.close)`; emits `run_start` at entry and `run_end` at exit (including `termination_reason="ERROR"` on the exception path). New `_is_model_configured()` helper populates `run_start.model_configured` before `optimize()` loads the model.
 - [x] search/orchestrator.py — emits 10 iteration-level events + `baseline_ready` per run. Coder outcome events are `coder_submitted` (no pass claim) and `coder_failed(reason)` — the orchestrator can't verify gates from `implement()`'s return value alone, so ground-truth per-tool-call records live in `traces/*.jsonl`. `iter_end.outcome` is `advanced`/`dead_end`/`skipped` (skipped only on Coder failure, no tree mutation). `running_best_score` tracked as a local float (O(N) total) instead of per-iter `tree.best_node()` (was O(N²)). `_per_workload_us` + `_emit_dead_end` helpers dedup the per-workload list-comp and the two-emit pair across 4 dead-end sites.
 - [x] benchmark/baseline_generator.py — emits `baseline_attempt` / `baseline_success` / `baseline_failure` in the retry loop.
@@ -72,13 +72,24 @@
 - [x] agents/trace_processor.py — dropped local `_isoformat_utc`, now imports `filename_ts` from `src/runtime/timefmt.py`; `datetime.utcnow()` deprecation fixed.
 - [x] .gitignore — `/runs/` added alongside `/traces/`.
 
+### Implemented during planner/reviewer submit-tool migration phase (real logic, not placeholders)
+
+- [x] agents/llm_backend.py — added `SUBMIT_OK_SENTINEL` constant + `format_submit_validation_error(exc)` helper. Both Coder/Planner/Reviewer submit-tool factories now share one source of truth for the OK string the LLM must emit on success and for the per-field validation-error rendering on failure. Replaces three near-identical inlined formatters.
+- [x] agents/coder.py — refactored to import `SUBMIT_OK_SENTINEL` + `format_submit_validation_error` from `llm_backend` (no behavior change; coder remains the canonical option-α reference).
+- [x] agents/planner.py — full option-α migration. New private `_make_submit_plan_tool(captured_output)` factory returns a closure-bound `@function_tool` that calls `_validate_and_convert(payload)` and pushes the validated `PlannerOutput` into the captured slot, returning `SUBMIT_OK_SENTINEL` on success or `format_submit_validation_error(...)` on Pydantic failure. `run()` builds an `Agent` with the tool registered, calls `Runner.run(..., max_turns=4)`, and on `MaxTurnsExceeded` falls back to the captured output if the LLM submitted before exhausting turns; raises `PlanningError` only if no valid submission was captured. `has_model` property gates external callers on `_SDK_AVAILABLE`. Submit-tool fields use Pydantic defaults so the LLM can omit optional fields without tool-call rejection.
+- [x] agents/reviewer.py — symmetric option-α migration. `_make_submit_review_tool` factory mirrors planner's; `run()` uses `max_turns=4` + `MaxTurnsExceeded → captured-output recovery → degraded fallback` (degraded path tags `error_reason=max_turns_exceeded` or `missing_submit_review` instead of raising). `has_model` property added. Submit-tool fields use Pydantic defaults.
+- [x] search/orchestrator.py — `PlanningError` catch site added next to existing `ImplementationError` catch; both increment `parent.consecutive_agent_failures`; successful child commit resets the counter to 0. Emits `planner_failed(reason)` event on the planner-failure path (mirrors `coder_failed`).
+- [x] search/tree.py — quarantine concept added: `TreeNode.consecutive_agent_failures: int` (default 0), module constant `QUARANTINE_THRESHOLD = 2`, `frontier()` filters out nodes at/above the threshold so chronically-failing branches stop attracting selection. `best_node()` deliberately still considers them. Serialize/deserialize updated; legacy checkpoints default the counter to 0.
+- [x] runtime/events.py — `planner_failed` added to `CORE_EVENT_KINDS` (count 18 → 19). Symmetric with `coder_failed`.
+- [x] prompts/planner/system.md + prompts/reviewer/system.md — appended `## Submission` section to each, documenting the `submit_plan` / `submit_review` tool contract (must call exactly once, expected field shapes, `OK` sentinel behavior).
+
 ## Next Up
 
 Phase A, Phase B, Phase C are all wired end-to-end on real CUDA-event benchmarking + real analytical profiling. GPU is available (NVIDIA RTX 6000 Ada, CUDA 12.8). For what last shipped, see `git log c912e9a..HEAD` + JOURNAL → "Bottleneck classify-once (2026-04-22)".
 
 Candidates (pick one before writing code; design-discussion first where called out):
 
-- **First live GPU run** (integration milestone, not a new module) — highest-value milestone now that every in-loop module is real. Run Phase A → B → C end-to-end against a SOL-ExecBench problem. Observability is now in place (logger phase): `./runs/run_<UTC>/run.log` is tail-able during the run, `events.jsonl` captures 18-kind structured narrative, `traces/acts_trace_<UTC>.jsonl` captures the full SDK per-LLM-call payloads. Likely triggers deferred work — the per-dtype ridge fix (if a tc workload shows up), the `do_bench`-shape timer rewrite (if sync-per-iter cost becomes visible), `detect_hardware()` (if the SOLAR arch YAML path proves inconvenient in practice).
+- **First live GPU run** (integration milestone, not a new module) — highest-value milestone now that every in-loop module is real. Run Phase A → B → C end-to-end against a SOL-ExecBench problem. Observability is now in place (logger phase): `./runs/run_<UTC>/run.log` is tail-able during the run, `events.jsonl` captures 19-kind structured narrative, `traces/acts_trace_<UTC>.jsonl` captures the full SDK per-LLM-call payloads. Likely triggers deferred work — the per-dtype ridge fix (if a tc workload shows up), the `do_bench`-shape timer rewrite (if sync-per-iter cost becomes visible), `detect_hardware()` (if the SOLAR arch YAML path proves inconvenient in practice).
 
 - **`actions/tier{1..6}` real guidance text** (non-GPU) — action-library descriptions are the Planner's fuel. Structure is done (`src/actions/tier*_*.py` ~373 LOC total); the guidance strings are placeholders. Content-heavy (literature synthesis from 9-paper KB + AccelOpt / Astra), high impact on search quality but does not require GPU. Good parallel track to the live-GPU run — disjoint files.
 
@@ -202,15 +213,15 @@ Items marked `(skeleton)` have interfaces + placeholder logic that keeps the pip
 - [x] prompts/planner/technique_select.md (done) — documents user prompt format
 - [x] prompts/coder/ (done) — system.md (prescribed workflow, hard rules, one sanctioned failure mode) + implement.md (user-prompt format)
 - [x] prompts/reviewer/ (done) — system.md (diagnostic reasoning) + interpret.md
-- [x] agents/planner.py (done) — Pydantic output_type, build_user_prompt(), PlanningError, technique validation
+- [x] agents/planner.py (done) — tool-using Agent with `submit_plan` tool (option α, mirrors Coder), Pydantic `PlannerOutput`, `build_user_prompt()`, `PlanningError`, technique validation, `max_turns=4`, `_make_submit_plan_tool` factory + `_validate_and_convert` helper, `has_model` property gated on `_SDK_AVAILABLE`. Static `parse_plan` removed (dead after submit-tool migration).
 - [x] agents/coder.py (done) — tool-using Agent, Pydantic `KernelCodeOutput`, `ImplementationError`, `_max_turns = 2*config.max_debug_retries + 2` (= 8 by default; +2 over 2N covers the `submit_kernel` tool call + final plain-text confirmation), placeholder tools until compiler/correctness land
-- [x] agents/reviewer.py (done) — Pydantic ReviewerFeedbackOutput, build_user_prompt, rule-based fallback (`degraded`/`error_reason`), configurable `prompt_dir`
+- [x] agents/reviewer.py (done) — tool-using Agent with `submit_review` tool (option α, mirrors Coder/Planner), Pydantic `ReviewerFeedbackOutput`, `build_user_prompt`, rule-based fallback (`degraded`/`error_reason` — tags expanded to include `max_turns_exceeded` and `missing_submit_review` alongside existing `llm_retries_exhausted`), configurable `prompt_dir`, `max_turns=4`, `has_model` property gated on `_SDK_AVAILABLE`. Static `parse_feedback` removed (dead after submit-tool migration).
 
 ### Phase 5: Search
 
-- [x] search/tree.py (done) — tree state, path_to_node, checkpoint save/load (atomic)
+- [x] search/tree.py (done) — tree state, path_to_node, checkpoint save/load (atomic). `TreeNode` carries `consecutive_agent_failures: int` (default 0); module constant `QUARANTINE_THRESHOLD = 2` defines the cutoff. `frontier()` excludes any node at or above the threshold so dead-weight branches stop attracting selection; `best_node()` intentionally still considers them (a quarantined parent may still hold the run's best score). Serialize/deserialize updated; legacy checkpoints default the counter to 0.
 - [x] search/beam.py (done) — beam pruning (B3 quality-weighted + B2 diversity-aware, configurable), epsilon-greedy selection
-- [x] search/orchestrator.py (done) — real control flow + real agents + real CUDA-event benchmarking + real analytical profiling. Fail-closed baseline check (aborts run on partial-workload failure); branch-local `DEAD_END` on child partial failure, profile failure, or missing representative latency. Post-refactor (2026-04-22): calls `classify_run` once after roofline resolution, threads `run_bottleneck` into retriever / planner / reviewer / `SearchResult`; commits `child.score` + `per_workload_latency_us` only after the profile DEAD_END gauntlet clears.
+- [x] search/orchestrator.py (done) — real control flow + real agents + real CUDA-event benchmarking + real analytical profiling. Fail-closed baseline check (aborts run on partial-workload failure); branch-local `DEAD_END` on child partial failure, profile failure, or missing representative latency. Post-refactor (2026-04-22): calls `classify_run` once after roofline resolution, threads `run_bottleneck` into retriever / planner / reviewer / `SearchResult`; commits `child.score` + `per_workload_latency_us` only after the profile DEAD_END gauntlet clears. Submit-tool migration phase (2026-04-26): added `PlanningError` catch site mirroring `ImplementationError`; both catches increment `parent.consecutive_agent_failures` (parent quarantine accounting); successful `tree.add_child(...)` resets the parent's counter to 0. Emits new `planner_failed` event alongside `coder_failed`.
 
 ### Phase 6: Pipeline & Integration
 
@@ -350,6 +361,31 @@ these before its trigger fires, re-read the trigger first.
   + `MemoryStore.add()` + checkpoint writes, all of which assume
   single-writer semantics on the tree. See JOURNAL → Search →
   "Serial beam expansion" for the rationale to keep it serial today.
+
+- [ ] **Test helper consolidation** — `_simulate_plan_submission`
+  (`tests/test_planner.py`) and `_simulate_review_submission`
+  (`tests/test_reviewer.py`) are near-identical (~30 lines each):
+  both pull the `submit_*` tool out of the patched `Agent`, invoke it
+  with a payload, and assert the captured output. Could share a
+  parametrized helper in `tests/conftest.py` that takes the Pydantic
+  Output class + module path and returns the simulator.
+  *Trigger*: a third `_simulate_*_submission` helper appears (e.g., a
+  fourth agent migrates to the submit-tool pattern), OR shared
+  retry/captured-output assertions diverge between the two test files
+  (the duplication itself is fine while only two copies exist).
+
+- [ ] **`_SDK_AVAILABLE` patch fixture** — ~17 LLM-path tests across
+  `tests/test_planner.py` + `tests/test_reviewer.py` repeat the same
+  `with (patch("src.agents.{planner,reviewer}._SDK_AVAILABLE", True),
+  patch(".Agent"), patch(".function_tool", side_effect=lambda f: f),
+  ...)` block. A `@pytest.fixture` returning the patch bundle as a
+  context manager would dedupe ~75 lines and remove a recurring
+  miss-one-patch failure mode (forgetting `function_tool` in
+  particular silently turns the tool into a `FunctionTool` wrapper
+  that breaks the simulator).
+  *Trigger*: when adding the next agent that needs the same
+  SDK-availability mock (a third copy makes the fixture obviously
+  worth it), OR if the boilerplate proves to mask test failures.
 
 ### Skipped (decisions, not tech debt)
 

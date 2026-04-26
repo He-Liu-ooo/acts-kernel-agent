@@ -98,7 +98,7 @@ When `winner_profiling_per_workload` is populated, a "Winner profile (per worklo
 Every CLI invocation creates a fresh `<run-dir>/run_<YYYYMMDDTHHMMSS_ffffffZ>/` directory (default `./runs/run_<UTC>/`) holding three files:
 
 - `run.log` — human-readable text log of the invocation.
-- `events.jsonl` — structured event stream (18 kinds) emitted by the orchestrator and `RunContext`.
+- `events.jsonl` — structured event stream (19 kinds) emitted by the orchestrator and `RunContext`.
 - `traces/acts_trace_<UTC>.jsonl` — SDK per-call records (LLM inputs/outputs, tool calls, spans) written by `JSONLTraceProcessor`. Relocated when `--trace-dir <path>` is passed; absent when `--trace-dir=` disables capture.
 
 The `httpx`, `openai`, and `agents` SDK loggers are silenced to WARNING so `run.log` stays focused on pipeline events.

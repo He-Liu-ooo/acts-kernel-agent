@@ -277,6 +277,55 @@ async def test_planner_failure_emits_skipped_not_dead_end(tmp_path, harness):
 
 
 @pytest.mark.asyncio
+async def test_repeated_planner_failure_quarantines_parent_after_threshold(
+    tmp_path, harness,
+):
+    """Two consecutive PlanningErrors on the same parent must bump
+    ``parent.consecutive_agent_failures`` to ``QUARANTINE_THRESHOLD``,
+    pulling the parent out of ``frontier()`` so subsequent iterations
+    can't re-pick it forever and silently consume the entire
+    ``max_depth`` budget. Without this, a deterministic Planner failure
+    on the highest-scoring node spends 20 iterations doing nothing."""
+    from src.agents.planner import PlanningError
+    from src.search.tree import QUARANTINE_THRESHOLD
+
+    harness.planner.plan = AsyncMock(side_effect=PlanningError("submit_plan missing"))
+    # Bump max_depth so we can run more iterations than QUARANTINE_THRESHOLD.
+    harness.config.max_depth = QUARANTINE_THRESHOLD + 2
+
+    fh = (tmp_path / "events.jsonl").open("w", buffering=1)
+    events.bind(fh)
+    try:
+        result = await _run_orch(harness)
+    finally:
+        events.unbind()
+        fh.close()
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "events.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    kinds = [r["kind"] for r in records]
+
+    # Two iterations should fail-and-skip; after that the only frontier
+    # node (root) is quarantined, so the next select_next has no work →
+    # the loop terminates via ALL_DEAD_END (frontier empty after pruning).
+    planner_failed_count = kinds.count("planner_failed")
+    assert planner_failed_count == QUARANTINE_THRESHOLD, (
+        f"expected {QUARANTINE_THRESHOLD} planner_failed events before "
+        f"the parent is quarantined, got {planner_failed_count}: {kinds!r}"
+    )
+
+    # Root node's failure counter should be at the threshold post-run.
+    root = result.tree.get_node(0)
+    assert root.consecutive_agent_failures >= QUARANTINE_THRESHOLD
+    # And the frontier must be empty (root is the only node, and it's
+    # quarantined).
+    assert root not in result.tree.frontier()
+
+
+@pytest.mark.asyncio
 async def test_dead_end_iteration_event_sequence(tmp_path, harness):
     """Partial-workload bench failure → bench_done(is_fully_successful=False)
     → branch_dead_end → iter_end(dead_end). No score_computed or reviewer

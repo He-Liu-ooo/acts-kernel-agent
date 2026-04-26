@@ -18,18 +18,19 @@ Manages tree state: nodes, frontier, and expansion.
 | `branch_quality` | BranchQuality \| None | Reviewer's assessment |
 | `action_applied` | str | Technique name that produced this node |
 | `depth` | int | Distance from root |
+| `consecutive_agent_failures` | `int` | Count of consecutive Planner/Coder failures on this parent. Reset to 0 after a successful `add_child`. Drives quarantine via `frontier()`. |
 
 ### Methods
 
 - `add_root(kernel) -> TreeNode`: Add baseline as root.
 - `add_child(parent_id, kernel, action) -> TreeNode`: Add optimization result.
 - `get_node(id) -> TreeNode`: Lookup.
-- `frontier() -> list[TreeNode]`: All non-dead_end nodes.
-- `best_node() -> TreeNode`: Highest SOL score.
+- `frontier() -> list[TreeNode]`: All non-dead_end nodes whose `consecutive_agent_failures < QUARANTINE_THRESHOLD` (module constant, default 2). Quarantining repeat-failing parents prevents `select_next` from burning the search budget on a deterministically-failing node by re-picking it forever.
+- `best_node() -> TreeNode`: Highest SOL score. Quarantined nodes are intentionally still considered here — quarantine blocks future expansion (a `frontier()` concern), not winner-as-final-answer; the node's already-measured score is still valid as the run's best.
 - `path_to_node(id) -> list[TreeNode]`: Ordered path from root to given node. Raises `KeyError` for unknown IDs.
 - `render_path(id) -> str`: Human-readable trajectory `"[i] action (QUALITY) — SOL s.sss"` from root to the given node, with the last step marked `← current`. Consumed by the Planner (path-to-parent) and Reviewer (path-to-child) so both agents reason about which actions have already been tried on this branch, not just the immediate parent.
 - `save(path)`: Serialize tree to JSON checkpoint. Uses atomic write (temp file + `os.replace`) so a crash mid-write can't corrupt the file.
-- `SearchTree.load(path) -> SearchTree`: Deserialize from JSON checkpoint. Raises `FileNotFoundError` for missing files. Preserves `_next_id` so new nodes don't collide.
+- `SearchTree.load(path) -> SearchTree`: Deserialize from JSON checkpoint. Raises `FileNotFoundError` for missing files. Preserves `_next_id` so new nodes don't collide. Legacy checkpoints (pre-quarantine) default `consecutive_agent_failures` to 0 — `data.get("consecutive_agent_failures", 0)` keeps them loadable.
 
 ## Beam Pruning — `beam.py`
 
@@ -104,8 +105,11 @@ async def run(
 2. Select node (epsilon-greedy from frontier)
 3. Retrieve past experiences from optimization memory (filtered by `run_bottleneck`)
 4. **Planner**: kernel source + profiling summary + memory + `tree_context=render_path(parent.id)` + `bottleneck=run_bottleneck` → `OptimizationPlan`
+   - On `PlanningError`: increment `parent.consecutive_agent_failures += 1`, emit `planner_failed`, decay epsilon, skip the iteration (no tree mutation). The next `select_next` either picks a different parent, or — if this parent's failures hit `QUARANTINE_THRESHOLD` — picks any other frontier node.
 5. **Coder** (with tools): plan + kernel + `kernel_spec`/`reference_fn`/`input_generators` → optimized kernel (self-corrects via compile + correctness tools)
+   - On `ImplementationError`: increment `parent.consecutive_agent_failures += 1`, emit the coder-failure event, decay epsilon, skip the iteration (no tree mutation). Same quarantine accounting as the Planner path — repeated failures on the same parent push it past `QUARANTINE_THRESHOLD` and out of `frontier()`.
 6. Add child node to tree — `child.score` and `per_workload_latency_us` are **not** committed yet
+   - On successful `tree.add_child(parent.id, child_kernel, plan.technique)`: reset `parent.consecutive_agent_failures = 0`. A productive parent shouldn't be permanently quarantined for one earlier transient blip.
 7. **Benchmark** child — `BenchmarkError` (majority-failure) OR `not is_fully_successful` (partial failure) → mark branch `DEAD_END`, `beam_prune`, next iteration
 8. **Profile** child on representative workload — skip when `repr_workload_latency_s` is None; `ProfilerError` → mark `DEAD_END`, `beam_prune`, next iteration; `(flops, nbytes) == (0, 0)` (no formula for op_type) → keep branch alive but skip profile
 9. Commit `child.profiling`, `child.score` (via `compute_sol_score`), `child.per_workload_latency_us` to the tree node

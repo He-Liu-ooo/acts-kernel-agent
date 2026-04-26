@@ -39,7 +39,7 @@ Best-first tree search with beam constraint.
 
 Plus a deterministic orchestrator (code, not LLM) that manages tree state, beam selection, and move-on criteria.
 
-**LLM SDK**: Agents are built on the OpenAI Agents SDK. The SDK provides the agent runtime (`Agent`, `Runner.run`, `function_tool`), structured output parsing via Pydantic `output_type`, and model-swapping via `OpenAIChatCompletionsModel` — any OpenAI-compatible API works by changing the base URL. The Coder uses SDK `function_tool` decorators for compile/correctness tools; Planner and Reviewer are single-call agents with no tools.
+**LLM SDK**: Agents are built on the OpenAI Agents SDK. The SDK provides the agent runtime (`Agent`, `Runner.run`, `function_tool`) and model-swapping via `OpenAIChatCompletionsModel` — any OpenAI-compatible API works by changing the base URL. Coder is the only multi-tool agent (compile + correctness + submit_kernel). Planner and Reviewer each carry a single `submit_plan` / `submit_review` tool that delivers their structured output, retrying in-loop on Pydantic validation failure within a 4-turn budget.
 
 **LLM Backend**: Default model is **DeepSeek V3** for all three agents. Selection rationale:
 - Triton/CUDA knowledge is strong and well-represented in pretraining data

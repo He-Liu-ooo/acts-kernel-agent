@@ -112,6 +112,8 @@ From advisor discussion: agent specialization should be driven by LLM context wi
 
 **Rationale**: Two approaches for structured LLM output: (1) Pydantic `output_type` on the SDK `Agent` — the SDK handles schema enforcement and parsing automatically, (2) JSON-mode with manual `json.loads()` + validation. Chose `output_type` because: the SDK generates the JSON schema from the Pydantic model and enforces it at the API level (constrained decoding), parsing errors are handled by the SDK retry logic, and the output model serves as the contract between agents. The Pydantic model (`OptimizationPlanOutput`) is converted to an internal dataclass (`OptimizationPlan`) via `_output_to_plan()` to keep Pydantic out of the rest of the codebase.
 
+*Subsequently* (option α, 2026-04-26) the Planner moved off `output_type=OptimizationPlanOutput` onto a `submit_plan` tool call — the same SDK strict-schema rejection the Coder hit on 2026-04-22 surfaced on the Planner's first live call (Pydantic `dict[str, X]` fields trip `additionalProperties should not be set`, and DeepSeek-reasoner additionally rejects any `response_format=json_schema`). The Pydantic validator still runs (inside the tool body), so the contract and in-loop retry behavior are preserved verbatim — only the SDK-wire shape changed. See "Planner + Reviewer submit-tool migration (2026-04-26)" entry below.
+
 ### Planner system prompt design (2026-04-17)
 
 **Rationale**: Analyzed prompt designs from 3 reference repos:
@@ -132,6 +134,8 @@ Adopted a hybrid approach: bottleneck→technique mapping tables from AutoKernel
 **Rule-based fallback** exists for two distinct paths: (1) no model configured — expected, quiet fallback; (2) LLM call exhausted retries — unexpected, must be visible. The `degraded` / `error_reason` fields on `ReviewerFeedback` distinguish these: the orchestrator logs a warning when a degraded reviewer drove a branch_quality decision, because a broken reviewer silently pushing PROMISING → PLATEAU would corrupt beam weighting and memory entries across the whole run.
 
 **`prompt_dir` constructor parameter**: reserved for the future Compute-Reviewer / Memory-Reviewer split. A specialized reviewer is one constructor arg away — no subclassing or prompt-string plumbing required.
+
+*Subsequently* (option α, 2026-04-26) the Reviewer moved off `output_type=ReviewerFeedbackOutput` onto a `submit_review` tool call for the same SDK reasons that drove the Coder (2026-04-22) and Planner (2026-04-26) migrations — strict-schema rejection on Pydantic `dict[str, X]` plus DeepSeek-reasoner's blanket rejection of `response_format=json_schema`. The Pydantic validator still runs inside the tool body; the rule-based degraded fallback still serves transient API blips and now also handles `max_turns_exceeded` / `missing_submit_review` failure modes via `error_reason` tags. See "Planner + Reviewer submit-tool migration (2026-04-26)" entry below.
 
 ### Multi-turn Reviewer deferred — kept single-call through the profiler PR (2026-04-21)
 
@@ -749,3 +753,34 @@ Triton effectively gives us Tiers 1-3.5. CUDA gives all 6 tiers — but the agen
 **Drift sentinel**: `tests/test_correctness.py::test_verify_correctness_atol_rtol_defaults_match_sol_execbench` reads `ToleranceSpec()` defaults at runtime and asserts the function signature defaults match. If SOL bumps to e.g. `1.5e-2`, the test fails and forces an update. Test skips gracefully when `sol_execbench` isn't importable (tier-1 venv).
 
 **What's NOT in scope**: dtype-aware tolerance table (e.g., bf16→1e-2, fp16→5e-3, fp32→1e-4) — premature; SOL itself didn't bother and treats one set of defaults as universal. Per-problem `tolerance` overrides — schema-supported by SOL's `Workload.tolerance` field but never exercised in any shipped example, so plumbing it through buys nothing today. Loosening the anti-cheat strict tolerances — those are an independent gate and the previous strict values still match how the stage is documented in PROCESS / doc/eval.
+
+### Planner + Reviewer submit-tool migration (2026-04-26)
+
+**Context**: The first live GPU run with the logger system (2026-04-26) cleared baseline (~50 s) and died on the Planner's first call with `agents.exceptions.UserError: additionalProperties should not be set for object types. Strict JSON schema is enabled, but the output type is not valid.` — same SDK error family the Coder hit on 2026-04-22 (Pydantic `dict[str, X]` fields trip the SDK's strict-schema validator). The obvious quick-fix `strict_json_schema=False` does **not** solve it: reading `agents/models/chatcmpl_converter.py:104-111` confirms the SDK still wires `response_format=json_schema` on the chat-completions request regardless of the strict flag (the flag only toggles the `"strict"` sub-field), and DeepSeek-reasoner rejects **any** `response_format=json_schema` on its endpoint. `output_type=` is a dead path for both Planner and Reviewer on our chosen backend.
+
+**Decision**: apply option α (Coder's 2026-04-22 fix) uniformly. Planner gets a `submit_plan` tool, Reviewer gets a `submit_review` tool. Each agent builds a fresh `Agent` per call with `[submit_*]` as the only tool, no `output_type`. Pydantic validation runs **inside the tool body**; on failure the tool returns a standard error string (`SUBMIT_PLAN_FAILED:` / `SUBMIT_REVIEW_FAILED:`) so the SDK hands it back to the LLM as an observation, preserving the in-loop validation-retry behavior of the old flow. Shared `SUBMIT_OK_SENTINEL` + `format_submit_validation_error()` helpers live in `llm_backend.py`; the Coder was refactored onto these helpers so all three agents share one error-shape contract.
+
+**Turn budget — `max_turns=4` for Planner and Reviewer**: `2N + 2` with `N=1` in-band validation retry (turn 1 invalid submit, turn 2 corrected resubmission, turn 3 plain-text confirmation that terminates the SDK loop, plus 1 buffer). Coder's existing `2 × max_debug_retries + 2` formula is unchanged — it owns a multi-tool debug loop; Planner/Reviewer have only the one tool.
+
+**Failure-handling decision matrix**:
+- *Planner failure* → typed `PlanningError` from `Planner.plan()`. Orchestrator catches at the per-iteration boundary (mirrors the existing `ImplementationError` branch from the Coder), logs a warning, decays epsilon, skips the iteration without adding a tree node.
+- *Reviewer failure* → falls through to the existing rule-based degraded fallback with new `error_reason` tags (`max_turns_exceeded`, `missing_submit_review`) added to the existing transient-API tags. Operator sees the degradation in the run log; orchestrator still gets a usable `ReviewerFeedback`.
+- *`MaxTurnsExceeded` recovery* — both agents prefer the captured submission if `submit_*` did get called before the budget ran out (option-γ pattern from the Coder migration); otherwise raise (Planner) or degrade (Reviewer).
+
+**Quarantine fix (Codex adversarial review catch)**: skip-iteration alone is insufficient for Planner failure. `select_next` is greedy; a parent that consistently makes the Planner fail keeps getting re-picked, burning the entire `max_depth` budget on a dead branch. Fix: `consecutive_agent_failures: int` counter on `TreeNode`, incremented in **both** the Coder and Planner orchestrator catches, reset on successful `tree.add_child(...)`. `SearchTree.frontier()` excludes any node at or above `QUARANTINE_THRESHOLD = 2`. `best_node()` intentionally still considers quarantined nodes — quarantine is a forward-expansion gate only; if the quarantined node is still the best result, it remains a valid final answer.
+
+**Codex review fixes folded in**:
+- `LLMBackend.has_model` now gates on `_SDK_AVAILABLE` in addition to model presence. Pre-migration, SDK-absent + model-stub silently fell into the rule-based fallback; post-migration the `submit_*` wrappers would raise `TypeError` because `function_tool` is unavailable. Gating `has_model` restores the silent-fallback behavior test fixtures rely on.
+- `submit_plan` / `submit_review` signatures mirror Pydantic optionality (`params: dict | None = None`, etc.). The old `output_type=` path accepted omitted optional fields via Pydantic defaults during deserialization; the new tool path needs explicit Python defaults so the same omissions land at the validator with the same shape.
+- `max_turns 2 → 4` to reserve the in-band validation-retry budget. The pre-migration `2` was sized for `output_type=` (one turn structured output + one confirmation) and would have left zero room for in-loop correction.
+
+**What is NOT in scope** (intentional YAGNI):
+- *No generic submit-tool factory.* Three agents on the pattern is below the threshold where DRY-ing pays; per-agent typed wrappers are the right granularity, and `function_tool` requires explicit signatures (a generic factory would defeat its parameter introspection).
+- *No removal of the Reviewer's rule-based fallback.* It still serves transient-API blips that predate this migration; collapsing to "raise on any LLM failure" would regress run robustness.
+- *No expansion of the Reviewer into a multi-tool agent.* The "Multi-turn Reviewer deferred" entry (2026-04-21) still stands — wire-format migration is unrelated to that trigger.
+- *No per-agent quarantine threshold tuning.* `QUARANTINE_THRESHOLD = 2` applies uniformly until live-run data argues otherwise.
+
+**Trigger for revisit**:
+- First live run where quarantine fires on a non-pathological parent (suggests threshold too aggressive, bump to 3 or split per-agent).
+- First live run where `max_turns=4` is too few for Planner/Reviewer validation retries (bump to `2N+2` with `N=2`, i.e. `max_turns=6`).
+- First live run where DeepSeek consistently omits both required *and* optional `submit_*` fields (fix the prompt, not the budget).

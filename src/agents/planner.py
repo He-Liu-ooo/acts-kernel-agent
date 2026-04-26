@@ -103,18 +103,22 @@ def _make_submit_plan_tool(captured: dict) -> Callable[..., str]:
     LLM for in-loop retry within the turn budget).
     """
 
+    # Optionality on params/target_region/rationale mirrors
+    # ``OptimizationPlanOutput``'s Pydantic defaults — without it the
+    # SDK rejects tool calls that omit any of these fields, even though
+    # the Pydantic model itself would have filled the defaults.
     def submit_plan(
         tier: int,
         technique: str,
-        params: dict[str, str],
-        target_region: str,
-        rationale: str,
+        params: dict[str, str] | None = None,
+        target_region: str = "",
+        rationale: str = "",
     ) -> str:
         try:
             captured["output"] = OptimizationPlanOutput(
                 tier=tier,
                 technique=technique,
-                params=params,
+                params=params or {},
                 target_region=target_region,
                 rationale=rationale,
             )
@@ -156,8 +160,13 @@ class PlannerAgent:
 
     @property
     def has_model(self) -> bool:
-        """True when the agent is backed by a real LLM."""
-        return self._model is not None
+        """True when the agent is backed by a real LLM AND the SDK is
+        importable. Both are required: ``Agent`` and ``function_tool``
+        are ``None`` in SDK-absent test environments, so ``plan()`` would
+        crash with ``TypeError`` if it took the LLM path with a model
+        stub but no real SDK behind it.
+        """
+        return self._model is not None and _SDK_AVAILABLE
 
     # ── prompt assembly ─────────────────────────────────────────────
 
@@ -254,18 +263,24 @@ class PlannerAgent:
             tools=[submit_tool],
         )
 
+        # Turn budget: 2*N + 2 with N=1 in-band validation retry. Reserves
+        # turns for: 1 invalid submit + 1 corrected submit + 1 confirmation,
+        # plus the +1 buffer the SDK needs to land confirmation cleanly.
+        # Without the retry budget, a single Pydantic validation slip
+        # downgrades to MaxTurnsExceeded and the option-γ recovery path
+        # has to catch it implicitly.
         try:
             result = await run_agent(
                 agent,
                 prompt,
                 run_config=make_run_config(temperature=0.3),
-                max_turns=2,
+                max_turns=4,
             )
         except MaxTurnsExceeded as exc:
             if "output" in captured:
                 return _validate_and_convert(captured["output"], available_actions)
             raise PlanningError(
-                "Planner exhausted turn budget (2) without calling submit_plan."
+                "Planner exhausted turn budget (4) without calling submit_plan."
             ) from exc
 
         if result is None:

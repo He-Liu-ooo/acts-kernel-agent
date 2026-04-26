@@ -5,23 +5,27 @@
 ## Architecture
 
 ```
-Planner (single-call, no tools)
+Planner (single-call: one `submit_plan` tool, no compile/correctness loop)
     → Coder (tool-using: compile + correctness)
         → [orchestrator-side eval]
-            → Reviewer (single-call, no tools)
+            → Reviewer (single-call: one `submit_review` tool, no compile/correctness loop)
 ```
 
-The deterministic orchestrator controls all flow. Agents are stateless — they receive context, make one LLM call (or one tool-loop for Coder), and return structured output.
+The deterministic orchestrator controls all flow. Agents are stateless — they receive context, make one LLM call (Planner / Reviewer route their structured submission through a single `submit_*` tool inside the SDK loop; Coder runs a multi-tool compile/correctness loop), and return structured output.
 
 ## Planner — `planner.py`
 
 **Role**: Analyzes profiling data + optimization memory, selects technique from action library, produces structured plan.
 
-**SDK pattern**: Single-call with Pydantic structured output. `Agent(name="Planner", instructions=..., model=..., output_type=OptimizationPlanOutput)` → `Runner.run()`. The SDK enforces the output schema — the LLM must return valid JSON matching `OptimizationPlanOutput`.
+**SDK pattern**: Single-call from the caller's view, but routed through one tool inside the SDK loop. `Agent(name="Planner", instructions=..., model=..., tools=[submit_plan])` is built fresh per `plan()` call (no compile/correctness loop — `submit_plan` is the only tool) → `Runner.run(..., max_turns=4)`. The submit tool replaces the `output_type=Pydantic` enforcement that the SDK used to translate to a `response_format=json_schema` API field — that field is rejected by reasoning-model providers (DeepSeek-reasoner, etc.), so the Planner routes its structured submission through a tool call instead, mirroring the Coder. Tool-call schemas are universally supported across OpenAI-compatible providers; the same Pydantic validator runs inside the tool body, preserving the "validation failure → in-loop retry" guarantee.
+
+- `submit_plan(tier, technique, params=None, target_region="", rationale="")` — required Python args (`tier`, `technique`) match `OptimizationPlanOutput`'s required Pydantic fields; optional args with defaults match the Pydantic-optional fields. The tool body instantiates `OptimizationPlanOutput(...)` (triggering validation) and stores the result in a per-call captured dict. On validation failure the tool returns `submit_plan FAILED:<error>` so the SDK hands the error back to the LLM as the tool-call response, prompting an in-loop retry within the turn budget.
+- `max_turns=4` reserves room for one in-band validation retry (initial submit attempt + corrective resubmit + headroom for the final plain-text confirmation), keeping the Planner cheap while still leaving the LLM a chance to self-correct a malformed submission.
+- `MaxTurnsExceeded` recovery: the captured dict is preferred — if a valid submission landed before the budget ran out, `_validate_and_convert` returns the corresponding `OptimizationPlan`. If the dict is empty, `PlanningError` is raised.
 
 **Output models**:
-- `OptimizationPlanOutput` (Pydantic) — schema sent to the LLM via `output_type`. Fields: `tier` (int), `technique` (str), `params` (dict), `target_region` (str), `rationale` (str).
-- `OptimizationPlan` (dataclass) — internal representation used by the rest of the codebase. Converted from `OptimizationPlanOutput` via `_output_to_plan()`.
+- `OptimizationPlanOutput` (Pydantic) — validated inside `submit_plan`'s tool body. Fields: `tier` (int, required), `technique` (str, required), `params` (dict, optional), `target_region` (str, optional), `rationale` (str, optional).
+- `OptimizationPlan` (dataclass) — internal representation used by the rest of the codebase. Converted from `OptimizationPlanOutput` via `_validate_and_convert()` (which also enforces the available-actions guard).
 
 **Prompt assembly**: `build_user_prompt()` (static method) assembles the user prompt from runtime data. Sections: Current kernel (with backtick escaping), **Run context** (once-per-run bottleneck via shared `render_run_context()` helper — omitted when no `bottleneck` is supplied), Profiling summary, Past experiences (with action parameters), Available actions, Search tree context, Reviewer feedback. Empty sections are omitted.
 
@@ -29,13 +33,19 @@ The deterministic orchestrator controls all flow. Agents are stateless — they 
 
 **Output**: `OptimizationPlan` — `{tier, technique, params, target_region, rationale}`.
 
-**Error handling**: `PlanningError` is raised when: (1) `run_agent()` returns `None` (all retries exhausted), or (2) the LLM returns a technique not in `available_actions`. Without a model configured, returns a default plan (no LLM call).
+**Error handling**: `PlanningError` is raised when: (1) `run_agent()` returns `None` (all retries exhausted), (2) the LLM returns a technique not in `available_actions`, or (3) SDK `MaxTurnsExceeded` fires without a captured submission. `MaxTurnsExceeded` is caught at the agent boundary — if a valid submission landed before the budget exhausted, the captured output is converted to an `OptimizationPlan` and returned; otherwise it's converted to `PlanningError` so the orchestrator has a single typed failure to catch. The orchestrator's iteration loop catches `PlanningError` branch-locally (skip-iter, decay epsilon, increment `parent.consecutive_agent_failures`, emit `planner_failed`) — no longer aborts the run. Without a model configured, returns a default plan (no LLM call).
 
 **Validation**: If `available_actions` is non-empty, the selected technique must be in the list. This prevents the LLM from hallucinating technique IDs.
 
 **System prompt** (`prompts/planner/system.md`): Bottleneck→technique mapping tables (memory_bound, compute_bound, balanced), expected gains by tier, experience interpretation guide, 7 anti-patterns, 6 decision rules.
 
 **Model choice**: Strongest reasoning model (planning quality is the bottleneck).
+
+**Private surface**:
+- `_make_submit_plan_tool(captured: dict) -> Callable[..., str]` — closure factory that returns the `submit_plan` tool body bound to a per-call captured dict. The tool body validates `OptimizationPlanOutput(**kwargs)`; on success it stores the validated output in `captured` and returns a sentinel string for the LLM to confirm; on failure it returns `submit_plan FAILED:<error>` so the SDK hands the error back for in-loop retry. Factory is unit-testable without the SDK.
+- `_validate_and_convert(out, available_actions) -> OptimizationPlan` — converts a captured `OptimizationPlanOutput` into the internal dataclass and enforces the available-actions guard (raises `PlanningError` on hallucinated technique IDs).
+- `has_model` property — `self._model is not None and _SDK_AVAILABLE`. Returns `False` even when a model stub is attached if the SDK isn't importable, so callers branch correctly without touching `_model` directly.
+- `parse_plan` static method — **REMOVED**. Pydantic validation now runs inside the tool body; there's no out-of-loop parsing path left.
 
 ## Coder — `coder.py`
 
@@ -81,23 +91,37 @@ The deterministic orchestrator controls all flow. Agents are stateless — they 
 
 **Role**: Interprets eval results into structured feedback. Acts as intelligent filter between raw profiling data and the Planner.
 
-**SDK pattern**: Single-call with Pydantic structured output, same shape as the Planner. `Agent(name="Reviewer", instructions=..., model=..., output_type=ReviewerFeedbackOutput)` → `Runner.run()`. Strict Pydantic validation on `bottleneck_classification` (`Literal["memory_bound", "compute_bound", "balanced"]`) and `branch_quality` (`BranchQuality` enum) surfaces hallucinated values as retry-worthy errors inside `run_agent`.
+**SDK pattern**: Single-call from the caller's view, routed through one tool inside the SDK loop — same shape as the Planner. `Agent(name="Reviewer", instructions=..., model=..., tools=[submit_review])` is built fresh per `review()` call (no compile/correctness loop — `submit_review` is the only tool) → `Runner.run(..., max_turns=4)`. The submit tool replaces the `output_type=Pydantic` enforcement that the SDK used to translate to a `response_format=json_schema` API field — that field is rejected by reasoning-model providers (DeepSeek-reasoner, etc.), so the Reviewer routes its structured submission through a tool call instead. Tool-call schemas are universally supported across OpenAI-compatible providers; the same Pydantic validator runs inside the tool body, preserving the "validation failure → in-loop retry" guarantee. Strict Pydantic validation on `bottleneck_classification` (`Literal["memory_bound", "compute_bound", "balanced"]`) and `branch_quality` (`BranchQuality` enum) surfaces hallucinated values as in-loop tool errors.
+
+- `submit_review(outcome, bottleneck_classification, branch_quality, metric_deltas=None, bottleneck_diagnosis="", suggestions=None, conditional_assessment="")` — required Python args (`outcome`, `bottleneck_classification`, `branch_quality`) match `ReviewerFeedbackOutput`'s required Pydantic fields; optional args with defaults match the Pydantic-optional fields. The tool body instantiates `ReviewerFeedbackOutput(...)` (triggering validation) and stores the result in a per-call captured dict. On validation failure the tool returns `submit_review FAILED:<error>` so the SDK hands the error back to the LLM as the tool-call response, prompting an in-loop retry within the turn budget.
+- `max_turns=4` reserves room for one in-band validation retry, mirroring the Planner.
+- `MaxTurnsExceeded` recovery: the captured dict is preferred — if a valid submission landed before the budget ran out, it's converted to `ReviewerFeedback` and returned. If the dict is empty, the rule-based fallback is invoked with `error_reason="max_turns_exceeded"`.
 
 **Output models**:
-- `ReviewerFeedbackOutput` (Pydantic) — schema sent to the LLM via `output_type`.
+- `ReviewerFeedbackOutput` (Pydantic) — validated inside `submit_review`'s tool body.
 - `ReviewerFeedback` (dataclass) — internal representation. Adds `degraded: bool` and `error_reason: str` so the orchestrator can surface/halt when a run came from retry exhaustion rather than a healthy LLM call. `BranchQuality` is a `str`-subclass enum defined in this module.
 
 **Prompt assembly**: `build_user_prompt()` (static method) — sections: Current kernel (with backtick escaping), **Run context** (once-per-run bottleneck via shared `render_run_context()` helper — always present for the Reviewer, since it's invoked only after the orchestrator has a `run_bottleneck`), Profiling summary, Scoring (SOL score, headroom %), optional Search tree context, optional Knowledge base context. Empty sections are omitted.
 
 **Input** (via orchestrator): `kernel_source`, `profiling_summary`, `sol_score`, `headroom_pct`, `bottleneck: BottleneckType` (once-per-run classification from `classify_run`), `tree_context=""` (root-to-child trajectory from `SearchTree.render_path`), `kb_context=""` (reserved for future Reviewer KB), `prev_sol_score=None`, `profiling: ProfilingResult | None = None` (renders the analytical + NCU blocks in the profiling summary when supplied).
 
-**Rule-based fallback**: `rule_based_feedback()` derives feedback from the sol delta alone when no LLM is configured **or** when `run_agent` returns `None` (all retries exhausted). In the retry-exhausted path the result is stamped `degraded=True, error_reason="llm_retries_exhausted"` and the orchestrator logs a warning — distinguishing it from the expected "no-LLM" configuration.
+**Rule-based fallback**: `rule_based_feedback()` derives feedback from the sol delta alone when no LLM is configured **or** when the SDK loop fails to produce a valid submission. In all degraded paths the result is stamped `degraded=True` with one of these `error_reason` tags so the orchestrator can distinguish causes:
+- `llm_retries_exhausted` — `run_agent` returned `None` after all transient retries.
+- `max_turns_exceeded` — SDK raised `MaxTurnsExceeded` and no valid submission was captured before the budget ran out.
+- `missing_submit_review` — the SDK loop ended cleanly (within `max_turns`) but the LLM never invoked `submit_review`.
+
+The orchestrator logs a warning for any non-empty `error_reason`, distinguishing all three from the expected "no-LLM" configuration (where `error_reason` stays empty).
 
 **Branch quality values**: `promising`, `blocked_potential`, `plateau`, `dead_end`.
 
 **Specialization hook**: `prompt_dir` is a constructor parameter, so a future Compute-Reviewer / Memory-Reviewer split can swap in specialized system prompts without subclassing.
 
 **Model choice**: Can be cheaper model (analysis is easier than planning).
+
+**Private surface**:
+- `_make_submit_review_tool(captured: dict) -> Callable[..., str]` — closure factory that returns the `submit_review` tool body bound to a per-call captured dict. The tool body validates `ReviewerFeedbackOutput(**kwargs)`; on success it stores the validated output in `captured` and returns a sentinel string for the LLM to confirm; on failure it returns `submit_review FAILED:<error>` so the SDK hands the error back for in-loop retry. Factory is unit-testable without the SDK.
+- `has_model` property — `self._model is not None and _SDK_AVAILABLE`. Returns `False` even when a model stub is attached if the SDK isn't importable, so callers branch correctly without touching `_model` directly.
+- `parse_feedback` static method — **REMOVED**. Pydantic validation now runs inside the tool body; there's no out-of-loop parsing path left.
 
 ## Why Debugger Was Merged Into Coder
 
