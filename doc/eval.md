@@ -37,7 +37,7 @@ Run by the orchestrator. Never part of the Coder's tool loop — prevents the LL
 
 | Stage | What | Seeds | Tolerance | On failure |
 |-------|------|-------|-----------|------------|
-| 1. Smoke test | Single input, output matches oracle | 42 | `atol/rtol` (default `1e-3`) | Coder self-corrects |
+| 1. Smoke test | Single input, output matches oracle | 42 | `atol/rtol` (default `1e-2`, mirrors SOL-ExecBench) | Coder self-corrects |
 | 2. Shape sweep | N trials with varying seeds | `0..n_sweep_trials-1` (default 5) | `atol/rtol` | Coder self-corrects |
 | 3. Numerical stability | Match oracle **and** output finite (no NaN/Inf) | 7 | `atol/rtol` | Coder self-corrects |
 | 4. Determinism | Match oracle **and** two runs on identical input are bitwise-equal | 11 | `atol/rtol` | Coder self-corrects |
@@ -51,7 +51,7 @@ Stages 3 and 4 fuse the oracle compare with their domain check so a seed-7 or se
 
 Tensor comparison is abstracted behind a `ComparisonPolicy` protocol (`compare`, `contains_non_finite`, `bitwise_equal`) so the module imports torch-free. Tests inject a scalar-backed policy; production uses `TorchComparisonPolicy`:
 
-- When `sol_execbench` is importable, delegates to `sol_execbench.core.bench.correctness.compute_error_stats` with `ToleranceSpec(max_atol, max_rtol, required_matched_ratio=1.0)`. This gives matched-ratio tolerance, separate NaN/Inf flags, and a hard max-error cap "for free."
+- When `sol_execbench` is importable, delegates to `sol_execbench.core.bench.correctness.compute_error_stats` with `ToleranceSpec(max_atol, max_rtol)` — `required_matched_ratio` is left at SOL's default (0.99 = 1% slack) so bf16 quantization outliers don't reject a mathematically correct kernel. Element-wise pass condition: `|output - reference| <= max_atol + max_rtol * |reference|`. This gives matched-ratio tolerance, separate NaN/Inf flags, and a hard max-error cap "for free."
 - Falls back to a local `torch.allclose` check when SOL-ExecBench is absent (keeps the module usable for non-SOL benchmarks).
 
 ### `verify_correctness` Contract
@@ -59,7 +59,7 @@ Tensor comparison is abstracted behind a `ComparisonPolicy` protocol (`compare`,
 ```python
 verify_correctness(
     candidate_fn, reference_fn, input_generator,
-    *, policy=None, atol=1e-3, rtol=1e-3,
+    *, policy=None, atol=1e-2, rtol=1e-2,
     strict_atol=1e-5, strict_rtol=1e-4,
     n_sweep_trials=5, n_anti_cheat_trials=3,
 ) -> CorrectnessResult

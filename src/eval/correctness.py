@@ -100,11 +100,14 @@ class TorchComparisonPolicy:
             return self._compare_fallback(output, expected, atol=atol, rtol=rtol)
         compute_error_stats, ToleranceSpec = sol
 
-        tolerance = ToleranceSpec(
-            max_atol=atol,
-            max_rtol=rtol,
-            required_matched_ratio=1.0,  # strict — every element must pass
-        )
+        # SOL-ExecBench element-wise pass condition (compute_error_stats):
+        #   tol_bound       = max_atol + max_rtol * |reference|
+        #   element_passes  iff |output - reference| <= tol_bound
+        #   overall_passes  iff (passing / total) >= required_matched_ratio
+        # required_matched_ratio is left at SOL's default — the 1% slack
+        # absorbs bf16 quantization outliers (~1 ULP ≈ 7.8e-3 at magnitude 1)
+        # without rejecting mathematically correct kernels.
+        tolerance = ToleranceSpec(max_atol=atol, max_rtol=rtol)
         correctness, exceeds = compute_error_stats(output, expected, tolerance)
         max_err = float(correctness.max_absolute_error or 0.0)
         if not exceeds:
@@ -217,8 +220,8 @@ def verify_correctness(
     input_generator: Callable[[int], tuple],
     *,
     policy: ComparisonPolicy | None = None,
-    atol: float = 1e-3,
-    rtol: float = 1e-3,
+    atol: float = 1e-2,
+    rtol: float = 1e-2,
     strict_atol: float = 1e-5,
     strict_rtol: float = 1e-4,
     n_sweep_trials: int = 5,
@@ -229,6 +232,12 @@ def verify_correctness(
     ``input_generator(seed)`` returns the args tuple for a trial. Seeds
     used: 42 (smoke), 0..n_sweep_trials-1 (sweep), 7 (stability), 11
     (determinism), 1000..1000+n_anti_cheat_trials-1 (anti-cheat).
+
+    ``atol`` / ``rtol`` mirror SOL-ExecBench's ``ToleranceSpec`` defaults
+    (1e-2) — loose enough for bf16 storage roundtrip (~1 ULP ≈ 7.8e-3
+    at magnitude 1), tight enough to catch fp32 math errors. Stages 1–4
+    use these; stage 5 (anti-cheat) uses ``strict_atol`` / ``strict_rtol``
+    to catch kernels that pass on canned seeds but fail on randomized inputs.
     """
     policy = policy or TorchComparisonPolicy()
     worst_error = 0.0

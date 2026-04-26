@@ -243,3 +243,27 @@ def test_verify_respects_n_sweep_trials():
     )
     # 1 (smoke) + 7 (sweep) + 1 (stability) + 2 (determinism) + 2 (anti-cheat) = 13
     assert calls["n"] == 13
+
+
+# ── Defaults pinned to SOL-ExecBench's ToleranceSpec ───────────────────────
+
+
+def test_verify_correctness_atol_rtol_defaults_match_sol_execbench():
+    """Drift sentinel: ``verify_correctness`` atol/rtol defaults track
+    SOL-ExecBench's ``ToleranceSpec`` defaults. Tightening below bf16's
+    ULP floor (~7.8e-3 at unit magnitude) false-flags every bf16 problem.
+    Skipped when SOL isn't importable (then the literals are unverifiable).
+    """
+    import inspect
+
+    import pytest
+
+    try:
+        from sol_execbench.core.data.workload import ToleranceSpec
+    except ImportError:
+        pytest.skip("sol_execbench not importable")
+
+    sol_defaults = ToleranceSpec()
+    sig = inspect.signature(verify_correctness)
+    assert sig.parameters["atol"].default == sol_defaults.max_atol
+    assert sig.parameters["rtol"].default == sol_defaults.max_rtol
