@@ -82,6 +82,7 @@
 - [x] search/tree.py — quarantine concept added: `TreeNode.consecutive_agent_failures: int` (default 0), module constant `QUARANTINE_THRESHOLD = 2`, `frontier()` filters out nodes at/above the threshold so chronically-failing branches stop attracting selection. `best_node()` deliberately still considers them. Serialize/deserialize updated; legacy checkpoints default the counter to 0.
 - [x] runtime/events.py — `planner_failed` added to `CORE_EVENT_KINDS` (count 18 → 19). Symmetric with `coder_failed`.
 - [x] prompts/planner/system.md + prompts/reviewer/system.md — appended `## Submission` section to each, documenting the `submit_plan` / `submit_review` tool contract (must call exactly once, expected field shapes, `OK` sentinel behavior).
+- [x] agents/planner.py + agents/reviewer.py — `function_tool(_make_submit_*_tool(...), strict_mode=False)` on both submit-tool registrations. The SDK's strict-schema validator rejects `dict[str, X]` (`params` on planner, `metric_deltas` on reviewer) with the same `additionalProperties should not be set` UserError that originally killed the Pydantic-output path; `strict_mode=False` bypasses the pre-flight check while keeping Pydantic validation inside the tool body. Validated end-to-end on the first live GPU run (rmsnorm, 2026-04-26, runs/run_20260426T152032_091547Z/). Tests widen 20 existing `function_tool` lambda patches to accept kwargs + add `test_submit_tool_registered_with_strict_mode_false` regression guard per agent. See JOURNAL → "Strict-mode opt-out for submit-tool dict params (2026-04-26)".
 
 ## Next Up
 

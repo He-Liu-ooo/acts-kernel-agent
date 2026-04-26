@@ -784,3 +784,25 @@ Triton effectively gives us Tiers 1-3.5. CUDA gives all 6 tiers — but the agen
 - First live run where quarantine fires on a non-pathological parent (suggests threshold too aggressive, bump to 3 or split per-agent).
 - First live run where `max_turns=4` is too few for Planner/Reviewer validation retries (bump to `2N+2` with `N=2`, i.e. `max_turns=6`).
 - First live run where DeepSeek consistently omits both required *and* optional `submit_*` fields (fix the prompt, not the budget).
+
+### Strict-mode opt-out for submit-tool dict params (2026-04-26)
+
+The first live GPU run after the Planner + Reviewer submit-tool migration (rmsnorm on RTX 6000 Ada, runs/run_20260426T152032_091547Z/) died on iter 1's first `function_tool(submit_plan)` call with `agents.exceptions.UserError: additionalProperties should not be set for object types`. Same error class that originally killed the `output_type=Pydantic` path — but raised against the *tool parameter* schema this time, not the output schema.
+
+**Root cause**. The migration moved structured submission from `output_type=OptimizationPlanOutput` to a `submit_plan` function tool. The Pydantic model still has a `params: dict[str, str]` field, and the corresponding tool param has the same annotation. The SDK's strict-schema validator (`agents.strict_schema._ensure_strict_json_schema`) walks both sides — output schemas *and* tool parameter schemas — and rejects `dict[str, X]` because the JSON-schema translation produces `additionalProperties: {type: ...}`, which strict mode forbids. The Coder migration didn't hit this because `submit_kernel(source_code: str, triton_kernel_name: str)` has no dict params.
+
+**Fix**: pass `strict_mode=False` to the `function_tool` call when registering the submit tools (`function_tool(_make_submit_plan_tool(captured), strict_mode=False)`, same for reviewer). The SDK's `function_tool` exposes this exact escape hatch in its docstring; setting it to False skips the pre-flight strict-schema validation. The tool schema is still sent to the API; only the SDK-side strictness check is disabled.
+
+**Why this is safe**. End-to-end type safety is preserved because Pydantic validation runs *inside the tool body*: the tool calls `OptimizationPlanOutput(**kwargs)` and returns `format_submit_validation_error(...)` on `ValidationError`, which the SDK relays back to the LLM as the tool-call response. Malformed payloads bounce through the existing in-loop retry budget (`max_turns=4` reserves room for one corrective resubmit). The validator we lose is OpenAI-side coercion of arg types before the function call lands; we already validate downstream of that, so the loss is redundant.
+
+**Why not restructure the dict to a JSON-string param** (the alternative considered). It would keep strict mode but require the LLM to nest-encode JSON inside a JSON tool call — an awkward UX that hurts model accuracy on the structured fields we care about. The strict-mode opt-out is the documented SDK affordance for exactly this case.
+
+**Tests**. Two changes:
+1. Widened all 20 existing `side_effect=lambda f: f` patches in `tests/test_planner.py` + `tests/test_reviewer.py` to `lambda f, **kw: f` so they don't `TypeError` on the new kwarg.
+2. Added `test_submit_tool_registered_with_strict_mode_false` in each agent's test file — a regression guard that records `function_tool` kwargs and asserts `[{"strict_mode": False}]`. Catches future "tidy-up" refactors that delete the kwarg without realizing it's load-bearing.
+
+**Validation**. Re-ran the live GPU run after the fix — Phase A → B → C completed cleanly in 406s, plateau termination after 3 iterations (no candidate beat baseline). Submit-tool migration now genuinely works end-to-end.
+
+**Trigger for revisit**:
+- A future SDK release tightens `strict_mode=False` semantics in a way that breaks our tool calls. Re-evaluate the JSON-string-param alternative if so.
+- A future Pydantic model adds a *required* `dict[str, X]` field whose schema the LLM gets wrong frequently. Strict-mode would catch the wrong shape one round earlier; the in-loop retry catches it one round later. Acceptable trade today, revisit if retry budget pressure rises.
