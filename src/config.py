@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import configparser
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -153,19 +156,105 @@ def load_config(path: Path) -> ACTSConfig:
     arch_path_str = cfg.get("hardware", "arch_config_path", fallback="")
     if arch_path_str:
         kwargs["arch_config_path"] = arch_path_str
-        kwargs["hardware"] = load_hardware_spec(Path(arch_path_str))
+        yaml_spec = load_hardware_spec(Path(arch_path_str))
+        for msg in validate_hardware_spec(yaml_spec, detect_hardware()):
+            logger.warning("arch_config_path %s: %s", arch_path_str, msg)
+        kwargs["hardware"] = yaml_spec
     else:
         kwargs["hardware"] = detect_hardware()
     return ACTSConfig(**kwargs)
 
 
 def detect_hardware() -> HardwareSpec:
-    """Detect GPU hardware and return a HardwareSpec.
+    """Detect GPU hardware via ``torch.cuda`` and return a HardwareSpec.
 
-    Fallback when no SOLAR arch YAML is provided.  Returns a default
-    (zeroed) spec if no GPU is available.
+    **Best-effort, partial spec.** Populates only the runtime-knowable
+    fields (``name``, ``freq_GHz``, ``SRAM_capacity``, ``DRAM_capacity``).
+    Per-precision throughput tables (``MAC_per_cycle_*``) and bandwidth
+    coefficients (``DRAM_byte_per_cycle``, ``SRAM_byte_per_cycle``) stay
+    at zero — those depend on architecture details ``torch.cuda`` cannot
+    infer (boost-clock vs base-clock, tensor-core configurations, memory
+    subsystem peak vs effective). For real ``T_SOL`` / roofline math,
+    callers must load a SOLAR arch YAML via ``load_hardware_spec()``.
+
+    Returns a fully-zeroed ``HardwareSpec`` (matches the no-config
+    placeholder) when:
+
+    - ``torch`` cannot be imported (CPU-only environment),
+    - ``torch.cuda.is_available()`` is False,
+    - no CUDA devices are visible, or
+    - the device-property probe raises (driver mismatch, etc.).
+
+    The orchestrator's existing zero-peak handling (substituting a
+    populated placeholder when peaks are zero) covers all of these.
     """
-    # Placeholder: return zeroed spec until CUDA detection is implemented.
-    # Real implementation would query torch.cuda / pynvml and map to
-    # SOLAR-schema fields.
-    return HardwareSpec()
+    try:
+        import torch
+    except Exception:
+        # Broken torch installs raise OSError (missing libcuda.so) or
+        # RuntimeError (ABI mismatch), not just ImportError. The docstring
+        # promises a zeroed-spec fallback for "torch cannot be imported"
+        # — honor that contract for the broken-driver case too.
+        return HardwareSpec()
+
+    try:
+        if not torch.cuda.is_available() or torch.cuda.device_count() == 0:
+            return HardwareSpec()
+        props = torch.cuda.get_device_properties(0)
+    except Exception:
+        return HardwareSpec()
+
+    return HardwareSpec(
+        name=props.name,
+        freq_GHz=props.clock_rate / 1_000_000,  # kHz → GHz
+        SRAM_capacity=props.L2_cache_size,
+        DRAM_capacity=props.total_memory,
+    )
+
+
+def validate_hardware_spec(spec: HardwareSpec, detected: HardwareSpec) -> list[str]:
+    """Compare a config-source HardwareSpec against the runtime-detected
+    spec and return a list of mismatch messages (empty = no mismatch).
+
+    Catches the silent-miscalibration class of bugs where an
+    ``arch_config_path`` YAML or the placeholder-substitution path doesn't
+    match the GPU actually running the workload (e.g. ``RTX6000Ada.yaml``
+    configured but H100 in the box → all T_SOL math is wrong but the run
+    completes "successfully").
+
+    Checks every field both sources populate: ``DRAM_capacity`` (discriminates
+    GPU family), ``SRAM_capacity`` (L2 — discriminates within a family that
+    shares DRAM, e.g. Ada 96 MB vs H100 50 MB), ``freq_GHz`` (boost clock —
+    both sources report boost, so they should match within driver precision).
+    Per-field skip-if-zero so the validator stays silent when either side
+    is unpopulated (no GPU, partial spec) — its job is to flag
+    *demonstrable* mismatches, not noise on missing data.
+    """
+    issues: list[str] = []
+    if spec.DRAM_capacity > 0 and detected.DRAM_capacity > 0:
+        ratio = spec.DRAM_capacity / detected.DRAM_capacity
+        if ratio < 0.9 or ratio > 1.1:
+            issues.append(
+                f"DRAM capacity mismatch: spec={spec.DRAM_capacity / 1024**3:.1f} GiB "
+                f"(name={spec.name!r}), detected={detected.DRAM_capacity / 1024**3:.1f} GiB "
+                f"(name={detected.name!r}) — the configured hardware probably "
+                f"doesn't match the actual GPU; T_SOL and sol_score will be wrong"
+            )
+    if spec.SRAM_capacity > 0 and detected.SRAM_capacity > 0:
+        ratio = spec.SRAM_capacity / detected.SRAM_capacity
+        if ratio < 0.9 or ratio > 1.1:
+            issues.append(
+                f"SRAM (L2) capacity mismatch: spec={spec.SRAM_capacity / 1024**2:.0f} MiB "
+                f"(name={spec.name!r}), detected={detected.SRAM_capacity / 1024**2:.0f} MiB "
+                f"(name={detected.name!r})"
+            )
+    if spec.freq_GHz > 0 and detected.freq_GHz > 0:
+        ratio = spec.freq_GHz / detected.freq_GHz
+        if ratio < 0.9 or ratio > 1.1:
+            issues.append(
+                f"freq_GHz mismatch: spec={spec.freq_GHz:.3f} GHz "
+                f"(name={spec.name!r}), detected={detected.freq_GHz:.3f} GHz "
+                f"(name={detected.name!r}) — both sources report boost clock, "
+                f"so a >10% delta likely means wrong YAML"
+            )
+    return issues
