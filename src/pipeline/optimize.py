@@ -75,6 +75,10 @@ async def optimize(
         config.hardware.peak_flops_fp32 <= 0
         or config.hardware.peak_memory_bandwidth_gb_s <= 0
     ):
+        from src.config import validate_hardware_spec
+
+        for msg in validate_hardware_spec(_PLACEHOLDER_HARDWARE_SPEC, config.hardware):
+            logger.warning("placeholder substitution: %s", msg)
         logger.warning(
             "HardwareSpec has zero peaks (name=%r) — substituting a populated "
             "placeholder (%s) so the orchestrator's profiler guard passes. "
@@ -150,11 +154,22 @@ async def _load_sol_execbench(
     problem = load_problem(problem_dir)
     spec = problem_to_kernel_spec(problem)
 
-    roofline = derive_t_sol_from_solar(problem)
+    workloads = select_workloads(problem.workloads, count=config.benchmark_workload_count)
+    # Pick the median-size workload as representative for SOLAR's static
+    # roofline analysis. Full per-workload re-derivation would re-run
+    # SOLAR's 4-stage pipeline N times for one number that's roughly
+    # invariant across shapes anyway.
+    representative = workloads[len(workloads) // 2] if workloads else None
+    arch_yaml_path = Path(config.arch_config_path) if config.arch_config_path else None
+    roofline = (
+        derive_t_sol_from_solar(
+            problem, representative, config.hardware, arch_yaml_path=arch_yaml_path,
+        )
+        if representative is not None
+        else None
+    )
     if roofline is not None:
         spec.t_sol_us = roofline.t_sol_us
-
-    workloads = select_workloads(problem.workloads, count=config.benchmark_workload_count)
 
     baseline = await generate_triton_baseline(
         problem, spec,

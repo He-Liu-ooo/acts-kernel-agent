@@ -18,6 +18,7 @@ Both paths produce a ``RooflineResult`` consumed by the scorer.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 # Re-export for backward compatibility — callers importing ``BottleneckType``
@@ -54,28 +55,35 @@ class RooflineResult:
 
 def derive_t_sol_from_solar(
     problem: Problem,
-    arch_config: str = "H100_PCIe",
+    workload: Workload,
+    hardware_spec: HardwareSpec,
+    arch_yaml_path: Path | None = None,
 ) -> RooflineResult | None:
     """Derive T_SOL via the SOLAR pipeline (optional dependency).
 
-    Returns ``None`` when SOLAR is not installed, signalling the caller
-    to fall back to ``compute_roofline()``.
+    Bridges to ``solar_adapter.derive_t_sol`` which drives SOLAR's
+    4-stage Python pipeline against the problem's reference + a
+    representative workload's concrete shapes.
+
+    *arch_yaml_path* overrides the arch resolution; otherwise the
+    adapter looks up by ``hardware_spec.name``.
+
+    Returns ``None`` when SOLAR is not installed (caller falls back to
+    ``compute_roofline()``) or when any pipeline stage produces no
+    result (per-stage diagnostics already logged inside the adapter).
     """
     from src.benchmark.solar_adapter import derive_t_sol
 
-    solar_result = derive_t_sol(problem, arch_config=arch_config)
+    solar_result = derive_t_sol(
+        problem, workload, hardware_spec, arch_yaml_path=arch_yaml_path,
+    )
     if solar_result is None:
         return None
 
-    bottleneck_map = {
-        "compute_bound": BottleneckType.COMPUTE_BOUND,
-        "memory_bound": BottleneckType.MEMORY_BOUND,
-        "balanced": BottleneckType.BALANCED,
-    }
     return RooflineResult(
         t_sol_us=solar_result.t_sol_us,
         arithmetic_intensity=solar_result.arithmetic_intensity,
-        bottleneck=bottleneck_map.get(solar_result.bottleneck, BottleneckType.MEMORY_BOUND),
+        bottleneck=solar_result.bottleneck,
         source="solar",
     )
 

@@ -71,6 +71,92 @@ async def test_load_sol_execbench_returns_reference_fn_and_all_generators():
 
 
 @pytest.mark.asyncio
+async def test_load_sol_execbench_forwards_arch_config_path_to_solar():
+    """Regression for the silent-arch-fallback bug: when the user configures
+    ``[hardware] arch_config_path`` (i.e. ``ACTSConfig.arch_config_path`` is
+    non-empty), Phase A must forward that path into the SOLAR adapter as
+    ``arch_yaml_path``. Otherwise the adapter falls back to name-based
+    lookup and lands on H100_PCIe for any unrecognized hardware name —
+    silently corrupting T_SOL / sol_score for the entire run."""
+    from src.benchmark.problem import Problem, Workload
+
+    problem = Problem(
+        name="p", axes={}, inputs={}, outputs={},
+        reference_source="def run(x): return x\n",
+    )
+    workloads = [Workload(uuid="w1", axes={}, inputs={})]
+    spec = _spec()
+    baseline = Kernel(spec=spec, source_code="src")
+
+    config = ACTSConfig(
+        hardware=HardwareSpec(name="some_custom_gpu"),
+        arch_config_path="/some/custom/arch.yaml",
+    )
+
+    captured: dict = {}
+
+    def _capture(problem_, workload_, hardware_, arch_yaml_path=None):
+        captured["arch_yaml_path"] = arch_yaml_path
+        return None
+
+    with (
+        patch("src.benchmark.problem_loader.load_problem", return_value=problem),
+        patch("src.benchmark.problem_loader.problem_to_kernel_spec", return_value=spec),
+        patch("src.benchmark.workload_selector.select_workloads", return_value=workloads),
+        patch("src.eval.roofline.derive_t_sol_from_solar", side_effect=_capture),
+        patch(
+            "src.benchmark.baseline_generator.generate_triton_baseline",
+            new_callable=AsyncMock,
+            return_value=baseline,
+        ),
+        patch("src.eval.inputs.build_reference_fn", return_value=lambda x: x),
+        patch("src.eval.inputs.build_input_generator", return_value=lambda s: ()),
+    ):
+        await _load_sol_execbench(Path("/fake"), config, MagicMock())
+
+    assert captured["arch_yaml_path"] == Path("/some/custom/arch.yaml")
+
+
+@pytest.mark.asyncio
+async def test_load_sol_execbench_passes_none_when_arch_config_path_empty():
+    """When ``arch_config_path`` is empty (the default), Phase A passes
+    ``arch_yaml_path=None`` and the adapter resolves by name. This keeps
+    the runtime-detected hardware path working without a config file."""
+    from src.benchmark.problem import Problem, Workload
+
+    problem = Problem(
+        name="p", axes={}, inputs={}, outputs={},
+        reference_source="def run(x): return x\n",
+    )
+    workloads = [Workload(uuid="w1", axes={}, inputs={})]
+    spec = _spec()
+    baseline = Kernel(spec=spec, source_code="src")
+
+    captured: dict = {}
+
+    def _capture(problem_, workload_, hardware_, arch_yaml_path=None):
+        captured["arch_yaml_path"] = arch_yaml_path
+        return None
+
+    with (
+        patch("src.benchmark.problem_loader.load_problem", return_value=problem),
+        patch("src.benchmark.problem_loader.problem_to_kernel_spec", return_value=spec),
+        patch("src.benchmark.workload_selector.select_workloads", return_value=workloads),
+        patch("src.eval.roofline.derive_t_sol_from_solar", side_effect=_capture),
+        patch(
+            "src.benchmark.baseline_generator.generate_triton_baseline",
+            new_callable=AsyncMock,
+            return_value=baseline,
+        ),
+        patch("src.eval.inputs.build_reference_fn", return_value=lambda x: x),
+        patch("src.eval.inputs.build_input_generator", return_value=lambda s: ()),
+    ):
+        await _load_sol_execbench(Path("/fake"), ACTSConfig(), MagicMock())
+
+    assert captured["arch_yaml_path"] is None
+
+
+@pytest.mark.asyncio
 async def test_optimize_forwards_correctness_context_to_orchestrator():
     """reference_fn + full generator list from Phase A reach Orchestrator.run()
     as kwargs so the Coder's correctness tool binds to every selected workload."""
@@ -179,6 +265,62 @@ async def test_zero_peak_caller_config_also_gets_placeholder_substituted():
     # Caller's config object must not be mutated — substitution returns a
     # new ACTSConfig via ``dataclasses.replace``.
     assert caller_config.hardware.peak_flops_fp32 == 0
+
+
+@pytest.mark.asyncio
+async def test_placeholder_substitution_warns_on_dram_mismatch(caplog):
+    """When the placeholder substitution fires but the detected GPU
+    obviously doesn't match the placeholder's DRAM (e.g. running on H100
+    where ``placeholder-RTX6000Ada`` would silently route SOLAR to the
+    Ada YAML), log a warning so the user sees the mismatch instead of
+    discovering it via wrong sol_score numbers."""
+    baseline = Kernel(spec=_spec(), source_code="src")
+    fake_orch = MagicMock()
+    fake_orch.run = AsyncMock(return_value=MagicMock())
+
+    # Detected: H100 (80 GiB) — peaks=0 because per-precision tables aren't
+    # populated by ``detect_hardware()``, so substitution will fire.
+    detected_h100 = HardwareSpec(
+        name="NVIDIA H100 PCIe",
+        freq_GHz=1.98,
+        SRAM_capacity=52_428_800,
+        DRAM_capacity=85_899_345_920,
+    )
+
+    with (
+        patch("src.pipeline.optimize._load_model_if_configured", return_value=None),
+        patch("src.config.detect_hardware", return_value=detected_h100),
+        patch("src.search.orchestrator.Orchestrator", return_value=fake_orch),
+        patch("src.memory.store.MemoryStore", return_value=MagicMock()),
+        patch("src.kernels.starters.matmul.make_matmul_kernel", return_value=baseline),
+        caplog.at_level("WARNING", logger="src.pipeline.optimize"),
+    ):
+        await optimize("placeholder")
+
+    assert any("DRAM capacity mismatch" in rec.message for rec in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_placeholder_substitution_silent_when_no_gpu_detected(caplog):
+    """When ``detect_hardware()`` returns a fully-zeroed spec (no GPU at
+    all), the placeholder substitution should NOT log a mismatch warning
+    — there's nothing to compare against, and warning here would noise
+    every CPU-only smoke run."""
+    baseline = Kernel(spec=_spec(), source_code="src")
+    fake_orch = MagicMock()
+    fake_orch.run = AsyncMock(return_value=MagicMock())
+
+    with (
+        patch("src.pipeline.optimize._load_model_if_configured", return_value=None),
+        patch("src.config.detect_hardware", return_value=HardwareSpec()),
+        patch("src.search.orchestrator.Orchestrator", return_value=fake_orch),
+        patch("src.memory.store.MemoryStore", return_value=MagicMock()),
+        patch("src.kernels.starters.matmul.make_matmul_kernel", return_value=baseline),
+        caplog.at_level("WARNING", logger="src.pipeline.optimize"),
+    ):
+        await optimize("placeholder")
+
+    assert not any("DRAM capacity mismatch" in rec.message for rec in caplog.records)
 
 
 @pytest.mark.asyncio

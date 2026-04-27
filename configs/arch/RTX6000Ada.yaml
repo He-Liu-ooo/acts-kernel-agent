@@ -1,0 +1,19 @@
+# NVIDIA RTX 6000 Ada Generation (AD102, sm_89)
+# Specs from NVIDIA datasheet:
+#   https://www.nvidia.com/content/dam/en-zz/Solutions/data-center/rtx-6000-ada/rtx-6000-ada-datasheet.pdf
+#
+# MAC_per_cycle math: peak_FLOPS / (2 * freq_GHz * 1e9)  (matches SOLAR's
+# H100_PCIe.yaml convention — half the peak since each MAC is 2 FLOPs).
+name: "RTX6000Ada"
+SRAM_capacity: 100663296   # 96 MiB L2 cache
+SRAM_byte_per_cycle: 5000  # ~12.5 TB/s estimate (Ada L2; NVIDIA does not publish exact)
+DRAM_capacity: 51539607552  # 48 GiB GDDR6 ECC
+DRAM_byte_per_cycle: 383    # 960 GB/s / 2.505 GHz
+freq_GHz: 2.505             # boost clock (datasheet)
+MAC_per_cycle_fp32_sm: 18185  # 91.1 TFLOPS  (CUDA cores)
+MAC_per_cycle_tf32_tc: 72705  # 364.2 TFLOPS (Tensor Cores, dense)
+MAC_per_cycle_fp16_tc: 145409 # 728.5 TFLOPS (Tensor Cores, dense)
+MAC_per_cycle_bf16_tc: 145409 # 728.5 TFLOPS
+MAC_per_cycle_fp8_tc: 290818  # 1457  TFLOPS
+MAC_per_cycle_int8_tc: 290818 # 1457  TOPS
+# nvfp4 is Blackwell-only; Ada has no NVFP4 support

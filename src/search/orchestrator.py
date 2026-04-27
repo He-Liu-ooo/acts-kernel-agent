@@ -605,6 +605,7 @@ class Orchestrator:
                 t_k_us=bench.median_latency_us,
                 t_p_us=baseline_bench.median_latency_us,
                 t_sol_us=roofline.t_sol_us,
+                t_sol_source=roofline.source,
             )
 
             # Reviewer sees the same trajectory as the Planner, extended
