@@ -629,6 +629,8 @@ class Orchestrator:
                     tree_context=tree.render_path(child.id),
                     prev_sol_score=prev_sol,
                     profiling=profiling,
+                    reviewer_metric_queries=self._config.reviewer_metric_queries,
+                    iter_idx=iter_no,
                 )
                 if feedback.degraded:
                     logger.warning(

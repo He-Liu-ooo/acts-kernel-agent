@@ -184,6 +184,51 @@ def test_detect_hardware_broken_torch_import_returns_zeroed_spec(exc):
     assert spec == HardwareSpec()
 
 
+# ── reviewer multi-turn flag ──────────────────────────────────────────
+
+
+def test_acts_config_reviewer_metric_queries_default_false():
+    """`reviewer_metric_queries` defaults to False — multi-turn Reviewer is
+    opt-in. Existing single-call path is the verified default."""
+    from src.config import ACTSConfig
+
+    cfg = ACTSConfig()
+    assert cfg.reviewer_metric_queries is False
+
+
+def test_load_config_reviewer_metric_queries_from_ini():
+    """`load_config` parses [search] reviewer_metric_queries via the
+    existing boolean coercion path used by `beam_diversity`."""
+    from src.config import load_config
+
+    ini = """\
+[search]
+reviewer_metric_queries = true
+"""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".cfg", delete=False) as f:
+        f.write(ini)
+        f.flush()
+        cfg = load_config(Path(f.name))
+
+    assert cfg.reviewer_metric_queries is True
+
+
+def test_load_config_reviewer_metric_queries_omitted_uses_default():
+    """When [search] omits the key, fall back to the dataclass default."""
+    from src.config import load_config
+
+    ini = """\
+[search]
+beam_width = 5
+"""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".cfg", delete=False) as f:
+        f.write(ini)
+        f.flush()
+        cfg = load_config(Path(f.name))
+
+    assert cfg.reviewer_metric_queries is False
+
+
 # ── validate_hardware_spec() ───────────────────────────────────────────
 
 

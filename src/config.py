@@ -95,6 +95,10 @@ class ACTSConfig:
     # Search parameters
     beam_width: int = 3
     beam_diversity: bool = True
+    # When True, the Reviewer registers a `query_metric` tool alongside
+    # `submit_review` and runs with `max_turns=6` instead of `4`. Default
+    # off — the existing single-call path is the verified default.
+    reviewer_metric_queries: bool = False
     max_depth: int = 20
     epsilon_start: float = 0.3
     epsilon_end: float = 0.05
@@ -134,7 +138,10 @@ def load_config(path: Path) -> ACTSConfig:
     cfg.read(path)
     kwargs: dict = {}
     _section_map = {
-        "search": ["beam_width", "beam_diversity", "max_depth", "epsilon_start", "epsilon_end"],
+        "search": [
+            "beam_width", "beam_diversity", "reviewer_metric_queries",
+            "max_depth", "epsilon_start", "epsilon_end",
+        ],
         "eval": ["warmup_runs", "timed_runs"],
         "move_on": ["sol_plateau_window", "sol_plateau_delta", "sol_target"],
         "debug": ["max_debug_retries", "max_baseline_retries"],

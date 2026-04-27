@@ -42,6 +42,9 @@ from src.agents.llm_backend import (
     render_run_context,
     run_agent,
 )
+# Re-exported under an alias so unit tests can patch the emit call site
+# inside this module without monkey-patching the runtime package.
+from src.runtime.events import emit as events_emit
 
 if TYPE_CHECKING:
     from src.eval.profiler import ProfilingResult
@@ -278,6 +281,53 @@ def _make_submit_review_tool(captured: dict) -> Callable[..., str]:
     return submit_review
 
 
+# ── Multi-turn fetch tool (gated by ACTSConfig.reviewer_metric_queries) ─
+
+
+def _make_query_metric_tool(
+    raw_metrics: dict[str, float] | None,
+    iter_idx: int,
+) -> Callable[[list[str]], dict[str, str]]:
+    """Closure-captures this iteration's raw_metrics + iter index.
+
+    Output is a string-valued dict so float values and the
+    ``"[unknown]"`` / ``"[no data]"`` sentinels coexist without type
+    confusion in the LLM's view. ``raw_metrics is None`` and
+    ``raw_metrics == {}`` are treated identically (both signal an
+    absent NCU dump for this iteration).
+
+    The tool registers with ``strict_mode=False``, so the SDK does
+    NOT pre-validate ``names``; this body does that itself, returning
+    a recoverable ``{"_error": ...}`` dict on shape drift instead of
+    iterating a bare string char-by-char and emitting garbage events.
+    """
+
+    def query_metric(names: list[str]) -> dict[str, str]:
+        if not isinstance(names, list):
+            return {
+                "_error": (
+                    f"`names` must be a list[str]; got "
+                    f"{type(names).__name__}. Retry with a list of "
+                    f"metric names from the menu."
+                )
+            }
+        coerced = [str(n) for n in names]
+        events_emit(
+            "reviewer_metric_query",
+            iter=iter_idx,
+            count=len(coerced),
+            names=coerced[:8],
+        )
+        if not raw_metrics:
+            return {n: "[no data]" for n in coerced}
+        return {
+            n: (f"{raw_metrics[n]}" if n in raw_metrics else "[unknown]")
+            for n in coerced
+        }
+
+    return query_metric
+
+
 # ── Agent ──────────────────────────────────────────────────────────────
 
 
@@ -322,13 +372,16 @@ class ReviewerAgent:
         tree_context: str = "",
         kb_context: str = "",
         profiling: "ProfilingResult | None" = None,
+        reviewer_metric_queries: bool = False,
     ) -> str:
         """Assemble the user prompt from runtime data.
 
         When ``profiling`` is supplied, it takes precedence over the raw
         ``profiling_summary`` string — the analytical + NCU blocks (and
         any degradation notice) are rendered from the dataclass so the
-        orchestrator doesn't have to stringify the result itself.
+        orchestrator doesn't have to stringify the result itself. The
+        multi-turn ``## Available raw metrics`` menu is also derived from
+        ``profiling.raw_metrics`` when ``reviewer_metric_queries=True``.
         """
         sections: list[str] = []
 
@@ -350,6 +403,19 @@ class ReviewerAgent:
         if kb_context:
             sections.append("## Knowledge base context\n" + kb_context)
 
+        if reviewer_metric_queries:
+            raw_metrics = profiling.raw_metrics if profiling is not None else None
+            if raw_metrics:
+                menu_lines = ["## Available raw metrics (queryable)"]
+                menu_lines.extend(f"- {k}" for k in sorted(raw_metrics))
+                sections.append("\n".join(menu_lines))
+            else:
+                sections.append(
+                    "## Available raw metrics (queryable)\n"
+                    "[no NCU data — profiling degraded; "
+                    "query_metric will return empty]"
+                )
+
         return "\n\n".join(sections)
 
     # ── main entry point ────────────────────────────────────────────
@@ -365,6 +431,8 @@ class ReviewerAgent:
         kb_context: str = "",
         prev_sol_score: float | None = None,
         profiling: "ProfilingResult | None" = None,
+        reviewer_metric_queries: bool = False,
+        iter_idx: int = 0,
     ) -> ReviewerFeedback:
         """Interpret eval results into structured Reviewer feedback.
 
@@ -399,21 +467,31 @@ class ReviewerAgent:
             tree_context=tree_context,
             kb_context=kb_context,
             profiling=profiling,
+            reviewer_metric_queries=reviewer_metric_queries,
         )
 
         captured: dict = {}
-        # ``strict_mode=False``: the SDK's strict-schema validator rejects
-        # ``dict[str, float]`` (the ``metric_deltas`` arg) with the same
-        # ``additionalProperties`` error that originally killed the
-        # ``output_type=Pydantic`` path. Pydantic validation still runs
-        # inside the tool body, so end-to-end type safety is preserved;
-        # malformed payloads bounce through the in-loop retry budget.
+        # ``strict_mode=False`` on both tools: the SDK's strict-schema
+        # validator rejects ``dict[str, X]`` and ``list[str]`` arg shapes —
+        # see JOURNAL "Strict-mode opt-out for submit-tool dict params
+        # (2026-04-26)" for the rationale. Pydantic / inline validation
+        # inside each tool body preserves end-to-end type safety.
         submit_tool = function_tool(_make_submit_review_tool(captured), strict_mode=False)
+        tools: list = [submit_tool]
+        max_turns = 4
+        if reviewer_metric_queries:
+            raw_metrics = profiling.raw_metrics if profiling is not None else None
+            query_tool = function_tool(
+                _make_query_metric_tool(raw_metrics=raw_metrics, iter_idx=iter_idx),
+                strict_mode=False,
+            )
+            tools.append(query_tool)
+            max_turns = 6
         agent = Agent(
             name="Reviewer",
             instructions=self._instructions,
             model=self._model,
-            tools=[submit_tool],
+            tools=tools,
         )
 
         def _degraded(reason: str) -> ReviewerFeedback:
@@ -426,16 +504,17 @@ class ReviewerAgent:
                 error_reason=reason,
             )
 
-        # Turn budget: 2*N + 2 with N=1 in-band validation retry. Mirrors
-        # planner.py — reserves room for one invalid submit + corrected
-        # submit + confirmation, so a single Pydantic slip self-corrects
-        # in-loop instead of degrading to rule-based fallback.
+        # Turn budget: ``max_turns`` is 4 (single-call) or 6 (multi-turn).
+        # The single-call path (2*N+2 with N=1) reserves room for one
+        # invalid submit + corrected submit + confirmation, so a single
+        # Pydantic slip self-corrects in-loop instead of degrading to
+        # rule-based. The multi-turn path adds room for one fetch.
         try:
             result = await run_agent(
                 agent,
                 prompt,
                 run_config=make_run_config(temperature=0.3),
-                max_turns=4,
+                max_turns=max_turns,
             )
         except MaxTurnsExceeded:
             if "output" in captured:

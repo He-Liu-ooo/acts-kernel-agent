@@ -813,3 +813,519 @@ async def test_submit_tool_registered_with_strict_mode_false():
         )
 
     assert recorded_kwargs == [{"strict_mode": False}]
+
+
+# ── review() — multi-turn (flag on) ────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_review_flag_on_registers_both_tools_with_strict_mode_false():
+    """When reviewer_metric_queries=True, both submit_review AND query_metric
+    must be registered, both with strict_mode=False. Same SDK strict-schema
+    trap as the planner submit-tool dict params (JOURNAL 2026-04-26)."""
+    capture_factory, fake_run = _simulate_review_submission(
+        outcome="improved",
+        bottleneck_classification="memory_bound",
+        branch_quality=BranchQuality.PROMISING,
+    )
+    recorded_kwargs: list[dict] = []
+
+    def recording_function_tool(f, **kwargs):
+        recorded_kwargs.append(kwargs)
+        return f
+
+    with (
+        patch("src.agents.reviewer._SDK_AVAILABLE", True),
+        patch("src.agents.reviewer.Agent"),
+        patch("src.agents.reviewer.run_agent", new_callable=AsyncMock) as mock_run,
+        patch("src.agents.reviewer.make_run_config", return_value=None),
+        patch("src.agents.reviewer.function_tool", side_effect=recording_function_tool),
+        patch("src.agents.reviewer._make_submit_review_tool", side_effect=capture_factory),
+    ):
+        mock_run.side_effect = fake_run
+        await ReviewerAgent(model=MagicMock()).review(
+            kernel_source="@triton.jit\ndef k(): ...",
+            profiling_summary="",
+            sol_score=0.5,
+            headroom_pct=50.0,
+            bottleneck=BottleneckType.MEMORY_BOUND,
+            reviewer_metric_queries=True,
+            iter_idx=2,
+        )
+
+    assert len(recorded_kwargs) == 2
+    assert all(kw == {"strict_mode": False} for kw in recorded_kwargs)
+
+
+@pytest.mark.asyncio
+async def test_review_flag_on_uses_max_turns_6():
+    """The multi-turn path budgets max_turns=6; flag-off keeps max_turns=4."""
+    capture_factory, fake_run = _simulate_review_submission(
+        outcome="improved",
+        bottleneck_classification="memory_bound",
+        branch_quality=BranchQuality.PROMISING,
+    )
+    with (
+        patch("src.agents.reviewer._SDK_AVAILABLE", True),
+        patch("src.agents.reviewer.Agent"),
+        patch("src.agents.reviewer.run_agent", new_callable=AsyncMock) as mock_run,
+        patch("src.agents.reviewer.make_run_config", return_value=None),
+        patch("src.agents.reviewer.function_tool", side_effect=lambda f, **kw: f),
+        patch("src.agents.reviewer._make_submit_review_tool", side_effect=capture_factory),
+    ):
+        mock_run.side_effect = fake_run
+        await ReviewerAgent(model=MagicMock()).review(
+            kernel_source="def k(): pass",
+            profiling_summary="",
+            sol_score=0.5,
+            headroom_pct=50.0,
+            bottleneck=BottleneckType.MEMORY_BOUND,
+            reviewer_metric_queries=True,
+            iter_idx=0,
+        )
+
+    mock_run.assert_awaited_once()
+    assert mock_run.await_args.kwargs.get("max_turns") == 6
+
+
+@pytest.mark.asyncio
+async def test_review_flag_off_still_uses_max_turns_4():
+    """Regression guard: with the flag off (default), the existing
+    max_turns=4 path is unchanged."""
+    capture_factory, fake_run = _simulate_review_submission(
+        outcome="improved",
+        bottleneck_classification="memory_bound",
+        branch_quality=BranchQuality.PROMISING,
+    )
+    with (
+        patch("src.agents.reviewer._SDK_AVAILABLE", True),
+        patch("src.agents.reviewer.Agent"),
+        patch("src.agents.reviewer.run_agent", new_callable=AsyncMock) as mock_run,
+        patch("src.agents.reviewer.make_run_config", return_value=None),
+        patch("src.agents.reviewer.function_tool", side_effect=lambda f, **kw: f),
+        patch("src.agents.reviewer._make_submit_review_tool", side_effect=capture_factory),
+    ):
+        mock_run.side_effect = fake_run
+        await ReviewerAgent(model=MagicMock()).review(
+            kernel_source="def k(): pass",
+            profiling_summary="",
+            sol_score=0.5,
+            headroom_pct=50.0,
+            bottleneck=BottleneckType.MEMORY_BOUND,
+        )
+
+    assert mock_run.await_args.kwargs.get("max_turns") == 4
+
+
+@pytest.mark.asyncio
+async def test_review_flag_on_threads_raw_metrics_into_prompt_menu():
+    """End-to-end: review(reviewer_metric_queries=True, profiling=...)
+    builds the prompt with the menu populated from profiling.raw_metrics."""
+    from src.eval.profiler import AnalyticalMetrics, ProfilingResult
+
+    profiling = ProfilingResult(
+        analytical=AnalyticalMetrics(
+            arithmetic_intensity=1.0, ridge_point=10.0,
+            achieved_tflops=5.0, achieved_bandwidth_gb_s=200.0,
+            pct_peak_compute=0.4, pct_peak_bandwidth=0.5,
+        ),
+        ncu=None,
+        raw_metrics={"sm__a.avg": 1.0, "sm__b.avg": 2.0},
+    )
+    capture_factory, fake_run = _simulate_review_submission(
+        outcome="improved",
+        bottleneck_classification="memory_bound",
+        branch_quality=BranchQuality.PROMISING,
+    )
+
+    with (
+        patch("src.agents.reviewer._SDK_AVAILABLE", True),
+        patch("src.agents.reviewer.Agent"),
+        patch("src.agents.reviewer.run_agent", new_callable=AsyncMock) as mock_run,
+        patch("src.agents.reviewer.make_run_config", return_value=None),
+        patch("src.agents.reviewer.function_tool", side_effect=lambda f, **kw: f),
+        patch("src.agents.reviewer._make_submit_review_tool", side_effect=capture_factory),
+    ):
+        mock_run.side_effect = fake_run
+        await ReviewerAgent(model=MagicMock()).review(
+            kernel_source="def k(): pass",
+            profiling_summary="",
+            sol_score=0.5,
+            headroom_pct=50.0,
+            bottleneck=BottleneckType.MEMORY_BOUND,
+            profiling=profiling,
+            reviewer_metric_queries=True,
+            iter_idx=1,
+        )
+
+    sent_prompt = mock_run.await_args.args[1]
+    assert "## Available raw metrics (queryable)" in sent_prompt
+    assert "- sm__a.avg" in sent_prompt
+    assert "- sm__b.avg" in sent_prompt
+
+
+@pytest.mark.asyncio
+async def test_review_flag_on_two_queries_plus_invalid_submit_busts_budget():
+    """Codex review regression test (2026-04-27): with the flag on, the
+    worst-case path of `2 query_metric calls + invalid submit_review +
+    corrected submit_review` requires more than `max_turns=6` turns. The
+    prompt now caps fetches at one per review precisely to preserve
+    submit-retry headroom; this test confirms the degraded fallback fires
+    cleanly when an LLM ignores the heuristic and walks the budget-bust
+    path, rather than raising or returning a partially-formed feedback."""
+    from src.agents.reviewer import MaxTurnsExceeded
+
+    with (
+        patch("src.agents.reviewer._SDK_AVAILABLE", True),
+        patch("src.agents.reviewer.Agent"),
+        patch("src.agents.reviewer.run_agent", new_callable=AsyncMock) as mock_run,
+        patch("src.agents.reviewer.make_run_config", return_value=None),
+        patch("src.agents.reviewer.function_tool", side_effect=lambda f, **kw: f),
+    ):
+        # SDK reports `Max turns (6) exceeded` after the LLM walked
+        # query → response → query → response → invalid submit (validation
+        # error response was the 6th turn) — no captured submission.
+        mock_run.side_effect = MaxTurnsExceeded("Max turns (6) exceeded")
+
+        feedback = await ReviewerAgent(model=MagicMock()).review(
+            kernel_source="src",
+            profiling_summary="",
+            sol_score=0.5,
+            headroom_pct=50.0,
+            bottleneck=BottleneckType.MEMORY_BOUND,
+            reviewer_metric_queries=True,
+            iter_idx=0,
+        )
+
+    # Must degrade cleanly to rule-based, with the existing tag — no new
+    # error_reason values, no exception escape.
+    assert feedback.degraded is True
+    assert feedback.error_reason == "max_turns_exceeded"
+    assert feedback.bottleneck_classification == "memory_bound"
+
+
+@pytest.mark.asyncio
+async def test_review_flag_on_max_turns_exceeded_no_capture_degrades():
+    """Flag on, MaxTurnsExceeded with no submit captured → existing degraded
+    fallback fires with error_reason='max_turns_exceeded' (no new tag)."""
+    from src.agents.reviewer import MaxTurnsExceeded
+
+    with (
+        patch("src.agents.reviewer._SDK_AVAILABLE", True),
+        patch("src.agents.reviewer.Agent"),
+        patch("src.agents.reviewer.run_agent", new_callable=AsyncMock) as mock_run,
+        patch("src.agents.reviewer.make_run_config", return_value=None),
+        patch("src.agents.reviewer.function_tool", side_effect=lambda f, **kw: f),
+    ):
+        mock_run.side_effect = MaxTurnsExceeded("Max turns (6) exceeded")
+
+        feedback = await ReviewerAgent(model=MagicMock()).review(
+            kernel_source="src",
+            profiling_summary="",
+            sol_score=0.5,
+            headroom_pct=50.0,
+            bottleneck=BottleneckType.MEMORY_BOUND,
+            reviewer_metric_queries=True,
+            iter_idx=0,
+        )
+
+    assert feedback.degraded is True
+    assert feedback.error_reason == "max_turns_exceeded"
+
+
+# ── build_user_prompt — metric menu append (multi-turn flag on) ────────
+
+
+def _profiling_with(raw_metrics: dict[str, float] | None) -> "ProfilingResult":
+    """Test helper: build a minimal ProfilingResult with the given raw_metrics.
+    The analytical block is filler — the menu-rendering tests only exercise
+    the raw_metrics-derived menu, not the profiling-summary section."""
+    from src.eval.profiler import AnalyticalMetrics, ProfilingResult
+
+    return ProfilingResult(
+        analytical=AnalyticalMetrics(
+            arithmetic_intensity=1.0, ridge_point=10.0,
+            achieved_tflops=5.0, achieved_bandwidth_gb_s=200.0,
+            pct_peak_compute=0.4, pct_peak_bandwidth=0.5,
+        ),
+        ncu=None,
+        raw_metrics=raw_metrics or {},
+    )
+
+
+def test_build_user_prompt_no_menu_when_flag_off():
+    """Default behavior (flag off): no menu section, regardless of
+    raw_metrics. Existing flag-off tests already serve as a regression
+    guard for the single-call default path."""
+    agent = ReviewerAgent(model=None)
+    prompt = agent.build_user_prompt(
+        kernel_source="def k(): pass",
+        profiling_summary="",
+        sol_score=0.5,
+        headroom_pct=50.0,
+        bottleneck=BottleneckType.MEMORY_BOUND,
+        profiling=_profiling_with({"foo": 1.0, "bar": 2.0}),  # provided but flag off
+    )
+    assert "Available raw metrics" not in prompt
+
+
+def test_build_user_prompt_menu_when_flag_on_and_raw_metrics_present():
+    """Flag on + non-empty raw_metrics: menu lists keys alphabetically."""
+    agent = ReviewerAgent(model=None)
+    prompt = agent.build_user_prompt(
+        kernel_source="def k(): pass",
+        profiling_summary="",
+        sol_score=0.5,
+        headroom_pct=50.0,
+        bottleneck=BottleneckType.MEMORY_BOUND,
+        reviewer_metric_queries=True,
+        profiling=_profiling_with({"sm__b": 1.0, "sm__a": 2.0}),
+    )
+    assert "## Available raw metrics (queryable)" in prompt
+    section = prompt.split("## Available raw metrics (queryable)")[1]
+    assert section.index("- sm__a") < section.index("- sm__b")
+
+
+def test_build_user_prompt_menu_degraded_notice_when_raw_metrics_empty():
+    """Flag on + empty raw_metrics: degraded-state notice replaces the list."""
+    agent = ReviewerAgent(model=None)
+    prompt = agent.build_user_prompt(
+        kernel_source="def k(): pass",
+        profiling_summary="",
+        sol_score=0.5,
+        headroom_pct=50.0,
+        bottleneck=BottleneckType.MEMORY_BOUND,
+        reviewer_metric_queries=True,
+        profiling=_profiling_with({}),
+    )
+    assert "## Available raw metrics (queryable)" in prompt
+    assert "[no NCU data" in prompt
+    assert "query_metric will return empty" in prompt
+
+
+def test_build_user_prompt_menu_degraded_notice_when_profiling_none():
+    """Flag on + profiling=None: same degraded notice as empty raw_metrics."""
+    agent = ReviewerAgent(model=None)
+    prompt = agent.build_user_prompt(
+        kernel_source="def k(): pass",
+        profiling_summary="",
+        sol_score=0.5,
+        headroom_pct=50.0,
+        bottleneck=BottleneckType.MEMORY_BOUND,
+        reviewer_metric_queries=True,
+        profiling=None,
+    )
+    assert "[no NCU data" in prompt
+
+
+@pytest.mark.asyncio
+async def test_review_partial_ncu_degradation_still_exposes_raw_metrics():
+    """Codex review regression test (2026-04-27): `ProfilingResult.degraded`
+    and `raw_metrics` are independent surfaces. A partial NCU parse failure
+    sets `degraded_reason` while still leaving `raw_metrics` populated with
+    whatever was successfully extracted. The multi-turn path must:
+
+    1. show the menu with real keys (not the degraded notice), and
+    2. return real values from `query_metric`.
+
+    The system prompt's degraded-state guidance must point at the menu
+    (visible to the LLM) — not at the abstract `degraded` flag — so the
+    LLM doesn't skip the tool exactly when the only-partial-data case
+    fires (the failure shape this feature is meant to recover from)."""
+    from src.eval.profiler import AnalyticalMetrics, ProfilingResult
+    from src.agents.reviewer import _make_query_metric_tool
+
+    profiling = ProfilingResult(
+        analytical=AnalyticalMetrics(
+            arithmetic_intensity=1.0, ridge_point=10.0,
+            achieved_tflops=5.0, achieved_bandwidth_gb_s=200.0,
+            pct_peak_compute=0.4, pct_peak_bandwidth=0.5,
+        ),
+        ncu=None,                                       # curated NCU dataclass un-built
+        raw_metrics={"sm__warps_active.avg.pct": 0.62}, # raw still populated
+        degraded_reason="parse_partial",                # degraded flag set
+    )
+    assert profiling.degraded is True
+    assert profiling.raw_metrics  # non-empty
+
+    # 1. Menu rendering: real keys visible, NOT the degraded notice.
+    capture_factory, fake_run = _simulate_review_submission(
+        outcome="improved",
+        bottleneck_classification="memory_bound",
+        branch_quality=BranchQuality.PROMISING,
+    )
+    with (
+        patch("src.agents.reviewer._SDK_AVAILABLE", True),
+        patch("src.agents.reviewer.Agent"),
+        patch("src.agents.reviewer.run_agent", new_callable=AsyncMock) as mock_run,
+        patch("src.agents.reviewer.make_run_config", return_value=None),
+        patch("src.agents.reviewer.function_tool", side_effect=lambda f, **kw: f),
+        patch("src.agents.reviewer._make_submit_review_tool", side_effect=capture_factory),
+    ):
+        mock_run.side_effect = fake_run
+        await ReviewerAgent(model=MagicMock()).review(
+            kernel_source="def k(): pass",
+            profiling_summary="",
+            sol_score=0.5,
+            headroom_pct=50.0,
+            bottleneck=BottleneckType.MEMORY_BOUND,
+            profiling=profiling,
+            reviewer_metric_queries=True,
+            iter_idx=1,
+        )
+
+    sent_prompt = mock_run.await_args.args[1]
+    assert "## Available raw metrics (queryable)" in sent_prompt
+    assert "- sm__warps_active.avg.pct" in sent_prompt
+    # The degraded-notice must NOT appear when raw_metrics is non-empty.
+    assert "[no NCU data" not in sent_prompt
+
+    # 2. Tool body returns real values, not "[no data]".
+    tool = _make_query_metric_tool(
+        raw_metrics=profiling.raw_metrics, iter_idx=1
+    )
+    out = tool(names=["sm__warps_active.avg.pct"])
+    assert out == {"sm__warps_active.avg.pct": "0.62"}
+
+
+# ── _make_query_metric_tool — direct unit tests ────────────────────────
+
+
+def test_make_query_metric_tool_all_known_names():
+    """All-known names → dict with stringified float values."""
+    from src.agents.reviewer import _make_query_metric_tool
+
+    raw = {"sm__warps_active.avg.pct": 0.62, "smsp__cycles_active.sum": 1234.5}
+    tool = _make_query_metric_tool(raw_metrics=raw, iter_idx=3)
+    out = tool(names=["sm__warps_active.avg.pct", "smsp__cycles_active.sum"])
+    assert out == {
+        "sm__warps_active.avg.pct": "0.62",
+        "smsp__cycles_active.sum": "1234.5",
+    }
+
+
+def test_make_query_metric_tool_all_unknown_names():
+    """All-unknown names → all '[unknown]'."""
+    from src.agents.reviewer import _make_query_metric_tool
+
+    raw = {"foo": 1.0}
+    tool = _make_query_metric_tool(raw_metrics=raw, iter_idx=0)
+    out = tool(names=["bar", "baz"])
+    assert out == {"bar": "[unknown]", "baz": "[unknown]"}
+
+
+def test_make_query_metric_tool_partial_unknown():
+    """Mixed known/unknown → mixed dict; one tool call serves both."""
+    from src.agents.reviewer import _make_query_metric_tool
+
+    raw = {"foo": 1.0}
+    tool = _make_query_metric_tool(raw_metrics=raw, iter_idx=0)
+    out = tool(names=["foo", "bar"])
+    assert out == {"foo": "1.0", "bar": "[unknown]"}
+
+
+def test_make_query_metric_tool_raw_metrics_none():
+    """raw_metrics=None → all '[no data]' (NCU was degraded this iter)."""
+    from src.agents.reviewer import _make_query_metric_tool
+
+    tool = _make_query_metric_tool(raw_metrics=None, iter_idx=0)
+    out = tool(names=["foo", "bar"])
+    assert out == {"foo": "[no data]", "bar": "[no data]"}
+
+
+def test_make_query_metric_tool_raw_metrics_empty_dict():
+    """raw_metrics={} → all '[no data]' (treated identically to None)."""
+    from src.agents.reviewer import _make_query_metric_tool
+
+    tool = _make_query_metric_tool(raw_metrics={}, iter_idx=0)
+    out = tool(names=["foo"])
+    assert out == {"foo": "[no data]"}
+
+
+def test_make_query_metric_tool_empty_names_list():
+    """Empty names=[] → empty dict; defensive against degenerate LLM call."""
+    from src.agents.reviewer import _make_query_metric_tool
+
+    tool = _make_query_metric_tool(raw_metrics={"foo": 1.0}, iter_idx=0)
+    assert tool(names=[]) == {}
+
+
+def test_make_query_metric_tool_emits_event_per_call():
+    """Tool body emits `reviewer_metric_query` event with iter, count, names[:8]."""
+    from src.agents.reviewer import _make_query_metric_tool
+
+    raw = {"foo": 1.0}
+    tool = _make_query_metric_tool(raw_metrics=raw, iter_idx=5)
+
+    with patch("src.agents.reviewer.events_emit") as mock_emit:
+        tool(names=["foo", "bar"])
+
+    mock_emit.assert_called_once()
+    call_kwargs = mock_emit.call_args.kwargs
+    call_args = mock_emit.call_args.args
+    assert call_args[0] == "reviewer_metric_query"
+    assert call_kwargs["iter"] == 5
+    assert call_kwargs["count"] == 2
+    assert call_kwargs["names"] == ["foo", "bar"]
+
+
+def test_make_query_metric_tool_truncates_names_in_event_to_first_8():
+    """names cap at 8 in the event payload — keeps events.jsonl bounded."""
+    from src.agents.reviewer import _make_query_metric_tool
+
+    tool = _make_query_metric_tool(raw_metrics={}, iter_idx=0)
+    long_names = [f"m{i}" for i in range(12)]
+
+    with patch("src.agents.reviewer.events_emit") as mock_emit:
+        tool(names=long_names)
+
+    call_kwargs = mock_emit.call_args.kwargs
+    assert call_kwargs["count"] == 12  # full count
+    assert call_kwargs["names"] == long_names[:8]  # truncated list
+
+
+def test_make_query_metric_tool_non_list_names_returns_error_dict():
+    """`strict_mode=False` means the SDK doesn't pre-validate `names`. If
+    the model emits a bare string, the tool body MUST NOT iterate it
+    char-by-char (silent garbage); it must return a recoverable error
+    dict so the LLM can self-correct in-loop."""
+    from src.agents.reviewer import _make_query_metric_tool
+
+    tool = _make_query_metric_tool(raw_metrics={"foo": 1.0}, iter_idx=0)
+    out = tool(names="foo")  # bare string — the failure mode Codex flagged
+    assert "_error" in out
+    assert "list" in out["_error"].lower()
+    assert "str" in out["_error"].lower()  # mentions actual type received
+
+
+def test_make_query_metric_tool_none_names_returns_error_dict():
+    """`names=None` must not raise — return a recoverable error dict."""
+    from src.agents.reviewer import _make_query_metric_tool
+
+    tool = _make_query_metric_tool(raw_metrics={"foo": 1.0}, iter_idx=0)
+    out = tool(names=None)  # type: ignore[arg-type]
+    assert "_error" in out
+    assert "list" in out["_error"].lower()
+
+
+def test_make_query_metric_tool_non_string_elements_are_coerced():
+    """Element-level type drift (e.g. int names) is coerced via str();
+    lookup proceeds against the stringified key. No exception, no garbage."""
+    from src.agents.reviewer import _make_query_metric_tool
+
+    tool = _make_query_metric_tool(raw_metrics={"42": 1.0}, iter_idx=0)
+    out = tool(names=[42])  # type: ignore[list-item]
+    assert out == {"42": "1.0"}
+
+
+def test_make_query_metric_tool_invalid_input_does_not_emit_event():
+    """Bad-input early-return path skips event emission — events.jsonl
+    only records well-formed query attempts."""
+    from src.agents.reviewer import _make_query_metric_tool
+
+    tool = _make_query_metric_tool(raw_metrics={"foo": 1.0}, iter_idx=0)
+
+    with patch("src.agents.reviewer.events_emit") as mock_emit:
+        tool(names="foo")  # bare string
+
+    mock_emit.assert_not_called()

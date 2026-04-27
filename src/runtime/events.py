@@ -32,7 +32,13 @@ CORE_EVENT_KINDS: frozenset[str] = frozenset({
     # (compile, correctness, turn-budget, missing ``submit_kernel``).
     "coder_submitted", "coder_failed",
     "bench_done", "profile_done", "score_computed",
-    "reviewer_feedback", "branch_dead_end", "iter_end", "verify_start",
+    "reviewer_feedback",
+    # Per-call event from the multi-turn Reviewer's ``query_metric`` tool —
+    # records ``{iter, count, names[:8]}`` so post-run analysis can see
+    # what the LLM actually asked for. Emitted only when
+    # ``ACTSConfig.reviewer_metric_queries`` is True.
+    "reviewer_metric_query",
+    "branch_dead_end", "iter_end", "verify_start",
     "verify_done", "run_end",
 })
 
