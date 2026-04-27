@@ -13,8 +13,17 @@ def shared_memory_tiling() -> Action:
         name="Shared Memory Tiling",
         description="Tile data through shared memory for reuse across threads.",
         preconditions=["memory_bound"],
-        guidance="Placeholder guidance.",
-        expected_impact="2-5x speedup on memory-bound kernels with data reuse.",
+        guidance=(
+            "Stage frequently-reused inputs (matmul A/B tiles, conv filters, reduction operands) into "
+            "`tl.dot`-shaped shared-memory tiles. Each tile should be loaded once per block and reused "
+            "across the full inner loop. Tile size is bounded by shared memory per SM divided by "
+            "concurrent blocks — making tiles too big collapses occupancy."
+        ),
+        anti_patterns=[
+            "Tiling data with no reuse — pure copy overhead, no speedup.",
+            "Tile size that leaves only one block per SM resident.",
+        ],
+        expected_impact="Often substantial when data has reuse; near-zero on streaming kernels.",
     )
 
 
@@ -26,8 +35,17 @@ def global_memory_coalescing() -> Action:
         name="Global Memory Coalescing",
         description="Ensure coalesced global memory access patterns.",
         preconditions=["memory_bound"],
-        guidance="Placeholder guidance.",
-        expected_impact="2-10x on uncoalesced access patterns.",
+        guidance=(
+            "Adjacent threads in a warp must read adjacent addresses. Strided or transposed access "
+            "patterns issue separate transactions per thread, wasting bandwidth. Restructure the index "
+            "computation, swap the loop nest, or stage through shared memory to coalesce. Verify with "
+            "the profiler's `gld_efficiency` (should be ≥80%)."
+        ),
+        anti_patterns=[
+            "Coalescing without measuring — pretty access patterns aren't always faster.",
+            "Transposing in global memory instead of staging through shared memory.",
+        ],
+        expected_impact="Often large on memory-bound kernels with uncoalesced loads; nothing otherwise.",
     )
 
 
@@ -39,7 +57,17 @@ def register_caching() -> Action:
         name="Register Caching",
         description="Cache frequently accessed values in registers to reduce memory traffic.",
         preconditions=["memory_bound"],
-        guidance="Placeholder guidance.",
+        guidance=(
+            "Hoist values out of inner loops into per-thread registers when the same address is hit "
+            "many times. Triton handles this automatically for scalars; for small vectors, store the "
+            "loaded values in a `tl.zeros`-initialized accumulator and reuse. Watch register pressure — "
+            "spilling to local memory is worse than the original load."
+        ),
+        anti_patterns=[
+            "Hoisting large arrays into registers — causes spilling, regressive.",
+            "Caching values that are only read once.",
+        ],
+        expected_impact="Typically modest; can be substantial when the same address is hit many times.",
     )
 
 
@@ -52,7 +80,17 @@ def prefetching() -> Action:
         description="Software prefetching via Triton num_stages pipelining.",
         preconditions=["memory_bound"],
         parameters={"num_stages": "2-5"},
-        guidance="Placeholder guidance.",
+        guidance=(
+            "Pass `num_stages=N` to `triton.autotune` or the Triton kernel decorator to overlap the "
+            "next iteration's loads with the current iteration's compute. Start with `num_stages=2`; "
+            "increase only if shared memory budget allows. Each stage roughly doubles the per-block "
+            "shared memory footprint."
+        ),
+        anti_patterns=[
+            "Increasing num_stages until shared memory overflows — drops occupancy to 1 block/SM.",
+            "Setting num_stages on kernels with no obvious load/compute overlap (e.g., elementwise).",
+        ],
+        expected_impact="Typically small-to-moderate; matters most on inner loops with cheap compute per load.",
     )
 
 
@@ -64,7 +102,17 @@ def bank_conflict_resolution() -> Action:
         name="Bank Conflict Resolution",
         description="Resolve shared memory bank conflicts via padding or access reordering.",
         preconditions=["memory_bound"],
-        guidance="Placeholder guidance.",
+        guidance=(
+            "Multiple threads in a warp hitting the same shared-memory bank serialize. The classic fix "
+            "for power-of-two strides is to pad the inner dimension by one element so adjacent rows "
+            "land on different banks. Triton's swizzling (`tl.swizzle2d`) handles this for matmul-shaped "
+            "tiles. NCU's `shared_load_transactions_per_request` reveals conflicts."
+        ),
+        anti_patterns=[
+            "Padding without verifying conflicts exist — wastes shared memory budget.",
+            "Hand-coding swizzles when `tl.dot` with a standard tile shape already does it.",
+        ],
+        expected_impact="Typically small; rarely the dominant factor unless shared memory is the bottleneck.",
     )
 
 
