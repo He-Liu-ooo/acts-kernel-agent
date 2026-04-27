@@ -35,7 +35,7 @@ Best-first tree search with beam constraint.
 |-------|------|------|
 | **Planner** | Every iteration | Analyzes profiling data + optimization memory, selects technique from structured action library, produces structured plan `{tier, technique, params, target_region, rationale}` |
 | **Coder** | Every iteration | Implements the plan into kernel code; one focused change per iteration. Has compile and correctness-check tools for self-correction within a retry budget. |
-| **Reviewer** | Every iteration (after eval) | Interprets eval results, produces structured feedback `{outcome, metric_deltas, bottleneck_classification, bottleneck_diagnosis, suggestions, branch_quality, conditional_assessment}` |
+| **Reviewer** | Every iteration (after eval) | Interprets eval results, produces structured feedback `{outcome, metric_deltas, bottleneck_classification, bottleneck_diagnosis, suggestions, branch_quality, conditional_assessment}`. Optional multi-turn capability via `query_metric` (gated by `ACTSConfig.reviewer_metric_queries`, default off) lets the Reviewer fetch additional `raw_metrics` from the iteration's profiling dump when the curated NCU subset is insufficient. |
 
 Plus a deterministic orchestrator (code, not LLM) that manages tree state, beam selection, and move-on criteria.
 
@@ -113,7 +113,7 @@ Compilation and correctness run inside the Coder's turn. The Coder calls these t
 | `compiler.py` | Coder's `compile_kernel_tool` | Triton compilation |
 | `correctness.py` + `anti_cheat.py` | Coder's `check_correctness_tool` | 5-stage correctness gate |
 
-Note: `anti_cheat.py` has two surfaces. **Correctness-level** (above): randomized inputs, precision checks — runs inside the Coder's turn. **Performance-level**: `scorer.py` flags `reward_hack_suspect` when `T_k < T_SOL` — the orchestrator routes flagged candidates through additional anti-cheat inspection (see SOL Score Invariant Violations).
+Note: `anti_cheat.py` has three surfaces. **Correctness-level** (above): randomized inputs, precision checks — runs inside the Coder's turn. **Performance-level**: `scorer.py` flags `reward_hack_suspect` when `T_k < T_SOL` — the orchestrator routes flagged candidates through additional anti-cheat inspection (see SOL Score Invariant Violations). **Process-level** (added 2026-04-27 scope expansion): the SOL `reward_hack` detector set (`check_monkey_patch`, `check_thread_injection`, `check_lazy_outputs`, `snapshot_critical_functions` + `check_eval_integrity`) wrapped as a per-iteration context manager — catches torch primitive rebinding, thread injection, lazy/deferred outputs, and namespace tampering between snapshot and check. See JOURNAL → "SOL integration scope expansion — adopt every applicable primitive (2026-04-27)" for the full integration plan.
 
 #### 5-Stage Correctness Gate
 
@@ -164,6 +164,18 @@ ACTS uses SOL-ExecBench (NVIDIA, 2026) as its benchmark suite. SOL-ExecBench pro
 - **Definition** (`definition.json`): Problem name, input/output tensor shapes, dtypes, symbolic axes
 - **Reference** (`reference.py`): PyTorch `run()` function — the ground-truth specification of the computation
 - **Workloads** (`workload.jsonl`): 7-48 concrete shape instantiations per problem (varying batch size, sequence length, etc.)
+
+**In-memory representation**: ACTS adopts SOL's pydantic models (`sol_execbench.core.data.{Definition, Workload, Solution, Trace}` plus all input variants and trace types) directly as the canonical schema. There is no parallel ACTS dataclass layer — a `Definition` parsed from disk flows unchanged through orchestrator, agents, and report. Other benchmarks (KernelBench, custom problem sets) plug in via per-benchmark adapters under `src/benchmarks/<name>/load.py` that produce `tuple[Definition, list[Workload]]` from their native format.
+
+**Benchmark-agnosticism guarantee** (architectural commitment, added 2026-04-27 scope expansion): the pipeline (`src/pipeline/`, `src/search/`, `src/eval/`, `src/agents/`, `src/kernels/`, `src/memory/`, `src/actions/`) operates exclusively on SOL pydantic types and does not import or reference any benchmark-specific on-disk format. The only place benchmark-format knowledge is allowed to live is `src/benchmarks/<name>/load.py`. Adding SOL-specific code paths outside the adapter (e.g., parsing `definition.json` directly in the orchestrator, or branching on benchmark category in `eval/`) is a violation of this contract. Adding a new benchmark is a one-file change: write `src/benchmarks/<name>/load.py` returning `tuple[Definition, list[Workload]]` from the native format. KernelBench's `Model.forward` wraps into a `def run(...)` string in `Definition.reference` with init params handled via `custom_inputs_entrypoint`; custom one-off kernels use `src/benchmarks/custom/` by dropping `definition.json` + `workload.jsonl` in a directory.
+
+**Constraints inherent to the canonical schema** (apply to all benchmarks, not just SOL-ExecBench):
+
+- Reference is a pure function — `def run(*args)` from inputs to outputs, no shared state across calls. Stateful kernels (KV cache, accumulators) must encode state as inputs/outputs.
+- Output count is static — declared in `Definition.outputs`; variable-output kernels don't fit.
+- dtype must be in SOL's enum — fp64/32/16/bf16, fp8 e4m3/e5m2, fp4 e2m1, int64/32/16/8, bool. Other dtypes (complex, uint) need an upstream SOL schema PR.
+- GPU-only correctness reference — `gen_inputs` and `verify_correctness` assume CUDA tensors.
+- Reference operations must be Triton-translatable (per backend choice; see Backend section).
 
 ### Triton Baseline Generation
 
@@ -332,6 +344,8 @@ Triton coverage by tier:
 3. **Reviewer sees** profiling results + roofline classification + SOL score + remaining headroom.
 4. **Planner sees** Reviewer's distilled summary only. Agents never see raw hardware specs.
 5. **Fallback** — when no arch YAML is provided, `detect_hardware()` queries the CUDA runtime (placeholder in V1).
+
+**Clock locking** (added 2026-04-27 scope expansion): GPU clocks are actively locked at startup via `sol_execbench.core.bench.clock_lock.lock_clocks` + `BenchmarkConfig` + `device_config.get_clock_preset(device_name)` (preset table per GPU model). Requires `sudo nvidia-smi --lock-gpu-clocks`; falls back to warn-only on permission denial via `probe_clock_lock_available()`. Removes boost-clock variance as a real source of timing noise on Ada / H100 — without this, T_k measurements drift run-to-run and the SOL score plateau detection fires on noise rather than real plateaus.
 
 ---
 

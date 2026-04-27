@@ -37,7 +37,7 @@ Fans out each call to two sinks:
 Contract:
 
 - `kind` must be in `CORE_EVENT_KINDS`; other kinds log a warning and are still written (schema drift stays visible, never silent).
-- `iter` is an explicit keyword. It appears on per-iteration events (`iter_start`, `planner_selected`, `planner_failed`, `coder_submitted`, `coder_failed`, `bench_done`, `profile_done`, `score_computed`, `reviewer_feedback`, `branch_dead_end`, `iter_end`) and is `None` on run-scope events (`run_start`, `baseline_*`, `verify_*`, `run_end`).
+- `iter` is an explicit keyword. It appears on per-iteration events (`iter_start`, `planner_selected`, `planner_failed`, `coder_submitted`, `coder_failed`, `bench_done`, `profile_done`, `score_computed`, `reviewer_feedback`, `reviewer_metric_query`, `branch_dead_end`, `iter_end`) and is `None` on run-scope events (`run_start`, `baseline_*`, `verify_*`, `run_end`).
 - **Never raises.** Serialization failures are caught and logged; file-handle errors during write do not propagate.
 - Skips serialization entirely when `logger.isEnabledFor(INFO)` is false — cheap to leave in hot paths.
 - All additional `**fields` are merged flat into the JSON object. Use `finite_or_none(x)` on any float that could be `inf`/`nan` (e.g. latency after a failed bench) so JSON stays valid.
@@ -52,11 +52,11 @@ Module-level handle registration, guarded by `_lock`. `RunContext.create` calls 
 
 ### Event catalog — `CORE_EVENT_KINDS`
 
-Frozenset of 19 kinds:
+Frozenset of 20 kinds:
 
 **Run scope** — `run_start`, `baseline_attempt`, `baseline_success`, `baseline_failure`, `baseline_ready`, `verify_start`, `verify_done`, `run_end`.
 
-**Per-iteration** — `iter_start`, `planner_selected`, `planner_failed`, `coder_submitted`, `coder_failed`, `bench_done`, `profile_done`, `score_computed`, `reviewer_feedback`, `branch_dead_end`, `iter_end`.
+**Per-iteration** — `iter_start`, `planner_selected`, `planner_failed`, `coder_submitted`, `coder_failed`, `bench_done`, `profile_done`, `score_computed`, `reviewer_feedback`, `reviewer_metric_query`, `branch_dead_end`, `iter_end`.
 
 Notable semantics:
 
@@ -64,6 +64,7 @@ Notable semantics:
 - `coder_failed` covers any `ImplementationError` (compile failure, correctness failure, exhausted retries).
 - `score_computed` carries `iter`, `score` (sol_score), `is_new_best`, `reward_hack_suspect`, `calibration_warning`, `t_k_us` (kernel median latency), `t_p_us` (baseline median latency), `t_sol_us` (T_SOL used in scoring), and `t_sol_source` — `"solar"` when SOLAR's pipeline produced T_SOL successfully, `"builtin"` when the in-process `compute_roofline()` fallback was used. The source field lets downstream consumers (telemetry, analysis, future memory retrieval) distinguish SOLAR-grounded sol_score numbers from fallback-grounded ones when auditing across runs that may have used different T_SOL backends.
 - `planner_failed`: any `PlanningError` cause — turn-budget exhaustion, missing `submit_plan` call, transient retry exhaustion, or the available-actions guard rejecting an unknown technique. Carries `iter` and `reason` (truncated exception string ≤ 200 chars). Always followed by `iter_end(outcome="skipped")`; no tree mutation occurs on this path.
+- `reviewer_metric_query`: emitted by the Reviewer's `query_metric` tool body each time the LLM invokes it during a multi-turn review. Carries `iter` (orchestrator iteration index), `count` (number of names in the query), and `names` (list of the first 8 names from the query, capped to keep `events.jsonl` lines bounded). Emission is gated on `ACTSConfig.reviewer_metric_queries=True`. Records what the Reviewer LLM asked for via the `query_metric` tool — useful post-run for analyzing whether the multi-turn capability is being exercised and on what metrics.
 - `iter_end.outcome` is exactly one of three constants: `ITER_ADVANCED` (`"advanced"`), `ITER_DEAD_END` (`"dead_end"`), `ITER_SKIPPED` (`"skipped"`). `skipped` fires only after either `coder_failed` or `planner_failed` and implies no tree mutation.
 
 ## `run_context.py`

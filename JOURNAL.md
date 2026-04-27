@@ -154,6 +154,27 @@ Adopted a hybrid approach: bottleneck→technique mapping tables from AutoKernel
 
 **Trigger for revisiting**: first real end-to-end run where the Reviewer's curated-set-based diagnosis is visibly signal-starved — top-2 stalls + headline metrics don't explain the measured bottleneck, and the LLM or rule-based fallback produces generic / incorrect technique guidance. At that point the failure shape is concrete and we can design the tool around it.
 
+> **Updated 2026-04-27**: deferral overridden by explicit user intent; see "Multi-turn Reviewer (Variant A): on-demand metric queries — preemptive capability behind a flag (2026-04-27)" below.
+
+### Multi-turn Reviewer (Variant A): on-demand metric queries — preemptive capability behind a flag (2026-04-27)
+
+**Context**: The 2026-04-21 deferral entry kept the Reviewer single-call until a real signal-starvation case appeared. Today's decision overrides that trigger: ship Variant A as a preemptive capability behind a default-off flag (`ACTSConfig.reviewer_metric_queries`), so the escape valve exists before the first signal-starvation case is observed. Variant B (re-profile subprocess) and beyond stay deferred with the same triggers; only Variant A — in-memory `raw_metrics` lookup — is implemented.
+
+**Locked decisions** (all confirmed during 2026-04-27 brainstorming):
+- Variant A only. One new tool: `query_metric(names: list[str]) -> dict[str, str]`.
+- Menu of available metric keys pre-loaded into the user prompt; no separate discovery tool.
+- `max_turns=6` (`2N+2` with `N=2`) when the flag is on; `max_turns=4` (existing) when off. Prompt heuristic caps fetches at **one per review** to preserve the in-band submit-retry headroom inside the 6-turn budget — querying twice technically fits without a retry but leaves no slack for a corrective resubmit on a Pydantic slip; the heuristic encodes that contract. No hard fetch-count cap in code; the budget is the only enforced limit. Codex adversarial review (2026-04-27) flagged the original "at most twice" wording as inconsistent with the budget — tightened to "at most once" before commit.
+- Default off. Existing single-call submit-tool path is the verified default.
+- Strict-mode opt-out reused for both the new tool's `list[str]` arg and `dict[str, str]` return value (same SDK trap as the planner submit-tool dict params, see "Strict-mode opt-out for submit-tool dict params, 2026-04-26").
+
+**Operating procedure (LLM contract)**: Read curated → submit; fetch is the exception. Encoded in `prompts/reviewer/system.md` `## Tools` section.
+
+**Failure contract is unchanged**: no new degraded `error_reason` tags, no new exception types. The `max_turns_exceeded` / `missing_submit_review` / `llm_retries_exhausted` paths cover the multi-turn case identically.
+
+**Defensive input validation in `_make_query_metric_tool`** (added post-Codex-review, 2026-04-27): `strict_mode=False` opts out of the SDK's pre-validation, so the tool body itself checks `isinstance(names, list)` and falls back to a recoverable `{"_error": "..."}` dict on shape drift. Element-level `str()` coercion defends against integer/None elements. Without these guards, a bare-string `names` payload would iterate char-by-char and emit garbage events to `events.jsonl` — silent corruption rather than a crash, but observability-poisoning. Codex adversarial review flagged this asymmetry with `submit_review` (which IS Pydantic-wrapped); the fix restores symmetry without rejecting opt-α's strict-mode-off design.
+
+**Trigger for revisiting Variant B**: a real run where the LLM consistently asks `query_metric` for keys *not* in `raw_metrics`, AND the curated NCU section is genuinely the wrong section for the bottleneck shape.
+
 ### Coder: Pydantic output_type, tool placeholders, explicit failure contract (2026-04-18)
 
 **Rationale**: Mirrored the Planner/Reviewer Pydantic structured-output pattern — `KernelCodeOutput` is the typed contract for the Coder's final answer, and schema validation is what catches drift between the LLM's output and the rest-of-pipeline's expectations. *Originally* (2026-04-18) the model was sent to the SDK via `output_type=KernelCodeOutput`, which the SDK translated to `response_format=json_schema` on the chat-completions request; the T4 follow-up (2026-04-22) added a second field (`triton_kernel_name`) plus a cross-field `@model_validator`. *Subsequently* (option α, 2026-04-22) the submission flow moved to a `submit_kernel(source_code, triton_kernel_name)` tool call because reasoning-model providers (DeepSeek-reasoner) reject the SDK's `response_format=json_schema` field; the Pydantic validator still runs (inside the tool body), so the contract and the in-loop retry behavior are preserved verbatim — only the SDK-wire shape changed. See "Coder routes final answer through submit_kernel (option α, 2026-04-22)" entry below.
@@ -661,6 +682,257 @@ full CLI eval. For ACTS's pattern (SOL-as-library) that's overkill, adds a
 container boundary around what should be a Python import, and doesn't
 solve the host driver bump (580+ still needed even with Docker). Library
 integration on 12.8 is the proportionate answer.
+
+### SOL integration scope expansion — adopt every applicable primitive (2026-04-27)
+
+**Extends** the 2026-04-22 entry above. That plan staged five tiers and
+treated reward-hack / clock-lock (Tier 4) as optional, while excluding
+several SOL surfaces by silence — output handling helpers, the per-iter
+memory pool, safetensors input loading, and the subprocess-isolated eval
+driver. User direction this session: tighten to the maximum SOL surface
+ACTS can use under the cu12.8 constraint. The "use as library" boundary
+holds — we still don't adopt SOL's CLI — but everything below that
+boundary is in scope.
+
+**Decision**: integrate every SOL primitive that has a counterpart concept
+in ACTS or that unlocks a SOL-problem shape ACTS would otherwise fail to
+consume. Promote Tier 4 from optional to required. The architectural
+change to subprocess-per-evaluation, previously a separate Deferred entry,
+is now in scope.
+
+**Newly in scope beyond the 2026-04-22 plan**:
+
+- **Full reward-hack adoption** (Tier 4 promoted from optional). All five
+  detectors: `check_monkey_patch`, `check_thread_injection`,
+  `check_lazy_outputs`, `snapshot_critical_functions`,
+  `check_eval_integrity`. The last two cover namespace tampering between
+  snapshot and check — not in the 2026-04-22 plan.
+- **Active clock locking**. Beyond `are_clocks_locked` warning: drive
+  clocks via `lock_clocks` / `verify_clocks` / `unlock_clocks` +
+  `BenchmarkConfig` + `device_config.get_clock_preset(device_name)`.
+  Requires `sudo nvidia-smi --lock-gpu-clocks`. Removes boost-clock
+  variance as a real source of timing noise on Ada / H100.
+- **Output handling**. `core/bench/io.py::normalize_outputs` (tuple/dict/
+  scalar return shapes) + `allocate_outputs` (DPS output buffers).
+  Currently the 5-stage gate and benchmark loop assume single-tensor
+  outputs; this unlocks SOL problems with multi-output or
+  destination-passing-style kernels.
+- **Per-iter memory pool**. `ShiftingMemoryPoolAllocator` advances
+  `data_ptr` each timed iteration to defeat kernels that memoize results
+  keyed on input tensor `id()`. Pairs with the Tier 2 `do_bench` adoption
+  via the `setup` callback. Modest extra VRAM (~256 B × iters per tensor).
+- **Safetensors input loading**. `core/bench/io.py::load_safetensors` for
+  workloads whose `workload.jsonl` references safetensors blobs (some
+  SOL problems carry frozen weight tensors via safetensors paths instead
+  of random init). Without this, those problems error at input
+  generation.
+- **Subprocess-isolated evaluation**. Adopt `driver/problem_packager.py::
+  ProblemPackager` + `driver/templates/eval_driver.py::_make_eval` +
+  `core/bench/utils.py::make_eval`. Each candidate runs in a fresh
+  subprocess. Architectural change: ACTS Coder runs `compile_kernel` +
+  `verify_correctness` inline as tools, and benchmark + profile run
+  inline in the orchestrator. Trades per-call subprocess latency
+  (~hundreds of ms) for crash safety, OOM tolerance, and reward-hack
+  robustness. The previously-separate "Subprocess-isolated correctness /
+  benchmark (Tier 3)" Deferred entry folds into this scope.
+
+**Transitive integrations** (come along with the above):
+
+- `core/utils.py::env_snapshot` + `hardware_from_device` — needed to
+  populate the `Environment` field of `Trace` (Tier 1).
+- `core/utils.py::redirect_stdio_to_file` + `flush_stdio_streams` and
+  `core/bench/utils.py::_read_log_file` — used by the subprocess driver
+  to capture candidate-kernel stdout / stderr.
+- All `core/data/workload.py` input variants — `RandomInput` /
+  `ScalarInput` / `SafetensorsInput` / `CustomInput` / `ToleranceSpec`
+  (Tier 1 + safetensors).
+- All `core/data/solution.py` types — `SourceFile` / `BuildSpec` /
+  `CompileOptions` / `SupportedLanguages` / `SupportedHardware` /
+  `SupportedBindings`.
+- All `core/data/trace.py` types — `Correctness` / `Performance` /
+  `Environment` / `EvaluationStatus` / `Evaluation` / `Trace`.
+
+**Stays out, even after this expansion**:
+
+| Skipped | Why |
+|---|---|
+| `cli/main.py` (the `sol-execbench` shell command) | ACTS consumes SOL as a library — the orchestrator owns the eval loop. Adopting the CLI would invert the architecture. |
+| `core/utils.py::is_cuda_available` / `list_cuda_devices` | Trivial wrappers over `torch.cuda.is_available()` / `get_device_name(i)`. ACTS already calls torch directly in `config.py::detect_hardware()`. |
+| Compile + run path for CUTLASS / cuTe DSL / cuTile / cuDNN-frontend solutions | Tier 1 brings the enum *labels* (`SupportedLanguages.{cute_dsl, cutile, cutlass, cudnn_frontend}`) for free, but actually compiling and running kernels in those languages requires `driver/templates/build_ext.py` + `cuda-tile==1.1.0` + `nvidia-cutlass-dsl[cu13]` + cuDNN-9 headers — all hard-blocked by cu12.8. ACTS's Coder generates Triton anyway. |
+| `driver/templates/build_ext.py` | Same reason — explicit `CUTLASS_DIR` env var, expects CUTLASS 3.x headers + cu13 toolchain. |
+| Internal helpers: `io.py::_rand_tensor`, `_generate_heuristic_tensor`, `_cast_to_fp4x2`; `shapes.py::_BIN_OPS`, `_UNARY_OPS`; `reward_hack.py::_ELAPSED_TIME_ADDR` | Module-private; reachable through their public callers (`gen_inputs`, `resolve_shape_expression`, `check_monkey_patch`). No need to import directly. |
+| SOL `tests/`, `examples/`, `data/`, `docker/`, `scripts/` | Repo infrastructure, not library code. |
+
+**Already-integrated baseline** (unchanged by this expansion):
+`set_seed` (in `eval/inputs.py::build_input_generator`),
+`compute_error_stats` (in `eval/correctness.py::TorchComparisonPolicy`,
+delegates when SOL importable, falls back to `torch.allclose`),
+`gen_inputs` (in `build_input_generator`). These transition from
+"optional with fallback" to load-bearing once SOL becomes the only
+runtime path.
+
+**Correction to 2026-04-22 entry**: Tier 4 named `check_result_caching` —
+the actual SOL function is `check_lazy_outputs` (catches lazy / deferred
+outputs that look like cached results). Same idea, correct name will
+appear in the spec.
+
+**Design implication carried forward**:
+`reward_hack.py::_ELAPSED_TIME_ADDR` snapshots `torch.cuda.Event.
+elapsed_time`'s `id()` at SOL module-load time. For `check_monkey_patch`
+to be load-bearing, ACTS must `import sol_execbench` early enough that no
+candidate kernel has touched torch first. Likely solution:
+`pipeline/optimize.py::main` imports SOL before the Coder is constructed
+or the LLM is invoked. The spec will pin the import-order contract.
+
+**Why this is recordable now, before the spec**: scope changes shape the
+options for *how* to land it (per-tier PRs vs themed mega-PR vs gated
+rollout). Capturing the IN/OUT decision in JOURNAL means the option
+analysis in the spec can refer to a stable scope rather than re-deriving
+it. PROCESS still describes the 2026-04-22 5-tier plan as the
+canonical-but-superseded baseline; PROCESS will be updated with the
+expanded plan when the spec lands and we transition to writing-plans.
+
+### SOL integration scope refinement — Tier 8 (subprocess) deferred (2026-04-27)
+
+**Same-day revision** of the entry above. The "all in scope" decision
+that promoted Tier 8 (subprocess-isolated evaluation via
+`ProblemPackager` + SOL eval driver) into the active SOL integration
+phase was reconsidered during design presentation. After a concrete
+inline-vs-subprocess functional comparison, Tier 8 is dropped from
+active scope and returned to deferred status with explicit triggers.
+Tiers 1–7 stay in active scope unchanged.
+
+**Functional parity for ACTS's actual use case**: for everything
+ACTS does on the success path, inline and subprocess produce
+identical results — Triton compile, 5-stage correctness gate, latency
+measurement, SOL score, NCU profile (NCU is already a subprocess
+from either parent), reports. Subprocess unlocks **operational**
+benefits but no new capabilities:
+
+- Crash recovery quality — kernel SEGV / illegal-memory / OOM puts
+  the parent's CUDA context in sticky-error state when inline;
+  subprocess fully isolates. ACTS today catches these inline and
+  marks DEAD_END but recovery is coarser.
+- Memory-leak isolation — child exit reclaims GPU memory; inline
+  needs explicit `torch.cuda.empty_cache()`.
+- Cross-iteration global-state isolation — Tier 4's
+  `check_eval_integrity` catches named-function tampering but not
+  arbitrary global state; subprocess catches all of it because state
+  dies with the child.
+- Tampering robustness against state-based reward hacks (weakref
+  caches, import-time hooks) that escape Tier 4's named-function
+  checks.
+
+**Cost is real**:
+
+- ~200–500ms per evaluation for fork + Python startup + `import
+  torch / triton / sol_execbench`. At 5–10 candidates × 20–50
+  iterations × dozens of problems per benchmarking sweep, this is
+  10s of minutes to hours of wallclock that doesn't go to actual
+  optimization.
+- Doubles surface area in the PR — parent-side ProblemPackager driver
+  + child-side eval_driver template + IPC serialize / deserialize
+  (`Definition` + `Workload` + kernel source over JSON, `Trace` back).
+- Complicates testing (two-process integration tests, IPC mocking)
+  and debugging (pdb across the boundary, log aggregation across
+  parent + per-eval log files).
+
+**Current threat model doesn't justify**: ACTS's Coder is our own
+LLM, generating Triton (constrained API), operating against a bounded
+internal search. There's no adversary trying to game the scorer. The
+5-stage correctness gate plus Tier 4's in-process `reward_hack`
+detector set covers the realistic tampering surface. Triton-post-gate
+crashes are rare enough that inline DEAD_END handling is functional,
+even if not as crisp as subprocess recovery.
+
+**Triggers for revisiting**:
+
+- *Trigger A*: ACTS evaluates externally-sourced kernels — KernelBench
+  external solutions, RL-discovered kernels from elsewhere, anything
+  not generated by our own Coder. The threat-model assumption "our
+  own LLM, well-prompted, narrow API" no longer holds, and isolation
+  becomes load-bearing.
+- *Trigger B*: ACTS runs on multi-tenant GPU hardware where another
+  tenant could attempt cross-process tampering. Today the dev box
+  is single-tenant.
+- *Trigger C*: A live run shows real, frequent kernel crashes that
+  disrupt the orchestrator (>1% of evaluations, or any case where
+  inline DEAD_END recovery requires manual intervention). Triton +
+  the 5-stage gate currently keep this rate near zero.
+
+**SOL surfaces dropped from active scope along with Tier 8**:
+`sol_execbench.driver.problem_packager.ProblemPackager`,
+`sol_execbench.driver.templates.eval_driver._make_eval`,
+`sol_execbench.core.bench.utils.make_eval`, plus the transitive
+stdout/stderr-capture helpers `core/utils.py::redirect_stdio_to_file`
++ `flush_stdio_streams` and `core/bench/utils.py::_read_log_file`.
+These remain available behind the trigger gate; adopting them later
+is a clean addition (no schema changes, just a new code path parallel
+to the inline one).
+
+**Active scope after this refinement**:
+
+- Group 1 (in-process library primitives): Tiers 1–7. Unchanged.
+- Group 2 (architectural change): empty. Header removed from PROCESS.
+- Delivery shape (option B): three PRs total — env bump → library
+  primitives mega-PR (T1 + 3 + 4 + 5 + 6 + 7) → timing redesign (T2).
+  One fewer PR than the prior 4-PR sequence.
+
+**Why this refinement during design, not after spec**: the "all in
+scope" decision was correct as a scope statement, but Tier 8 differs
+from Tiers 1–7 in kind — it changes ACTS's process model, not just
+which library functions we call. The functional-parity analysis
+surfaced that distinction concretely. Catching it during section-1
+architecture review avoids paying spec-writing and implementation
+cost on a tier that was always more expensive than the others and
+less needed today.
+
+### Benchmark-agnosticism elevated to architectural commitment (2026-04-27)
+
+**Context**: during design review of the SOL integration, the user
+asked the load-bearing question — does the pipeline still work for
+non-SOL kernels (custom problems, KernelBench, etc.) after Tier 1
+makes SOL pydantic types canonical? Walking through the data flow
+showed yes: `src/benchmarks/<name>/load.py` is the only place
+benchmark-format knowledge lives, and once a `Definition` +
+`list[Workload]` exist in memory, downstream stages don't know or
+care where they came from.
+
+**Decision**: elevate this from "current state" to an explicit
+architectural contract recorded in PRD. The pipeline (`src/pipeline/`,
+`src/search/`, `src/eval/`, `src/agents/`, `src/kernels/`,
+`src/memory/`, `src/actions/`) operates exclusively on SOL pydantic
+types and does not import or reference any benchmark-specific
+on-disk format. The only place benchmark-format knowledge is allowed
+to live is `src/benchmarks/<name>/load.py`. Adding SOL-specific code
+paths outside the adapter is a violation of the contract — future
+PRs that try to (e.g.) parse `definition.json` directly in the
+orchestrator, or branch on benchmark category in `eval/`, should be
+rejected at review.
+
+**Why elevate now, not later**: the SOL integration mega-PR will
+touch roughly half of `src/`, with several files reaching for SOL
+types directly. Without an explicit architectural commitment, it's
+easy for a future PR to slip in "convenient" SOL-specific code paths
+in the orchestrator or eval modules — each individually small, but
+cumulatively reintroducing benchmark coupling. Pinning the
+benchmark-agnosticism guarantee in PRD before the mega-PR lands gives
+review a clean rule to enforce against.
+
+**Constraints recorded alongside** (apply to all benchmarks, inherent
+to the SOL schema and ACTS's Triton-first approach): pure-function
+reference, static output count, SOL dtype enum, GPU-only correctness
+reference, Triton-translatable operations. These are real but
+benchmark-agnostic — they constrain SOL-format problems and KernelBench
+problems and one-off custom problems equally.
+
+**Where pinned**: PRD → "Benchmark Source — SOL-ExecBench" section,
+sub-paragraph "Benchmark-agnosticism guarantee" with the constraint
+list. PROCESS doesn't need a separate entry; the existing SOL Tier 5
+description and the Backlog adapter scaffold already reflect the
+implementation side. Future per-benchmark adapters (KernelBench,
+TritonBench, etc.) follow the same `tuple[Definition, list[Workload]]`
+contract.
 
 ### Dynamic bottleneck reclassification — deferred to profiler implementation (2026-04-15)
 
