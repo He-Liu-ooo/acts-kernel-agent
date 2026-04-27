@@ -99,6 +99,27 @@ Mutable dataclass. All parameters for a single optimization run.
 
 ## Functions
 
-- `load_config(path) -> ACTSConfig`: Parse `.cfg` file, fall back to defaults. Loads arch YAML if `[hardware] arch_config_path` is set.
+- `load_config(path) -> ACTSConfig`: Parse `.cfg` file, fall back to defaults. Loads arch YAML if `[hardware] arch_config_path` is set; after load, calls `validate_hardware_spec()` against `detect_hardware()` and logs a `WARNING` per mismatch.
 - `load_hardware_spec(path) -> HardwareSpec`: Parse a SOLAR arch config YAML into a `HardwareSpec`.
-- `detect_hardware() -> HardwareSpec`: Query CUDA runtime. Returns zeroed spec if no GPU. Fallback when no arch YAML is provided.
+- `detect_hardware() -> HardwareSpec`: Query CUDA runtime via `torch.cuda.get_device_properties(0)`. Populates runtime-knowable fields:
+  - `name` — GPU model string (e.g. "NVIDIA RTX 6000 Ada Generation")
+  - `freq_GHz` — boost clock from `clock_rate / 1_000_000` (kHz → GHz)
+  - `SRAM_capacity` — `L2_cache_size`
+  - `DRAM_capacity` — `total_memory`
+
+  Per-precision throughput tables (`MAC_per_cycle_*`) and bandwidth coefficients (`DRAM_byte_per_cycle`, `SRAM_byte_per_cycle`) stay zero — those require a SOLAR arch YAML. Returns a fully-zeroed `HardwareSpec` on any failure: torch import error (catches `Exception`, covering broken-driver `OSError`/`RuntimeError`), `torch.cuda.is_available()` False, no CUDA devices, or device-property probe raises.
+
+### `validate_hardware_spec(spec, detected) -> list[str]`
+
+Compares config-source `spec` against runtime-`detected` spec and returns a list of mismatch messages (empty = no mismatch). Catches the silent-miscalibration class of bugs where the YAML or placeholder substitution doesn't match the actual GPU.
+
+Three checks, each with **10% tolerance** and **per-field skip-if-zero**:
+- `DRAM_capacity` — GPU-family fingerprint (Ada 48 GiB ≠ H100 80 GiB).
+- `SRAM_capacity` (L2) — discriminates within a family that shares DRAM (Ada 96 MiB vs H100 50 MiB).
+- `freq_GHz` — both sources report boost clock, so >10% delta likely means wrong YAML.
+
+Call sites:
+1. `load_config()` — after loading a YAML via `arch_config_path`, validates against `detect_hardware()`.
+2. `pipeline/optimize.py::optimize()` — before substituting `_PLACEHOLDER_HARDWARE_SPEC` for zero-peak specs.
+
+Both call sites **warn (don't raise)** — sometimes you legitimately model GPU X while running on GPU Y for ablation.

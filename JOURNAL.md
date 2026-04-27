@@ -208,6 +208,22 @@ Inspired by STARK's grounded instruction technique (Meta AI/Duke). STARK's ablat
 
 Actions themselves don't change when power/ELP modes are added. Only the Planner's selection criteria and scorer change.
 
+### Initial guidance authoring decisions (2026-04-27)
+
+**Trigger**: First live GPU run (rmsnorm, 2026-04-26) showed the Planner picked `t1_block_size_tuning` for all 3 iterations even after the Reviewer flagged each as "regressed." Root cause: every applicable action carried `guidance="Placeholder guidance."` — the Planner had nothing to discriminate on. Authored real guidance for the ~18 actions across `tier{1..6}_*.py`.
+
+**Five design choices (Q&A 2026-04-27)**:
+
+- **Q1 — Format depth**: hybrid (tier1–2 terse ~50 words; tier3–6 structured ~120 words). Prompt-token cost was the constraint; mechanical knobs don't need decision scaffolding, architectural rewrites do.
+- **Q2 — Anti-pattern provenance**: mix. Populated where upstream repos (AccelOpt / Astra / autokernel / cuda-optimized-skill / evotoolkit) gave explicit warnings; left empty where they didn't. Hand-fabricating anti-patterns from imagined failures risks anchoring the Planner on non-existent hazards. Sparse-but-grounded beats dense-and-speculative.
+- **Q3 — `expected_impact` shape**: qualitative descriptors only ("typically modest", "high-variance, kernel-dependent", "potentially large on memory-bound kernels"). Dropped the rough numeric ranges that were already there as placeholders. Reason: with SOLAR not yet wired and `T_SOL=0.0` in every score event, no real ratio data exists to calibrate ranges; rough numbers actively mislead the Planner toward "expected 3-5x" actions over honest "high-variance" ones.
+- **Q4 — Tier asymmetry**: tier-matched density (consistent with Q1c). Same reasoning — guidance density should match the decision surface the Planner faces at that tier.
+- **Q5 — Source mining**: own knowledge of GPU kernel optimization for tier1–3 (well-trodden ground); upstream-repo grep for tier4–6 where novel patterns live. The "9-paper KB" referenced in earlier PROCESS.md notes does not exist as a directory; only the 5 upstream repos under `repo/` are mineable.
+
+**Two known limitations recorded as a Deferred Improvement (PROCESS.md → "Action library KB refinement")**: (a) `expected_impact` is qualitative because no real T_SOL data exists yet to calibrate; (b) `anti_patterns` is sparse because no failed-kernel `Experience` corpus exists in `MemoryStore` yet. Trigger to revisit: after SOLAR adapter lands, OR after ≥10 live runs accumulate enough failed-kernel records.
+
+**Why not skip to Q1=(b) structured-everywhere**: prompt-token cost compounds across iterations. The orchestrator filters the registry by `(kernel_type, bottleneck)` per iter, but a typical filter still surfaces 5–10 actions; structured-everywhere would put ~1200 words of action context into every Planner call. Hybrid keeps the typical iter under ~600 words while still arming the Planner with the high-decision-surface tier3–6 detail when those tiers are applicable.
+
 ---
 
 ## Evaluation
@@ -701,6 +717,30 @@ A kernel can shift its effective bottleneck only by changing its data access pat
 **Implementation**: `Kernel.triton_kernel_name` field added (default `""` for back-compat with hand-written kernels and pre-T4 checkpoints). `KernelCodeOutput.triton_kernel_name` is required, cross-validated against `triton_kernel_names_in(source_code)` (the multi-name-returning sibling of `_extract_triton_kernel_name`). `CoderAgent.implement` and `.translate` now return `KernelCodeOutput` (not bare `str`) so callers thread both fields through. `profile_kernel` resolution priority is `kernel.triton_kernel_name → regex fallback → entrypoint last-ditch`. Coder system + translate prompts both gain a Hard Rule documenting the schema.
 
 **What's NOT in scope** (intentional YAGNI): no separate `KernelSpec.host_wrapper_name` field — `entrypoint` already plays that role at the per-problem level. No memory_store migration — the new field is on `Kernel`, not `Experience`. No regex deprecation — kept as fallback for hand-written / test kernels.
+
+### SOLAR adapter design (2026-04-27)
+
+**Reuse SOLAR, don't reimplement**. ACTS calls SOLAR's published Python API for all four pipeline stages (`PyTorchProcessor` → `PyTorchToEinsum` → `EinsumGraphAnalyzer` → `EinsumGraphPerfModel`) directly — no subprocess calls, no reimplementation of MAC counting / einsum conversion / roofline math. Bridge + arch YAML are the only ACTS-side code.
+
+**Bridge: synthesize a SOLAR-shaped `Model` from `Problem` + representative `Workload`**. SOLAR expects a model file with `class Model(nn.Module)` + `def get_inputs()`; ACTS holds the reference as `def run(*tensors)` inside a `Problem` dataclass. Bridge folds const + var + expr axes (fixed-point eval for expressions like `half_head_dim = attention_head_dim // 2` from flux_rope) into concrete integer shapes. Soft-fall to `None` on bridge `ValueError` so the load path can fall back to the built-in analytical roofline rather than crashing.
+
+**Arch resolution priority**: explicit `arch_yaml_path` (forwarded from `config.arch_config_path`) > SOLAR-bundled name (`H100_PCIe`, `B200`) > ACTS-supplied YAML (`_ACTS_ARCH_YAMLS` lookup, currently mapping `RTX6000Ada`, `NVIDIA RTX 6000 Ada Generation`, `placeholder-RTX6000Ada` all to `configs/arch/RTX6000Ada.yaml`) > fallback to `H100_PCIe` with WARNING. The placeholder alias was added after Codex flagged that the placeholder substitution path silently fell through to H100 even though the placeholder's peaks already mirror Ada — SOLAR was computing T_SOL against H100 while in-process roofline used Ada peaks.
+
+**Read only `fused` model, ignore `unfused` and `fused_prefetched`**. `fused` matches what a well-fused Triton kernel achieves; `unfused` is too pessimistic (every tensor through DRAM) and `fused_prefetched` is too optimistic (perfect compute/memory overlap, unreachable in Triton). Multi-roofline expansion explicitly out of scope — per-op breakdown / headroom analysis is the profiler's job, not SOLAR's.
+
+**`SolarResult.bottleneck` typed as `BottleneckType` enum, not string**. Original implementation had two parallel string-keyed mappings (SOLAR's `"memory"` / `"compute"` / `"balanced"` → ACTS's `"memory_bound"` / `"compute_bound"` / `"balanced"` → `BottleneckType` enum) that could drift. Mapped once at the SOLAR boundary; downstream passes the enum through.
+
+**Backward-pass kernels deferred**. SOLAR ships `BackwardProcessor` for gradient-graph analysis but the bridge currently synthesizes only `Model` + `get_inputs()`. Filed in PROCESS Backlog → "Backward-kernel SOLAR support" with the schema decision (parse `Problem.op_type` suffix vs add explicit `Problem.kind` field) as an open question.
+
+### Hardware spec validation (2026-04-27)
+
+**Problem**: two sources populate `HardwareSpec` for overlapping fields — `detect_hardware()` (runtime probe) for `name`, `freq_GHz`, `SRAM_capacity`, `DRAM_capacity`, and `load_hardware_spec(yaml_path)` for the same fields plus per-precision MAC tables. `load_config()` is mutually exclusive (YAML or detect, never merged), so the system can't catch a wrong-YAML-for-this-GPU misconfiguration. Same gap exists at the placeholder substitution path (Ada-shaped placeholder substituted on top of H100 detection silently routes SOLAR to the Ada YAML).
+
+**Solution**: `validate_hardware_spec(spec, detected) -> list[str]` compares the three overlapping fields with 10% tolerance and per-field skip-if-zero. Returns mismatch messages; empty = no mismatch. Called from two sites: `load_config()` after YAML load, `optimize()` before placeholder substitution. Logs `WARNING` per mismatch (doesn't raise — sometimes you legitimately model GPU X while running on GPU Y for ablation).
+
+**Why these three fields**: `DRAM_capacity` is the GPU-family fingerprint (Ada 48 GB ≠ H100 80 GB). `SRAM_capacity` (L2) is the within-family discriminator (Ada 96 MB vs H100 50 MB) — catches mismatches DRAM alone misses (e.g. Ada vs L40S, both 48 GB DRAM). `freq_GHz` — both sources report boost clock, so >10% delta is almost certainly wrong YAML rather than legitimate variance.
+
+**Why not `name`**: aliases vary (`"RTX6000Ada"` vs `"NVIDIA RTX 6000 Ada Generation"`); fuzzy matching would either miss real mismatches or raise on the legitimate alias case.
 
 ---
 

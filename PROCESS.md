@@ -86,15 +86,21 @@
 
 ## Next Up
 
-Phase A, Phase B, Phase C are all wired end-to-end on real CUDA-event benchmarking + real analytical profiling. GPU is available (NVIDIA RTX 6000 Ada, CUDA 12.8). For what last shipped, see `git log c912e9a..HEAD` + JOURNAL → "Bottleneck classify-once (2026-04-22)".
+Phase A, Phase B, Phase C are all wired end-to-end on real CUDA-event benchmarking + real analytical profiling. GPU is available (NVIDIA RTX 6000 Ada, CUDA 12.8). **First live GPU run completed 2026-04-26** (rmsnorm, run dir `runs/run_20260426T152032_091547Z/`) — full Phase A → B → C, plateau termination after 3 iterations, no failures or quarantines. The integration milestone is cleared; the next phase is V1 completion.
 
-Candidates (pick one before writing code; design-discussion first where called out):
+### Active phase — V1 completion (CLEARED 2026-04-27)
 
-- **First live GPU run** (integration milestone, not a new module) — highest-value milestone now that every in-loop module is real. Run Phase A → B → C end-to-end against a SOL-ExecBench problem. Observability is now in place (logger phase): `./runs/run_<UTC>/run.log` is tail-able during the run, `events.jsonl` captures 19-kind structured narrative, `traces/acts_trace_<UTC>.jsonl` captures the full SDK per-LLM-call payloads. Likely triggers deferred work — the per-dtype ridge fix (if a tc workload shows up), the `do_bench`-shape timer rewrite (if sync-per-iter cost becomes visible), `detect_hardware()` (if the SOLAR arch YAML path proves inconvenient in practice).
+All three items below landed this session. V1 completion is now closed; the next phase opens with backward-kernel SOLAR support as the highest-priority Backlog item, and the third live GPU run on additional SOL-ExecBench problems as the next validation milestone.
 
-- **`actions/tier{1..6}` real guidance text** (non-GPU) — action-library descriptions are the Planner's fuel. Structure is done (`src/actions/tier*_*.py` ~373 LOC total); the guidance strings are placeholders. Content-heavy (literature synthesis from 9-paper KB + AccelOpt / Astra), high impact on search quality but does not require GPU. Good parallel track to the live-GPU run — disjoint files.
+1. **`actions/tier{1..6}` real guidance text** (non-GPU, parallel-safe) — **DONE (2026-04-27)**. All 6 tier files (`src/actions/tier{1..6}_*.py`) now carry real `guidance` / `anti_patterns` / `expected_impact` text replacing the placeholder strings. Known limitations recorded in Backlog → "Action library KB refinement" Deferred Improvement: `expected_impact` is qualitative-only (no real `T_SOL` data to calibrate numeric ranges yet) and `anti_patterns` is sparse-but-grounded (only populated where upstream repos gave explicit warnings, deliberately avoiding hand-fabricated hazards). Both have explicit re-open triggers documented.
 
-- **`config.py::detect_hardware()`** (non-GPU code, uses GPU at runtime) — currently a placeholder returning a zeroed spec. Wire `torch.cuda` / `pynvml` to populate `HardwareSpec` fields at startup. `pipeline/optimize.py` already has a placeholder-spec fallback that would become a best-effort warning path once this lands. Small feature, useful for ablation runs that skip the SOLAR arch YAML.
+2. **`config.py::detect_hardware()`** (non-GPU code, uses GPU at runtime) — **DONE (2026-04-27)**. Now wires `torch.cuda.get_device_properties(0)` to populate `name`, `freq_GHz`, `SRAM_capacity`, `DRAM_capacity` (best-effort: returns zeroed `HardwareSpec` on missing/broken torch). Per-precision throughput tables stay zero — those still require the SOLAR arch YAML. Bonus: `validate_hardware_spec()` helper added to catch wrong-YAML-vs-actual-GPU mismatches at config-load and pre-placeholder-substitution time.
+
+3. **SOLAR adapter integration** (GPU + needs SOLAR package install) — **DONE (2026-04-27)**. `src/benchmark/solar_adapter.py` is the full implementation (was synthetic-data stub) and drives SOLAR's 4-stage Python pipeline. New `configs/arch/RTX6000Ada.yaml` hand-authored. `eval/roofline.py::derive_t_sol_from_solar` accepts `arch_yaml_path` and returns `RooflineResult(source="solar"|"builtin")`. `pipeline/optimize.py::_load_sol_execbench` forwards `config.arch_config_path` and picks the median-workload for static roofline. `orchestrator.py` emits `t_sol_source` on `score_computed`. Validated end-to-end on the second live GPU run (T_SOL=0.282µs for rmsnorm batch=16, within 6% of napkin math against RTX 6000 Ada peaks).
+
+**Sequencing**: items 1 and 2 landed in parallel, item 3 landed after them — exactly as planned. Next-phase milestone: third live GPU run on additional SOL-ExecBench problems (validation), with backward-kernel SOLAR support (Backlog) as the next implementation pickup.
+
+### Backlog (post-V1-completion)
 
 - **Codex adversarial review of the most recent PR** — `/codex:adversarial-review` against `d9e6c4b..dd3220a` to catch anything the non-adversarial pass missed. Highest-value targets: the deferred-`child.score` invariant (does any other call-site still assume score is populated the moment the benchmark succeeds?), the fused Phase C loop (is `_resolve_workload_roofline`'s `(0, 0)` contract honored at every call site?), and the `dataclasses.replace` in `optimize.py` (does it actually leave the caller's config untouched in every path?).
 
@@ -175,9 +181,9 @@ Candidates (pick one before writing code; design-discussion first where called o
   (what cu12.8 blocks) in JOURNAL → "SOL integration tightening —
   CUDA 12.8 plan (2026-04-22)".
 
-Recommended order: **first live GPU run** (end-to-end smoke, now observable via `runs/run_<UTC>/`) → action guidance text + `detect_hardware` in parallel (disjoint files) → adversarial review. Multi-turn Reviewer in parallel once its design discussion settles. SOL integration tightening can land in parallel once the env bump is done — Tier 1 (schemas) is disjoint from the live-run work and from action guidance. Defer the remaining Deferred Improvements until their triggers fire during the live run.
+SOL integration tightening can land in parallel with the active V1-completion phase once the env bump is done — Tier 1 (schemas) is disjoint from action-guidance work and from `detect_hardware()`/`solar_adapter` work. Defer the remaining Deferred Improvements until their triggers fire during the next live run (after the V1-completion phase lands).
 
-Still deferred regardless of GPU: `eval/anti_cheat.py` (threat model empty for bounded internal search; SOL-side wiring described in SOL integration tightening Tier 4 above) and `benchmark/solar_adapter.py` (needs SOLAR package installed).
+Still deferred regardless of GPU: `eval/anti_cheat.py` (threat model empty for bounded internal search; SOL-side wiring described in SOL integration tightening Tier 4 above).
 
 ## Remaining (dependency-ordered)
 
@@ -374,6 +380,45 @@ these before its trigger fires, re-read the trigger first.
   fourth agent migrates to the submit-tool pattern), OR shared
   retry/captured-output assertions diverge between the two test files
   (the duplication itself is fine while only two copies exist).
+
+- [ ] **Action library KB refinement** — initial action guidance text
+  authored 2026-04-27 with intentional limitations recorded in JOURNAL
+  → "Initial guidance authoring decisions (2026-04-27)". Two known
+  gaps: (a) `expected_impact` is qualitative-only ("typically modest",
+  "high-variance") instead of numeric ranges, because no real `T_SOL`
+  data exists yet to calibrate (SOLAR adapter is still synthetic);
+  (b) `anti_patterns` is sparse — populated only where upstream repos
+  (AccelOpt / Astra / autokernel / cuda-optimized-skill / evotoolkit)
+  gave explicit warnings, left empty otherwise. Hand-fabricating
+  anti-patterns from imagined failures risked anchoring the Planner on
+  non-existent hazards, so the deliberate choice was sparse-but-grounded.
+  *Trigger*: (a) reopens once the SOLAR adapter lands and real T_SOL is
+  available — at that point `expected_impact` ranges can be calibrated
+  against observed `T_k / T_SOL` distributions across actions; (b)
+  reopens once ≥10 live runs accumulate enough failed-kernel
+  `Experience` records in `MemoryStore` to ground anti-patterns from
+  actual ACTS failure modes (not from imagined ones).
+
+- [ ] **Backward-kernel SOLAR support** — current `solar_adapter.py`
+  bridge synthesizes a forward-only `Model` (`get_inputs()` only); SOLAR
+  ships `BackwardProcessor` (`solar/graph/backward_processor.py`) which
+  sets `requires_grad=True`, runs forward, calls `backward()`, and
+  extracts the gradient graph for stages 2-4. Bridge would need two more
+  synthesized helpers (`get_loss_fn`, `get_target` — SOLAR doesn't care
+  about loss semantics, only that the gradient graph builds) and a
+  branch in `derive_t_sol` selecting `BackwardProcessor` vs
+  `PyTorchProcessor` for stage 1. Stages 2-4 + result parsing unchanged.
+  Open schema decision: **how do we identify backward problems?** Two
+  options — (A) parse `Problem.op_type` for `_backward` suffix (cheap, no
+  schema change, risks convention drift); (B) add explicit
+  `Problem.kind: Literal["forward","backward"]` field (cleaner, also
+  needed by `eval/correctness.py` for grad-comparison and by the
+  baseline generator for backward-Triton baselines). Recommend (B) —
+  backward is a multi-module feature that touches schema + correctness +
+  inputs + baseline generator + adapter, deserves its own brainstorming
+  round rather than a one-off solar_adapter patch. *Trigger*: when ACTS
+  first exercises a backward problem in SOL-ExecBench (likely the first
+  attention-backward or layernorm-backward kernel).
 
 - [ ] **`_SDK_AVAILABLE` patch fixture** — ~17 LLM-path tests across
   `tests/test_planner.py` + `tests/test_reviewer.py` repeat the same

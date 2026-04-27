@@ -199,10 +199,30 @@ Shared eval primitives imported across memory / search / pipeline without pullin
 
 Two paths, each returning both T_SOL and bottleneck classification — no hybrid:
 
-1. **SOLAR** (preferred): `derive_t_sol_from_solar()` calls the SOLAR adapter on the PyTorch reference. SOLAR uses its own arch config internally. Returns tight, hardware-grounded T_SOL + bottleneck.
-2. **Built-in** (fallback): `compute_roofline()` does `T_SOL = max(FLOPs / peak_compute, bytes / peak_bandwidth)` from `KernelSpec` fields + `HardwareSpec` (loaded from SOLAR arch YAML). Used when SOLAR is not installed.
+1. **SOLAR** (preferred): `derive_t_sol_from_solar(problem, workload, hardware, *, arch_yaml_path=None)` calls the SOLAR adapter on the PyTorch reference. Returns tight, hardware-grounded T_SOL + bottleneck. `arch_yaml_path` is set when the caller forwards `config.arch_config_path` from the .cfg so SOLAR's arch resolution can pick up an explicit YAML; left `None` triggers the name/fallback resolution path below. On bridge failure (e.g. unresolvable expr axis) the adapter logs a warning and returns `None`, and the caller falls back to the built-in roofline rather than crashing the load path. The returned `RooflineResult.source` is set to `"solar"`.
+2. **Built-in** (fallback): `compute_roofline()` does `T_SOL = max(FLOPs / peak_compute, bytes / peak_bandwidth)` from `KernelSpec` fields + `HardwareSpec` (loaded from SOLAR arch YAML). Used when SOLAR is not installed or when the SOLAR path soft-fails. Sets `RooflineResult.source = "builtin"`.
 
 Both classify the kernel as `MEMORY_BOUND`, `COMPUTE_BOUND`, or `BALANCED`.
+
+### SOLAR adapter pipeline — `src/benchmark/solar_adapter.py`
+
+Drives SOLAR via its published Python API (no subprocess) in four stages:
+
+1. `PyTorchProcessor.process_model_file` — extract the PyTorch graph from a synthesized bridge file
+2. `PyTorchToEinsum.convert` — convert to einsum representation
+3. `EinsumGraphAnalyzer.analyze_graph` — count MACs and memory elements
+4. `EinsumGraphPerfModel.predict` — apply the arch YAML's roofline; reads the `fused` section's `runtime_ms`, `bottleneck`, and `arithmetic_intensity`
+
+`_write_model_bridge_file` synthesizes a SOLAR-shaped `Model(nn.Module)` + `get_inputs()` from the ACTS `Problem` + a representative `Workload`. Handles const, var, and expr axes (fixed-point eval); 0-D tensors via `shape=[]`; and int/bool dtypes via `_tensor_constructor_call` (since `torch.randn` doesn't support those).
+
+**Arch resolution priority** (in `_resolve_arch_config`):
+
+1. Explicit `arch_yaml_path` (forwarded from `config.arch_config_path`)
+2. SOLAR-bundled name (`H100_PCIe`, `B200`) — passed through as-is
+3. ACTS-supplied YAML lookup in `_ACTS_ARCH_YAMLS` (currently: `RTX6000Ada`, `NVIDIA RTX 6000 Ada Generation`, `placeholder-RTX6000Ada` — all → `configs/arch/RTX6000Ada.yaml`)
+4. Fallback: `H100_PCIe` with a `WARNING` log
+
+`SolarResult.bottleneck` is a `BottleneckType` enum (consistent with `RooflineResult.bottleneck`), not a raw SOLAR string.
 
 ### Classification helpers
 

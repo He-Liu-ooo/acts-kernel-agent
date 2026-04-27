@@ -112,7 +112,7 @@ async def run(
    - On successful `tree.add_child(parent.id, child_kernel, plan.technique)`: reset `parent.consecutive_agent_failures = 0`. A productive parent shouldn't be permanently quarantined for one earlier transient blip.
 7. **Benchmark** child — `BenchmarkError` (majority-failure) OR `not is_fully_successful` (partial failure) → mark branch `DEAD_END`, `beam_prune`, next iteration
 8. **Profile** child on representative workload — skip when `repr_workload_latency_s` is None; `ProfilerError` → mark `DEAD_END`, `beam_prune`, next iteration; `(flops, nbytes) == (0, 0)` (no formula for op_type) → keep branch alive but skip profile
-9. Commit `child.profiling`, `child.score` (via `compute_sol_score`), `child.per_workload_latency_us` to the tree node
+9. Commit `child.profiling`, `child.score` (via `compute_sol_score`), `child.per_workload_latency_us` to the tree node. The emitted `score_computed` event carries `t_sol_source` (`"solar"` or `"builtin"`) so audit can distinguish SOLAR-grounded scores from `compute_roofline()` fallback-grounded ones.
 10. **Reviewer**: eval results + `run_bottleneck` + live `ProfilingResult` + `tree_context=render_path(child.id)` → `ReviewerFeedback` + `branch_quality`. When profiling was skipped, defaults `branch_quality` to `PROMISING` (keeps the branch alive so `beam_prune` treats it normally)
 11. `beam_prune(tree, beam_width, enable_diversity=config.beam_diversity)`
 12. Termination checks: `sol_target` (child.score ≥ threshold), `plateau` (via `detect_plateau` on `best_scores`), else decay epsilon and continue
