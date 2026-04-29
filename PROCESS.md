@@ -87,17 +87,19 @@
 
 ## Next Up
 
-Phase A, Phase B, Phase C are all wired end-to-end on real CUDA-event benchmarking + real analytical profiling. GPU is available (NVIDIA RTX 6000 Ada, CUDA 12.8). **First live GPU run completed 2026-04-26** (rmsnorm, run dir `runs/run_20260426T152032_091547Z/`) — full Phase A → B → C, plateau termination after 3 iterations, no failures or quarantines. **V1 completion cleared 2026-04-27** (action library guidance, real `detect_hardware()`, SOLAR adapter integration; second live GPU run validated SOLAR T_SOL=0.282µs for rmsnorm batch=16). **Multi-turn Reviewer (Variant A) shipped 2026-04-27** — opt-in `query_metric` tool behind `ACTSConfig.reviewer_metric_queries` (default off). Validation milestone for the multi-turn capability is a third live GPU run with the flag on.
+Phase A, Phase B, Phase C are all wired end-to-end on real CUDA-event benchmarking + real analytical profiling. GPU is available (NVIDIA RTX 6000 Ada, CUDA 12.8). **First live GPU run completed 2026-04-26** (rmsnorm, run dir `runs/run_20260426T152032_091547Z/`) — full Phase A → B → C, plateau termination after 3 iterations, no failures or quarantines. **V1 completion cleared 2026-04-27** (action library guidance, real `detect_hardware()`, SOLAR adapter integration; second live GPU run validated SOLAR T_SOL=0.282µs for rmsnorm batch=16). **Multi-turn Reviewer (Variant A) shipped 2026-04-27** — opt-in `query_metric` tool behind `ACTSConfig.reviewer_metric_queries` (default off). Validation milestone for the multi-turn capability is a third live GPU run with the flag on. **SOL integration mega-PR (PR2) landing 2026-04-28/29** — Sub-commits A through E completed in working tree (env bump + Tier 1 schema adoption + Tier 3 sol_score delegation + Tier 4 reward-hack defenses + Tier 5 adapter scaffold + Tier 6 output handling + Tier 7 safetensors); Sub-commit F (governance doc consistency sweep) is the current pass. Tier 8 (subprocess-isolated evaluation) deferred per same-day functional-parity analysis.
 
-### Active phase — SOL integration (firing next, in order)
+### Active phase — SOL integration (mega-PR LANDING — Sub-commit F in flight)
 
-Ordered sequence — design discussion happens before each phase fires, code lands one phase at a time. **Scope expansion 2026-04-27**: SOL integration phase now adopts every applicable in-process SOL primitive. Tier 4 (reward-hack + clock-lock) PROMOTED from optional → required and lands in this phase, not in anti-cheat. Two new tiers added: output handling (Tier 6), safetensors loading (Tier 7). **Tier 8 (subprocess-isolated evaluation) was briefly in scope and then deferred same-day** — inline and subprocess have functional parity for ACTS's actual use case; subprocess's crash-recovery and tampering-isolation benefits don't justify the per-eval overhead under the current threat model. See JOURNAL → "SOL integration scope refinement — Tier 8 (subprocess) deferred (2026-04-27)" for the rationale and trigger conditions, and Deferred Improvements below for the entry.
+**Status update 2026-04-28**: the SOL integration mega-PR (PR2) has landed in the working tree. Tier 1 (schema), Tier 3 (sol_score delegation), Tier 4 (reward-hack defenses + clock-lock scaffold), Tier 5 (benchmark adapter scaffold), Tier 6 (output handling — `normalize_outputs` / `allocate_outputs` / DPS buffers), Tier 7 (safetensors input loading) are LANDED. Tier 2 (do_bench timing + per-iter memory pool) remains DEFERRED — own phase (PR 3) with test-seam design discussion required before code lands. **Tier 8 (subprocess-isolated evaluation) deferred same-day per functional-parity analysis** — see JOURNAL → "SOL integration scope refinement — Tier 8 (subprocess) deferred (2026-04-27)". Env bump completed (Python 3.12 + cu128 + `pip install -e SOL-ExecBench`) — see `configs/venvs/3.12.md`.
 
-1. **SOL integration tightening (2026-04-22 plan + 2026-04-27 scope expansion + Tier 8 deferral)** — see expanded Backlog entry below for the full 7-tier plan (Tiers 1–7; Tier 8 deferred). Sub-phase sequence (option B, 3 PRs): env bump (Python 3.12 + cu128 + `pip install -e SOL-ExecBench`) → library primitives mega-PR (Tier 1 + Tier 3 + Tier 4 + Tier 5 + Tier 6 + Tier 7, all in-process) → Tier 2 (timing adoption with `do_bench` + memory pool, own phase with test-seam design discussion). Each sub-phase gets a design pass per CLAUDE.md before code lands.
+**Remaining queue (in order):**
 
-2. **`eval/anti_cheat.py` orchestration layer** — collapses to a thin wrapper now that SOL Tier 4 lands the process-level reward-hack primitives directly. `anti_cheat.py` becomes the coordination point: routes the `reward_hack_suspect` / `calibration_warning` flags from `scorer.py` (performance-level surface), composes Stage 5 randomized-input checks from `correctness.py` (correctness-level surface), and exposes the SOL `reward_hack` snapshot/check pair (process-level surface) as a context manager the orchestrator wraps each evaluation with. Skeleton-level placeholders (`generate_randomized_inputs`, `strict_tolerance_check`) finalize here. Design discussion required first — orchestrator-side handler shape for the audit flags (mark branch dead vs warn-only vs human-review queue), check fire timing (per-iter vs startup vs final-report). **No code yet** until design lands.
+1. **SOL Tier 2 — do_bench timing + per-iter memory pool (PR 3)** — see Backlog entry below. Replace `_TorchCudaTimer` in `eval/benchmark.py` with `sol_execbench.core.bench.timing.{time_runnable, do_bench, clone_args}`, wire `ShiftingMemoryPoolAllocator` into `do_bench`'s `setup` callback. Test-seam redesign: 12 tests in `tests/test_benchmark.py` need rewrite. Design discussion required before code lands.
 
-3. **Backward-kernel SOLAR support** — see existing Backlog entry below. Sequenced after anti-cheat so the schema decisions (parse `op_type` suffix vs. add `Problem.kind` field) ride on the SOL Tier 1 schema-adoption work that lands in phase 1 above, rather than landing as a one-off.
+2. **Backward-kernel SOLAR support** — see existing Backlog entry below. The schema work it depended on (SOL Tier 1) has now landed; backward becomes the next high-leverage feature for the kernel coverage surface. Pulls in `BackwardProcessor` for stage 1, extends the bridge with `get_loss_fn`/`get_target` synthesis, branches `derive_t_sol`. Touches schema + correctness + inputs + baseline generator + adapter — deserves its own brainstorming round.
+
+3. **`eval/anti_cheat.py` orchestration layer** — partially shipped via SOL Tier 4 in the mega-PR (process-level surface live: `per_iter_anti_cheat` context manager + `check_lazy_outputs_after_bench`). Remaining work is the orchestrator-side coordination: route `reward_hack_suspect` / `calibration_warning` from `scorer.py` to a handler (mark branch dead vs warn-only vs human-review queue), wire `per_iter_anti_cheat` into the orchestrator's per-iteration evaluation, and decide check-fire timing (per-iter vs startup vs final-report). Design discussion required first — primitives are wired but the policy layer that turns them into search-control signals is not.
 
 ### Backlog (post-V1-completion)
 
@@ -238,9 +240,9 @@ Ordered sequence — design discussion happens before each phase fires, code lan
   (2026-04-22)" + "SOL integration scope expansion — adopt every
   applicable primitive (2026-04-27)".
 
-SOL integration tightening can land in parallel with the active V1-completion phase once the env bump is done — Tier 1 (schemas) is disjoint from action-guidance work and from `detect_hardware()`/`solar_adapter` work. Defer the remaining Deferred Improvements until their triggers fire during the next live run (after the V1-completion phase lands).
+SOL integration mega-PR (Tiers 1, 3, 4, 5, 6, 7) has landed in the working tree as of 2026-04-28; Sub-commit F (governance doc consistency sweep) is the current pass. Tier 2 (timing) remains DEFERRED — own phase (PR 3) with test-seam design discussion required before code lands. Defer the remaining Deferred Improvements until their triggers fire during the next live run.
 
-`eval/anti_cheat.py` is no longer indefinitely deferred — sequenced as phase 2 of the active queue above. Under the 2026-04-27 scope expansion (option B), SOL Tier 4 (the full `reward_hack` detector set + active clock locking) lands in SOL integration phase 1, NOT anti-cheat phase 2. Anti-cheat phase 2 collapses to a thin orchestration layer over the already-wired SOL primitives: routes audit flags, finalizes the skeleton functions (`generate_randomized_inputs`, `strict_tolerance_check`), exposes the SOL `reward_hack` snapshot/check pair as a per-iteration context manager.
+`eval/anti_cheat.py` primitives shipped via SOL Tier 4 in the mega-PR (process-level surface live: `per_iter_anti_cheat`, `check_lazy_outputs_after_bench`, plus correctness-level helpers `generate_randomized_inputs` / `strict_tolerance_check`). Remaining work is the orchestrator-side coordination layer — sequenced as phase 3 of the active queue above. Active clock locking from the original Tier 4 scope landed as a scaffold; promotion to required `lock_clocks` invocation is a follow-up driven by clock-variance evidence in live runs.
 
 ## Remaining (dependency-ordered)
 
@@ -255,12 +257,12 @@ Items marked `(skeleton)` have interfaces + placeholder logic that keeps the pip
 ### Phase 2: Evaluation Harness
 
 - [x] eval/correctness.py (done) — 5-stage gate (smoke → shape-sweep → numerical stability → determinism → anti-cheat) with short-circuit failure attribution. Injectable `ComparisonPolicy` (torch-free at import); `TorchComparisonPolicy` delegates to `sol_execbench.compute_error_stats` when installed, falls back to `torch.allclose` otherwise.
-- [x] eval/inputs.py (done) — `build_reference_fn` (exec PyTorch reference source, resolve `run`) + `build_input_generator` (wraps SOL's `gen_inputs` with seeding). Torch + sol_execbench lazy-imported.
+- [x] eval/inputs.py (done) — `build_reference_fn` (exec PyTorch reference source, resolve `run`) + `build_input_generator` (wraps SOL's `gen_inputs` with seeding) + `allocate_dps_outputs` (Tier 6 helper — pre-allocates DPS output buffers via `sol_execbench.core.bench.io.allocate_outputs`, single source of truth for the gate / benchmark / NCU subprocess). `build_input_generator` accepts a `blob_roots: list[Path] | None` kwarg and detects `SafetensorsInput` entries in the workload (Tier 7) — when present, calls `load_safetensors` once at build time so on-disk reads stay out of the per-iteration timing path. Torch + sol_execbench lazy-imported.
 - [x] eval/benchmark.py (done) — CUDA-event timing via injectable `BenchmarkTimer` Protocol; multi-workload parallel-list contract with fresh-timer-per-workload isolation; fail-closed on partial-workload failures (<half survive → `BenchmarkError`; `is_fully_successful` property on result); 100us sentinel on empty-workload path.
 - [x] eval/profiler.py (done) — hybrid analytical roofline (required, fail-closed) + curated NCU subprocess (best-effort, degrades on failure). Representative workload per iteration; Phase C re-profiles the winner on every selected workload. Source-hash-keyed cache. Tier 1 fake-ncu unit tests + Tier 2 `@pytest.mark.gpu` real-GPU tests (`tests/test_profiler_gpu.py`). Per-iter signals feed the Reviewer; run-level classification comes from `classify_run` (see JOURNAL.md → "Bottleneck classify-once (2026-04-22)").
 - [x] eval/roofline.py (done) — two clean paths: SOLAR (`derive_t_sol_from_solar` accepts `arch_yaml_path`, returns `RooflineResult(source="solar")`) or built-in `compute_roofline()` fallback (`source="builtin"`). `SolarResult.bottleneck` typed as `BottleneckType` enum (no string round-trip).
 - [x] eval/scorer.py (done) — SOL Score with audit flags per SOL-ExecBench paper Section 4.3
-- [ ] eval/anti_cheat.py (skeleton) — two surfaces: correctness-level (input randomization, precision checks) + performance-level (T_k < T_SOL flagging from scorer)
+- [x] eval/anti_cheat.py (done) — three surfaces: (1) correctness-level via Stage 5 in `eval/correctness.py` (input randomization, strict-tolerance checks via `generate_randomized_inputs` + `strict_tolerance_check` helpers); (2) performance-level via scorer audit flags (`reward_hack_suspect` when `T_k < T_SOL`, `calibration_warning`); (3) process-level via the SOL `reward_hack` detector set wired in — `per_iter_anti_cheat` context manager snapshots `torch.cuda.Event` namespace + thread count on entry, runs `check_monkey_patch`, and on exit runs `check_thread_injection` + `check_eval_integrity`; `check_lazy_outputs_after_bench` runs after the timing loop. Backed by `sol_execbench.core.bench.reward_hack.{snapshot_critical_functions, check_monkey_patch, check_thread_injection, check_eval_integrity, check_lazy_outputs}`. See JOURNAL → SOL Tier 4 entry.
 
 ### Phase 3: Actions & Memory
 
@@ -292,10 +294,8 @@ Items marked `(skeleton)` have interfaces + placeholder logic that keeps the pip
 - [x] pipeline/optimize.py Phase A (done) — real two-path load, roofline, workload selection, model-configured `CoderAgent`, and fail-closed `generate_triton_baseline`. Phase B runs real CUDA-event benchmarking + real analytical profiling. Post-refactor (2026-04-22): placeholder hardware substitution also applies to caller-supplied zero-peak configs (not just `config is None`) via `dataclasses.replace`. V1-completion (2026-04-27): forwards `Path(config.arch_config_path)` to `derive_t_sol_from_solar`, picks median-workload as static-roofline representative, threads `roofline.source` through, and runs `validate_hardware_spec` before placeholder substitution.
 - [x] pipeline/verify.py (done) — recompiles the winner and reruns the 5-stage correctness gate against the PyTorch reference; compile failures surface as `passed=False` with a compile-phrased detail string
 - [x] pipeline/report.py (done) — `generate_report` + `render_report`; trace via `result.tree.path_to_node`; propagates `reward_hack_suspect` / `calibration_warning`; surfaces run-level `bottleneck` (from `SearchResult.run_bottleneck`) and `winner_per_workload_bottlenecks` (via `classify_workload` on every selected workload, fused with the Phase C re-profile pass)
-- [x] benchmark/problem_loader.py (done)
 - [x] benchmark/baseline_generator.py (done) — `generate_triton_baseline` drives `CoderAgent.translate` + post-verifies on every selected workload; `BaselineGenerationError` on no-model / retry exhaustion.
 - [x] benchmark/workload_selector.py (done)
-- [x] benchmark/solution_formatter.py (done)
 - [x] benchmark/solar_adapter.py (done) — drives SOLAR's 4-stage Python pipeline (`PyTorchProcessor` → `PyTorchToEinsum` → `EinsumGraphAnalyzer` → `EinsumGraphPerfModel`). Bridge synthesizes a SOLAR-shaped `Model` from `Problem` + representative `Workload` (handles const + var + expr axes via fixed-point eval, 0-D tensors, int/bool dtypes). Arch resolution: explicit `arch_yaml_path` > SOLAR-bundled name (H100_PCIe, B200) > ACTS-supplied YAML (`_ACTS_ARCH_YAMLS`, includes `placeholder-RTX6000Ada` alias) > H100_PCIe with WARNING. `configs/arch/RTX6000Ada.yaml` hand-authored. Forward-only — backward-pass kernels deferred (see Backlog → "Backward-kernel SOLAR support").
 
 ### Future (Post-V1)
@@ -316,20 +316,22 @@ these before its trigger fires, re-read the trigger first.
 - [ ] **Per-dtype peak in `_compute_analytical()` ridge** — profiler currently
   uses `hardware_spec.peak_flops_fp32` regardless of workload dtype
   (`src/eval/profiler.py:186`). For tensor-core workloads (fp16/bf16) the
-  real ridge is much higher, so `classify_workload()` mislabels tc-heavy
-  workloads as compute-bound when they're actually memory-bound (or vice
-  versa). Search loop is unaffected (it uses SOLAR's run-level label, not
-  the analytical per-workload one), so the impact is confined to Phase C
-  diagnostic accuracy in `OptimizationReport.winner_per_workload_bottlenecks`.
+  real ridge is much higher, so `analytical.pct_peak_compute` /
+  `pct_peak_bandwidth` are off for tc-heavy workloads.
+  **Blast radius narrowed 2026-04-28** when `OptimizationReport.winner_per_workload_bottlenecks`
+  switched from analytical to SOLAR (see JOURNAL "SOLAR as sole
+  bottleneck source"). The per-dtype-peak issue no longer affects
+  bottleneck labels in any report, only the analytical %peak numbers
+  the Reviewer reads as one of several profiling signals. Fix is now
+  scoped to Reviewer signal accuracy, not search-routing or report
+  labeling.
   Fix requires plumbing `Workload.dtype` (or kernel-inspected dtype) into
   the helper plus a `peak_for_dtype(hw, dtype)` lookup against
   `HardwareSpec.MAC_per_cycle_{fp32_sm, fp16_tc, bf16_tc}`.
-  *Trigger*: first Phase C report on a tc workload that shows a
-  classification disagreeing with NCU's `tensor_core_util_pct`, OR the
-  first SOL run whose per-workload labels look obviously wrong relative
-  to the kernel's known regime. Don't pre-fix — current SOLAR stub
-  (`solar_adapter.py:69-77`) means run-level labels are also fake, so
-  fixing per-workload accuracy in isolation has no consumer yet.
+  *Trigger*: first live run where the Reviewer's prose summary
+  describes a tc workload as compute-bound (analytical) while SOLAR
+  classifies it as memory-bound (or vice-versa) and the disagreement
+  drives a wrong technique selection.
 
 - [ ] **`MemoryStore.add()` batched flush** — currently rewrites the full
   JSON on every add (O(N²) write bytes per session). Split into
@@ -412,11 +414,15 @@ these before its trigger fires, re-read the trigger first.
   running SOL pydantic validation twice per problem load. Threading
   one `CorrectnessContext` through instead of rebuilding inside the
   generator drops the duplicate validation pass.
-  *Trigger*: the "baseline_generator constructs its own context"
-  trigger has fired (as of the Codex-review fix round — see JOURNAL).
-  Defer until a fourth field needs to travel alongside the trio
-  (e.g., `device`, `tolerance_override`, or a per-problem `atol`),
-  then do both the type cleanup and the dup-build fix in one pass.
+  **TRIGGER FIRED 2026-04-28** — under the SOL integration mega-PR, a
+  fourth field (`policy: ComparisonPolicy`) now travels alongside
+  `definition` + `kernel` + `workload` at three call sites
+  (`eval/correctness.py`, `eval/benchmark.py`, `search/orchestrator.py`).
+  The four-field surface is the originally-stated trigger condition.
+  Reopen this entry: do the type cleanup (`CorrectnessContext` carrying
+  the four fields) and the duplicate-validation fix in one pass.
+  Sequence after Tier 2 timing work (PR 3) so the timing refactor doesn't
+  collide with the parameter-shape refactor at the same call sites.
 
 - [ ] **`SearchResult.tree` → lighter path snapshot** —
   Phase C currently gets the full `SearchTree` on `SearchResult` so

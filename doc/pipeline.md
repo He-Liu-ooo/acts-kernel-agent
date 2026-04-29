@@ -18,7 +18,14 @@ python -m src.pipeline.optimize [problem_path] [--run-dir DIR] [--trace-dir DIR]
 
 `optimize()` takes a `problem_path` that is either a SOL-ExecBench problem directory (contains `definition.json` + `workload.jsonl`) or the literal string `"placeholder"` for the built-in matmul demo. SOL mode is the real path; placeholder mode keeps the CLI runnable without an LLM or SOL dependency.
 
-**SOL mode** (`_load_sol_execbench`):
+**Adapter dispatch** (`_load_problem`): real-problem paths funnel through a thin adapter dispatcher before reaching the SOL-specific loader. Precedence:
+
+1. `config.benchmark_adapter` — explicit override (`"sol_execbench"`, `"kernelbench"`); unknown values raise `UnknownBenchmarkFormat`. `"kernelbench"` raises `NotImplementedError` until that adapter ships.
+2. `definition.json` present → SOL-ExecBench adapter (`_load_sol_problem`).
+3. `model.py` present → KernelBench (`NotImplementedError`).
+4. otherwise raise `UnknownBenchmarkFormat`.
+
+**SOL mode** (`_load_sol_problem`, dispatched from `_load_problem`):
 
 1. `load_problem()` parses the SOL definition + workloads.
 2. `problem_to_kernel_spec()` derives the `KernelSpec` (name, entrypoint, kernel_type).
@@ -37,7 +44,11 @@ Delegates to `Orchestrator.run()`. Runs up to `max_depth` iterations with 3 agen
 
 ### Phase C: Report
 
-`generate_report(result)` walks the root-to-best path on `result.tree` to build the `technique_trace`, carries the audit flags (`reward_hack_suspect`, `calibration_warning`) off the best node's `ScoreResult`, and unwraps `termination_reason` to a plain string. `render_report` formats the report for the CLI and surfaces audit flags as explicit `[AUDIT]` lines so a flagged run can't be skimmed past.
+`generate_report(result, ...)` walks the root-to-best path on `result.tree` to build the `technique_trace`, carries the audit flags (`reward_hack_suspect`, `calibration_warning`) off the best node's `ScoreResult`, and unwraps `termination_reason` to a plain string. `render_report` formats the report for the CLI and surfaces audit flags as explicit `[AUDIT]` lines so a flagged run can't be skimmed past.
+
+`optimize()` returns `(SearchResult, OptimizationReport)` — a 2-tuple. The report is built inside `optimize()` (not in `main()`) so the rich Phase A locals (`definition`, `workloads`, `hardware_spec`, `arch_yaml_path`, `blob_roots`) reach `generate_report` directly. `main()` unpacks the tuple and renders.
+
+SOL `Trace` payloads are emitted per evaluation (`trace_emitted` event, built by `Orchestrator._emit_trace`) so per-evaluation environment + correctness + performance records land in `events.jsonl` alongside the score line.
 
 ## baseline_generator.py — Triton Baseline Generation
 
@@ -59,11 +70,11 @@ Re-runs the correctness gate on the best kernel to confirm results are reproduci
 
 ## report.py — Report Generation
 
-`generate_report(result, *, workloads=None, input_generators=None, hardware_spec=None, cache_dir=None, problem=None) -> OptimizationReport`
+`generate_report(result, *, workloads=None, input_generators=None, hardware_spec=None, cache_dir=None, definition=None, definition_path=None, blob_roots=None, arch_yaml_path=None) -> OptimizationReport`
 
 Reads the best node's `ScoreResult` and walks `result.tree.path_to_node(best.id)` to build the root-to-best action sequence. The root's `action_applied` is the empty-string baseline placeholder and is filtered out of the trace. When `best.score is None` (scoring failed), the returned report surfaces only `termination_reason` + `total_iterations` without crashing.
 
-When `workloads` + `hardware_spec` are supplied, `generate_report` iterates the selected workloads once: it calls `classify_bottleneck` to populate `winner_per_workload_bottlenecks`, and (when `input_generators` is also supplied) re-profiles the winning kernel on each workload into `winner_profiling_per_workload`. The two passes are fused so `(flops, nbytes)` are computed once per workload and shared between classification and the re-profile call.
+When `workloads` + `hardware_spec` are supplied, `generate_report` iterates the selected workloads once. Per-workload bottlenecks are sourced from SOLAR via `derive_t_sol_from_solar(definition, workload, hardware_spec, arch_yaml_path=...).bottleneck` (SOLAR is authoritative). Workloads where SOLAR returns `None` or where `definition is None` are **omitted** from `winner_per_workload_bottlenecks` rather than falling back to the analytical band classifier (`classify_bottleneck` in `eval/roofline.py` is the analytical band classifier; it is no longer used for per-workload labels). When `input_generators` is also supplied, the same loop re-profiles the winning kernel on each workload into `winner_profiling_per_workload`. The two passes are fused so `(flops, nbytes)` are computed once per workload and shared between SOLAR-call and the re-profile call. `blob_roots` is forwarded into `profile_kernel` so the NCU subprocess driver resolves safetensors-backed inputs against the same root list as the in-process generator (defaults to `[definition_path.parent]` when unspecified).
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -73,7 +84,7 @@ When `workloads` + `hardware_spec` are supplied, `generate_report` iterates the 
 | `speedup` | float | Baseline / best |
 | `technique_trace` | `list[str]` | Root-to-best action sequence (root baseline filtered out) |
 | `bottleneck` | `BottleneckType \| None` | Once-per-run classification, copied verbatim from `SearchResult.run_bottleneck` (produced by `classify_run` in `eval/roofline.py`). `None` on the placeholder path that has no roofline. |
-| `winner_per_workload_bottlenecks` | `dict[str, BottleneckType]` | Per-workload shape-derived classification (via `classify_workload`) for every selected workload, keyed by `Workload.uuid`. Populated only when `workloads` + `hardware_spec` are provided. Replaces the removed `bottleneck_transitions` (classification is invariant within a run — the per-workload view is the only non-trivial axis left for diagnostics). |
+| `winner_per_workload_bottlenecks` | `dict[str, BottleneckType]` | Per-workload classification sourced from SOLAR via `derive_t_sol_from_solar(...).bottleneck`, keyed by `Workload.uuid`. Populated only when `workloads` + `hardware_spec` + `definition` are all provided. Workloads where SOLAR returns `None` (or `definition is None`) are **omitted** — there is no fallback to the analytical band classifier. (The previous `classify_workload` helper was deleted on 2026-04-28; SOLAR is now the authoritative per-workload source.) Replaces the removed `bottleneck_transitions` (classification is invariant within a run — the per-workload view is the only non-trivial axis left for diagnostics). |
 | `winner_profiling_per_workload` | `dict[str, ProfilingResult]` | Phase C re-profile of the winning kernel on every selected workload (spec §3.4). Empty when `input_generators` is missing. |
 | `remaining_headroom_pct` | float | Distance to hardware limit, `(1 - sol_score) * 100` |
 | `total_iterations` | int | Search iterations run |
@@ -98,7 +109,7 @@ When `winner_profiling_per_workload` is populated, a "Winner profile (per worklo
 Every CLI invocation creates a fresh `<run-dir>/run_<YYYYMMDDTHHMMSS_ffffffZ>/` directory (default `./runs/run_<UTC>/`) holding three files:
 
 - `run.log` — human-readable text log of the invocation.
-- `events.jsonl` — structured event stream (19 kinds) emitted by the orchestrator and `RunContext`.
+- `events.jsonl` — structured event stream (27 kinds in `CORE_EVENT_KINDS`) emitted by the orchestrator and `RunContext`.
 - `traces/acts_trace_<UTC>.jsonl` — SDK per-call records (LLM inputs/outputs, tool calls, spans) written by `JSONLTraceProcessor`. Relocated when `--trace-dir <path>` is passed; absent when `--trace-dir=` disables capture.
 
 The `httpx`, `openai`, and `agents` SDK loggers are silenced to WARNING so `run.log` stays focused on pipeline events.
@@ -129,7 +140,7 @@ The stand-in `_PLACEHOLDER_HARDWARE_SPEC` mirrors the Tier 1/2 test-fixture valu
 
 `optimize()` forwards `problem.definition_path` as `problem_definition_path` to `Orchestrator.run()`. The profiler's NCU subprocess driver re-loads the problem directory (`definition.json` + `workload.jsonl`) to rebuild the input generator — closures don't pickle across the subprocess boundary. On the placeholder path `problem` is `None` and the profiler falls back to `module.make_inputs` or `spec['args']`.
 
-`_load_sol_execbench()` derives the roofline once per problem (not once per workload) and threads three signals into Phase B:
+`_load_sol_problem()` (the SOL adapter dispatched by `_load_problem`) derives the roofline once per problem (not once per workload) and threads three signals into Phase B:
 
 1. **Representative-workload selection** — picks `representative = workloads[len(workloads) // 2]` (median index by selection order) and feeds only that workload into `derive_t_sol_from_solar()`. Full per-workload re-derivation would re-run SOLAR's 4-stage pipeline N times for a number that's roughly invariant across shapes, so the static roofline is computed once on the median workload.
 2. **Arch YAML forwarding to SOLAR** — passes `Path(config.arch_config_path)` as `arch_yaml_path` to `derive_t_sol_from_solar()` whenever the `.cfg` sets `[hardware] arch_config_path`; otherwise passes `None`. Without this explicit path the SOLAR adapter falls back to its name-based arch lookup, which silently resolves unknown hardware names to `H100_PCIe`.

@@ -16,7 +16,7 @@ Each step is user-triggered — Claude does not auto-advance.
 1. **Pick feature** — next item from the dependency-ordered list in PROCESS.md.
 2. **Design discussion** (if non-trivial) — align on approach before writing code. For any feature that is not mechanical (new module, new data surface, cross-module refactor, anything touching GPU / eval / search / agent contracts), **invoke the `superpowers:brainstorming` skill** via the `Skill` tool before proposing an approach. Default to brainstorming; skip it only for trivially mechanical changes (typo fix, single-call-site rename, one-line bug fix). The settled design + rationale gets recorded in JOURNAL.md before any code is written.
 3. **Write tests** — test-first; define expected behavior before implementation.
-4. **Write code** — implement to pass the tests.
+4. **Write code** — implement to pass the tests. **Start by decomposing the work into subtasks** and identifying any with disjoint file sets and no data dependencies; dispatch those to subagents in parallel via the Agent tool (see "Parallel execution" subsection below for the gate, prompt discipline, and test-collision rule). Sequential subtasks (shared files or import dependencies) stay inline in the main conversation. Parallel dispatch uses general-purpose Agent calls with explicit prompts — *not* the `superpowers:subagent-driven-development` skill chain (see "Superpowers skill scope" subsection).
 5. **Review** — user triggers the `codex:review` agent for an automated first pass, then asks Codex directly, then reviews themselves. Iterate on steps 3–4 until review passes.
 6. **Simplify** — user triggers `simplify`.
 7. **Update docs** — after review passes, verify consistency between src/ and:
@@ -27,7 +27,7 @@ Each step is user-triggered — Claude does not auto-advance.
 
    **At the start of this step, default to parallel subagent dispatch.** The governance files above (PRD / JOURNAL / PROCESS / doc/*) are almost always disjoint from each other — each agent touches one file with the same delta brief, no data dependencies. One agent per file, dispatched in a single message. Reserve inline edits for the case where only one file truly changes, or for a small touch-up after the main fan-out. If the consistency sweep itself is still needed (the read side — scanning for stale references), run that as a single read-only subagent first, then fan out the write side based on its punch list. See "Parallel execution" below for the disjoint-file-set gate.
 
-   **Retire design specs and implementation plans during this step.** If the feature produced files under `doc/specs/` or `doc/plans/` (the authoring artifacts from `superpowers:brainstorming` / `superpowers:writing-plans`), they're process exhaust once the code lands — git log + the governance docs tell the ongoing story better. Before committing: section-by-section, fold any content that isn't already in JOURNAL / PRD / PROCESS / doc/* into the appropriate file (typical candidates: explicit non-goals list → JOURNAL; operator-visible failure matrix → doc/<module>.md; unique architectural rationale → JOURNAL). Then delete the spec + plan, strip any cross-references to their paths from the remaining docs, and remove the now-empty `doc/specs/` / `doc/plans/` directories if nothing else lives there. Exception: if the feature is multi-phase and later phases will extend the spec, keep the spec until the series completes.
+   **Specs and plans are never committed.** Files under `doc/specs/` or `doc/plans/` (the authoring artifacts from `superpowers:brainstorming` / `superpowers:writing-plans`) live uncommitted in the working tree throughout the feature's lifecycle. They are scratch artifacts — process exhaust by design — and never get staged. The information that matters retires into JOURNAL / PRD / PROCESS / doc/* via direct edits as it stabilizes, *during* the brainstorm and writing-plans flows, not at the end. By the time code lands, the governance docs already carry every load-bearing decision; the spec and plan are deleted from the working tree without ever having been committed. Skill instructions to "commit the design document" are overridden by this rule. Exception: if the feature is multi-phase and later phases will extend the spec, keep the spec uncommitted in the working tree until the series completes, then delete.
 8. **Commit** — propose the commit split, discuss with the user, wait for approval, then commit and update **PROCESS.md** for the next round.
 
 ### Rules
@@ -60,6 +60,21 @@ When a feature decomposes into tasks with **disjoint file sets and no data depen
 When multiple approaches exist, present options with tradeoffs. Wait for user to pick before implementing. Record the decision + rationale in JOURNAL.md.
 
 For non-trivial features the `superpowers:brainstorming` skill is the required entry point — it structures the options / tradeoffs / open-questions dialogue so the user can steer before any code is written. If you catch yourself thinking "I'll just sketch the design inline," that's the signal to invoke the skill instead.
+
+### Superpowers skill scope
+
+Superpowers skills are invoked **only** for the design phase of the workflow:
+
+- `superpowers:brainstorming` — workflow step 2 (design discussion). Produces a spec under `doc/specs/`.
+- `superpowers:writing-plans` — runs after brainstorming. Produces an implementation plan under `doc/plans/`.
+
+**Once the spec and plan are written, superpowers is disabled for the remainder of the feature.** Implementation (workflow steps 3–4) follows the plan directly using Read / Edit / Write / Bash and inline TDD; no other superpowers skills are invoked. Explicitly:
+
+- Do **not** invoke `superpowers:subagent-driven-development`. Implementation is coordinated from the main conversation context, not via the skill's implementer/reviewer subagent loops. Parallel general-purpose Agent dispatches (per workflow step 4 + "Parallel execution") are still allowed and encouraged — the rule bans skill-chain control of implementation, not subagent dispatch itself.
+- Do **not** invoke `superpowers:test-driven-development` or any other implementation-flavored superpowers skill.
+- Do **not** invoke any skill-internal review flow. Review (workflow step 5) is **user-triggered only** — the user runs `codex:review` and conducts their own review; Claude Code does not auto-invoke any review skill.
+
+This rule overrides any "next step" instruction inside a skill that suggests invoking another skill, including the writing-plans skill's terminal step (which historically chains into implementation skills) — that chain stops at the plan, and Claude Code waits for the user to trigger workflow step 3.
 
 ### After any architectural change
 

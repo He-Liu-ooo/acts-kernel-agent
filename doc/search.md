@@ -77,7 +77,7 @@ async def run(
     reference_fn: Callable | None = None,
     input_generators: list[Callable[[int], tuple]] | None = None,
     problem_definition_path: Path | None = None,
-    problem: Problem | None = None,
+    definition: Definition | None = None,
 ) -> SearchResult
 ```
 
@@ -89,7 +89,7 @@ async def run(
 | `reference_fn` | PyTorch oracle (from `definition.json`). Threaded into the Coder's correctness tool. Required when the Coder is LLM-backed |
 | `input_generators` | One seed→args generator per selected workload. Threaded verbatim into the Coder's correctness tool so every iteration verifies on the full coverage set |
 | `problem_definition_path` | SOL-ExecBench `definition.json` path. The profiler subprocess driver re-loads it to rebuild the (unpicklable) input generator. `None` falls back to `module.make_inputs` or `spec['args']` — only safe for Tier 2 self-contained kernels |
-| `problem` | Parsed `Problem` used once per run to derive the hoisted `(flops, nbytes)` for the analytical profiler. `None` falls back to `baseline.spec.flop_count` / `memory_bytes` — correct for placeholder starter kernels |
+| `definition` | Parsed SOL `Definition` (the SOL-ExecBench replacement for the legacy ACTS `Problem` type, which has been removed). Used once per run to derive the hoisted `(flops, nbytes)` for the analytical profiler via `compute_roofline_inputs(definition, workloads[repr_idx])`, and threaded into `benchmark_kernel` for DPS-mode output allocation. `None` falls back to `baseline.spec.flop_count` / `memory_bytes` — correct for placeholder starter kernels |
 
 ### Fail-fast hardware guard
 
@@ -97,7 +97,7 @@ async def run(
 
 ### Representative-workload hoist
 
-`repr_idx = len(workloads) // 2` (middle of the selected-workload list so large/small-axis outliers don't dominate the profile; `0` when `workloads` is empty or length < 2). The analytical profiler's `(flops, nbytes)` are derived **once** from `(problem, workloads[repr_idx])` via `compute_roofline_inputs` and reused across all iterations — these are invariant per run, so recomputing per-iter would just repeat the same call. `repr_input_generator` and `repr_workload_axes` are captured the same way.
+`repr_idx = len(workloads) // 2` (middle of the selected-workload list so large/small-axis outliers don't dominate the profile; `0` when `workloads` is empty or length < 2). The analytical profiler's `(flops, nbytes)` are derived **once** from `(definition, workloads[repr_idx])` via `compute_roofline_inputs` and reused across all iterations — these are invariant per run, so recomputing per-iter would just repeat the same call. `repr_input_generator` and `repr_workload_axes` (`workloads[repr_idx].model_dump(mode="json")`) are captured the same way. Placeholder path (no SOL `definition`): `iter_flops` / `iter_nbytes` fall back to `baseline.spec.flop_count` / `memory_bytes` and `repr_workload_axes` is `{}`.
 
 ### Per-Iteration Flow
 
@@ -110,7 +110,7 @@ async def run(
    - On `ImplementationError`: increment `parent.consecutive_agent_failures += 1`, emit the coder-failure event, decay epsilon, skip the iteration (no tree mutation). Same quarantine accounting as the Planner path — repeated failures on the same parent push it past `QUARANTINE_THRESHOLD` and out of `frontier()`.
 6. Add child node to tree — `child.score` and `per_workload_latency_us` are **not** committed yet
    - On successful `tree.add_child(parent.id, child_kernel, plan.technique)`: reset `parent.consecutive_agent_failures = 0`. A productive parent shouldn't be permanently quarantined for one earlier transient blip.
-7. **Benchmark** child — `BenchmarkError` (majority-failure) OR `not is_fully_successful` (partial failure) → mark branch `DEAD_END`, `beam_prune`, next iteration
+7. **Benchmark** child — call wraps in `per_iter_anti_cheat(self._config.anti_cheat_critical_names)` (channel A reward-hack detection); `definition` is threaded into `benchmark_kernel` so DPS kernels can pre-allocate per-iter outputs via `allocate_outputs(definition, workload)`. `BenchmarkError` (majority-failure) OR `not is_fully_successful` (partial failure) → mark branch `DEAD_END`, `beam_prune`, next iteration. After bench succeeds, `BenchmarkResult.last_outputs` (last workload's last-iter output tensors) is fed into `check_lazy_outputs_after_bench` to catch lazy/proxy returns; the list is then `.clear()`-ed so large GPU tensors don't pin through the LLM round-trip ahead
 8. **Profile** child on representative workload — skip when `repr_workload_latency_s` is None; `ProfilerError` → mark `DEAD_END`, `beam_prune`, next iteration; `(flops, nbytes) == (0, 0)` (no formula for op_type) → keep branch alive but skip profile
 9. Commit `child.profiling`, `child.score` (via `compute_sol_score`), `child.per_workload_latency_us` to the tree node. The emitted `score_computed` event carries `t_sol_source` (`"solar"` or `"builtin"`) so audit can distinguish SOLAR-grounded scores from `compute_roofline()` fallback-grounded ones.
 10. **Reviewer**: eval results + `run_bottleneck` + live `ProfilingResult` + `tree_context=render_path(child.id)` → `ReviewerFeedback` + `branch_quality`. When profiling was skipped, defaults `branch_quality` to `PROMISING` (keeps the branch alive so `beam_prune` treats it normally)
@@ -119,6 +119,32 @@ async def run(
 13. Budget exhausted after `max_depth` iterations → `BUDGET`
 
 Baseline benchmark partial failure is **not** caught — no baseline means no signal, and the orchestrator raises `BenchmarkError` so the caller can surface it.
+
+### Anti-cheat / reward-hack flow
+
+Three independent detector channels feed the same DEAD_END routing pipeline, with one shared helper (`_kill_branch`) consolidating the per-site side-effects:
+
+- **Channel A — in-band per-iter anti-cheat.** The eval block (benchmark) is executed inside `per_iter_anti_cheat(self._config.anti_cheat_critical_names)`. A candidate that monkey-patches `torch.cuda.Event`, spawns a background thread, or returns lazy/proxy outputs raises `RewardHackDetected` from inside the context manager. The orchestrator catches it, emits `reward_hack_detected{iter, reason, child_id}`, and routes through `_kill_branch(..., reason=DEAD_REWARD_HACK, bumps_agent_failures=True)` — agent-accountable, so the parent's `consecutive_agent_failures` is incremented and quarantine kicks in on repeat offenders.
+- **Channel B — post-bench reward-hack re-eval.** When `score.reward_hack_suspect` is set (the SOL scorer's `T_k < ~T_SOL` margin signal), `_reward_hack_re_eval(child, kernel, workloads, input_generators, reference_fn=..., definition=...)` re-runs the candidate against the reference oracle with strict tolerance (`atol=1e-5`, `rtol=1e-4`) and a fresh `per_iter_anti_cheat` snapshot. The re-eval uses `maybe_wrap_dps_candidate` so DPS kernels are correctly invoked with pre-allocated outputs, and `compare_outputs` with `build_normalize_context(definition)` so multi-output (tuple/dict) returns compare name-by-name via SOL's `normalize_outputs`. Cleared → emit `reward_hack_cleared{iter, child_id}`, accept the original score and continue. Not cleared → emit `reward_hack_confirmed{iter, child_id}` and route through `_kill_branch(..., reason=DEAD_REWARD_HACK_CONFIRMED, bumps_agent_failures=True)`. Errors during the re-eval (compile failure, exception during oracle call) are treated as "not cleared" — fail-closed so a crash doesn't accidentally promote the suspect score. Skip path: when `reference_fn` / `input_generators` / `workloads` are absent (placeholder runs), the re-eval returns `True` (cleared) since there is no oracle to compare against.
+- **Channel C — calibration warning.** When `score.calibration_warning` is set (less severe T_k vs. T_SOL margin), the orchestrator emits `calibration_warning{iter, child_id, t_k_us, t_sol_us}` for observability but does **not** kill the branch — calibration is a roofline-tightness signal, not a cheating signal.
+
+**CUDA sticky-state recovery.** A subset of `RuntimeError` messages (substring match against `_CUDA_STICKY_PATTERNS = ("illegal memory access", "device-side assert", "unspecified launch failure", "misaligned address", "out of memory", "cublas", "cudnn")`) trigger a single `torch.cuda.synchronize()` retry. A loose `"cuda" in msg` check is intentionally **not** used — strings like "operation not implemented for CUDA" are real bugs and must propagate. Non-matching `RuntimeError`s re-raise. After the sync, the branch is killed via `_kill_branch(..., reason=DEAD_CUDA_ERROR)` (infra failure, no agent-failure bump). A run-level `consecutive_cuda_errors` counter is incremented when the sync itself fails; on the third consecutive failure the orchestrator raises `CUDAContextPoisoned` to abort the whole run rather than burn iterations producing meaningless results from a poisoned device. The counter resets to zero after any successful bench or successful sync.
+
+**`_kill_branch(child, parent, iter_no, *, reason, detail, bumps_agent_failures)` helper.** Consolidates the six DEAD_END exit sites (channel A reward-hack, channel B reward-hack-confirmed, CUDA sticky-state, partial bench failure, repr-workload-latency-unavailable, profiler error). Each call: marks `child.branch_quality = DEAD_END`, optionally bumps `parent.consecutive_agent_failures` (True only for agent-output failures — Coder/Planner produced a buggy/cheating kernel; False for infra failures where the agent isn't accountable), runs `beam_prune`, and emits the `branch_dead_end{reason, detail}` + `iter_end{outcome=dead_end}` pair. The trailing `epsilon = max(epsilon_end, epsilon - decay)` decay still lives at each call site because `epsilon` and `decay` are local to `run()`'s frame.
+
+**`DEAD_*` reason constants** (defined in `runtime/events.py`, frozen in `DEAD_REASONS`):
+
+| Constant | When |
+|----------|------|
+| `DEAD_REWARD_HACK` | Channel A — in-band `RewardHackDetected` raised inside `per_iter_anti_cheat` |
+| `DEAD_REWARD_HACK_CONFIRMED` | Channel B — post-bench re-eval failed to clear `reward_hack_suspect` |
+| `DEAD_CUDA_ERROR` | Sticky-state CUDA error caught + recovered via `synchronize()` (run continues) |
+| `DEAD_BENCH_FAILURE` | Child benchmark partial-workload failure (`not is_fully_successful`) or `BenchmarkError` |
+| `DEAD_PROFILER_ERROR` | `ProfilerError` from `profile_kernel` (zero latency, missing peaks, etc.) |
+| `DEAD_REPR_LATENCY_UNAVAILABLE` | Representative workload's measurement was `inf` (partial slice failure on the middle workload) |
+| `DEAD_AGENT_FAILURE` | Reserved for agent-output failures routed through `_kill_branch` (Planner/Coder skip-iter cases currently emit `planner_failed` / `coder_failed` directly without DEAD_END routing) |
+
+**`_emit_trace(iter_no, child, bench, roofline, definition, workloads, repr_idx)`.** Builds a SOL `Trace` per evaluation (`Definition` name + representative `Workload` + `Evaluation{status, environment, timestamp, correctness, performance}`) and fires `trace_emitted{iter, child_id, trace}`. The cached `Environment` is built lazily on first use via `env_snapshot(device="cuda:0")` (with a CPU-only fabricated stub fallback so `Trace`'s `NonEmptyString` validator doesn't reject it). Best-effort — all exceptions are swallowed so a trace serialization hiccup never interrupts the search loop. The placeholder path (no SOL workloads / no `definition`) emits a minimal `trace_emitted{iter, child_id, latency_us}` payload without a full `Trace` object. **Note:** the file-dump side of trace emission was deliberately removed in this PR — PR 3 will re-add it once `_run_dir` is properly threaded through the orchestrator.
 
 ### `TerminationReason`
 

@@ -98,6 +98,9 @@ Mutable dataclass. All parameters for a single optimization run.
 - `benchmark_workload_count` (3): representative workloads for iterative benchmarking.
 - `arch_config_path` (""): path to SOLAR arch YAML. If empty, `detect_hardware()` is used.
 - `hardware`: populated from arch YAML or `detect_hardware()` at startup.
+- `safetensors_blob_roots` (None: `list[Path] | None`): override the default `[problem_dir]` blob_roots used by `build_input_generator` to resolve `SafetensorsInput` workloads. When `None`, the dispatcher falls back to `[problem_path]`, preserving the in-tree fixture layout. Useful when blobs live outside the problem directory (e.g. a shared model-weight staging area).
+- `benchmark_adapter` (None: `str | None`): explicit override for the `_load_problem` dispatcher's adapter choice. Values: `"sol_execbench"` (also auto-selected when `definition.json` is present), `"kernelbench"` (raises `NotImplementedError` until that adapter ships). When `None`, the dispatcher inspects the problem directory and either picks an adapter or raises `UnknownBenchmarkFormat`.
+- `anti_cheat_critical_names` (`list[str]`, default `["elapsed_time", "synchronize", "wait", "record", "query"]`): names of methods on `torch.cuda.Event` whose `id()` is snapshotted on entry to `per_iter_anti_cheat` and re-checked on exit. A monkey-patch substitution between snapshot and check raises `RewardHackDetected` and the orchestrator marks the branch DEAD_END. Default covers the timing primitives a candidate would need to patch to fake faster-than-SOL latencies; operators can extend without code change.
 
 ## Functions
 

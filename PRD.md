@@ -113,7 +113,7 @@ Compilation and correctness run inside the Coder's turn. The Coder calls these t
 | `compiler.py` | Coder's `compile_kernel_tool` | Triton compilation |
 | `correctness.py` + `anti_cheat.py` | Coder's `check_correctness_tool` | 5-stage correctness gate |
 
-Note: `anti_cheat.py` has three surfaces. **Correctness-level** (above): randomized inputs, precision checks — runs inside the Coder's turn. **Performance-level**: `scorer.py` flags `reward_hack_suspect` when `T_k < T_SOL` — the orchestrator routes flagged candidates through additional anti-cheat inspection (see SOL Score Invariant Violations). **Process-level** (added 2026-04-27 scope expansion): the SOL `reward_hack` detector set (`check_monkey_patch`, `check_thread_injection`, `check_lazy_outputs`, `snapshot_critical_functions` + `check_eval_integrity`) wrapped as a per-iteration context manager — catches torch primitive rebinding, thread injection, lazy/deferred outputs, and namespace tampering between snapshot and check. See JOURNAL → "SOL integration scope expansion — adopt every applicable primitive (2026-04-27)" for the full integration plan.
+Note: `anti_cheat.py` has three landed surfaces (real, not skeleton). **Correctness-level** (above): `generate_randomized_inputs` + `strict_tolerance_check` provide randomized inputs and strict precision checks — runs inside the Coder's turn. **Performance-level**: `scorer.py` flags `reward_hack_suspect` when `T_k < T_SOL` — the orchestrator routes flagged candidates through additional anti-cheat inspection (see SOL Score Invariant Violations). **Process-level** (added 2026-04-27 scope expansion): the `per_iter_anti_cheat` context manager (yielding an `AntiCheatContext`) plus `check_lazy_outputs_after_bench` wrap the SOL `reward_hack` detector set (`check_monkey_patch`, `check_thread_injection`, `check_lazy_outputs`, `snapshot_critical_functions` + `check_eval_integrity`) — caught torch primitive rebinding, thread injection, lazy/deferred outputs, and namespace tampering between snapshot and check. See JOURNAL → "SOL integration scope expansion — adopt every applicable primitive (2026-04-27)" for the full integration plan.
 
 #### 5-Stage Correctness Gate
 
@@ -272,7 +272,7 @@ Classification is once-per-run (via `classify_run` in `eval/roofline.py`) — in
 | Compute-bound | Arithmetic intensity > ridge point (outside balanced band) | Tier 3 (compute optimization) |
 | Balanced | Near the ridge point | Either tier, guided by NCU sub-metrics |
 
-The run-level label is threaded into retriever / planner / reviewer every iteration via `SearchResult.run_bottleneck` and surfaces in Phase C as `OptimizationReport.bottleneck`. A separate per-workload view — `OptimizationReport.winner_per_workload_bottlenecks`, populated by `classify_workload` — captures how individual workloads land relative to the ridge, which the single representative workload's label cannot show.
+The run-level label is threaded into retriever / planner / reviewer every iteration via `SearchResult.run_bottleneck` and surfaces in Phase C as `OptimizationReport.bottleneck`. A separate per-workload view — `OptimizationReport.winner_per_workload_bottlenecks`, populated by per-workload `derive_t_sol_from_solar(...).bottleneck` calls in `src/pipeline/report.py::generate_report` — captures how individual workloads land relative to the ridge, which the single representative workload's label cannot show. Workloads where SOLAR returns `None` are omitted from this map.
 
 See JOURNAL → "Bottleneck classify-once (2026-04-22)" for why a per-iter dynamic reclassification (earlier design) was dropped.
 
@@ -345,7 +345,7 @@ Triton coverage by tier:
 4. **Planner sees** Reviewer's distilled summary only. Agents never see raw hardware specs.
 5. **Fallback** — when no arch YAML is provided, `detect_hardware()` queries the CUDA runtime (placeholder in V1).
 
-**Clock locking** (added 2026-04-27 scope expansion): GPU clocks are actively locked at startup via `sol_execbench.core.bench.clock_lock.lock_clocks` + `BenchmarkConfig` + `device_config.get_clock_preset(device_name)` (preset table per GPU model). Requires `sudo nvidia-smi --lock-gpu-clocks`; falls back to warn-only on permission denial via `probe_clock_lock_available()`. Removes boost-clock variance as a real source of timing noise on Ada / H100 — without this, T_k measurements drift run-to-run and the SOL score plateau detection fires on noise rather than real plateaus.
+**Clock locking** (added 2026-04-27 scope expansion): GPU clocks are actively locked at startup via the `sol_execbench.core.bench.clock_lock` primitives — `lock_clocks` / `verify_clocks` / `unlock_clocks` / `probe_clock_lock_available` — paired with `device_config.get_clock_preset(device_name)` (preset table per GPU model). The pipeline calls these directly (see `_try_acquire_clock_lock` and `_unlock_clocks_safe` in `src/pipeline/optimize.py`); `unlock_clocks` is also registered on `atexit` for safety. Requires `sudo nvidia-smi --lock-gpu-clocks`; falls back to warn-only on permission denial via `probe_clock_lock_available()`. Removes boost-clock variance as a real source of timing noise on Ada / H100 — without this, T_k measurements drift run-to-run and the SOL score plateau detection fires on noise rather than real plateaus.
 
 ---
 
@@ -390,9 +390,16 @@ arch_config_path = configs/arch/H100_PCIe.yaml
 
 ```
 Phase A: Load Problem
-  SOL-ExecBench problem -> parse definition.json, reference.py, workload.jsonl
+  `_load_problem` dispatcher (`src/pipeline/optimize.py`): adapter selection
+     1. `ACTSConfig.benchmark_adapter` override -> `'sol_execbench'` |
+        `'kernelbench'` (NotImplementedError until that adapter ships).
+     2. else `definition.json` present -> SOL-ExecBench adapter.
+     3. else `model.py` present -> KernelBench (NotImplementedError).
+     4. else raise `UnknownBenchmarkFormat`.
+  SOL-ExecBench path -> `src/benchmarks/sol_execbench/load.py` parses
+       definition.json, reference.py, workload.jsonl; classify via
+       `classify_run` once-per-run.
   -> derive T_SOL via SOLAR (PyTorch reference + hardware arch config)
-  -> classify kernel as compute-bound or memory-bound
   -> generate Triton baseline via Coder (PyTorch -> Triton one-shot translation)
   -> verify Triton baseline correctness against PyTorch reference
      -> retry up to max_baseline_retries on failure; skip problem if exhausted

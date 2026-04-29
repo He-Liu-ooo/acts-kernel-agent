@@ -405,6 +405,58 @@ Updates the design intent referenced in "Dynamic bottleneck reclassification —
 
 **Spec supersession**: `docs/superpowers/specs/2026-04-20-eval-profiler-design.md` diverged too far from the implementation (items 1-3, 6, 9-10 contradict the spec; item 7 wasn't there). Canonical design rationale lives in this JOURNAL entry + the `Profiler approach` entry above. The spec file is deleted in the same commit — no SUPERSEDED marker, since `docs/superpowers/specs/` has no other residents to preserve a convention for.
 
+### SOL-ExecBench upstream API shapes (2026-04-29)
+
+**Rationale**. Three SOL upstream API shapes are load-bearing at our integration boundary and not obvious from the field names alone. Each was discovered the hard way (validator failures or test reds) and warrants a single canonical record so a future contributor doesn't re-derive them.
+
+**What changed.** No code change — this is a documentation entry capturing the shapes that already drive `src/eval/anti_cheat.py`, `src/search/orchestrator.py::_emit_trace`, and the `Trace`/`Evaluation`/`Performance` plumbing.
+
+The shapes:
+
+1. **`compute_error_stats(candidate, reference, spec) -> (Correctness, exceeds: bool)`**, not a single object with a `.passed` attribute. Verified at `src/eval/anti_cheat.py::strict_tolerance_check` line 83: `_correctness, exceeds = compute_error_stats(...)`. The `exceeds` boolean is the negation of "passed" — `return not exceeds` to get a pass-style flag. Mistaking this for `.passed` produces an `AttributeError` at the first tolerance check, not a silent miscompute.
+2. **`Trace.definition` is `NonEmptyString`**, not a sub-model. We pass `definition.name` (a string) — passing the `Definition` object itself trips Pydantic's `NonEmptyString` validator. Verified at `src/search/orchestrator.py::_emit_trace` line 1087: `trace = Trace(definition=definition.name, ...)`.
+3. **`Trace.evaluation` nests `Performance(latency_ms=, reference_latency_ms=, speedup_factor=)`**, with the `_ms` suffix and `speedup_factor` (not `latency_us` or `speedup`). Our internal benchmark numbers carry microseconds — convert at the SOL boundary: `latency_ms=bench.median_latency_us / 1000.0`. Verified at `src/search/orchestrator.py::_emit_trace` lines 1080–1083. The mismatch would be a Pydantic validation error at `Trace` construction (caught in the broad `except` and silently swallowed), so a contributor who renames our internal fields to match SOL's surface needs to update both the `_us → _ms` divide and the `speedup → speedup_factor` rename.
+
+**What we explicitly did NOT do.** No abstraction layer over these shapes. They're not re-exported from a `src/sol_compat.py` shim — the field-rename + type-cast lives at the single call site that needs it. Adding a shim would just push the rediscovery cost into a new layer.
+
+**Trigger for revisit.** SOL upstream renames any of these fields (e.g. `compute_error_stats` returns a single `CorrectnessResult` with a `.passed` attribute, or `Performance.speedup_factor` is renamed `speedup`). Fix at the integration boundary (`anti_cheat.py::strict_tolerance_check`, `orchestrator.py::_emit_trace`) — do not propagate the SOL renames into ACTS-internal field names.
+
+### Subprocess driver integration tests required, not just unit tests (2026-04-29)
+
+**Rationale**. The `_profiler_driver.py` subprocess (NCU → forked Python child) was the silent-failure capital of the profiler PR series. Tier 1 unit tests with fake `ncu` greened up clean through every single bug listed below — none of them surfaced until either an adversarial Codex review or a real-GPU integration run forced the two hops to actually execute. Parallel to the `feedback_gpu_tests_required.md` rule, but narrower: any subprocess driver added to ACTS needs end-to-end integration coverage, not just unit-level mocks of its inputs and outputs.
+
+**What changed.** No code change — this is a lesson-capture entry pointing at the bug history so future subprocess drivers (e.g. clock-lock probe, isolated correctness runner) get an integration test from day one rather than after a real-GPU red.
+
+**Bug history that motivates the rule.**
+
+- **F1 — `sol_load.load(...)` shadowed by an inner import**. Adversarial Codex caught a name shadow that made the driver call a stub from a sibling import path instead of the real SOL loader. Tier 1 mocked at the wrong boundary; the import-shadow only fires when the real module is on `sys.path`.
+- **G2 — `blob_roots` not forwarded to the subprocess spec**. Workloads that load `safetensors` blobs from a base directory degraded to empty inputs because the parent's `blob_roots` configuration didn't ride along in the JSON spec. Tier 1's synthetic inputs hid this — only a real workload with blob refs surfaced the empty-tensor case.
+- **G4 — `kernel_fn(*inputs)` without DPS branch**. The driver called the kernel as a value-returning function and assumed the return value was the output tensor. For destination-passing-style kernels (where the output tensor is *passed in* and the function returns `None`), the driver captured `None` as the output and downstream tolerance checks compared `None` to the reference. Tier 1 only tested value-returning kernels; the DPS branch needed a real DPS Triton kernel to surface.
+
+**What we explicitly did NOT do.** No "Tier 1.5" mock-the-subprocess-shape test layer. The lesson is not "add more mocks" — every one of the bugs above lives at a boundary the mocks specifically can't reach (real loader, real blob filesystem, real kernel return convention). Either Tier 2 (`@pytest.mark.gpu` end-to-end) or an explicit subprocess integration test that runs the actual driver script with a real Python interpreter.
+
+**Trigger for revisit.** Any new subprocess driver added to ACTS — not just GPU-bound ones. The two-hop pattern (parent → subprocess → forked child) is the failure mode, regardless of whether the inner hop is `ncu`, `nvprof`, a Docker container, or a separate Python process for clock-lock. First commit of the new driver gets a Tier 2 integration test in the same PR; review will block on its absence.
+
+### Python 3.10 → 3.12 bump for SOL-ExecBench (2026-04-29)
+
+**Rationale**. SOL-ExecBench pins `requires-python = ">=3.12"`. The pre-SOL ACTS venv was Python 3.10. Three install paths were considered for getting 3.12 onto Ubuntu 20.04 (the dev host); only one worked end-to-end without `sudo` rights or an OS upgrade.
+
+**What changed.** `pyproject.toml` `requires-python` bumped from `>=3.10` to `>=3.12`. Production venv path is `/tmp/acts_run_venv` built via `uv venv --python 3.12`; the older `/tmp/acts_test_venv` (3.10, no torch) stays for torch-less unit tests. Canonical install recipe lives in `configs/venvs/3.12.md`.
+
+**Install path comparison.**
+
+- **deadsnakes PPA (rejected — no packages)**. The natural first try on Ubuntu 20.04 — `add-apt-repository ppa:deadsnakes/ppa` historically backports modern CPython. apt resolution returned no Python 3.12 packages for 20.04 by the time of the bump; deadsnakes had moved on. The 2026-04-22 SOL integration tightening entry above still shows the deadsnakes-based recipe — that recipe was correct as of 04-22 but stopped working before the install actually happened.
+- **System upgrade (rejected — out of scope)**. Bumping the OS to 22.04+ to get a `python3.12` apt package would have shipped 3.12, but a host upgrade is wildly out of proportion for a venv requirement. Vetoed.
+- **`uv` (chosen — userspace, no `sudo`)**. `uv` ships its own CPython distributions and auto-fetches 3.12 on first `uv venv --python 3.12` invocation. No PPA, no `sudo`, no OS upgrade. Same recipe also handles torch (cu128 wheels via `--index-url`) and SOL-ExecBench (editable + `--no-deps` to skip the cu13-only deps that don't have cu128 wheels).
+
+**What we explicitly did NOT do.** No conda. No pyenv. No system-level Python install. The dev-host invariant ("no `sudo` modifications") makes `uv` the only path that works, and the resulting venv is portable enough that a future host bump (20.04 → 22.04) won't require redoing the recipe.
+
+**cu128 wheels + `pip install -e SOL --no-deps` rationale**. Already documented in `configs/venvs/3.12.md` ("Why `--no-deps`"): SOL's `pyproject.toml` lists `cuda-tile==1.1.0`, `nvidia-cutlass-dsl[cu13]==4.4.1`, and `nvidia-cudnn-frontend==1.18.0` (cu13-paired build) — all cu13-only with no cu128 wheels. Letting pip resolve them either fails outright or pulls cu13 wheels that crash on the first GPU op. ACTS doesn't use the SOL features that need any of these (CUTLASS / cuTe DSL / cuTile target Blackwell sm_100+, ACTS targets Ada sm_89), so the `--no-deps` install + hand-curated `pip install pydantic safetensors click rich pyyaml pytest pytest-asyncio` sidesteps the entire cu13 surface.
+
+**Trigger for revisit.**
+- SOL upstream relaxes `requires-python` back to `>=3.10` (unlikely — they're on the modern-Python track). Then the dual-venv split (`/tmp/acts_test_venv` for unit tests, `/tmp/acts_run_venv` for live runs) collapses back to a single 3.10 venv.
+- A SOL feature ACTS wants pulls in cuda-tile / cutlass-dsl / cudnn-frontend for real. Then either the cu13 stack arrives on Ubuntu 22.04+ (host bump) or ACTS stays scoped to the cu128-compatible SOL surface.
+
 ---
 
 ## Optimization Memory
@@ -682,6 +734,19 @@ full CLI eval. For ACTS's pattern (SOL-as-library) that's overkill, adds a
 container boundary around what should be a Python import, and doesn't
 solve the host driver bump (580+ still needed even with Docker). Library
 integration on 12.8 is the proportionate answer.
+
+**Retrospective (2026-04-28, post-mega-PR)**: Plan landed as designed. cu12.8
+stayed clean — no cu13 wheels were ever installed (verified by smoke test
+in `configs/venvs/3.12.md`: `torch 2.11.0+cu128 cuda 12.8`). `--no-deps`
+plus a hand-curated dep list correctly skipped `cuda-tile`,
+`nvidia-cutlass-dsl[cu13]`, and `nvidia-cudnn-frontend` — none of those
+primitives are reached from any ACTS code path on Ada. Tier 1 (schemas),
+Tier 2 (timing via `do_bench`/`time_runnable`), Tier 3 (`sol_score`
+delegation), and Tier 5 (benchmark adapter pattern under `src/benchmarks/`)
+all shipped; Tier 4 (reward-hack + clock-lock) wired via `eval/anti_cheat.py`
+ahead of the original "deferred" schedule once the live-run threat model
+warranted it. The blocked surfaces in the table above remain blocked, as
+expected, with zero observed impact on ACTS workflows.
 
 ### SOL integration scope expansion — adopt every applicable primitive (2026-04-27)
 
@@ -964,6 +1029,8 @@ A kernel can shift its effective bottleneck only by changing its data access pat
 
 **Per-workload diagnostics**: The operator can still ask "how do individual workloads land relative to the ridge" — a single representative-workload label can't answer that. Phase C populates `OptimizationReport.winner_per_workload_bottlenecks` via a second helper `classify_workload(problem, workload, hardware)` for every selected workload. This replaces the (also dropped) `OptimizationReport.bottleneck_transitions` field, which was built around the per-iter assumption.
 
+**Superseded by 2026-04-28 ("SOLAR as sole bottleneck source")**: The per-workload `classify_workload` helper described above was deleted. Phase C's per-workload labels now come from `derive_t_sol_from_solar(...).bottleneck` directly — both bottleneck surfaces (run-level and per-workload) collapse onto SOLAR. The run-level `classify_run` decision documented above stands; only the per-workload helper was retired. See the 2026-04-28 entry below for the rationale (consistency, dtype-aware accuracy, single source of truth).
+
 **Typing change bundled in**: The previously-deferred "Thread `BottleneckType` end-to-end" item (PROCESS → Deferred Improvements) rode along — `BottleneckType` moved from `eval/roofline.py` into a leaf `eval/types.py` module (preventing the circular-import headache that would otherwise arise once `memory/experience.py` and `eval/profiler.py` both type-check against it), and every call-site that used `.value` strings now takes the enum directly (Planner / Reviewer / `OptimizationReport.bottleneck` / `winner_per_workload_bottlenecks`).
 
 **Follow-on Codex review fixes** (same PR):
@@ -1118,3 +1185,36 @@ The first live GPU run after the Planner + Reviewer submit-tool migration (rmsno
 **Trigger for revisit**:
 - A future SDK release tightens `strict_mode=False` semantics in a way that breaks our tool calls. Re-evaluate the JSON-string-param alternative if so.
 - A future Pydantic model adds a *required* `dict[str, X]` field whose schema the LLM gets wrong frequently. Strict-mode would catch the wrong shape one round earlier; the in-loop retry catches it one round later. Acceptable trade today, revisit if retry budget pressure rises.
+
+### SOLAR as sole bottleneck source (2026-04-28)
+
+Both bottleneck classification surfaces — run-level and per-workload — now derive from SOLAR. Previously the per-workload surface in `OptimizationReport.winner_per_workload_bottlenecks` used the analytical band classifier (`flops/nbytes` ratio compared to the hardware ridge); now it calls `derive_t_sol_from_solar` once per selected workload and reads `RooflineResult.bottleneck`.
+
+**What changed.** Three coordinated edits:
+
+1. **`classify_workload(definition, workload, hardware) -> BottleneckType` deleted** from `src/eval/roofline.py`. It was unreachable in production — `report.py::generate_report` had been duplicating its logic inline (because `classify_workload`'s strict ValueError-on-no-formula didn't fit the placeholder-path fallback in `_resolve_workload_roofline`), and the helper itself was only exercised by 7 tests. Pure dead weight.
+2. **`report.py::generate_report` per-workload classification path** swapped from `classify_bottleneck(flops/nbytes, ridge_point)` to `derive_t_sol_from_solar(definition, w, hardware_spec, arch_yaml_path=...).bottleneck`. Workloads where SOLAR returns `None` (not installed) or `definition is None` (placeholder mode) are omitted from the dict rather than fall back to the analytical classifier.
+3. **`optimize.py` rich-args plumbing**: `optimize()` now returns `(SearchResult, OptimizationReport)` and builds the report inside its own scope where `definition` / `workloads` / `arch_yaml_path` / `blob_roots` are in scope. Previously the bare `generate_report(result)` call in `main()` couldn't access those locals, so the per-workload classification never fired in production runs. Net effect: post-2026-04-28 production runs actually surface per-workload SOLAR labels in their printed report.
+
+**Why SOLAR everywhere instead of analytical.**
+
+- *Consistency.* The SOLAR-vs-analytical split was a vestige of the bottleneck-classify-once refactor (2026-04-22), which rightly avoided running SOLAR per-iteration but left the per-workload surface analytical because Phase C was the only consumer and "cheap is fine." Q2's correction: Phase C runs once per run, so the cost is a one-shot `O(N_workloads)` SOLAR-pipeline invocation at report time. ~10 workloads × ~hundreds of milliseconds each = sub-second overhead at the very tail of a run that already took minutes.
+- *Accuracy.* The analytical classifier uses `peak_flops_fp32` regardless of workload dtype — for tensor-core workloads (fp16/bf16) it mislabels because the real ridge is much higher (`peak_flops_fp16_tc`). The "Per-dtype peak in `_compute_analytical()` ridge" Deferred entry tracked this. SOLAR's graph analysis sees the actual operations and doesn't trip on dtype.
+- *Single source of truth.* Today SOLAR is authoritative for run-level (via `classify_run`) and analytical was the per-workload odd one out. Collapsing both surfaces onto SOLAR removes the asymmetry and the need for two thresholds to stay calibrated against each other.
+
+**`compute_roofline_inputs` retains exactly two callers** post-Q2, both feeding `_compute_analytical` for arithmetic-intensity / %peak math (which is *not* bottleneck classification — that surface is a Reviewer signal, not a search-routing signal):
+
+1. `orchestrator.py::Orchestrator.run` — per-iter representative-workload profile.
+2. `report.py::_resolve_workload_roofline` — Phase C re-profile, called once per selected workload.
+
+A new caller almost always means either a third `profile_kernel` site (legitimate — extend the docstring's call-site list) or bottleneck classification accidentally re-routed away from SOLAR (regression — fix instead). The function's docstring spells this out so a future contributor doesn't drift back into the analytical-classifier pattern.
+
+**What this means for the analytical formula.** It survives, but only on the cold/fallback path: `compute_roofline()` (in `roofline.py`) is the no-SOLAR fallback that `classify_run` uses when `RooflineResult` is `None`. That's the only remaining bottleneck-classifying caller of `classify_bottleneck`, and it's reachable only when SOLAR isn't installed at all. Production runs with SOLAR live never hit it.
+
+**Side effects on Deferred Improvements.**
+
+- "Per-dtype peak in `_compute_analytical()` ridge" entry's blast radius shrinks: it no longer affects `OptimizationReport.winner_per_workload_bottlenecks` (which is now SOLAR), only the `analytical.pct_peak_compute` / `pct_peak_bandwidth` numbers the Reviewer reads. The fix's value is now scoped to Reviewer signal accuracy, not search-routing or report labeling. Trigger remains the same; impact is narrower.
+
+**Trigger for revisit.**
+- A live run where Phase C report's per-workload SOLAR runs are too slow on a problem with many selected workloads (>10s aggregate). Then either cache by `(op_type, axes_signature)` or fall back to a coarse analytical first pass with SOLAR on disagreement only.
+- A SOLAR upgrade that introduces a per-workload-classification fast path. Adopt directly instead of going through the full pipeline N times.

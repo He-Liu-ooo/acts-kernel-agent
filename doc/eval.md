@@ -23,6 +23,8 @@ Run once at startup before the search loop. Results are constant for the entire 
 |--------|---------|
 | `roofline.py` | T_SOL derivation + once-per-run bottleneck classification (`classify_run`) consumed by retriever / planner / reviewer every iteration |
 
+This table covers only the **eval-harness slice** of Phase A. The wider Phase A flow is orchestrated by `pipeline/optimize.py`: the `_load_problem` adapter dispatcher selects a benchmark format (currently SOL), `derive_t_sol_from_solar` fills the T_SOL + bottleneck pair, `validate_hardware_spec` (from `src/config.py`) reconciles the configured `HardwareSpec` with `detect_hardware()`, and the clock-lock primitives from `sol_execbench.core.bench.clock_lock` (`probe_clock_lock_available`, `acquire_clock_lock`) attempt to pin GPU clocks for the run — all before the search loop starts. See `doc/pipeline.md` for the end-to-end Phase A wiring.
+
 ### Orchestrator-Side (after Coder returns, every iteration)
 
 Run by the orchestrator. Never part of the Coder's tool loop — prevents the LLM from gaming benchmark numbers.
@@ -51,15 +53,19 @@ Stages 3 and 4 fuse the oracle compare with their domain check so a seed-7 or se
 
 Tensor comparison is abstracted behind a `ComparisonPolicy` protocol (`compare`, `contains_non_finite`, `bitwise_equal`) so the module imports torch-free. Tests inject a scalar-backed policy; production uses `TorchComparisonPolicy`:
 
-- When `sol_execbench` is importable, delegates to `sol_execbench.core.bench.correctness.compute_error_stats` with `ToleranceSpec(max_atol, max_rtol)` — `required_matched_ratio` is left at SOL's default (0.99 = 1% slack) so bf16 quantization outliers don't reject a mathematically correct kernel. Element-wise pass condition: `|output - reference| <= max_atol + max_rtol * |reference|`. This gives matched-ratio tolerance, separate NaN/Inf flags, and a hard max-error cap "for free."
-- Falls back to a local `torch.allclose` check when SOL-ExecBench is absent (keeps the module usable for non-SOL benchmarks).
+- Delegates to `sol_execbench.core.bench.correctness.compute_error_stats` with `ToleranceSpec(max_atol, max_rtol)` — `required_matched_ratio` is left at SOL's default (0.99 = 1% slack) so bf16 quantization outliers don't reject a mathematically correct kernel. Element-wise pass condition: `|output - reference| <= max_atol + max_rtol * |reference|`. This gives matched-ratio tolerance, separate NaN/Inf flags, and a hard max-error cap "for free."
+- **SOL-ExecBench is mandatory.** `_try_import_sol()` raises `ImportError("TorchComparisonPolicy requires sol_execbench. ...")` on first `compare` call when SOL is absent — there is no `torch.allclose` fallback. A fallback's pass criterion (every element within tolerance) would diverge from SOL's matched-ratio rule and silently hide bf16 outliers in non-SOL test runs, so the policy fails closed instead.
 
 ### `verify_correctness` Contract
 
 ```python
 verify_correctness(
     candidate_fn, reference_fn, input_generator,
-    *, policy=None, atol=1e-2, rtol=1e-2,
+    *,
+    definition: Definition | None = None,
+    kernel: Kernel | None = None,
+    workload: Workload | None = None,
+    policy=None, atol=1e-2, rtol=1e-2,
     strict_atol=1e-5, strict_rtol=1e-4,
     n_sweep_trials=5, n_anti_cheat_trials=3,
 ) -> CorrectnessResult
@@ -67,9 +73,31 @@ verify_correctness(
 
 `input_generator(seed) -> tuple` produces fresh args for each trial. The Coder's correctness tool iterates over the **full** input-generator list (one per selected workload) and short-circuits on the first failing workload so the Coder sees the offending workload index and stage.
 
+The three SOL-aware kwargs drive the multi-output / DPS flow:
+
+- `definition` — when provided, both candidate and reference outputs flow through SOL's `normalize_outputs` so multi-output (tuple / dict) returns get compared name-by-name under per-name dtypes from `definition.outputs`. When `None`, the gate falls back to comparing raw outputs directly (preserves back-compat with non-SOL benchmarks and the scalar-policy unit tests that drive the gate without a `Definition`).
+- `kernel` + `workload` — required when the candidate's host wrapper is destination-passing-style (`kernel.dps=True`). The gate then allocates output buffers per call via `allocate_dps_outputs(definition, workload, device=...)` (which delegates to `sol_execbench.core.bench.io.allocate_outputs`) and invokes `candidate_fn(*inputs, *outputs)`; the filled buffers serve as the candidate's outputs for the per-stage comparison. The reference oracle is always return-by-value — it's the PyTorch `run()` from `definition.json` and is never DPS — so the comparison sides line up via `normalize_outputs`. When `kernel` is `None` or `kernel.dps` is `False`, the gate calls `candidate_fn(*inputs)` and treats the return value as the output (legacy / non-DPS path).
+
 ### `anti_cheat.py`
 
-Currently a placeholder (`generate_randomized_inputs`, `strict_tolerance_check`) marked as `skeleton` in PROCESS.md. The correctness-level anti-cheat surface is handled by Stage 5 above; the performance-level `reward_hack_suspect` flag is surfaced by `scorer.py`. The `anti_cheat.py` surface will fill in when the threat model becomes non-empty (see PROCESS.md → Deferred Improvements → "Reward-hack detection").
+Real implementation. Coordinates three layers of reward-hack defense:
+
+**1. Correctness-level — Stage 5 of `verify_correctness`.** Randomized inputs at seeds `1000..1000+n_anti_cheat_trials-1` evaluated under strict tolerance (`strict_atol=1e-5`, `strict_rtol=1e-4`). Catches kernels that pass on canned seeds but diverge on random inputs.
+
+**2. Performance-level — scorer flags.** `compute_sol_score` sets `reward_hack_suspect` when `T_k < T_SOL` (candidate beats hardware speed-of-light) and `calibration_warning` when `T_b <= T_SOL` (baseline already at limit). The orchestrator's `_reward_hack_re_eval` re-runs the candidate under SOL strict tolerance when `score.reward_hack_suspect` fires and emits `reward_hack_confirmed` (then `_kill_branch(reason=DEAD_REWARD_HACK_CONFIRMED)`) or `reward_hack_cleared`.
+
+**3. Process-level — SOL `reward_hack` detector set.** The `per_iter_anti_cheat(critical_names)` context manager wraps each evaluation:
+
+- *On entry:* `snapshot_critical_functions(namespace, critical_names)` over `vars(torch.cuda.Event)` plus `check_monkey_patch()` — the latter validates SOL's module-load `_ELAPSED_TIME_ADDR` snapshot, fires only if a candidate patched `torch.cuda.Event.elapsed_time` after sol_execbench import. The import-order contract in `pipeline/optimize.py` (SOL imported first) keeps this snapshot trustworthy.
+- *On exit (unconditional):* `check_thread_injection(threads_before, threading.active_count())` and `check_eval_integrity(snapshot, namespace)`. Run unconditionally so a body that raised for any reason still gets validated; a tampered run is more important to surface than whatever caused the body to error.
+
+`check_lazy_outputs_after_bench(outputs)` runs after the bench loop and validates that every produced tensor is a strict `type(t) is torch.Tensor` (rejects FakeTensor / lazy proxies). Any `RewardHackDetected` raised by these checks propagates to the orchestrator's `_kill_branch(reason=DEAD_REWARD_HACK)`.
+
+**Helpers.**
+
+- `AntiCheatContext` — dataclass holding `snapshot: dict[str, int]`, `namespace: MappingProxyType[str, Any]` (read-only view over `torch.cuda.Event`'s namespace, prevents accidental mutation across the per-iter window), and `threads_before: int`.
+- `generate_randomized_inputs(input_generator, seed) -> list` — thin wrapper that materializes a tuple from the per-seed generator (used by Stage 5 + the re-eval).
+- `strict_tolerance_check(candidate_output, reference_output, *, atol=1e-5, rtol=1e-4) -> bool` — strict-spec wrapper around `compute_error_stats` with `required_matched_ratio=1.0` (zero slack); used by the SOLAR-strict re-eval.
 
 ## Benchmark — `benchmark.py`
 
@@ -108,12 +136,11 @@ When both `workloads` and `input_generators` are empty (placeholder CLI path, no
 
 ## Inputs — `inputs.py`
 
-Bridges SOL-ExecBench's `Problem` to the pair of callables `verify_correctness` needs.
+Bridges SOL `Definition` + `Workload` directly to the pair of callables `verify_correctness` needs (plus the DPS allocator). The legacy ACTS `Problem` / `Workload` dataclasses are gone — SOL's pydantic models flow through unchanged, no shim layer.
 
 - `build_reference_fn(source, entrypoint="run") -> Callable` — execs the PyTorch reference source (from `definition.json`'s `reference` field) into an isolated namespace and resolves the entrypoint symbol. Raises `ReferenceLoadError` when the entrypoint is missing or non-callable; `SyntaxError` / `ImportError` from the source propagate unchanged so the real cause is visible. Pure-Python (no torch import) so the module loads in the test venv.
-- `build_input_generator(problem, workload, *, device="cuda") -> Callable[[int], tuple]` — wraps `sol_execbench.core.bench.io.gen_inputs`. Validates SOL's pydantic `Definition` + `Workload` models **once** at build time so the per-seed call only pays the RNG reset (`set_seed(seed)`) plus input generation. Lazy-imports torch + sol_execbench so the module stays importable without the GPU stack.
-
-`_problem_to_sol_dict` / `_workload_to_sol_dict` shim ACTS's hand-written dataclasses into SOL's pydantic shape; the "adopt SOL pydantic end-to-end" cleanup is tracked as a Deferred Improvement in PROCESS.md.
+- `build_input_generator(definition, workload, *, device="cuda", blob_roots: list[Path] | None = None) -> Callable[[int], tuple]` — wraps `sol_execbench.core.bench.io.gen_inputs`. Per-seed call resets RNG (`set_seed(seed)`) and generates fresh inputs. `blob_roots` is forwarded to `sol_execbench.core.bench.io.load_safetensors` when the workload declares any `SafetensorsInput` — blobs are resolved against the roots in order (first existing match wins) and loaded **once at build time**, so the on-disk read is excluded from the per-seed (and therefore per-iter) timing path. Torch and sol_execbench are lazy-imported so the module remains importable without the GPU stack.
+- `allocate_dps_outputs(definition, workload, *, device="cuda") -> list` — pre-allocates DPS output buffers for `kernel_fn(*inputs, *outputs)` calls. Resolves the workload's axes against the definition once (`definition.get_resolved_axes_values(workload.axes)`), then delegates to `sol_execbench.core.bench.io.allocate_outputs`. Single source of truth for the DPS allocation shape — used by the correctness gate (`maybe_wrap_dps_candidate`), the benchmark loop, and the `_profiler_driver` NCU subprocess.
 
 ## Profiler — `profiler.py`
 
@@ -226,9 +253,13 @@ Drives SOLAR via its published Python API (no subprocess) in four stages:
 
 ### Classification helpers
 
-- `classify_bottleneck(arithmetic_intensity, ridge_point) -> BottleneckType` — shared band (BALANCED within a narrow ratio of the ridge, otherwise MEMORY_BOUND / COMPUTE_BOUND). Every classifier funnels through this so the threshold can't drift between callers.
-- `classify_run(hardware, roofline, baseline_spec) -> BottleneckType` — once-per-run classification consumed by retriever / planner / reviewer. Prefers the baseline's shape-derived AI when available; otherwise uses the roofline's AI. Called once by the orchestrator right after roofline resolution.
-- `classify_workload(problem, workload, hardware) -> BottleneckType` — per-workload classification for Phase C's `OptimizationReport.winner_per_workload_bottlenecks`. Derives `(flops, nbytes)` from `compute_roofline_inputs` and feeds `classify_bottleneck`. Raises `ValueError` on no-formula ops or zero-peak hardware.
+SOLAR is the sole bottleneck source post-2026-04-28 (see JOURNAL "SOLAR as sole bottleneck source"). The analytical band classifier remains as a fallback for `compute_roofline()` when SOLAR is unavailable, but is never the per-workload classifier in production.
+
+- `classify_bottleneck(arithmetic_intensity, ridge_point) -> BottleneckType` — shared band (BALANCED within a narrow ratio of the ridge, otherwise MEMORY_BOUND / COMPUTE_BOUND). Used inside `compute_roofline()`'s no-SOLAR fallback path so the threshold can't drift.
+- `classify_run(hardware, roofline, baseline_spec) -> BottleneckType` — once-per-run classification consumed by retriever / planner / reviewer. Returns `roofline.bottleneck` verbatim when a `RooflineResult` is provided (SOLAR is authoritative); otherwise falls back to `compute_roofline(baseline_spec, hardware)`. Called once by the orchestrator right after roofline resolution.
+- Per-workload classification — `report.py::generate_report` calls `derive_t_sol_from_solar` once per selected workload and reads `RooflineResult.bottleneck`. Workloads where SOLAR is unavailable or returns `None` are omitted from `OptimizationReport.winner_per_workload_bottlenecks` rather than fall back to the analytical classifier (the omission is the signal "SOLAR couldn't classify this one"; the analytical formula's per-dtype peak limitation made it the wrong fallback for tensor-core workloads anyway).
+
+`compute_roofline_inputs(definition, workload) -> (flops, nbytes)` in `src/benchmark/roofline_shapes.py` is **only** used to feed `_compute_analytical`'s arithmetic-intensity / %peak math at the two `profile_kernel` call sites (orchestrator per-iter + report.py Phase C re-profile). It is **not** used for bottleneck classification. The function's docstring lists the authoritative call sites; a third call site likely indicates a regression that re-routed bottleneck classification away from SOLAR.
 
 ## SOL Score — `scorer.py`
 

@@ -37,7 +37,7 @@ Fans out each call to two sinks:
 Contract:
 
 - `kind` must be in `CORE_EVENT_KINDS`; other kinds log a warning and are still written (schema drift stays visible, never silent).
-- `iter` is an explicit keyword. It appears on per-iteration events (`iter_start`, `planner_selected`, `planner_failed`, `coder_submitted`, `coder_failed`, `bench_done`, `profile_done`, `score_computed`, `reviewer_feedback`, `reviewer_metric_query`, `branch_dead_end`, `iter_end`) and is `None` on run-scope events (`run_start`, `baseline_*`, `verify_*`, `run_end`).
+- `iter` is an explicit keyword. It appears on per-iteration events (`iter_start`, `planner_selected`, `planner_failed`, `coder_submitted`, `coder_failed`, `bench_done`, `profile_done`, `score_computed`, `reviewer_feedback`, `reviewer_metric_query`, `branch_dead_end`, `iter_end`, `trace_emitted`, `reward_hack_detected`, `reward_hack_confirmed`, `reward_hack_cleared`, `calibration_warning`) and is `None` on run-scope events (`run_start`, `baseline_*`, `verify_*`, `run_end`, `clock_lock_unavailable`, `clock_drift_detected`).
 - **Never raises.** Serialization failures are caught and logged; file-handle errors during write do not propagate.
 - Skips serialization entirely when `logger.isEnabledFor(INFO)` is false — cheap to leave in hot paths.
 - All additional `**fields` are merged flat into the JSON object. Use `finite_or_none(x)` on any float that could be `inf`/`nan` (e.g. latency after a failed bench) so JSON stays valid.
@@ -52,11 +52,21 @@ Module-level handle registration, guarded by `_lock`. `RunContext.create` calls 
 
 ### Event catalog — `CORE_EVENT_KINDS`
 
-Frozenset of 20 kinds:
+Frozenset of 27 kinds:
 
-**Run scope** — `run_start`, `baseline_attempt`, `baseline_success`, `baseline_failure`, `baseline_ready`, `verify_start`, `verify_done`, `run_end`.
+**Run scope** — `run_start`, `baseline_attempt`, `baseline_success`, `baseline_failure`, `baseline_ready`, `verify_start`, `verify_done`, `run_end`, `clock_lock_unavailable`, `clock_drift_detected`.
 
-**Per-iteration** — `iter_start`, `planner_selected`, `planner_failed`, `coder_submitted`, `coder_failed`, `bench_done`, `profile_done`, `score_computed`, `reviewer_feedback`, `reviewer_metric_query`, `branch_dead_end`, `iter_end`.
+**Per-iteration** — `iter_start`, `planner_selected`, `planner_failed`, `coder_submitted`, `coder_failed`, `bench_done`, `profile_done`, `score_computed`, `reviewer_feedback`, `reviewer_metric_query`, `branch_dead_end`, `iter_end`, `trace_emitted`, `reward_hack_detected`, `reward_hack_confirmed`, `reward_hack_cleared`, `calibration_warning`.
+
+**SOL integration sub-grouping** (added 2026-04-27, distributed across the two scopes above):
+
+- `trace_emitted` (per-iter) — fired once per evaluation with the SOL `Trace` payload (Tier 1).
+- `clock_lock_unavailable` (run-scope) — clock-lock setup failed at run start; emitted once.
+- `clock_drift_detected` (run-scope) — clock drift observed during the run; emitted once.
+- `reward_hack_detected` (per-iter) — channel A: process-level detector raised inside the eval block → branch DEAD_END.
+- `reward_hack_confirmed` (per-iter) — channel B confirm: sol_score's `reward_hack_suspect` re-eval reproduced the anomaly → branch DEAD_END.
+- `reward_hack_cleared` (per-iter) — channel B clear: sol_score's `reward_hack_suspect` re-eval did not reproduce → score accepted.
+- `calibration_warning` (per-iter) — fires when sol_score's `calibration_warning` bit is set (T_k near or below the ~T_SOL margin).
 
 Notable semantics:
 
@@ -66,6 +76,22 @@ Notable semantics:
 - `planner_failed`: any `PlanningError` cause — turn-budget exhaustion, missing `submit_plan` call, transient retry exhaustion, or the available-actions guard rejecting an unknown technique. Carries `iter` and `reason` (truncated exception string ≤ 200 chars). Always followed by `iter_end(outcome="skipped")`; no tree mutation occurs on this path.
 - `reviewer_metric_query`: emitted by the Reviewer's `query_metric` tool body each time the LLM invokes it during a multi-turn review. Carries `iter` (orchestrator iteration index), `count` (number of names in the query), and `names` (list of the first 8 names from the query, capped to keep `events.jsonl` lines bounded). Emission is gated on `ACTSConfig.reviewer_metric_queries=True`. Records what the Reviewer LLM asked for via the `query_metric` tool — useful post-run for analyzing whether the multi-turn capability is being exercised and on what metrics.
 - `iter_end.outcome` is exactly one of three constants: `ITER_ADVANCED` (`"advanced"`), `ITER_DEAD_END` (`"dead_end"`), `ITER_SKIPPED` (`"skipped"`). `skipped` fires only after either `coder_failed` or `planner_failed` and implies no tree mutation.
+
+### Dead-end reasons
+
+The `branch_dead_end` event's `reason` field is constrained to a fixed set of string constants exported from `events.py`. Telemetry consumers (log parsers, regression tests) key on these strings — they are kept stable. Dynamic detail (which CUDA error message, which exception text) goes into the separate `detail` payload field, not concatenated into `reason`.
+
+Constants:
+
+- `DEAD_REWARD_HACK` (`"reward_hack"`) — channel A process-level reward-hack detector tripped.
+- `DEAD_REWARD_HACK_CONFIRMED` (`"reward_hack_confirmed"`) — channel B re-eval confirmed sol_score's `reward_hack_suspect`.
+- `DEAD_CUDA_ERROR` (`"cuda_error"`) — CUDA runtime error during evaluation.
+- `DEAD_PROFILER_ERROR` (`"profiler_error"`) — profiler subprocess or NCU failure.
+- `DEAD_BENCH_FAILURE` (`"bench_failure"`) — benchmark run did not produce a usable measurement.
+- `DEAD_REPR_LATENCY_UNAVAILABLE` (`"repr_workload_latency_unavailable"`) — representative-workload latency missing/non-finite (sol_score input incomplete).
+- `DEAD_AGENT_FAILURE` (`"agent_failure"`) — agent-side error not covered by the more specific buckets above.
+
+`DEAD_REASONS` (frozenset) mirrors `CORE_EVENT_KINDS`'s validation pattern. The orchestrator's `_emit_dead_end` helper validates the `reason` argument against `DEAD_REASONS` and warns (does not raise) on unknown values — schema drift stays visible without aborting the run, matching `emit()`'s unknown-kind policy.
 
 ## `run_context.py`
 
