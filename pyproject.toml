@@ -6,12 +6,23 @@ build-backend = "setuptools.build_meta"
 name = "acts-kernel-agent"
 version = "0.1.0"
 description = "LLM-driven GPU kernel optimization via tree search, multi-agent coordination, and persistent optimization memory"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
+# SOL-ExecBench is a hard runtime dependency: ACTS uses sol_execbench
+# pydantic schemas (Definition / Workload / ToleranceSpec) as its core data
+# model, plus gen_inputs / compute_error_stats / do_bench / reward_hack for
+# correctness, timing, and Tier 4 anti-cheat. It is *not* installable from
+# PyPI in this project's setup — it is installed editable from a local path
+# with --no-deps to avoid SOL's CUDA-13-only deps. See configs/venvs/3.12.md
+# for the canonical recipe (uv venv + cu128 torch + editable SOL install).
+# The `sol` extra below is metadata-only — surface in pyproject for
+# discoverability; actual install is `uv pip install -e <SOL path> --no-deps`.
 dependencies = [
-    "triton>=2.2.0",
-    "torch>=2.1.0",
+    "triton>=3.0.0",
+    "torch>=2.10",
     "openai-agents>=0.1.0",
     "pyyaml>=6.0",
+    "pydantic>=2.0",
+    "safetensors>=0.4",
 ]
 
 [project.optional-dependencies]
@@ -19,14 +30,12 @@ dev = [
     "pytest>=7.0",
     "pytest-asyncio>=0.21",
 ]
-# SOL-ExecBench integration. Installed from repo/benchmark/SOL-ExecBench
-# in dev. Provides Definition / Workload / ToleranceSpec schemas,
-# gen_inputs, and compute_error_stats used by the correctness gate.
-# Kept optional because SOL requires Python 3.12+ / torch 2.10+, which
-# exceeds this project's declared requires-python and torch floors —
-# correctness.py falls back to a local torch.allclose path when absent.
+# Marker extra for SOL-ExecBench. Not resolvable from PyPI — install via:
+#   uv pip install -e /path/to/SOL-ExecBench --no-deps
+# (see configs/venvs/3.12.md). Listed here so `pip show` / metadata tools
+# surface SOL as a declared component rather than a hidden import.
 sol = [
-    "sol-execbench>=1.0.0",
+    "sol-execbench",
 ]
 
 [tool.setuptools.packages.find]
