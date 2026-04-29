@@ -40,6 +40,24 @@ CORE_EVENT_KINDS: frozenset[str] = frozenset({
     "reviewer_metric_query",
     "branch_dead_end", "iter_end", "verify_start",
     "verify_done", "run_end",
+    # SOL integration (2026-04-27) — Tier 1 Trace + Tier 4 anti-cheat /
+    # clock-lock observability. ``trace_emitted`` is fired once per
+    # evaluation with the SOL ``Trace`` payload. The ``reward_hack_*``
+    # triplet covers the two-channel detector flow:
+    #   channel A — process-level detector raised inside the eval block
+    #     → ``reward_hack_detected`` (branch DEAD_END);
+    #   channel B — sol_score flagged ``reward_hack_suspect`` and the
+    #     re-eval was either confirmed (``reward_hack_confirmed`` →
+    #     DEAD_END) or cleared (``reward_hack_cleared`` → accept score).
+    # ``calibration_warning`` fires when sol_score's ``calibration_warning``
+    # bit is set (T_k < ~T_SOL margin).
+    "trace_emitted",
+    "clock_lock_unavailable",
+    "clock_drift_detected",
+    "reward_hack_detected",
+    "reward_hack_confirmed",
+    "reward_hack_cleared",
+    "calibration_warning",
 })
 
 # ``iter_end.outcome`` values. Kept as string constants (not an enum) so
@@ -49,6 +67,24 @@ CORE_EVENT_KINDS: frozenset[str] = frozenset({
 ITER_ADVANCED = "advanced"
 ITER_DEAD_END = "dead_end"
 ITER_SKIPPED = "skipped"
+
+# Reason codes for the ``branch_dead_end`` event. Telemetry consumers
+# (log parsers, regression tests) key on these strings — keep them stable.
+# Dynamic detail (which CUDA error message, which exception text) goes into
+# the separate ``detail`` payload field, not concatenated into the reason.
+DEAD_REWARD_HACK = "reward_hack"
+DEAD_REWARD_HACK_CONFIRMED = "reward_hack_confirmed"
+DEAD_CUDA_ERROR = "cuda_error"
+DEAD_PROFILER_ERROR = "profiler_error"
+DEAD_BENCH_FAILURE = "bench_failure"
+DEAD_REPR_LATENCY_UNAVAILABLE = "repr_workload_latency_unavailable"
+DEAD_AGENT_FAILURE = "agent_failure"
+
+DEAD_REASONS: frozenset[str] = frozenset({
+    DEAD_REWARD_HACK, DEAD_REWARD_HACK_CONFIRMED, DEAD_CUDA_ERROR,
+    DEAD_PROFILER_ERROR, DEAD_BENCH_FAILURE, DEAD_REPR_LATENCY_UNAVAILABLE,
+    DEAD_AGENT_FAILURE,
+})
 
 _events_fh: IO[str] | None = None
 _lock = threading.Lock()

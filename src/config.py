@@ -126,6 +126,33 @@ class ACTSConfig:
     hardware: HardwareSpec = field(default_factory=HardwareSpec)
     arch_config_path: str = ""  # Path to SOLAR arch YAML (e.g. "configs/arch/H100_PCIe.yaml")
 
+    # Override default safetensors blob_roots ([problem_path]) for safetensors
+    # loading. Useful when blobs live outside the problem directory (e.g.
+    # shared model-weight staging area). When None, _load_problem falls back
+    # to ``[problem_path]`` so the in-tree fixture layout works unchanged.
+    safetensors_blob_roots: list[Path] | None = None
+
+    # SOL integration (2026-04-27)
+    # ──────────────────────────────────────────────────────────────────
+    # ``benchmark_adapter`` overrides ``_load_problem`` auto-detection.
+    # Values: "sol_execbench" (presence of ``definition.json`` triggers
+    # this implicitly), "kernelbench" (NotImplementedError until that
+    # adapter ships). When None, the dispatcher inspects the problem
+    # directory and picks an adapter or raises ``UnknownBenchmarkFormat``.
+    benchmark_adapter: str | None = None
+
+    # Names of methods/functions on ``torch.cuda.Event`` whose ``id()`` is
+    # snapshotted on entry to ``per_iter_anti_cheat`` and re-checked on
+    # exit. A monkey-patch substitution between snapshot and check raises
+    # ``RewardHackDetected`` and the orchestrator marks the branch DEAD_END.
+    # Default covers the timing primitives a candidate would need to patch
+    # to fake faster-than-SOL latencies.
+    anti_cheat_critical_names: list[str] = field(
+        default_factory=lambda: [
+            "elapsed_time", "synchronize", "wait", "record", "query",
+        ]
+    )
+
 
 def load_config(path: Path) -> ACTSConfig:
     """Load ACTSConfig from a .cfg file via configparser.

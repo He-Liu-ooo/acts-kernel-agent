@@ -17,7 +17,7 @@ import pytest
 
 from src.config import ACTSConfig, HardwareSpec
 from src.kernels.kernel import Kernel, KernelSpec, KernelType
-from src.pipeline.optimize import _load_sol_execbench, optimize
+from src.pipeline.optimize import _load_problem, optimize
 
 
 def _spec() -> KernelSpec:
@@ -30,27 +30,43 @@ def _spec() -> KernelSpec:
 
 
 @pytest.mark.asyncio
-async def test_load_sol_execbench_returns_reference_fn_and_all_generators():
+async def test_load_problem_returns_reference_fn_and_all_generators():
     """Phase A must return a reference_fn and one generator per selected workload
     so Phase B's correctness tool binds to the full coverage set. Collapsing to
     just workloads[0] lets kernels that pass workload 1 but break 2..N slip through."""
-    from src.benchmark.problem import Problem, Workload
+    from sol_execbench.core.data import Definition, Workload
 
-    problem = Problem(
-        name="p", axes={}, inputs={}, outputs={},
-        reference_source="def run(x): return x * 2.0\n",
-        op_type="elementwise",
-    )
-    workloads = [Workload(uuid=f"wl-{i}", axes={}, inputs={}) for i in range(3)]
+    definition = Definition.model_validate({
+        "name": "p",
+        "axes": {"N": {"type": "var"}},
+        "inputs": {"x": {"shape": ["N"], "dtype": "float32"}},
+        "outputs": {"y": {"shape": ["N"], "dtype": "float32"}},
+        "reference": "def run(x): return x * 2.0\n",
+        "op_type": "elementwise",
+    })
+    workloads = [
+        Workload.model_validate({"uuid": f"wl-{i}", "axes": {"N": 8}, "inputs": {}})
+        for i in range(3)
+    ]
     spec = _spec()
     baseline = Kernel(spec=spec, source_code="src")
 
     ref_fn = lambda x: x * 2.0
     gens = [lambda seed, i=i: (i, seed) for i in range(3)]
 
+    # Explicit ``benchmark_adapter="sol_execbench"`` so the dispatcher
+    # routes to the SOL adapter without needing a real definition.json
+    # on disk (path is /fake).
+    config = ACTSConfig(benchmark_adapter="sol_execbench")
+
     with (
-        patch("src.benchmark.problem_loader.load_problem", return_value=problem),
-        patch("src.benchmark.problem_loader.problem_to_kernel_spec", return_value=spec),
+        patch(
+            "src.benchmarks.sol_execbench.load",
+            return_value=(definition, workloads),
+        ),
+        patch(
+            "src.pipeline.optimize._definition_to_kernel_spec", return_value=spec,
+        ),
         patch("src.benchmark.workload_selector.select_workloads", return_value=workloads),
         patch("src.eval.roofline.derive_t_sol_from_solar", return_value=None),
         patch(
@@ -61,47 +77,62 @@ async def test_load_sol_execbench_returns_reference_fn_and_all_generators():
         patch("src.eval.inputs.build_reference_fn", return_value=ref_fn),
         patch("src.eval.inputs.build_input_generator", side_effect=gens),
     ):
-        result = await _load_sol_execbench(Path("/fake"), ACTSConfig(), MagicMock())
+        result = await _load_problem(Path("/fake"), config, MagicMock())
 
-    # Expect 6-tuple: (baseline, problem, workloads, roofline, reference_fn, input_generators)
-    assert len(result) == 6
-    _baseline, _problem, _workloads, _roofline, got_ref, got_gens = result
+    # Expect 7-tuple: (baseline, definition, workloads, roofline,
+    #                   reference_fn, input_generators, definition_path)
+    assert len(result) == 7
+    (
+        _baseline, _definition, _workloads, _roofline,
+        got_ref, got_gens, _definition_path,
+    ) = result
     assert got_ref is ref_fn
     assert got_gens == gens  # all three, in workload order
 
 
 @pytest.mark.asyncio
-async def test_load_sol_execbench_forwards_arch_config_path_to_solar():
+async def test_load_problem_forwards_arch_config_path_to_solar():
     """Regression for the silent-arch-fallback bug: when the user configures
     ``[hardware] arch_config_path`` (i.e. ``ACTSConfig.arch_config_path`` is
     non-empty), Phase A must forward that path into the SOLAR adapter as
     ``arch_yaml_path``. Otherwise the adapter falls back to name-based
     lookup and lands on H100_PCIe for any unrecognized hardware name —
     silently corrupting T_SOL / sol_score for the entire run."""
-    from src.benchmark.problem import Problem, Workload
+    from sol_execbench.core.data import Definition, Workload
 
-    problem = Problem(
-        name="p", axes={}, inputs={}, outputs={},
-        reference_source="def run(x): return x\n",
-    )
-    workloads = [Workload(uuid="w1", axes={}, inputs={})]
+    definition = Definition.model_validate({
+        "name": "p",
+        "axes": {"N": {"type": "var"}},
+        "inputs": {"x": {"shape": ["N"], "dtype": "float32"}},
+        "outputs": {"y": {"shape": ["N"], "dtype": "float32"}},
+        "reference": "def run(x): return x\n",
+    })
+    workloads = [
+        Workload.model_validate({"uuid": "w1", "axes": {"N": 8}, "inputs": {}})
+    ]
     spec = _spec()
     baseline = Kernel(spec=spec, source_code="src")
 
     config = ACTSConfig(
         hardware=HardwareSpec(name="some_custom_gpu"),
         arch_config_path="/some/custom/arch.yaml",
+        benchmark_adapter="sol_execbench",
     )
 
     captured: dict = {}
 
-    def _capture(problem_, workload_, hardware_, arch_yaml_path=None):
+    def _capture(definition_, workload_, hardware_, arch_yaml_path=None):
         captured["arch_yaml_path"] = arch_yaml_path
         return None
 
     with (
-        patch("src.benchmark.problem_loader.load_problem", return_value=problem),
-        patch("src.benchmark.problem_loader.problem_to_kernel_spec", return_value=spec),
+        patch(
+            "src.benchmarks.sol_execbench.load",
+            return_value=(definition, workloads),
+        ),
+        patch(
+            "src.pipeline.optimize._definition_to_kernel_spec", return_value=spec,
+        ),
         patch("src.benchmark.workload_selector.select_workloads", return_value=workloads),
         patch("src.eval.roofline.derive_t_sol_from_solar", side_effect=_capture),
         patch(
@@ -112,35 +143,45 @@ async def test_load_sol_execbench_forwards_arch_config_path_to_solar():
         patch("src.eval.inputs.build_reference_fn", return_value=lambda x: x),
         patch("src.eval.inputs.build_input_generator", return_value=lambda s: ()),
     ):
-        await _load_sol_execbench(Path("/fake"), config, MagicMock())
+        await _load_problem(Path("/fake"), config, MagicMock())
 
     assert captured["arch_yaml_path"] == Path("/some/custom/arch.yaml")
 
 
 @pytest.mark.asyncio
-async def test_load_sol_execbench_passes_none_when_arch_config_path_empty():
+async def test_load_problem_passes_none_when_arch_config_path_empty():
     """When ``arch_config_path`` is empty (the default), Phase A passes
     ``arch_yaml_path=None`` and the adapter resolves by name. This keeps
     the runtime-detected hardware path working without a config file."""
-    from src.benchmark.problem import Problem, Workload
+    from sol_execbench.core.data import Definition, Workload
 
-    problem = Problem(
-        name="p", axes={}, inputs={}, outputs={},
-        reference_source="def run(x): return x\n",
-    )
-    workloads = [Workload(uuid="w1", axes={}, inputs={})]
+    definition = Definition.model_validate({
+        "name": "p",
+        "axes": {"N": {"type": "var"}},
+        "inputs": {"x": {"shape": ["N"], "dtype": "float32"}},
+        "outputs": {"y": {"shape": ["N"], "dtype": "float32"}},
+        "reference": "def run(x): return x\n",
+    })
+    workloads = [
+        Workload.model_validate({"uuid": "w1", "axes": {"N": 8}, "inputs": {}})
+    ]
     spec = _spec()
     baseline = Kernel(spec=spec, source_code="src")
 
     captured: dict = {}
 
-    def _capture(problem_, workload_, hardware_, arch_yaml_path=None):
+    def _capture(definition_, workload_, hardware_, arch_yaml_path=None):
         captured["arch_yaml_path"] = arch_yaml_path
         return None
 
     with (
-        patch("src.benchmark.problem_loader.load_problem", return_value=problem),
-        patch("src.benchmark.problem_loader.problem_to_kernel_spec", return_value=spec),
+        patch(
+            "src.benchmarks.sol_execbench.load",
+            return_value=(definition, workloads),
+        ),
+        patch(
+            "src.pipeline.optimize._definition_to_kernel_spec", return_value=spec,
+        ),
         patch("src.benchmark.workload_selector.select_workloads", return_value=workloads),
         patch("src.eval.roofline.derive_t_sol_from_solar", side_effect=_capture),
         patch(
@@ -151,7 +192,11 @@ async def test_load_sol_execbench_passes_none_when_arch_config_path_empty():
         patch("src.eval.inputs.build_reference_fn", return_value=lambda x: x),
         patch("src.eval.inputs.build_input_generator", return_value=lambda s: ()),
     ):
-        await _load_sol_execbench(Path("/fake"), ACTSConfig(), MagicMock())
+        await _load_problem(
+            Path("/fake"),
+            ACTSConfig(benchmark_adapter="sol_execbench"),
+            MagicMock(),
+        )
 
     assert captured["arch_yaml_path"] is None
 
@@ -178,6 +223,7 @@ async def test_optimize_forwards_correctness_context_to_orchestrator():
         patch(
             "src.kernels.starters.matmul.make_matmul_kernel", return_value=baseline,
         ),
+        patch("src.pipeline.report.generate_report", return_value=MagicMock()),
     ):
         await optimize("placeholder")
 
@@ -188,19 +234,23 @@ async def test_optimize_forwards_correctness_context_to_orchestrator():
     assert kwargs["input_generators"] == []
 
     # SOL-ExecBench path: reference_fn and the full generator list come back
-    # from _load_sol_execbench and reach Orchestrator.run as kwargs.
+    # from _load_problem and reach Orchestrator.run as kwargs.
     fake_orch.run.reset_mock()
     with (
         patch("src.pipeline.optimize._load_model_if_configured", return_value=None),
         patch("src.search.orchestrator.Orchestrator", return_value=fake_orch),
         patch("src.memory.store.MemoryStore", return_value=store_instance),
         patch(
-            "src.pipeline.optimize._load_sol_execbench",
+            "src.pipeline.optimize._load_problem",
             new_callable=AsyncMock,
-            return_value=(baseline, MagicMock(), [MagicMock()] * 3, None, ref_fn, gens),
+            return_value=(
+                baseline, MagicMock(), [MagicMock()] * 3, None,
+                ref_fn, gens, Path("/fake/definition.json"),
+            ),
         ),
         patch("pathlib.Path.is_dir", return_value=True),
         patch.object(Path, "exists", autospec=True, return_value=True),
+        patch("src.pipeline.report.generate_report", return_value=MagicMock()),
     ):
         await optimize("/fake/problem")
 
@@ -365,7 +415,7 @@ def test_main_defaults_to_placeholder_when_no_arg(tmp_path, monkeypatch):
 
     async def fake_optimize(problem_path, config=None):
         captured["problem_path"] = problem_path
-        return MagicMock()
+        return MagicMock(), MagicMock()
 
     with (
         patch.object(opt_mod, "optimize", side_effect=fake_optimize),
@@ -387,7 +437,7 @@ def test_main_forwards_problem_path_to_optimize(tmp_path, monkeypatch):
 
     async def fake_optimize(problem_path, config=None):
         captured["problem_path"] = problem_path
-        return MagicMock()
+        return MagicMock(), MagicMock()
 
     with (
         patch.object(opt_mod, "optimize", side_effect=fake_optimize),
@@ -410,7 +460,7 @@ def test_main_creates_run_dir(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
 
     async def fake_optimize(problem_path, config=None):
-        return MagicMock()
+        return MagicMock(), MagicMock()
 
     with (
         patch.object(opt_mod, "optimize", side_effect=fake_optimize),
@@ -438,7 +488,7 @@ def test_main_trace_dir_defaults_under_run_dir(tmp_path, monkeypatch):
     fake_processor.path = tmp_path / "some" / "trace.jsonl"
 
     async def fake_optimize(problem_path, config=None):
-        return MagicMock()
+        return MagicMock(), MagicMock()
 
     with (
         patch.object(opt_mod, "optimize", side_effect=fake_optimize),
@@ -489,7 +539,7 @@ def test_main_emits_run_start_and_run_end(tmp_path, monkeypatch):
     )
 
     async def fake_optimize(problem_path, config=None):
-        return fake_result
+        return fake_result, MagicMock()
 
     with (
         patch.object(opt_mod, "optimize", side_effect=fake_optimize),
@@ -557,7 +607,7 @@ def test_main_explicit_trace_dir_override(tmp_path, monkeypatch):
     fake_processor.path = external / "trace.jsonl"
 
     async def fake_optimize(problem_path, config=None):
-        return MagicMock()
+        return MagicMock(), MagicMock()
 
     with (
         patch.object(opt_mod, "optimize", side_effect=fake_optimize),
@@ -593,7 +643,7 @@ def test_main_enables_trace_capture_when_sdk_available(tmp_path, monkeypatch):
     fake_processor.path = tmp_path / "trace.jsonl"
 
     async def fake_optimize(problem_path, config=None):
-        return MagicMock()
+        return MagicMock(), MagicMock()
 
     with (
         patch.object(opt_mod, "optimize", side_effect=fake_optimize),
@@ -619,7 +669,7 @@ def test_main_skips_trace_capture_when_sdk_absent(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
 
     async def fake_optimize(problem_path, config=None):
-        return MagicMock()
+        return MagicMock(), MagicMock()
 
     with (
         patch.object(opt_mod, "optimize", side_effect=fake_optimize),
@@ -642,7 +692,7 @@ def test_main_skips_trace_capture_when_disabled_explicitly(tmp_path, monkeypatch
     monkeypatch.chdir(tmp_path)
 
     async def fake_optimize(problem_path, config=None):
-        return MagicMock()
+        return MagicMock(), MagicMock()
 
     with (
         patch.object(opt_mod, "optimize", side_effect=fake_optimize),
@@ -666,7 +716,7 @@ def test_main_completes_run_even_if_trace_setup_raises(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
 
     async def fake_optimize(problem_path, config=None):
-        return MagicMock()
+        return MagicMock(), MagicMock()
 
     with (
         patch.object(opt_mod, "optimize", side_effect=fake_optimize),
@@ -701,3 +751,205 @@ async def test_placeholder_mode_never_loads_model():
         await optimize("placeholder")
 
     mock_load_model.assert_not_called()
+
+
+# ── SOL integration: import-order, clock-lock, adapter dispatch ───────
+
+
+def test_import_order_contract_sol_first():
+    """``import sol_execbench`` must be the first non-stdlib import in
+    ``pipeline/optimize.py``. SOL's ``core.bench.reward_hack`` snapshots
+    ``torch.cuda.Event.elapsed_time`` at module load — any user-supplied
+    torch import landing first would let the snapshot capture a tampered
+    address.
+
+    We verify this by reading the source: the first non-stdlib ``import``
+    line (after the docstring) must reference ``sol_execbench``.
+    """
+    from src.pipeline import optimize as opt_mod
+
+    src = Path(opt_mod.__file__).read_text()
+    # Use the AST so docstrings, multi-line strings, and conditional
+    # blocks can't trip the parser. Walk top-level body in order; first
+    # ``Import`` / ``ImportFrom`` whose top-level package is not stdlib
+    # must be sol_execbench.
+    import ast
+    import sys
+
+    stdlib = set(sys.stdlib_module_names) | {"__future__"}
+    tree = ast.parse(src)
+    found_third_party = None
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            mod = node.names[0].name.split(".")[0]
+        elif isinstance(node, ast.ImportFrom):
+            if node.level > 0 or node.module is None:
+                continue
+            mod = node.module.split(".")[0]
+        else:
+            continue
+        if mod in stdlib:
+            continue
+        found_third_party = mod
+        break
+    assert found_third_party == "sol_execbench", (
+        f"first non-stdlib import must be sol_execbench, got {found_third_party!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_load_problem_dispatches_to_sol_when_definition_present(tmp_path):
+    """When ``definition.json`` exists in the problem dir, the dispatcher
+    routes to the SOL adapter without needing ``benchmark_adapter`` set."""
+    from src.pipeline.optimize import _load_problem
+
+    (tmp_path / "definition.json").write_text("{}")  # presence-only check
+    captured: dict = {}
+
+    async def fake_sol_loader(problem_dir, config, coder):
+        captured["called"] = problem_dir
+        return ("sentinel-tuple",)
+
+    with patch(
+        "src.pipeline.optimize._load_sol_problem", side_effect=fake_sol_loader,
+    ):
+        result = await _load_problem(tmp_path, ACTSConfig(), MagicMock())
+
+    assert result == ("sentinel-tuple",)
+    assert captured["called"] == tmp_path
+
+
+@pytest.mark.asyncio
+async def test_load_problem_raises_unknown_format_when_no_markers(tmp_path):
+    """Empty directory → no definition.json, no model.py → raises
+    ``UnknownBenchmarkFormat`` with a useful message."""
+    from src.pipeline.optimize import UnknownBenchmarkFormat, _load_problem
+
+    with pytest.raises(UnknownBenchmarkFormat, match="Cannot determine"):
+        await _load_problem(tmp_path, ACTSConfig(), MagicMock())
+
+
+@pytest.mark.asyncio
+async def test_load_problem_raises_on_unknown_adapter_value():
+    """Explicit override with a typo → ``UnknownBenchmarkFormat``."""
+    from src.pipeline.optimize import UnknownBenchmarkFormat, _load_problem
+
+    config = ACTSConfig(benchmark_adapter="kerneblench-typo")
+    with pytest.raises(UnknownBenchmarkFormat, match="Unknown benchmark_adapter"):
+        await _load_problem(Path("/fake"), config, MagicMock())
+
+
+@pytest.mark.asyncio
+async def test_load_problem_kernelbench_not_implemented():
+    """Setting ``benchmark_adapter='kernelbench'`` raises NotImplementedError."""
+    from src.pipeline.optimize import _load_problem
+
+    config = ACTSConfig(benchmark_adapter="kernelbench")
+    with pytest.raises(NotImplementedError):
+        await _load_problem(Path("/fake"), config, MagicMock())
+
+
+def test_main_emits_clock_lock_unavailable_when_probe_fails(tmp_path, monkeypatch):
+    """When ``probe_clock_lock_available()`` returns False (no sudo or
+    unsupported GPU), ``main()`` must log a warning and emit a
+    ``clock_lock_unavailable`` event so post-run analysis sees the lack
+    of timing isolation."""
+    import json
+
+    from src.pipeline import optimize as opt_mod
+
+    monkeypatch.chdir(tmp_path)
+
+    async def fake_optimize(problem_path, config=None):
+        return MagicMock(), MagicMock()
+
+    with (
+        patch.object(opt_mod, "optimize", side_effect=fake_optimize),
+        patch("src.agents.llm_backend._SDK_AVAILABLE", False),
+        patch.object(opt_mod, "probe_clock_lock_available", return_value=False),
+        patch.object(opt_mod, "lock_clocks") as mock_lock,
+        patch("src.pipeline.report.generate_report", return_value=MagicMock()),
+        patch("src.pipeline.report.render_report", return_value=""),
+    ):
+        opt_mod.main(["placeholder", "--run-dir", str(tmp_path / "runs")])
+
+    # lock_clocks must NOT be called when the probe fails.
+    mock_lock.assert_not_called()
+    rd = next((tmp_path / "runs").glob("run_*"))
+    lines = [
+        json.loads(line)
+        for line in (rd / "events.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    kinds = [e["kind"] for e in lines]
+    assert "clock_lock_unavailable" in kinds, kinds
+
+
+def test_main_unlocks_clocks_on_normal_exit(tmp_path, monkeypatch):
+    """On normal exit, ``main()`` must call ``unlock_clocks`` exactly once
+    via the ``finally`` path. The atexit registration is a safety net for
+    abnormal exits; the explicit call ensures unlock happens before the
+    interpreter teardown."""
+    from src.pipeline import optimize as opt_mod
+
+    monkeypatch.chdir(tmp_path)
+
+    async def fake_optimize(problem_path, config=None):
+        return MagicMock(), MagicMock()
+
+    with (
+        patch.object(opt_mod, "optimize", side_effect=fake_optimize),
+        patch("src.agents.llm_backend._SDK_AVAILABLE", False),
+        patch.object(opt_mod, "probe_clock_lock_available", return_value=True),
+        patch.object(opt_mod, "lock_clocks", return_value=True),
+        patch.object(opt_mod, "verify_clocks", return_value=True),
+        patch.object(opt_mod, "unlock_clocks") as mock_unlock,
+        patch("src.pipeline.report.generate_report", return_value=MagicMock()),
+        patch("src.pipeline.report.render_report", return_value=""),
+    ):
+        opt_mod.main(["placeholder", "--run-dir", str(tmp_path / "runs")])
+
+    # First call from the explicit ``finally`` block; the atexit-registered
+    # call sees ``locked=False`` (idempotent flag) and no-ops.
+    assert mock_unlock.call_count >= 1
+
+
+def test_main_unlocks_clocks_when_optimize_raises(tmp_path, monkeypatch):
+    """If ``optimize()`` raises, the clock-lock cleanup must still fire so
+    the GPU isn't left pinned across runs."""
+    from src.pipeline import optimize as opt_mod
+
+    monkeypatch.chdir(tmp_path)
+
+    async def raising_optimize(problem_path, config=None):
+        raise RuntimeError("boom")
+
+    with (
+        patch.object(opt_mod, "optimize", side_effect=raising_optimize),
+        patch("src.agents.llm_backend._SDK_AVAILABLE", False),
+        patch.object(opt_mod, "probe_clock_lock_available", return_value=True),
+        patch.object(opt_mod, "lock_clocks", return_value=True),
+        patch.object(opt_mod, "verify_clocks", return_value=True),
+        patch.object(opt_mod, "unlock_clocks") as mock_unlock,
+    ):
+        with pytest.raises(RuntimeError, match="boom"):
+            opt_mod.main(["placeholder", "--run-dir", str(tmp_path / "runs")])
+
+    assert mock_unlock.call_count >= 1
+
+
+def test_unlock_clocks_safe_is_idempotent():
+    """``_unlock_clocks_safe`` swallows exceptions and clears the flag so
+    a second call is a no-op even if unlock_clocks raises on the first."""
+    from src.pipeline import optimize as opt_mod
+
+    opt_mod._clock_lock_state["locked"] = True
+    opt_mod._clock_lock_state["device_name"] = "TestGPU"
+    with patch.object(opt_mod, "unlock_clocks", side_effect=RuntimeError("nope")):
+        # First call: unlock raises but we swallow it; flag is cleared.
+        opt_mod._unlock_clocks_safe()
+    assert opt_mod._clock_lock_state["locked"] is False
+    # Second call: flag cleared, no-op.
+    with patch.object(opt_mod, "unlock_clocks") as mock_unlock:
+        opt_mod._unlock_clocks_safe()
+        mock_unlock.assert_not_called()

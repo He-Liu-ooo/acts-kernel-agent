@@ -15,6 +15,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
 from src.runtime.events import (
+    DEAD_BENCH_FAILURE,
+    DEAD_CUDA_ERROR,
+    DEAD_PROFILER_ERROR,
+    DEAD_REASONS,
+    DEAD_REPR_LATENCY_UNAVAILABLE,
+    DEAD_REWARD_HACK,
+    DEAD_REWARD_HACK_CONFIRMED,
     ITER_ADVANCED,
     ITER_DEAD_END,
     ITER_SKIPPED,
@@ -24,11 +31,37 @@ from src.runtime.events import (
 
 logger = logging.getLogger(__name__)
 
+
+# Sticky-state CUDA error patterns that one ``torch.cuda.synchronize()``
+# can recover from. Anything else (e.g. "operation not implemented for
+# CUDA") propagates so genuine bugs aren't silently treated as transient.
+_CUDA_STICKY_PATTERNS = (
+    "illegal memory access",
+    "device-side assert",
+    "unspecified launch failure",
+    "misaligned address",
+    "out of memory",
+    "cublas",
+    "cudnn",
+)
+
+
+class CUDAContextPoisoned(RuntimeError):
+    """Raised when ``torch.cuda.synchronize()`` fails 3 times in a row.
+
+    The orchestrator catches transient CUDA launch errors and recovers
+    by syncing the device + marking the branch DEAD_END. After 3
+    consecutive sync failures the context is presumed unrecoverable
+    (sticky illegal-memory-access, stream poisoning) and the run is
+    aborted to avoid burning iterations producing meaningless results.
+    """
+
 if TYPE_CHECKING:
+    from sol_execbench.core.data import Definition, Workload
+
     from src.agents.coder import CoderAgent
     from src.agents.reviewer import ReviewerAgent
     from src.agents.planner import PlannerAgent
-    from src.benchmark.problem import Problem, Workload
     from src.config import ACTSConfig
     from src.eval.roofline import RooflineResult
     from src.eval.types import BottleneckType
@@ -131,8 +164,20 @@ def _per_workload_us(bench) -> list[float | None]:
     return [finite_or_none(v) for v in bench.per_workload_latency_us.values()]
 
 
-def _emit_dead_end(iter_no: int, reason: str) -> None:
-    emit("branch_dead_end", iter=iter_no, reason=reason)
+def _emit_dead_end(iter_no: int, reason: str, *, detail: str | None = None) -> None:
+    """Fire ``branch_dead_end`` + ``iter_end`` for a DEAD_END iteration.
+
+    *reason* must be one of ``DEAD_REASONS`` so telemetry consumers can
+    pivot on the stable code rather than parse a free-form string. Any
+    dynamic context (CUDA error message, exception text) goes into
+    *detail* and is emitted as a separate payload field.
+    """
+    if reason not in DEAD_REASONS:
+        logger.warning("unknown branch_dead_end reason: %s", reason)
+    payload: dict[str, Any] = {"reason": reason}
+    if detail is not None:
+        payload["detail"] = detail
+    emit("branch_dead_end", iter=iter_no, **payload)
     emit("iter_end", iter=iter_no, outcome=ITER_DEAD_END)
 
 
@@ -180,6 +225,45 @@ class Orchestrator:
         self._reviewer = reviewer
         self._retriever = retriever
         self._tree: SearchTree | None = None
+        # Cached SOL ``Environment`` for ``trace_emitted``. Built lazily
+        # on first use so test paths that mock CUDA don't pay the
+        # ``env_snapshot`` cost. Reset per ``run()`` invocation.
+        self._environment = None
+
+    def _kill_branch(
+        self,
+        child: TreeNode,
+        parent: TreeNode,
+        iter_no: int,
+        *,
+        reason: str,
+        detail: str | None = None,
+        bumps_agent_failures: bool = False,
+    ) -> None:
+        """Mark a child DEAD_END, prune the beam, decay epsilon, and emit
+        the standard ``branch_dead_end`` + ``iter_end`` pair.
+
+        *bumps_agent_failures* is True for agent-output failures
+        (Coder/Planner produced a buggy/cheating kernel — accountable to
+        the parent's quarantine counter); False for infra failures (CUDA
+        error, profiler failure, partial bench failure) where the agent
+        isn't accountable. Caller is responsible for the trailing
+        ``epsilon = max(...)`` decay update because the local ``epsilon``
+        and ``decay`` live in ``run()``'s frame; this helper handles the
+        per-site DEAD_END side-effects only.
+        """
+        from src.agents.reviewer import BranchQuality
+        from src.search.beam import beam_prune
+
+        child.branch_quality = BranchQuality.DEAD_END
+        if bumps_agent_failures:
+            parent.consecutive_agent_failures += 1
+        beam_prune(
+            self._tree,
+            self._config.beam_width,
+            enable_diversity=self._config.beam_diversity,
+        )
+        _emit_dead_end(iter_no, reason, detail=detail)
 
     async def run(
         self,
@@ -190,7 +274,7 @@ class Orchestrator:
         reference_fn: Callable[..., Any] | None = None,
         input_generators: list[Callable[[int], tuple]] | None = None,
         problem_definition_path: Path | None = None,
-        problem: Problem | None = None,
+        definition: Definition | None = None,
     ) -> SearchResult:
         """Execute the full search loop from baseline to best kernel.
 
@@ -215,16 +299,21 @@ class Orchestrator:
         ``module.make_inputs`` or ``spec['args']`` — only safe for Tier 2
         self-contained kernels, not real Coder outputs.
 
-        *problem*: the parsed ``Problem`` — used each iteration to derive
-        per-workload ``(flops, nbytes)`` for the analytical profiler
-        (``problem_to_kernel_spec`` deliberately leaves the spec's flop /
-        byte counts at zero for SOL problems). ``None`` falls back to
-        ``baseline.spec.flop_count`` / ``memory_bytes`` — correct for the
-        placeholder starter kernels, which populate those fields directly.
+        *definition*: the parsed SOL ``Definition`` — used each iteration
+        to derive per-workload ``(flops, nbytes)`` for the analytical
+        profiler (``KernelSpec.flop_count`` / ``memory_bytes`` are
+        intentionally left at zero for SOL problems). ``None`` falls back
+        to ``baseline.spec.flop_count`` / ``memory_bytes`` — correct for
+        the placeholder starter kernels, which populate those fields
+        directly.
         """
         from src.agents.coder import ImplementationError
         from src.agents.planner import PlanningError
         from src.agents.reviewer import BranchQuality
+        from src.eval.anti_cheat import (
+            check_lazy_outputs_after_bench,
+            per_iter_anti_cheat,
+        )
         from src.eval.benchmark import BenchmarkError, benchmark_kernel
         from src.eval.profiler import ProfilerError, profile_kernel
         from src.eval.roofline import classify_run, compute_roofline
@@ -232,6 +321,12 @@ class Orchestrator:
         from src.kernels.kernel import Kernel, KernelSpec
         from src.search.beam import beam_prune, select_next
         from src.search.tree import SearchTree
+        from sol_execbench.core.bench.reward_hack import RewardHackDetected
+
+        # CUDA sticky-state recovery counter. Each transient CUDA error
+        # increments this; 3 consecutive failures raise CUDAContextPoisoned
+        # to fail the run rather than burn iterations on a poisoned device.
+        consecutive_cuda_errors = 0
 
         # Fail-fast: zeroed HardwareSpec (the ``detect_hardware()`` fallback)
         # would make every analytical profile raise ProfilerError and silently
@@ -261,6 +356,7 @@ class Orchestrator:
             self._config,
             workloads=workloads,
             input_generators=input_generators,
+            definition=definition,
         )
         if not baseline_bench.is_fully_successful:
             raise BenchmarkError(
@@ -313,15 +409,18 @@ class Orchestrator:
         repr_idx = (len(workloads) // 2) if workloads else 0
 
         # Per-iteration (flops, nbytes) are invariant across the run —
-        # derived from (problem, representative workload) or from the
+        # derived from (definition, representative workload) or from the
         # baseline spec in the placeholder path — so hoist them out of
         # the loop instead of recomputing every iteration.
-        if problem is not None and workloads:
+        if definition is not None and workloads:
             from src.benchmark.roofline_shapes import compute_roofline_inputs
             iter_flops, iter_nbytes = compute_roofline_inputs(
-                problem, workloads[repr_idx]
+                definition, workloads[repr_idx]
             )
-            repr_workload_axes = dict(workloads[repr_idx].__dict__)
+            # The profiler driver receives the workload as a JSON-serializable
+            # dict (mode="json" so SOL's pydantic input variants flatten to
+            # plain dicts via the discriminated-union encoder).
+            repr_workload_axes = workloads[repr_idx].model_dump(mode="json")
         else:
             iter_flops = baseline.spec.flop_count
             iter_nbytes = baseline.spec.memory_bytes
@@ -415,9 +514,7 @@ class Orchestrator:
             # skip this iteration without adding a tree node and let the
             # next select_next pick a different parent. The full search
             # run survives one Coder hiccup the way it survives one
-            # branch's benchmark crash. (Option γ, 2026-04-22 — closes
-            # the "Coder failure surfacing at the orchestrator" Deferred
-            # Improvement.)
+            # branch's benchmark crash.
             try:
                 coder_output = await self._coder.implement(
                     kernel_source=parent.kernel.source_code,
@@ -443,10 +540,13 @@ class Orchestrator:
             # Build child kernel — carry the Coder's declared
             # ``triton_kernel_name`` so the profiler skips the regex
             # fallback and filters NCU on the symbol the Coder named.
+            # ``dps`` is threaded so DPS kernels see the pre-allocated
+            # output buffers in the benchmark + correctness paths.
             child_kernel = Kernel(
                 spec=baseline.spec,
                 source_code=new_source,
                 triton_kernel_name=coder_output.triton_kernel_name,
+                dps=getattr(coder_output, "dps", False),
             )
             child = tree.add_child(parent.id, child_kernel, plan.technique)
             # Successful child generation clears the parent's counter so
@@ -460,26 +560,92 @@ class Orchestrator:
             # crashes on a slice of the workload set cannot be scored or
             # promoted. Baseline failure is not caught — no baseline
             # means no signal, and the caller is expected to surface it.
-            dead_reason: str | None = None
+            #
+            # The eval block (benchmark) is wrapped in
+            # ``per_iter_anti_cheat`` so a candidate that monkey-patches
+            # torch.cuda.Event, spawns a background thread, or returns
+            # lazy/proxy outputs trips ``RewardHackDetected`` and lands
+            # on the DEAD_END path. CUDA sticky-state errors get one
+            # ``synchronize()`` retry before counting against the 3-strike
+            # ``CUDAContextPoisoned`` budget.
+            dead_detail: str | None = None
             bench = None
             try:
-                bench = benchmark_kernel(
-                    child_kernel,
-                    self._config,
-                    workloads=workloads,
-                    input_generators=input_generators,
+                with per_iter_anti_cheat(self._config.anti_cheat_critical_names):
+                    bench = benchmark_kernel(
+                        child_kernel,
+                        self._config,
+                        workloads=workloads,
+                        input_generators=input_generators,
+                        definition=definition,
+                    )
+                check_lazy_outputs_after_bench(bench.last_outputs)
+                # Drop GPU tensor refs as soon as the lazy-output check
+                # accepts them — for large workloads the captured outputs
+                # are hundreds of MB pinned through the LLM round-trip
+                # ahead (profile + score + reviewer).
+                bench.last_outputs.clear()
+                # Bench succeeded without any reward-hack signal — clear
+                # the CUDA error counter so a single transient blip earlier
+                # in the run doesn't accumulate forever.
+                consecutive_cuda_errors = 0
+            except RewardHackDetected as e:
+                emit(
+                    "reward_hack_detected",
+                    iter=iter_no,
+                    reason=str(e)[:200],
+                    child_id=str(child.id),
                 )
+                self._kill_branch(
+                    child, parent, iter_no,
+                    reason=DEAD_REWARD_HACK,
+                    detail=str(e)[:120],
+                    bumps_agent_failures=True,
+                )
+                epsilon = max(self._config.epsilon_end, epsilon - decay)
+                continue
             except BenchmarkError as e:
-                dead_reason = f"child benchmark failed ({e})"
+                dead_detail = f"child benchmark failed ({e})"
+            except RuntimeError as e:
+                # CUDA sticky-state recovery. Match against known transient
+                # launch-failure patterns only; a generic RuntimeError that
+                # merely *mentions* "CUDA" (e.g. "operation not implemented
+                # for CUDA") is a real bug and must propagate.
+                msg = str(e)
+                msg_lower = msg.lower()
+                if not any(p in msg_lower for p in _CUDA_STICKY_PATTERNS):
+                    raise
+                try:
+                    import torch
+                    torch.cuda.synchronize()
+                    # sync succeeded — branch-local failure, run continues.
+                    consecutive_cuda_errors = 0
+                except Exception:
+                    consecutive_cuda_errors += 1
+                    if consecutive_cuda_errors >= 3:
+                        raise CUDAContextPoisoned(
+                            f"3+ consecutive cuda.synchronize() failures: {e}"
+                        ) from e
+                logger.warning(
+                    "Iteration %d: transient CUDA error (%s) — branch DEAD_END",
+                    iter_no, msg[:200],
+                )
+                self._kill_branch(
+                    child, parent, iter_no,
+                    reason=DEAD_CUDA_ERROR,
+                    detail=msg[:120],
+                )
+                epsilon = max(self._config.epsilon_end, epsilon - decay)
+                continue
             else:
                 if not bench.is_fully_successful:
-                    dead_reason = (
+                    dead_detail = (
                         f"child benchmark had partial-workload failures "
                         f"(errors={bench.workload_errors})"
                     )
 
-            if dead_reason is not None:
-                logger.warning("Iteration %d: %s — marking branch dead_end", iter_no, dead_reason)
+            if dead_detail is not None:
+                logger.warning("Iteration %d: %s — marking branch dead_end", iter_no, dead_detail)
                 # bench_done fires even on partial-workload failure so the
                 # event log has a row for every benchmark attempt.
                 emit(
@@ -489,9 +655,11 @@ class Orchestrator:
                     per_workload_us=_per_workload_us(bench),
                     is_fully_successful=False,
                 )
-                child.branch_quality = BranchQuality.DEAD_END
-                beam_prune(tree, self._config.beam_width, enable_diversity=self._config.beam_diversity)
-                _emit_dead_end(iter_no, dead_reason)
+                self._kill_branch(
+                    child, parent, iter_no,
+                    reason=DEAD_BENCH_FAILURE,
+                    detail=dead_detail,
+                )
                 epsilon = max(self._config.epsilon_end, epsilon - decay)
                 continue
 
@@ -521,20 +689,36 @@ class Orchestrator:
                 # failure on this slice) — we've already caught fully-
                 # dead children above, so this is the "majority survived
                 # but the middle workload didn't" edge. Skip profiling;
-                # dead_reason would have kicked in for ≥50% failure.
+                # the bench_failure path would have kicked in for ≥50%
+                # failure.
                 logger.warning(
                     "Iteration %d: representative workload latency unavailable "
                     "— skipping profile (child benchmark: %s)",
                     iter_no,
                     bench.per_workload_latency_us,
                 )
-                child.branch_quality = BranchQuality.DEAD_END
-                beam_prune(tree, self._config.beam_width, enable_diversity=self._config.beam_diversity)
-                _emit_dead_end(iter_no, "repr_workload_latency_unavailable")
+                self._kill_branch(
+                    child, parent, iter_no,
+                    reason=DEAD_REPR_LATENCY_UNAVAILABLE,
+                )
                 epsilon = max(self._config.epsilon_end, epsilon - decay)
                 continue
 
             if iter_flops > 0 and iter_nbytes > 0:
+                # blob_roots default mirrors ``_load_problem``: prefer the
+                # config override, otherwise fall back to the problem
+                # directory so safetensors-backed workloads resolve their
+                # blobs against the same root the in-process generator used.
+                # ``problem_definition_path`` is None for the placeholder
+                # path (no SOL problem dir to fall back to) — pass None
+                # through so the driver omits the field.
+                if problem_definition_path is not None:
+                    profile_blob_roots = (
+                        self._config.safetensors_blob_roots
+                        or [problem_definition_path.parent]
+                    )
+                else:
+                    profile_blob_roots = self._config.safetensors_blob_roots
                 try:
                     profiling = profile_kernel(
                         child_kernel,
@@ -545,6 +729,7 @@ class Orchestrator:
                         nbytes=iter_nbytes,
                         latency_s=repr_workload_latency_s,
                         problem_definition_path=problem_definition_path,
+                        blob_roots=profile_blob_roots,
                     )
                 except ProfilerError as e:
                     logger.warning(
@@ -552,9 +737,11 @@ class Orchestrator:
                         iter_no,
                         e,
                     )
-                    child.branch_quality = BranchQuality.DEAD_END
-                    beam_prune(tree, self._config.beam_width, enable_diversity=self._config.beam_diversity)
-                    _emit_dead_end(iter_no, f"profiler_error: {str(e)[:120]}")
+                    self._kill_branch(
+                        child, parent, iter_no,
+                        reason=DEAD_PROFILER_ERROR,
+                        detail=str(e)[:120],
+                    )
                     epsilon = max(self._config.epsilon_end, epsilon - decay)
                     continue
             else:
@@ -565,7 +752,7 @@ class Orchestrator:
                     "Iteration %d: skipping profile — no (flops, nbytes) for "
                     "op_type=%r (branch stays alive)",
                     iteration + 1,
-                    problem.op_type if problem is not None else "<no-problem>",
+                    definition.op_type if definition is not None else "<no-definition>",
                 )
             child.profiling = profiling
             if profiling is not None:
@@ -606,6 +793,56 @@ class Orchestrator:
                 t_p_us=baseline_bench.median_latency_us,
                 t_sol_us=roofline.t_sol_us,
                 t_sol_source=roofline.source,
+            )
+
+            # Channel B reward-hack flow: ``reward_hack_suspect`` is the
+            # SOL scorer's "T_k < ~T_SOL margin" signal. Re-eval with
+            # strict tolerance + a fresh anti_cheat snapshot. If cleared,
+            # accept the original score. If still flagged, mark the
+            # branch DEAD_END so a candidate that beats the hardware
+            # bound by gaming the bench doesn't propagate.
+            if child.score.reward_hack_suspect:
+                cleared = await self._reward_hack_re_eval(
+                    child, child_kernel, workloads, input_generators,
+                    reference_fn=reference_fn, definition=definition,
+                )
+                if not cleared:
+                    emit(
+                        "reward_hack_confirmed",
+                        iter=iter_no,
+                        child_id=str(child.id),
+                    )
+                    self._kill_branch(
+                        child, parent, iter_no,
+                        reason=DEAD_REWARD_HACK_CONFIRMED,
+                        bumps_agent_failures=True,
+                    )
+                    epsilon = max(self._config.epsilon_end, epsilon - decay)
+                    continue
+                emit("reward_hack_cleared", iter=iter_no, child_id=str(child.id))
+
+            if child.score.calibration_warning:
+                emit(
+                    "calibration_warning",
+                    iter=iter_no,
+                    child_id=str(child.id),
+                    t_k_us=bench.median_latency_us,
+                    t_sol_us=roofline.t_sol_us,
+                )
+
+            # Tier 1 trace emission. Build a lightweight SOL ``Trace``
+            # carrying the eval status + performance numbers + the
+            # snapshotted environment and fire ``trace_emitted``.
+            # Best-effort — never let a trace serialization hiccup
+            # interrupt the search loop.
+            self._emit_trace(
+                iter_no=iter_no,
+                child=child,
+                bench=bench,
+                roofline=roofline,
+                definition=definition,
+                workloads=workloads,
+                repr_idx=repr_idx,
             )
 
             # Reviewer sees the same trajectory as the Planner, extended
@@ -681,3 +918,182 @@ class Orchestrator:
             tree,
             run_bottleneck=run_bottleneck,
         )
+
+    async def _reward_hack_re_eval(
+        self,
+        child,
+        kernel,
+        workloads,
+        input_generators,
+        *,
+        reference_fn,
+        definition,
+    ) -> bool:
+        """Re-eval a suspect candidate with strict tolerance + fresh anti_cheat.
+
+        Returns ``True`` when the re-eval cleared the suspicion (accept
+        the original score), ``False`` when the candidate is still
+        flagged (mark branch DEAD_END). Errors during the re-eval are
+        treated as "not cleared" — fail-closed so a re-eval that crashes
+        doesn't accidentally promote the original suspect score.
+
+        Skip path: when no reference_fn / generators are available
+        (placeholder runs), return True so the suspect is implicitly
+        cleared — there's no oracle to compare against anyway, and the
+        scorer's reward_hack_suspect bit is the only signal we'd have.
+        """
+        from src.eval.anti_cheat import (
+            generate_randomized_inputs,
+            per_iter_anti_cheat,
+        )
+        from src.eval.correctness import (
+            TorchComparisonPolicy,
+            build_normalize_context,
+            compare_outputs,
+            maybe_wrap_dps_candidate,
+        )
+        from sol_execbench.core.bench.reward_hack import RewardHackDetected
+
+        if reference_fn is None or not input_generators or not workloads:
+            return True
+
+        # Resolve the candidate entrypoint once. ``compile_kernel`` may
+        # be expensive and we want all workloads to share one fn handle.
+        try:
+            from src.kernels.compiler import compile_kernel
+
+            compiled = compile_kernel(kernel)
+            if not compiled.success or compiled.compiled_fn is None:
+                return False
+            cand_fn = compiled.compiled_fn
+        except Exception:
+            return False
+
+        # Use the normalized comparator so multi-output (tuple/dict)
+        # returns are compared name-by-name via SOL's ``normalize_outputs``.
+        # The prior tensor-only branch fell through on tuple/dict and
+        # returned True, fail-OPEN — a suspect multi-output kernel was
+        # auto-cleared without any output comparison. ``norm`` is None
+        # when ``definition`` is absent (placeholder runs); in that case
+        # ``compare_outputs`` delegates to ``policy.compare`` which handles
+        # single tensors and falls back to the catch-all ``except Exception``
+        # below for any other shape — fail-closed by construction.
+        policy = TorchComparisonPolicy()
+        norm = build_normalize_context(definition)
+
+        try:
+            with per_iter_anti_cheat(self._config.anti_cheat_critical_names):
+                # Workloads + input_generators are 1:1 paired (same invariant
+                # the benchmark loop relies on at src/eval/benchmark.py:156).
+                # We zip here because ``maybe_wrap_dps_candidate`` needs the
+                # per-workload axes to resolve output shapes for
+                # ``allocate_outputs``. The unwrapped ``cand_fn(*inputs)``
+                # raised TypeError on DPS kernels (host wrapper expects
+                # ``(*inputs, *outputs)``); the catch-all ``except Exception``
+                # returned False, auto-confirming any DPS branch that hit
+                # ``reward_hack_suspect`` as a hack regardless of correctness.
+                for wl, gen in zip(workloads, input_generators):
+                    wrapped_cand = maybe_wrap_dps_candidate(
+                        cand_fn,
+                        kernel=kernel,
+                        workload=wl,
+                        definition=definition,
+                    )
+                    inputs = generate_randomized_inputs(gen, seed=42)
+                    cand_out = wrapped_cand(*inputs)
+                    ref_out = reference_fn(*inputs)
+                    outcome = compare_outputs(
+                        cand_out,
+                        ref_out,
+                        policy=policy,
+                        atol=1e-5,
+                        rtol=1e-4,
+                        norm=norm,
+                    )
+                    if not outcome.match:
+                        return False
+        except RewardHackDetected:
+            return False
+        except Exception:
+            # Any other error during re-eval → fail-closed (treat as
+            # not cleared). Surfacing the exception would crash the
+            # whole run for what is supposed to be a per-branch check.
+            return False
+        return True
+
+    def _emit_trace(
+        self,
+        *,
+        iter_no: int,
+        child,
+        bench,
+        roofline,
+        definition,
+        workloads,
+        repr_idx: int,
+    ) -> None:
+        """Build a SOL ``Trace`` for this evaluation and emit ``trace_emitted``.
+        All exceptions are swallowed — trace emission is best-effort
+        observability.
+        """
+        try:
+            from sol_execbench.core.data import (
+                Correctness,
+                Evaluation,
+                EvaluationStatus,
+                Performance,
+                Trace,
+            )
+            from sol_execbench.core.utils import env_snapshot
+
+            if self._environment is None:
+                try:
+                    self._environment = env_snapshot(device="cuda:0")
+                except Exception:
+                    # Tests / CPU-only paths — fabricate a stub
+                    # environment so Trace's NonEmptyString validator
+                    # doesn't reject it.
+                    from sol_execbench.core.data import Environment
+
+                    self._environment = Environment(hardware="unknown", libs={})
+
+            if not workloads or definition is None:
+                # Placeholder path — we don't have a real Workload to
+                # bind the Trace to, so emit the event with a minimal
+                # payload and skip the JSON dump.
+                emit(
+                    "trace_emitted",
+                    iter=iter_no,
+                    child_id=str(child.id),
+                    latency_us=bench.median_latency_us,
+                )
+                return
+
+            wl = workloads[repr_idx] if repr_idx < len(workloads) else workloads[0]
+            from src.runtime.timefmt import iso_ts
+
+            evaluation = Evaluation(
+                status=EvaluationStatus.PASSED,
+                environment=self._environment,
+                timestamp=iso_ts(),
+                correctness=Correctness(),
+                performance=Performance(
+                    latency_ms=bench.median_latency_us / 1000.0,
+                    reference_latency_ms=0.0,
+                    speedup_factor=child.score.sol_score if child.score else 0.0,
+                ),
+            )
+            trace = Trace(
+                definition=definition.name,
+                workload=wl,
+                solution=str(child.id),
+                evaluation=evaluation,
+            )
+            emit(
+                "trace_emitted",
+                iter=iter_no,
+                child_id=str(child.id),
+                trace=trace.model_dump(mode="json"),
+            )
+        except Exception as exc:
+            logger.debug("trace_emitted: skipped (%s)", exc)

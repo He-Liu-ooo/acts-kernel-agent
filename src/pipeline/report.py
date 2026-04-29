@@ -8,7 +8,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
 if TYPE_CHECKING:
-    from src.benchmark.problem import Problem, Workload
+    from sol_execbench.core.data import Definition, Workload
+
     from src.config import HardwareSpec
     from src.eval.profiler import ProfilingResult
     from src.eval.types import BottleneckType
@@ -16,18 +17,19 @@ if TYPE_CHECKING:
 
 
 def _resolve_workload_roofline(
-    problem: Problem | None,
+    definition: Definition | None,
     workload: Workload,
     kernel,
 ) -> tuple[int, int]:
     """Return ``(flops, nbytes)`` for a workload. SOL path derives from
-    Problem + Workload via ``compute_roofline_inputs``; placeholder path
-    falls back to the kernel spec's populated counts. Returns ``(0, 0)``
-    when the op_type has no formula — caller decides how to handle.
+    Definition + Workload via ``compute_roofline_inputs``; placeholder
+    path falls back to the kernel spec's populated counts. Returns
+    ``(0, 0)`` when the op_type has no formula — caller decides how to
+    handle.
     """
-    if problem is not None:
+    if definition is not None:
         from src.benchmark.roofline_shapes import compute_roofline_inputs
-        return compute_roofline_inputs(problem, workload)
+        return compute_roofline_inputs(definition, workload)
     return kernel.spec.flop_count, kernel.spec.memory_bytes
 
 
@@ -38,11 +40,13 @@ class OptimizationReport:
     ``bottleneck`` is the once-per-run classification from ``classify_run``
     — invariant across iterations because the problem + representative
     workload + hardware don't change. ``winner_per_workload_bottlenecks``
-    maps a workload UUID to its shape-derived bottleneck (via
-    ``classify_workload``) so the operator can see where individual
-    workloads land relative to the ridge. ``winner_profiling_per_workload``
-    maps a workload UUID to the ``ProfilingResult`` captured by
-    re-profiling the winning kernel on every selected workload.
+    maps a workload UUID to its SOLAR-derived bottleneck (one
+    ``derive_t_sol_from_solar`` call per selected workload), capturing
+    how individual workloads land under SOLAR's graph analysis rather
+    than the analytical band classifier the run-level path uses.
+    ``winner_profiling_per_workload`` maps a workload UUID to the
+    ``ProfilingResult`` captured by re-profiling the winning kernel on
+    every selected workload.
     """
 
     baseline_latency_us: float = 0.0
@@ -67,17 +71,21 @@ def generate_report(
     input_generators: list[Callable[..., Any]] | None = None,
     hardware_spec: HardwareSpec | None = None,
     cache_dir: Path | None = None,
-    problem: Problem | None = None,
+    definition: Definition | None = None,
+    definition_path: Path | None = None,
+    blob_roots: list[Path] | None = None,
+    arch_yaml_path: Path | None = None,
 ) -> OptimizationReport:
     """Generate an optimization report from a completed search result.
 
     ``bottleneck`` is taken verbatim from ``result.run_bottleneck`` —
     the once-per-run classification that drove retriever / planner /
-    reviewer. ``winner_per_workload_bottlenecks`` is populated by calling
-    ``classify_workload`` on each selected workload when ``problem`` and
-    ``hardware_spec`` are both provided; this captures how the winning
-    kernel's workloads actually land relative to the ridge, which a
-    single representative workload can't surface.
+    reviewer. ``winner_per_workload_bottlenecks`` is populated by
+    calling ``derive_t_sol_from_solar`` on each selected workload when
+    ``definition`` and ``hardware_spec`` are both provided; SOLAR is
+    the authoritative bottleneck source. Workloads where SOLAR is
+    unavailable or returns ``None`` get omitted from the dict rather
+    than fall back to the analytical classifier.
 
     When ``workloads`` + ``input_generators`` + ``hardware_spec`` are
     provided, the winning kernel is re-profiled on *every* selected
@@ -85,6 +93,17 @@ def generate_report(
     stored in ``winner_profiling_per_workload``. If any of those are
     ``None``, per-workload re-profiling is skipped and the field stays
     empty — callers in the placeholder pipeline pay no re-profile cost.
+
+    *definition_path* is the source ``definition.json`` the profiler
+    subprocess driver reloads to rebuild input generators (SOL no longer
+    carries the path on the type itself).
+
+    *blob_roots* is forwarded into ``profile_kernel`` so the NCU
+    subprocess driver can resolve safetensors-backed workload inputs
+    against the same root list the in-process generator used. ``None``
+    falls back to ``[definition_path.parent]`` when ``definition_path``
+    is provided (mirrors ``_load_problem``); if both are ``None`` the
+    field is omitted from the spec JSON entirely.
     """
     best = result.best_node
     path = result.tree.path_to_node(best.id)
@@ -94,8 +113,6 @@ def generate_report(
     per_workload_bottlenecks: dict[str, BottleneckType] = {}
     per_workload_profiling: dict[str, ProfilingResult] = {}
     if workloads and hardware_spec is not None:
-        from src.eval.roofline import classify_bottleneck
-
         do_reprofile = bool(input_generators)
         if do_reprofile:
             from src.eval.profiler import profile_kernel
@@ -107,25 +124,22 @@ def generate_report(
             )
             per_workload_latency_us = best.per_workload_latency_us or {}
 
-        peak_compute = hardware_spec.peak_flops_fp32
-        peak_bw = hardware_spec.peak_memory_bandwidth_gb_s
-        ridge_point = (
-            (peak_compute * 1e12) / (peak_bw * 1e9)
-            if peak_compute > 0 and peak_bw > 0
-            else 0.0
-        )
+        if definition is not None:
+            from src.eval.roofline import derive_t_sol_from_solar
 
         generators = input_generators if do_reprofile else [None] * len(workloads)
         for w, ig in zip(workloads, generators):
-            flops, nbytes = _resolve_workload_roofline(problem, w, best.kernel)
+            flops, nbytes = _resolve_workload_roofline(definition, w, best.kernel)
             if flops <= 0 or nbytes <= 0:
                 # No formula → skip both classification and re-profile for
                 # this workload rather than poisoning the dicts.
                 continue
-            if ridge_point > 0:
-                per_workload_bottlenecks[w.uuid] = classify_bottleneck(
-                    flops / nbytes, ridge_point
+            if definition is not None:
+                solar = derive_t_sol_from_solar(
+                    definition, w, hardware_spec, arch_yaml_path=arch_yaml_path,
                 )
+                if solar is not None:
+                    per_workload_bottlenecks[w.uuid] = solar.bottleneck
             if not do_reprofile:
                 continue
 
@@ -137,18 +151,23 @@ def generate_report(
             else:
                 latency_s = aggregate_latency_s
 
+            # Default blob_roots to the problem dir when caller didn't
+            # supply an override — same precedence as ``_load_problem``.
+            effective_blob_roots = blob_roots
+            if effective_blob_roots is None and definition_path is not None:
+                effective_blob_roots = [definition_path.parent]
+
             per_workload_profiling[w.uuid] = profile_kernel(
                 best.kernel,
-                dict(w.__dict__),
+                w.model_dump(mode="json"),
                 ig,
                 hardware_spec=hardware_spec,
                 flops=flops,
                 nbytes=nbytes,
                 latency_s=latency_s,
                 cache_dir=cache_dir,
-                problem_definition_path=(
-                    problem.definition_path if problem is not None else None
-                ),
+                problem_definition_path=definition_path,
+                blob_roots=effective_blob_roots,
             )
 
     score = best.score
