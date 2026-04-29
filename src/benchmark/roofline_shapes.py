@@ -6,13 +6,13 @@ the hybrid profiler's arithmetic-intensity + achieved-peak math needs
 nonzero counts, and zeros make ``_compute_analytical`` raise
 ``ProfilerError`` — which the orchestrator then treats as a dead branch.
 
-This module rebuilds those counts from a ``Problem`` + the representative
-``Workload`` the profiler will measure on. Flop formulas are intentionally
-conservative and coarse: matmul / GEMM gets the canonical ``2·M·N·K``;
-elementwise and small-compute ops get ``C·numel(output)`` with a low
-constant per op type; anything we don't model returns ``(0, 0)`` so the
-caller can skip analytical profiling for this iteration without killing
-the branch.
+This module rebuilds those counts from a SOL ``Definition`` + the
+representative ``Workload`` the profiler will measure on. Flop formulas
+are intentionally conservative and coarse: matmul / GEMM gets the
+canonical ``2·M·N·K``; elementwise and small-compute ops get
+``C·numel(output)`` with a low constant per op type; anything we don't
+model returns ``(0, 0)`` so the caller can skip analytical profiling
+for this iteration without killing the branch.
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from src.benchmark.problem import Problem, TensorDef, Workload
+    from sol_execbench.core.data import Definition, Workload
 
 
 # Bytes per element for the dtype strings SOL-ExecBench emits. Keys are
@@ -30,7 +30,8 @@ _DTYPE_BYTES: dict[str, int] = {
     "float32": 4, "fp32": 4, "float": 4, "torch.float32": 4, "f32": 4,
     "float16": 2, "fp16": 2, "half": 2, "torch.float16": 2, "f16": 2,
     "bfloat16": 2, "bf16": 2, "torch.bfloat16": 2,
-    "float8_e4m3": 1, "float8_e5m2": 1, "fp8": 1, "e4m3": 1, "e5m2": 1,
+    "float8_e4m3": 1, "float8_e5m2": 1, "float8_e4m3fn": 1, "fp8": 1,
+    "e4m3": 1, "e5m2": 1,
     "int64": 8, "long": 8, "torch.int64": 8, "i64": 8,
     "int32": 4, "int": 4, "torch.int32": 4, "i32": 4,
     "int16": 2, "short": 2, "torch.int16": 2, "i16": 2,
@@ -50,15 +51,37 @@ _PER_ELEM_FLOPS: dict[str, int] = {
 }
 
 
-def compute_roofline_inputs(problem: Problem, workload: Workload) -> tuple[int, int]:
-    """Return ``(flops, nbytes)`` for ``problem`` running at ``workload``.
+def compute_roofline_inputs(
+    definition: Definition, workload: Workload,
+) -> tuple[int, int]:
+    """Return ``(flops, nbytes)`` for ``definition`` running at ``workload``.
 
     ``(0, 0)`` means "we don't have a formula here" — callers must treat
     that as a signal to skip analytical profiling rather than feed zeros
     into ``_compute_analytical`` (which would raise).
+
+    Call sites — ONLY two production paths, both feed
+    ``profile_kernel(flops=, nbytes=)`` → ``_compute_analytical`` for
+    arithmetic-intensity / %peak-compute / %peak-bandwidth math. **Not**
+    used for bottleneck classification — SOLAR (``derive_t_sol_from_solar``)
+    is the sole bottleneck source post-2026-04-28 (see JOURNAL "SOLAR as
+    sole bottleneck source"):
+
+    1. ``src/search/orchestrator.py::Orchestrator.run`` — per iteration
+       on the representative workload, threading flops/nbytes into the
+       per-iter profiler call.
+    2. ``src/pipeline/report.py::_resolve_workload_roofline`` — Phase C
+       re-profile, called once per selected workload when the winner
+       runs the full-suite re-profile pass.
+
+    A new caller almost certainly means one of: (a) a third profile_kernel
+    invocation has been added (legitimate — extend this list), or (b)
+    bottleneck classification has accidentally been re-routed away from
+    SOLAR (regression — fix instead). Verify before adding the third
+    site.
     """
-    nbytes = _io_bytes(problem, workload)
-    flops = _flops(problem, workload)
+    nbytes = _io_bytes(definition, workload)
+    flops = _flops(definition, workload)
     if flops <= 0 or nbytes <= 0:
         return 0, 0
     return flops, nbytes
@@ -67,20 +90,23 @@ def compute_roofline_inputs(problem: Problem, workload: Workload) -> tuple[int, 
 # ── internals ────────────────────────────────────────────────────────────
 
 
-def _flops(problem: Problem, workload: Workload) -> int:
-    op = (problem.op_type or "").lower()
+def _flops(definition: Definition, workload: Workload) -> int:
+    op = (definition.op_type or "").lower()
     if op in ("matmul", "gemm", "linear"):
-        return _matmul_flops(problem, workload)
+        return _matmul_flops(definition, workload)
 
     weight = _PER_ELEM_FLOPS.get(op)
-    if weight is None or not problem.outputs:
+    if weight is None or not definition.outputs:
         return 0
-    out0 = next(iter(problem.outputs.values()))
-    n = _numel(out0, problem, workload)
+    output_shapes = _safe_output_shapes(definition, workload)
+    if not output_shapes:
+        return 0
+    first_shape = next(iter(output_shapes.values()))
+    n = _shape_numel(first_shape)
     return weight * n if n > 0 else 0
 
 
-def _matmul_flops(problem: Problem, workload: Workload) -> int:
+def _matmul_flops(definition: Definition, workload: Workload) -> int:
     """GEMM ``C[M, N] = A[M, K] @ B[K, N]`` → ``2·M·N·K``.
 
     K is resolved from (a) the first input's last-axis name or (b) common
@@ -88,75 +114,119 @@ def _matmul_flops(problem: Problem, workload: Workload) -> int:
     first output's numel so this also handles batched GEMMs where the
     output shape is ``[..., M, N]``.
     """
-    if not problem.outputs or not problem.inputs:
+    if not definition.outputs or not definition.inputs:
         return 0
-    out0 = next(iter(problem.outputs.values()))
-    mn = _numel(out0, problem, workload)
+
+    output_shapes = _safe_output_shapes(definition, workload)
+    if not output_shapes:
+        return 0
+    mn = _shape_numel(next(iter(output_shapes.values())))
     if mn <= 0:
         return 0
 
-    k = _resolve_contraction_axis(problem, workload)
+    k = _resolve_contraction_axis(definition, workload)
     return 2 * mn * k if k > 0 else 0
 
 
-def _resolve_contraction_axis(problem: Problem, workload: Workload) -> int:
+def _resolve_contraction_axis(definition: Definition, workload: Workload) -> int:
     """Find ``K`` — the inner / contraction dimension of a GEMM. Tries,
     in order: the first input's last-axis name, then common aliases.
     Returns 0 when unresolvable so callers bail cleanly."""
-    inputs_iter = iter(problem.inputs.values())
+    inputs_iter = iter(definition.inputs.values())
     first_input = next(inputs_iter, None)
     if first_input is not None and first_input.shape:
         axis_name = first_input.shape[-1]
-        value = _resolve_axis(axis_name, problem, workload)
+        value = _resolve_axis(axis_name, definition, workload)
         if value is not None and value > 0:
             return value
     for alias in ("K", "k", "inner", "contract"):
-        value = _resolve_axis(alias, problem, workload)
+        value = _resolve_axis(alias, definition, workload)
         if value is not None and value > 0:
             return value
     return 0
 
 
-def _io_bytes(problem: Problem, workload: Workload) -> int:
+def _io_bytes(definition: Definition, workload: Workload) -> int:
     """Total I/O traffic: sum of ``numel(t) · dtype_bytes(t.dtype)`` across
     every input + output tensor. Matches the coarse DRAM-traffic model the
     analytical profiler's bandwidth axis is built on."""
+    input_shapes = _safe_input_shapes(definition, workload)
+    output_shapes = _safe_output_shapes(definition, workload)
+    if input_shapes is None or output_shapes is None:
+        return 0
     total = 0
-    for tensor in list(problem.inputs.values()) + list(problem.outputs.values()):
-        n = _numel(tensor, problem, workload)
+    for name, spec in definition.inputs.items():
+        n = _shape_numel(input_shapes.get(name))
         if n <= 0:
             return 0
-        total += n * _dtype_bytes(tensor.dtype)
+        total += n * _dtype_bytes(_dtype_str(spec.dtype))
+    for name, spec in definition.outputs.items():
+        n = _shape_numel(output_shapes.get(name))
+        if n <= 0:
+            return 0
+        total += n * _dtype_bytes(_dtype_str(spec.dtype))
     return total
 
 
-def _numel(tensor: TensorDef, problem: Problem, workload: Workload) -> int:
-    """Elements in a single tensor. ``shape=None`` (Python scalar) and
-    ``shape=[]`` (0-D tensor) both collapse to 1. Unresolvable axis
-    names return 0 so callers bail."""
-    if tensor.shape is None or tensor.shape == []:
+def _shape_numel(shape) -> int:
+    """Elements in a single tensor shape. ``None`` (Python scalar) and
+    ``()`` (0-D tensor) both collapse to 1. Negative or zero-size dims
+    return 0 so callers bail."""
+    if shape is None or shape == ():
         return 1
     product = 1
-    for axis_name in tensor.shape:
-        value = _resolve_axis(axis_name, problem, workload)
+    for value in shape:
         if value is None or value <= 0:
             return 0
         product *= value
     return product
 
 
-def _resolve_axis(name: str, problem: Problem, workload: Workload) -> int | None:
+def _safe_input_shapes(definition: Definition, workload: Workload):
+    """Resolve input shapes via ``definition.get_input_shapes`` or return
+    ``None`` if any axis can't be resolved (caller bails)."""
+    try:
+        return definition.get_input_shapes(workload.axes)
+    except ValueError:
+        # ValueError = workload-driven (missing var-axis values) → expected,
+        # caller bails to (0, 0). KeyError = schema-level corruption (workload
+        # references an undeclared axis) → propagate so the orchestrator sees
+        # it loud rather than silently skipping profiling.
+        return None
+
+
+def _safe_output_shapes(definition: Definition, workload: Workload):
+    """Resolve output shapes via ``definition.get_output_shapes`` or return
+    ``None`` if any axis can't be resolved (caller bails)."""
+    try:
+        return definition.get_output_shapes(workload.axes)
+    except ValueError:
+        # ValueError = workload-driven (missing var-axis values) → expected,
+        # caller bails to (0, 0). KeyError = schema-level corruption (workload
+        # references an undeclared axis) → propagate so the orchestrator sees
+        # it loud rather than silently skipping profiling.
+        return None
+
+
+def _resolve_axis(name: str, definition: Definition, workload: Workload) -> int | None:
     """Resolve an axis name to its concrete int value. Workload overrides
-    win over const axes from the problem. ``expr`` axes aren't evaluated
-    — callers bail through the ``None`` return path."""
+    win over const axes from the definition. ``expr`` axes aren't evaluated
+    here — callers fall through the ``None`` return path."""
     if name in workload.axes:
         return workload.axes[name]
-    axis = problem.axes.get(name)
+    axis = definition.axes.get(name)
     if axis is None:
         return None
-    if axis.type == "const" and axis.value is not None:
+    if axis.type == "const":
         return axis.value
     return None
+
+
+def _dtype_str(dtype) -> str:
+    """Coerce a SOL ``DType`` enum (or any string-like) to a lower-case
+    string suitable for ``_DTYPE_BYTES`` lookup."""
+    value = getattr(dtype, "value", None)
+    return value if isinstance(value, str) else str(dtype)
 
 
 def _dtype_bytes(dtype: str) -> int:

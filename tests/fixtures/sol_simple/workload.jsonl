@@ -1,0 +1,2 @@
+{"uuid":"w1","axes":{"N":1024},"inputs":{"a":{"type":"random"},"b":{"type":"random"}}}
+{"uuid":"w2","axes":{"N":4096},"inputs":{"a":{"type":"random"},"b":{"type":"random"}}}

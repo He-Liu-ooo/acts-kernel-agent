@@ -1,12 +1,15 @@
 """Tests for benchmark/workload_selector.py — representative workload selection."""
 
-from src.benchmark.problem import Workload
+from sol_execbench.core.data import Workload
+
 from src.benchmark.workload_selector import select_workloads
 
 
 def _make_workloads(batch_sizes: list[int]) -> list[Workload]:
     return [
-        Workload(uuid=f"wl-{bs}", axes={"batch_size": bs})
+        Workload.model_validate(
+            {"uuid": f"wl-{bs}", "axes": {"batch_size": bs}, "inputs": {}}
+        )
         for bs in batch_sizes
     ]
 

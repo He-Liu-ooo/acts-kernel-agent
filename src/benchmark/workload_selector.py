@@ -7,7 +7,10 @@ them every iteration is too slow, so we pick a small representative subset
 
 from __future__ import annotations
 
-from src.benchmark.problem import Workload
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from sol_execbench.core.data import Workload
 
 
 def select_workloads(

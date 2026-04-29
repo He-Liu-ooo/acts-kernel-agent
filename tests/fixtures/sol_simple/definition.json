@@ -1,0 +1,11 @@
+{
+  "name": "test_elementwise_add",
+  "op_type": "elementwise",
+  "axes": {"N": {"type": "var"}},
+  "inputs": {
+    "a": {"shape": ["N"], "dtype": "float32"},
+    "b": {"shape": ["N"], "dtype": "float32"}
+  },
+  "outputs": {"y": {"shape": ["N"], "dtype": "float32"}},
+  "reference": "import torch\n\ndef run(a, b):\n    return a + b\n"
+}

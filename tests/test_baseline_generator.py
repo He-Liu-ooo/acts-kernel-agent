@@ -10,19 +10,29 @@ Covers:
 - all attempts fail → raises BaselineGenerationError (problem gets skipped by caller)
 - ``CoderAgent.translate`` is invoked with the PyTorch reference source, the
   KernelSpec, and an input generator built from the first selected workload
+- ``blob_roots`` kwarg is forwarded to ``build_input_generator`` so safetensors-
+  backed workloads resolve their on-disk weights before Phase B starts
+  (regression test for Codex G2: prior code dropped this kwarg in
+  ``generate_triton_baseline``'s rebuild path even though
+  ``_load_sol_problem`` threaded it into the search-loop generators).
 """
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from sol_execbench.core.data import Definition, Workload
 
 from src.agents.coder import CoderAgent, ImplementationError, KernelCodeOutput
 from src.benchmark.baseline_generator import (
     BaselineGenerationError,
     generate_triton_baseline,
 )
+from src.eval.correctness import CorrectnessResult, CorrectnessStage
+from src.kernels.compiler import CompilationResult
+from src.kernels.kernel import KernelSpec, KernelType
 
 
 def _coder_output(source_code: str, triton_kernel_name: str = "kernel_fn") -> KernelCodeOutput:
@@ -34,30 +44,29 @@ def _coder_output(source_code: str, triton_kernel_name: str = "kernel_fn") -> Ke
         source_code=source_code,
         triton_kernel_name=triton_kernel_name,
     )
-from src.benchmark.problem import Problem, Workload
-from src.eval.correctness import CorrectnessResult, CorrectnessStage
-from src.kernels.compiler import CompilationResult
-from src.kernels.kernel import KernelSpec, KernelType
 
 
 # ── fixtures ───────────────────────────────────────────────────────────
 
-def _make_problem(
+def _make_definition(
     name: str = "test_prob",
     reference: str = "def run(x):\n    return x * 2.0\n",
-) -> Problem:
-    return Problem(
-        name=name,
-        axes={},
-        inputs={},
-        outputs={},
-        reference_source=reference,
-        op_type="elementwise",
-    )
+) -> Definition:
+    return Definition.model_validate({
+        "name": name,
+        "axes": {"N": {"type": "var"}},
+        "inputs": {"x": {"shape": ["N"], "dtype": "float32"}},
+        "outputs": {"y": {"shape": ["N"], "dtype": "float32"}},
+        "reference": reference,
+        "op_type": "elementwise",
+    })
 
 
 def _make_workloads(n: int = 3) -> list[Workload]:
-    return [Workload(uuid=f"wl-{i}", axes={}, inputs={}) for i in range(n)]
+    return [
+        Workload.model_validate({"uuid": f"wl-{i}", "axes": {"N": 8}, "inputs": {}})
+        for i in range(n)
+    ]
 
 
 def _make_spec(name: str = "test_prob", entrypoint: str = "kernel_fn") -> KernelSpec:
@@ -89,7 +98,7 @@ def patched_io():
         ),
         patch(
             "src.benchmark.baseline_generator.build_input_generator",
-            side_effect=lambda problem, workload, **_: lambda seed: (float(seed),),
+            side_effect=lambda definition, workload, **_: lambda seed: (float(seed),),
         ),
     ):
         yield
@@ -112,7 +121,7 @@ async def test_empty_workloads_raises_value_error():
     coder.translate = AsyncMock(return_value=_coder_output("src"))
     with pytest.raises(ValueError, match="workload"):
         await generate_triton_baseline(
-            _make_problem(), _make_spec(), coder=coder, workloads=[],
+            _make_definition(), _make_spec(), coder=coder, workloads=[],
         )
 
 
@@ -126,7 +135,7 @@ async def test_no_coder_raises_baseline_error():
     """
     with pytest.raises(BaselineGenerationError, match="No model"):
         await generate_triton_baseline(
-            _make_problem(), _make_spec(), coder=None, workloads=_make_workloads(),
+            _make_definition(), _make_spec(), coder=None, workloads=_make_workloads(),
         )
 
 
@@ -136,7 +145,7 @@ async def test_coder_without_model_raises_baseline_error():
     coder = CoderAgent(model=None)
     with pytest.raises(BaselineGenerationError, match="No model"):
         await generate_triton_baseline(
-            _make_problem(), _make_spec(), coder=coder, workloads=_make_workloads(),
+            _make_definition(), _make_spec(), coder=coder, workloads=_make_workloads(),
         )
 
 
@@ -163,7 +172,7 @@ async def test_successful_translate_returns_verified_kernel(patched_io):
         ) as mock_verify,
     ):
         result = await generate_triton_baseline(
-            _make_problem(), spec, coder=coder, workloads=workloads,
+            _make_definition(), spec, coder=coder, workloads=workloads,
         )
 
     assert result is not None
@@ -195,7 +204,7 @@ async def test_verify_uses_all_selected_workloads(patched_io):
         ) as mock_verify,
     ):
         result = await generate_triton_baseline(
-            _make_problem(), _make_spec(), coder=coder, workloads=workloads,
+            _make_definition(), _make_spec(), coder=coder, workloads=workloads,
         )
 
     assert result is not None
@@ -207,7 +216,7 @@ async def test_verify_uses_all_selected_workloads(patched_io):
 async def test_translate_receives_reference_source_and_all_generators(patched_io):
     """translate() gets reference_source, spec, reference_fn, and every selected
     workload's generator — so its correctness tool can catch cross-workload bugs."""
-    problem = _make_problem(reference="def run(x):\n    return x + 1\n")
+    definition = _make_definition(reference="def run(x):\n    return x + 1\n")
     spec = _make_spec()
     workloads = _make_workloads(n=3)
     coder = CoderAgent(model=MagicMock())
@@ -224,11 +233,11 @@ async def test_translate_receives_reference_source_and_all_generators(patched_io
         ),
     ):
         await generate_triton_baseline(
-            problem, spec, coder=coder, workloads=workloads,
+            definition, spec, coder=coder, workloads=workloads,
         )
 
     kwargs = coder.translate.call_args.kwargs
-    assert kwargs["reference_source"] == problem.reference_source
+    assert kwargs["reference_source"] == definition.reference
     assert kwargs["kernel_spec"] is spec
     assert callable(kwargs["reference_fn"])
     assert isinstance(kwargs["input_generators"], list)
@@ -259,7 +268,7 @@ async def test_translate_kernel_name_propagates_to_kernel(patched_io):
         patch("src.benchmark.baseline_generator.verify_correctness", return_value=_pass()),
     ):
         result = await generate_triton_baseline(
-            _make_problem(), spec, coder=coder, workloads=workloads,
+            _make_definition(), spec, coder=coder, workloads=workloads,
         )
 
     assert result.triton_kernel_name == "main_k"
@@ -290,7 +299,7 @@ async def test_correctness_failure_on_any_workload_triggers_retry(patched_io):
         ),
     ):
         result = await generate_triton_baseline(
-            _make_problem(), _make_spec(),
+            _make_definition(), _make_spec(),
             coder=coder, workloads=workloads, max_retries=3,
         )
 
@@ -319,7 +328,7 @@ async def test_implementation_error_triggers_retry(patched_io):
         ),
     ):
         result = await generate_triton_baseline(
-            _make_problem(), _make_spec(),
+            _make_definition(), _make_spec(),
             coder=coder, workloads=workloads, max_retries=3,
         )
 
@@ -349,7 +358,7 @@ async def test_compile_failure_in_post_verify_is_treated_as_attempt_failure(patc
         ) as mock_verify,
     ):
         result = await generate_triton_baseline(
-            _make_problem(), _make_spec(),
+            _make_definition(), _make_spec(),
             coder=coder, workloads=workloads, max_retries=3,
         )
 
@@ -387,7 +396,7 @@ async def test_all_attempts_fail_raises_baseline_error(patched_io):
         pytest.raises(BaselineGenerationError, match="3 attempts"),
     ):
         await generate_triton_baseline(
-            _make_problem(), _make_spec(),
+            _make_definition(), _make_spec(),
             coder=coder, workloads=workloads, max_retries=3,
         )
 
@@ -432,7 +441,7 @@ async def test_generate_triton_baseline_emits_attempt_events(tmp_path, patched_i
             ),
         ):
             await generate_triton_baseline(
-                _make_problem(), _make_spec(),
+                _make_definition(), _make_spec(),
                 coder=coder, workloads=workloads, max_retries=3,
             )
     finally:
@@ -454,3 +463,149 @@ async def test_generate_triton_baseline_emits_attempt_events(tmp_path, patched_i
     # Failure records carry the ImplementationError name.
     failures = [r for r in records if r["kind"] == "baseline_failure"]
     assert all("ImplementationError" in r["reason"] for r in failures)
+
+
+# ── G2 regression: blob_roots threading for safetensors workloads ─────
+
+
+@pytest.mark.asyncio
+async def test_blob_roots_forwarded_to_build_input_generator():
+    """Regression for Codex G2 (P1-2).
+
+    ``_load_sol_problem`` computes ``blob_roots = config.safetensors_blob_roots
+    or [problem_dir]`` and must thread it into every input-generator
+    construction site. The earlier fix only patched the search-loop site;
+    ``generate_triton_baseline`` rebuilt its own generators and dropped
+    the kwarg, so any safetensors-bearing workload tripped a
+    FileNotFoundError before Phase B could start.
+
+    This test mocks ``build_input_generator`` and asserts the kwarg
+    survives the call so the missing-kwarg form (which used to raise
+    TypeError under the strict-spy below) cannot regress silently.
+    """
+    workloads = _make_workloads(n=2)
+    coder = CoderAgent(model=MagicMock())
+    coder.translate = AsyncMock(return_value=_coder_output("src"))
+
+    fake_roots = [Path("/tmp/fake_blob_root")]
+    seen_roots: list[list[Path] | None] = []
+
+    def _spy(definition, workload, *, blob_roots):
+        # Strict signature: positional-or-keyword `definition`/`workload`,
+        # keyword-only `blob_roots`. If the production code drops the
+        # kwarg this raises TypeError, surfacing the bug on import-time
+        # behavior rather than on the safetensors filesystem branch.
+        seen_roots.append(blob_roots)
+        return lambda seed: (workload.uuid, seed)
+
+    with (
+        patch(
+            "src.benchmark.baseline_generator.build_reference_fn",
+            return_value=lambda x: x * 2.0,
+        ),
+        patch(
+            "src.benchmark.baseline_generator.build_input_generator",
+            side_effect=_spy,
+        ),
+        patch(
+            "src.benchmark.baseline_generator.compile_kernel",
+            return_value=_compile_ok(),
+        ),
+        patch(
+            "src.benchmark.baseline_generator.verify_correctness",
+            return_value=_pass(),
+        ),
+    ):
+        await generate_triton_baseline(
+            _make_definition(),
+            _make_spec(),
+            coder=coder,
+            workloads=workloads,
+            blob_roots=fake_roots,
+        )
+
+    assert len(seen_roots) == 2  # one build per workload
+    assert all(r is fake_roots for r in seen_roots)
+
+
+@pytest.mark.asyncio
+async def test_blob_roots_defaults_to_none_when_omitted(patched_io):
+    """Default ``blob_roots=None`` keeps the existing call sites working
+    so the new kwarg is non-breaking for non-safetensors callers."""
+    coder = CoderAgent(model=MagicMock())
+    coder.translate = AsyncMock(return_value=_coder_output("src"))
+
+    with (
+        patch(
+            "src.benchmark.baseline_generator.compile_kernel",
+            return_value=_compile_ok(),
+        ),
+        patch(
+            "src.benchmark.baseline_generator.verify_correctness",
+            return_value=_pass(),
+        ),
+    ):
+        result = await generate_triton_baseline(
+            _make_definition(),
+            _make_spec(),
+            coder=coder,
+            workloads=_make_workloads(n=1),
+        )
+
+    assert result is not None
+
+
+@pytest.mark.gpu
+@pytest.mark.asyncio
+async def test_safetensors_workload_resolves_blob_with_roots(monkeypatch):
+    """End-to-end GPU regression: a safetensors-bearing workload survives
+    the input-generator construction step in ``generate_triton_baseline``
+    iff ``blob_roots`` points at the staging directory.
+
+    On the broken pre-fix code (no kwarg threading), this raises
+    ``FileNotFoundError`` at line 66 because ``load_safetensors`` falls
+    back to resolving ``"weights.safetensors"`` against CWD. We swap CWD
+    to a temp directory to guarantee the relative path can't accidentally
+    resolve, then run the baseline far enough to confirm the input-
+    generator stage succeeds. The Coder is mocked to return failing
+    source so the test exits via ``BaselineGenerationError`` rather than
+    a fake-success path — what matters is that the FileNotFoundError
+    from the pre-fix code never surfaces.
+    """
+    import tempfile
+
+    from src.benchmarks.sol_execbench import load as sol_load
+
+    fixture = Path(__file__).parent / "fixtures" / "sol_safetensors"
+    definition, workloads = sol_load(fixture)
+
+    spec = KernelSpec(
+        name=definition.name,
+        kernel_type=KernelType.MATMUL,
+        entrypoint="kernel_fn",
+        pytorch_reference=definition.reference,
+    )
+
+    coder = CoderAgent(model=MagicMock())
+    coder.translate = AsyncMock(side_effect=ImplementationError("forced fail"))
+
+    # Make CWD a directory with no weights file so that the broken
+    # (no-blob_roots) path provably can't resolve the relative blob.
+    with tempfile.TemporaryDirectory() as cwd:
+        monkeypatch.chdir(cwd)
+
+        # With the fix, blob_roots steers load_safetensors to the fixture
+        # dir; the input-generator construction succeeds and the loop
+        # proceeds to translate(), which fails with the mocked
+        # ImplementationError → BaselineGenerationError after retries.
+        # Without the fix, build_input_generator raises FileNotFoundError
+        # *before* ever reaching the retry loop.
+        with pytest.raises(BaselineGenerationError, match="failed after"):
+            await generate_triton_baseline(
+                definition,
+                spec,
+                coder=coder,
+                workloads=workloads,
+                max_retries=1,
+                blob_roots=[fixture],
+            )

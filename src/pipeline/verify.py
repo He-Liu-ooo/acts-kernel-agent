@@ -15,6 +15,8 @@ from typing import TYPE_CHECKING, Any, Callable
 from src.runtime.events import emit
 
 if TYPE_CHECKING:
+    from sol_execbench.core.data import Definition, Workload
+
     from src.eval.correctness import ComparisonPolicy
     from src.kernels.kernel import Kernel
 
@@ -32,6 +34,8 @@ def verify_optimized_kernel(
     *,
     reference_fn: Callable[..., Any],
     input_generator: Callable[[int], tuple],
+    definition: Definition | None = None,
+    workload: Workload | None = None,
     policy: ComparisonPolicy | None = None,
     cache_dir: Path | None = None,
 ) -> VerificationResult:
@@ -41,6 +45,11 @@ def verify_optimized_kernel(
     Returns a ``VerificationResult`` describing the outcome — compile
     failures surface as ``passed=False`` with a compile-phrased detail
     string.
+
+    *workload* is required when ``optimized.dps`` is True so the gate can
+    pre-allocate output buffers via ``allocate_outputs(definition,
+    resolved_axes, device)``; the kernel object itself carries the DPS
+    flag and is threaded through to ``verify_correctness``.
     """
     from src.eval.correctness import verify_correctness
     from src.kernels.compiler import compile_kernel
@@ -57,6 +66,9 @@ def verify_optimized_kernel(
         candidate_fn=compiled.compiled_fn,
         reference_fn=reference_fn,
         input_generator=input_generator,
+        definition=definition,
+        kernel=optimized,
+        workload=workload,
         policy=policy,
     )
     details = result.error_message if not result.passed else "Verification passed."

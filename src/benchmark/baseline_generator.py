@@ -25,7 +25,8 @@ from src.runtime.events import emit
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from src.benchmark.problem import Problem, Workload
+    from sol_execbench.core.data import Definition, Workload
+
     from src.eval.correctness import ComparisonPolicy
     from src.kernels.kernel import KernelSpec
 
@@ -35,7 +36,7 @@ class BaselineGenerationError(Exception):
 
 
 async def generate_triton_baseline(
-    problem: Problem,
+    definition: Definition,
     spec: KernelSpec,
     *,
     coder: CoderAgent | None,
@@ -43,16 +44,24 @@ async def generate_triton_baseline(
     max_retries: int = 3,
     cache_dir: Path | None = None,
     policy: ComparisonPolicy | None = None,
+    blob_roots: list[Path] | None = None,
 ) -> Kernel:
     """Translate a PyTorch reference into a verified Triton baseline.
 
     Returns the first candidate that compiles and passes correctness on
     every workload in *workloads*. Raises ``BaselineGenerationError``
     when no model is configured or when the attempt budget is exhausted.
+
+    *blob_roots* is forwarded to ``build_input_generator`` so workloads
+    that declare ``SafetensorsInput`` can resolve their on-disk weights
+    during this baseline-translation step. Mirrors the same kwarg flow
+    the search-loop input generators use in ``_load_sol_problem``;
+    omitting it here would make any safetensors-bearing problem fail
+    before Phase B starts.
     """
     if coder is None or not coder.has_model:
         raise BaselineGenerationError(
-            f"No model configured for '{problem.name}' — set ACTS_MODEL_CONFIG "
+            f"No model configured for '{definition.name}' — set ACTS_MODEL_CONFIG "
             "or drop configs/models/<provider>.json in place.",
         )
 
@@ -61,17 +70,21 @@ async def generate_triton_baseline(
             "generate_triton_baseline requires at least one workload.",
         )
 
-    reference_fn = build_reference_fn(problem.reference_source)
-    input_generators = [build_input_generator(problem, w) for w in workloads]
+    reference_fn = build_reference_fn(definition.reference)
+    input_generators = [
+        build_input_generator(definition, w, blob_roots=blob_roots) for w in workloads
+    ]
 
     for attempt in range(max_retries):
         emit("baseline_attempt", attempt=attempt + 1, max_attempts=max_retries)
         try:
             output = await coder.translate(
-                reference_source=problem.reference_source,
+                reference_source=definition.reference,
                 kernel_spec=spec,
                 reference_fn=reference_fn,
                 input_generators=input_generators,
+                definition=definition,
+                workloads=workloads,
             )
         except ImplementationError as exc:
             emit(
@@ -85,6 +98,7 @@ async def generate_triton_baseline(
             spec=spec,
             source_code=output.source_code,
             triton_kernel_name=output.triton_kernel_name,
+            dps=output.dps,
         )
         compiled = compile_kernel(candidate, cache_dir=cache_dir)
         if not compiled.success:
@@ -100,9 +114,12 @@ async def generate_triton_baseline(
                 candidate_fn=compiled.compiled_fn,
                 reference_fn=reference_fn,
                 input_generator=gen,
+                definition=definition,
+                kernel=candidate,
+                workload=wl,
                 policy=policy,
             ).passed
-            for gen in input_generators
+            for gen, wl in zip(input_generators, workloads)
         ):
             emit(
                 "baseline_success",
@@ -118,6 +135,6 @@ async def generate_triton_baseline(
         )
 
     raise BaselineGenerationError(
-        f"Baseline translation for '{problem.name}' failed after "
+        f"Baseline translation for '{definition.name}' failed after "
         f"{max_retries} attempts.",
     )

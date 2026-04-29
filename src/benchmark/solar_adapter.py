@@ -15,11 +15,11 @@ subprocess calls):
   4. ``EinsumGraphPerfModel.predict``      — apply the arch YAML's roofline.
 
 SOLAR expects a model file with ``class Model(nn.Module)`` + ``def
-get_inputs()``. ACTS holds the reference as a ``def run(*tensors)``
-function inside a ``Problem`` dataclass. The bridge in
+get_inputs()``. ACTS receives the reference as a ``def run(*tensors)``
+function inside a SOL ``Definition``. The bridge in
 ``_write_model_bridge_file`` synthesizes the SOLAR-shaped wrapper from
-the problem's ``reference_source`` + a representative ``Workload``'s
-concrete axis values.
+``definition.reference`` + a representative ``Workload``'s concrete
+axis values.
 """
 
 from __future__ import annotations
@@ -33,7 +33,8 @@ from typing import TYPE_CHECKING
 from src.eval.types import BottleneckType
 
 if TYPE_CHECKING:
-    from src.benchmark.problem import Problem, Workload
+    from sol_execbench.core.data import Definition, Workload
+
     from src.config import HardwareSpec
 
 logger = logging.getLogger(__name__)
@@ -118,14 +119,22 @@ _PRECISION_FOR_DTYPE = {
 }
 
 
-def _precision_for_first_input(problem: Problem) -> str:
+def _dtype_str(dtype) -> str:
+    """Coerce a SOL ``DType`` enum (or any string-like) to a lower-case
+    string suitable for dtype lookups. ``DType`` is a ``str``-subclass
+    enum, so ``getattr(value)`` returns the underlying string."""
+    value = getattr(dtype, "value", None)
+    return value if isinstance(value, str) else str(dtype)
+
+
+def _precision_for_first_input(definition: Definition) -> str:
     """Pick the SOLAR ``--precision`` flag from the first input tensor's
     dtype. SOLAR uses this to select which ``MAC_per_cycle_*`` field of
     the arch YAML to apply."""
-    if not problem.inputs:
+    if not definition.inputs:
         return "fp16"
-    first = next(iter(problem.inputs.values()))
-    return _PRECISION_FOR_DTYPE.get(first.dtype.lower(), "fp16")
+    first = next(iter(definition.inputs.values()))
+    return _PRECISION_FOR_DTYPE.get(_dtype_str(first.dtype).lower(), "fp16")
 
 
 def is_solar_available() -> bool:
@@ -133,73 +142,51 @@ def is_solar_available() -> bool:
     return _SOLAR_AVAILABLE
 
 
-# ── bridge: ACTS Problem + Workload → SOLAR model file ──────────────────
+# ── bridge: SOL Definition + Workload → SOLAR model file ────────────────
 
 def _write_model_bridge_file(
-    problem: Problem, workload: Workload, target_path: Path
+    definition: Definition, workload: Workload, target_path: Path
 ) -> Path:
-    """Synthesize a SOLAR-compatible ``model.py`` from an ACTS Problem +
+    """Synthesize a SOLAR-compatible ``model.py`` from a SOL Definition +
     Workload. The file contains the reference source verbatim, a
     ``class Model(nn.Module)`` whose ``forward`` calls ``run``, and a
     ``def get_inputs()`` that builds tensors per the workload's concrete
-    axis values + the problem's input dtypes/shapes.
+    axis values + the definition's input dtypes/shapes.
 
-    Const axes (e.g. ``hidden_size: const 4096``) are folded in alongside
-    the workload's var-axis values so every shape symbol resolves to an
-    integer at synthesis time.
+    Uses ``definition.get_resolved_axes_values`` to fold const + expr axes
+    into the workload's var-axis values in one shot, so every shape symbol
+    resolves to an integer at synthesis time.
     """
-    concrete: dict[str, int] = dict(workload.axes)
-    for name, axis_def in problem.axes.items():
-        if axis_def.type == "const" and axis_def.value is not None:
-            concrete[name] = axis_def.value
-
-    # Resolve ``expr`` axes (e.g. ``half_head_dim = attention_head_dim // 2``
-    # in flux_rope) by fixed-point evaluation against ``concrete``. SOL-ExecBench
-    # expressions are simple integer arithmetic over other axis names, so a
-    # restricted ``eval`` with no builtins is sufficient and keeps the bridge
-    # synchronous. Iterate until no progress to handle expr-on-expr chains.
-    pending_exprs = {
-        name: axis_def.expression
-        for name, axis_def in problem.axes.items()
-        if axis_def.type == "expr" and axis_def.expression is not None
-    }
-    while pending_exprs:
-        progress = False
-        for name in list(pending_exprs):
-            try:
-                value = eval(pending_exprs[name], {"__builtins__": {}}, concrete)
-            except (NameError, SyntaxError):
-                continue
-            concrete[name] = int(value)
-            del pending_exprs[name]
-            progress = True
-        if not progress:
-            raise ValueError(
-                f"unresolved expr axes {list(pending_exprs)} "
-                f"(known concrete axes={sorted(concrete)})"
-            )
+    try:
+        concrete = definition.get_resolved_axes_values(workload.axes)
+    except (KeyError, ValueError) as exc:
+        raise ValueError(
+            f"could not resolve axes for {definition.name!r} "
+            f"(workload axes={workload.axes}): {exc}"
+        ) from exc
 
     forward_args: list[str] = []
     inputs_lines: list[str] = []
-    for tensor_name, tensor_def in problem.inputs.items():
+    for tensor_name, tensor_spec in definition.inputs.items():
         forward_args.append(tensor_name)
-        if tensor_def.shape is None:
+        dtype_str = _dtype_str(tensor_spec.dtype)
+        if tensor_spec.shape is None:
             # Python scalar input — placeholder 1.0 keeps SOLAR's tracer
             # happy without affecting the analyzed op graph.
             inputs_lines.append("        1.0,")
             continue
-        if tensor_def.shape == []:
+        if tensor_spec.shape == []:
             # 0-D tensor — distinct from ``shape=None`` (Python scalar).
             # Emit a ``()``-shaped tensor; the dtype-aware constructor
             # avoids ``torch.randn(, ...)`` (SyntaxError) and also handles
             # int/bool dtypes that ``torch.randn`` rejects.
             inputs_lines.append(
-                f"        {_tensor_constructor_call(tensor_def.dtype, '()')},"
+                f"        {_tensor_constructor_call(dtype_str, '()')},"
             )
             continue
         resolved = []
-        for axis in tensor_def.shape:
-            if isinstance(axis, int):
+        for axis in tensor_spec.shape:
+            if isinstance(axis, int) or (isinstance(axis, str) and axis.isdigit()):
                 resolved.append(str(axis))
             elif axis in concrete:
                 resolved.append(str(concrete[axis]))
@@ -207,11 +194,11 @@ def _write_model_bridge_file(
                 raise ValueError(
                     f"unresolved axis {axis!r} for input {tensor_name!r} "
                     f"(workload axes={workload.axes}, "
-                    f"const axes={[n for n, a in problem.axes.items() if a.type == 'const']})"
+                    f"resolved={sorted(concrete)})"
                 )
         shape_str = ", ".join(resolved)
         inputs_lines.append(
-            f"        {_tensor_constructor_call(tensor_def.dtype, shape_str)},"
+            f"        {_tensor_constructor_call(dtype_str, shape_str)},"
         )
 
     forward_args_str = ", ".join(forward_args)
@@ -221,7 +208,7 @@ def _write_model_bridge_file(
         "import torch\n"
         "import torch.nn as nn\n"
         "\n"
-        f"{problem.reference_source}\n"
+        f"{definition.reference}\n"
         "\n"
         "class Model(nn.Module):\n"
         f"    def forward(self, {forward_args_str}):\n"
@@ -283,7 +270,7 @@ def _resolve_arch_config(hardware_spec: HardwareSpec, arch_yaml_path: Path | Non
 # ── main entry point ────────────────────────────────────────────────────
 
 def derive_t_sol(
-    problem: Problem,
+    definition: Definition,
     workload: Workload,
     hardware_spec: HardwareSpec,
     arch_yaml_path: Path | None = None,
@@ -291,7 +278,7 @@ def derive_t_sol(
 ) -> SolarResult | None:
     """Derive T_SOL via SOLAR's 4-stage Python pipeline.
 
-    Bridges the ACTS ``Problem`` + ``Workload`` to SOLAR's expected
+    Bridges the SOL ``Definition`` + ``Workload`` to SOLAR's expected
     ``Model`` shape, drives all 4 SOLAR stages in a temp dir, and parses
     the perf YAML's ``fused`` runtime as ``T_SOL``.
 
@@ -311,19 +298,19 @@ def derive_t_sol(
         return None
 
     arch_config = _resolve_arch_config(hardware_spec, arch_yaml_path)
-    precision = _precision_for_first_input(problem)
+    precision = _precision_for_first_input(definition)
 
     with tempfile.TemporaryDirectory(prefix="acts_solar_") as tmpdir:
         tmp = Path(tmpdir)
         try:
-            model_file = _write_model_bridge_file(problem, workload, tmp / "model.py")
+            model_file = _write_model_bridge_file(definition, workload, tmp / "model.py")
         except ValueError as exc:
             # Bridge couldn't synthesize a SOLAR model file (e.g. an axis
             # form the bridge doesn't know how to emit). Soft-fall-back to
             # the built-in roofline rather than crashing the load path.
             logger.warning(
-                "SOLAR bridge failed for problem %r: %s — falling back to built-in roofline",
-                problem.name, exc,
+                "SOLAR bridge failed for definition %r: %s — falling back to built-in roofline",
+                definition.name, exc,
             )
             return None
 
@@ -345,7 +332,7 @@ def derive_t_sol(
             )
         )
         if not proc.process_model_file(str(model_file), str(tmp / "graph")):
-            logger.warning("SOLAR stage 1 (process_model_file) failed for problem %r", problem.name)
+            logger.warning("SOLAR stage 1 (process_model_file) failed for problem %r", definition.name)
             return None
 
         # Stage 2 — einsum conversion.
@@ -356,7 +343,7 @@ def derive_t_sol(
             copy_graph=False, expand_complex_ops=True, enable_rename=False,
         )
         if conv_result is None:
-            logger.warning("SOLAR stage 2 (PyTorchToEinsum) failed for problem %r", problem.name)
+            logger.warning("SOLAR stage 2 (PyTorchToEinsum) failed for problem %r", definition.name)
             return None
 
         # Stage 3 — analysis.
@@ -368,7 +355,7 @@ def derive_t_sol(
             einsum_yaml, analysis_dir, precision=precision, copy_graph=False,
         )
         if analysis is None:
-            logger.warning("SOLAR stage 3 (EinsumGraphAnalyzer) failed for problem %r", problem.name)
+            logger.warning("SOLAR stage 3 (EinsumGraphAnalyzer) failed for problem %r", definition.name)
             return None
 
         # Stage 4 — perf prediction.
@@ -377,12 +364,12 @@ def derive_t_sol(
             arch_config=arch_config, precision=precision, copy_analysis=False,
         )
         if perf is None:
-            logger.warning("SOLAR stage 4 (EinsumGraphPerfModel) failed for problem %r", problem.name)
+            logger.warning("SOLAR stage 4 (EinsumGraphPerfModel) failed for problem %r", definition.name)
             return None
 
     section = perf.get(roofline_model, {})
     if not section:
-        logger.warning("SOLAR perf YAML missing %r section for problem %r", roofline_model, problem.name)
+        logger.warning("SOLAR perf YAML missing %r section for problem %r", roofline_model, definition.name)
         return None
 
     runtime_ms = float(section.get("runtime_ms", 0.0))

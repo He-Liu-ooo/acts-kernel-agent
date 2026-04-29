@@ -350,7 +350,7 @@ class TestRunBottleneckInReport:
         # Roofline.bottleneck was MEMORY_BOUND — that's the run-level value.
         assert report.bottleneck is BottleneckType.MEMORY_BOUND
         # Placeholder path (no workloads, no problem): per-workload
-        # bottlenecks stays empty — classify_workload requires Problem.
+        # bottlenecks stays empty — classify_workload requires Definition.
         assert report.winner_per_workload_bottlenecks == {}
 
 
@@ -378,7 +378,7 @@ class TestReportWinnerReprofile:
         """When ``workloads`` + ``input_generators`` + ``hardware_spec`` are
         supplied, ``generate_report`` calls ``profile_kernel`` once per
         workload and stores the result keyed by workload UUID."""
-        from src.benchmark.problem import Workload
+        from sol_execbench.core.data import Workload
         from src.eval.scorer import ScoreResult
         from src.pipeline.report import generate_report
         from src.search.orchestrator import SearchResult, TerminationReason
@@ -410,9 +410,9 @@ class TestReportWinnerReprofile:
         )
 
         workloads = [
-            Workload(uuid="wl0", axes={"N": 128}),
-            Workload(uuid="wl1", axes={"N": 256}),
-            Workload(uuid="wl2", axes={"N": 512}),
+            Workload.model_validate({"uuid": "wl0", "axes": {"N": 128}, "inputs": {}}),
+            Workload.model_validate({"uuid": "wl1", "axes": {"N": 256}, "inputs": {}}),
+            Workload.model_validate({"uuid": "wl2", "axes": {"N": 512}, "inputs": {}}),
         ]
         gens = [lambda s, i=i: (i, s) for i in range(3)]
 
@@ -533,12 +533,12 @@ class TestPerWorkloadLatencyPersistedOnNode:
         """After a successful child iteration, the TreeNode should carry
         the benchmark's ``per_workload_latency_us`` so later re-profiling
         can use each workload's real latency."""
-        from src.benchmark.problem import Workload
+        from sol_execbench.core.data import Workload
         from src.search.orchestrator import Orchestrator
 
         workloads = [
-            Workload(uuid="wl0", axes={}),
-            Workload(uuid="wl1", axes={}),
+            Workload.model_validate({"uuid": "wl0", "axes": {}, "inputs": {}}),
+            Workload.model_validate({"uuid": "wl1", "axes": {}, "inputs": {}}),
         ]
         baseline_bench = BenchmarkResult(
             median_latency_us=100.0,
@@ -589,7 +589,7 @@ class TestReportUsesPerWorkloadLatency:
     are wrong for any workload whose latency diverges from the aggregate."""
 
     def test_reprofile_uses_per_workload_latency_when_available(self, harness):
-        from src.benchmark.problem import Workload
+        from sol_execbench.core.data import Workload
         from src.eval.scorer import ScoreResult
         from src.pipeline.report import generate_report
         from src.search.orchestrator import SearchResult, TerminationReason
@@ -618,7 +618,10 @@ class TestReportUsesPerWorkloadLatency:
             termination_reason=TerminationReason.BUDGET,
             tree=tree,
         )
-        workloads = [Workload(uuid=u, axes={}) for u in ("wl0", "wl1", "wl2")]
+        workloads = [
+            Workload.model_validate({"uuid": u, "axes": {}, "inputs": {}})
+            for u in ("wl0", "wl1", "wl2")
+        ]
         gens = [lambda s: () for _ in range(3)]
 
         profile_fake = MagicMock(return_value=_make_profile())
@@ -638,7 +641,7 @@ class TestReportUsesPerWorkloadLatency:
         """Legacy checkpoint (or placeholder path): no per_workload_latency_us
         on the node. The re-profile loop must fall back to the aggregate so
         old trees still render."""
-        from src.benchmark.problem import Workload
+        from sol_execbench.core.data import Workload
         from src.eval.scorer import ScoreResult
         from src.pipeline.report import generate_report
         from src.search.orchestrator import SearchResult, TerminationReason
@@ -663,7 +666,10 @@ class TestReportUsesPerWorkloadLatency:
             termination_reason=TerminationReason.BUDGET,
             tree=tree,
         )
-        workloads = [Workload(uuid=u, axes={}) for u in ("wl0", "wl1")]
+        workloads = [
+            Workload.model_validate({"uuid": u, "axes": {}, "inputs": {}})
+            for u in ("wl0", "wl1")
+        ]
         gens = [lambda s: () for _ in range(2)]
 
         profile_fake = MagicMock(return_value=_make_profile())
@@ -687,12 +693,8 @@ class TestReportUsesPerWorkloadLatency:
         ``problem.definition_path`` to ``profile_kernel`` so the NCU
         subprocess can rebuild inputs. Without this, the driver ignores
         the in-process input_generator and NCU silently degrades."""
-        from src.benchmark.problem import (
-            AxisDef,
-            Problem,
-            TensorDef,
-            Workload,
-        )
+        from sol_execbench.core.data import Definition, Workload
+
         from src.eval.scorer import ScoreResult
         from src.pipeline.report import generate_report
         from src.search.orchestrator import SearchResult, TerminationReason
@@ -720,24 +722,28 @@ class TestReportUsesPerWorkloadLatency:
             termination_reason=TerminationReason.BUDGET,
             tree=tree,
         )
-        workloads = [Workload(uuid="wl0", axes={"M": 128, "N": 128, "K": 64})]
-        problem = Problem(
-            name="sol-matmul",
-            axes={
-                "M": AxisDef(type="var"),
-                "N": AxisDef(type="var"),
-                "K": AxisDef(type="var"),
+        workloads = [
+            Workload.model_validate({
+                "uuid": "wl0",
+                "axes": {"M": 128, "N": 128, "K": 64},
+                "inputs": {},
+            })
+        ]
+        definition = Definition.model_validate({
+            "name": "sol-matmul",
+            "axes": {
+                "M": {"type": "var"},
+                "N": {"type": "var"},
+                "K": {"type": "var"},
             },
-            inputs={
-                "a": TensorDef(shape=["M", "K"], dtype="float32"),
-                "b": TensorDef(shape=["K", "N"], dtype="float32"),
+            "inputs": {
+                "a": {"shape": ["M", "K"], "dtype": "float32"},
+                "b": {"shape": ["K", "N"], "dtype": "float32"},
             },
-            outputs={"c": TensorDef(shape=["M", "N"], dtype="float32")},
-            reference_source="def run(a, b): return a @ b\n",
-            op_type="matmul",
-            workloads=workloads,
-            definition_path=definition_path,
-        )
+            "outputs": {"c": {"shape": ["M", "N"], "dtype": "float32"}},
+            "reference": "def run(a, b): return a @ b\n",
+            "op_type": "matmul",
+        })
         gens = [lambda s: ()]
 
         profile_fake = MagicMock(return_value=_make_profile())
@@ -747,7 +753,8 @@ class TestReportUsesPerWorkloadLatency:
                 workloads=workloads,
                 input_generators=gens,
                 hardware_spec=harness.config.hardware,
-                problem=problem,
+                definition=definition,
+                definition_path=definition_path,
             )
 
         assert profile_fake.call_count == 1
@@ -759,7 +766,7 @@ class TestReportUsesPerWorkloadLatency:
         must still call profile_kernel but with
         ``problem_definition_path=None`` — the driver then falls back to
         ``make_inputs`` / ``args`` (the pre-existing behavior)."""
-        from src.benchmark.problem import Workload
+        from sol_execbench.core.data import Workload
         from src.eval.scorer import ScoreResult
         from src.pipeline.report import generate_report
         from src.search.orchestrator import SearchResult, TerminationReason
@@ -784,7 +791,9 @@ class TestReportUsesPerWorkloadLatency:
             termination_reason=TerminationReason.BUDGET,
             tree=tree,
         )
-        workloads = [Workload(uuid="wl0", axes={})]
+        workloads = [
+            Workload.model_validate({"uuid": "wl0", "axes": {}, "inputs": {}})
+        ]
         gens = [lambda s: ()]
 
         profile_fake = MagicMock(return_value=_make_profile())
@@ -803,22 +812,22 @@ class TestReportUsesPerWorkloadLatency:
 class TestRooflineInputsDerivedPerIteration:
     """SOL-shaped problems arrive at the orchestrator with
     ``KernelSpec.flop_count == 0`` and ``KernelSpec.memory_bytes == 0`` —
-    ``problem_to_kernel_spec`` leaves them at zero because SOLAR supplies
+    ``_definition_to_kernel_spec`` leaves them at zero because SOLAR supplies
     ``T_SOL`` directly. The orchestrator must rederive per-iteration
-    ``(flops, nbytes)`` from the Problem + representative Workload rather
+    ``(flops, nbytes)`` from the Definition + representative Workload rather
     than feed the zeroed spec into ``profile_kernel`` (which would raise
     ``ProfilerError`` and DEAD_END every branch)."""
 
     @pytest.mark.asyncio
     async def test_sol_problem_with_zero_spec_counts_still_profiles(self, harness):
         """A SOL-shaped Kernel has ``flop_count=0`` and ``memory_bytes=0``.
-        When we pass a Problem + Workload, the orchestrator must thread
+        When we pass a Definition + Workload, the orchestrator must thread
         helper-computed counts into profile_kernel, not the spec zeros."""
-        from src.benchmark.problem import AxisDef, Problem, TensorDef, Workload
+        from sol_execbench.core.data import Definition, Workload
         from src.search.orchestrator import Orchestrator
 
         # Rebuild the baseline with zeroed counts (mirrors what
-        # problem_to_kernel_spec produces for a SOL problem).
+        # _definition_to_kernel_spec produces for a SOL problem).
         harness.baseline = Kernel(
             spec=KernelSpec(
                 name="sol-matmul",
@@ -828,23 +837,28 @@ class TestRooflineInputsDerivedPerIteration:
             ),
             source_code="# placeholder",
         )
-        workloads = [Workload(uuid="wl0", axes={"M": 128, "N": 128, "K": 64})]
-        problem = Problem(
-            name="sol-matmul",
-            axes={
-                "M": AxisDef(type="var"),
-                "N": AxisDef(type="var"),
-                "K": AxisDef(type="var"),
+        workloads = [
+            Workload.model_validate({
+                "uuid": "wl0",
+                "axes": {"M": 128, "N": 128, "K": 64},
+                "inputs": {},
+            })
+        ]
+        definition = Definition.model_validate({
+            "name": "sol-matmul",
+            "axes": {
+                "M": {"type": "var"},
+                "N": {"type": "var"},
+                "K": {"type": "var"},
             },
-            inputs={
-                "a": TensorDef(shape=["M", "K"], dtype="float32"),
-                "b": TensorDef(shape=["K", "N"], dtype="float32"),
+            "inputs": {
+                "a": {"shape": ["M", "K"], "dtype": "float32"},
+                "b": {"shape": ["K", "N"], "dtype": "float32"},
             },
-            outputs={"c": TensorDef(shape=["M", "N"], dtype="float32")},
-            reference_source="def run(a, b): return a @ b\n",
-            op_type="matmul",
-            workloads=workloads,
-        )
+            "outputs": {"c": {"shape": ["M", "N"], "dtype": "float32"}},
+            "reference": "def run(a, b): return a @ b\n",
+            "op_type": "matmul",
+        })
         input_generators = [lambda seed: ()]
 
         child_bench = BenchmarkResult(
@@ -875,7 +889,7 @@ class TestRooflineInputsDerivedPerIteration:
                 workloads=workloads,
                 roofline=harness.roofline,
                 input_generators=input_generators,
-                problem=problem,
+                definition=definition,
             )
 
         # profile_kernel must have been called with nonzero flops / nbytes
@@ -894,7 +908,7 @@ class TestRooflineInputsDerivedPerIteration:
         ``child.profiling = None``, and keep the branch alive (PROMISING).
         A zero-spec op must not DEAD_END the whole search."""
         from src.agents.reviewer import BranchQuality
-        from src.benchmark.problem import AxisDef, Problem, TensorDef, Workload
+        from sol_execbench.core.data import Definition, Workload
         from src.search.orchestrator import Orchestrator
 
         harness.baseline = Kernel(
@@ -906,16 +920,19 @@ class TestRooflineInputsDerivedPerIteration:
             ),
             source_code="# placeholder",
         )
-        workloads = [Workload(uuid="wl0", axes={"N": 256})]
-        problem = Problem(
-            name="sol-unknown",
-            axes={"N": AxisDef(type="var")},
-            inputs={"x": TensorDef(shape=["N"], dtype="float32")},
-            outputs={"y": TensorDef(shape=["N"], dtype="float32")},
-            reference_source="def run(x): return x\n",
-            op_type="some_op_without_a_formula",
-            workloads=workloads,
-        )
+        workloads = [
+            Workload.model_validate({
+                "uuid": "wl0", "axes": {"N": 256}, "inputs": {}
+            })
+        ]
+        definition = Definition.model_validate({
+            "name": "sol-unknown",
+            "axes": {"N": {"type": "var"}},
+            "inputs": {"x": {"shape": ["N"], "dtype": "float32"}},
+            "outputs": {"y": {"shape": ["N"], "dtype": "float32"}},
+            "reference": "def run(x): return x\n",
+            "op_type": "some_op_without_a_formula",
+        })
         input_generators = [lambda seed: ()]
 
         baseline_bench = BenchmarkResult(
@@ -946,7 +963,7 @@ class TestRooflineInputsDerivedPerIteration:
                 workloads=workloads,
                 roofline=harness.roofline,
                 input_generators=input_generators,
-                problem=problem,
+                definition=definition,
             )
 
         assert profile_fake.call_count == 0, (
