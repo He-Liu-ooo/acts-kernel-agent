@@ -7,6 +7,8 @@ production policy (used when no policy is injected).
 
 from __future__ import annotations
 
+import pytest
+
 from src.eval.correctness import CorrectnessStage, verify_correctness
 from tests.conftest import ScalarPolicy, scalar_gen as _gen, scalar_ref as _ref
 
@@ -256,8 +258,6 @@ def test_verify_correctness_atol_rtol_defaults_match_sol_execbench():
     """
     import inspect
 
-    import pytest
-
     try:
         from sol_execbench.core.data.workload import ToleranceSpec
     except ImportError:
@@ -267,3 +267,216 @@ def test_verify_correctness_atol_rtol_defaults_match_sol_execbench():
     sig = inspect.signature(verify_correctness)
     assert sig.parameters["atol"].default == sol_defaults.max_atol
     assert sig.parameters["rtol"].default == sol_defaults.max_rtol
+
+
+# ── Multi-output normalization (SOL ``normalize_outputs`` integration) ───
+
+
+@pytest.mark.gpu
+def test_verify_correctness_handles_multi_output_reference():
+    """Reference returns a tuple of two tensors; verify_correctness routes
+    both candidate and reference outputs through ``normalize_outputs``
+    (using the workload definition's ``outputs`` order) before per-name
+    tolerance comparison. A correct multi-output candidate must pass."""
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required for multi-output integration test")
+
+    from sol_execbench.core.data import Definition
+
+    definition = Definition.model_validate({
+        "name": "two_out",
+        "axes": {"N": {"type": "var"}},
+        "inputs": {"x": {"shape": ["N"], "dtype": "float32"}},
+        "outputs": {
+            "out1": {"shape": ["N"], "dtype": "float32"},
+            "out2": {"shape": ["N"], "dtype": "float32"},
+        },
+        "reference": "def run(x):\n    return x.relu(), x.tanh()\n",
+        "op_type": "elementwise",
+    })
+
+    def input_generator(seed: int) -> tuple:
+        gen = torch.Generator(device="cuda").manual_seed(seed)
+        return (torch.randn(64, generator=gen, device="cuda"),)
+
+    def reference_fn(x):
+        return x.relu(), x.tanh()
+
+    def candidate_fn(x):
+        return x.relu(), x.tanh()
+
+    result = verify_correctness(
+        candidate_fn=candidate_fn,
+        reference_fn=reference_fn,
+        input_generator=input_generator,
+        definition=definition,
+    )
+    assert result.passed, (
+        f"multi-output verify failed at stage "
+        f"{result.failed_stage}: {result.error_message}"
+    )
+
+
+@pytest.mark.gpu
+def test_verify_correctness_catches_wrong_second_output():
+    """Multi-output check must compare every named output. A candidate that
+    matches on output 1 but fakes output 2 must fail — otherwise the
+    normalization wrapper would only be cosmetic."""
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required for multi-output integration test")
+
+    from sol_execbench.core.data import Definition
+
+    definition = Definition.model_validate({
+        "name": "two_out_bad",
+        "axes": {"N": {"type": "var"}},
+        "inputs": {"x": {"shape": ["N"], "dtype": "float32"}},
+        "outputs": {
+            "out1": {"shape": ["N"], "dtype": "float32"},
+            "out2": {"shape": ["N"], "dtype": "float32"},
+        },
+        "reference": "def run(x):\n    return x.relu(), x.tanh()\n",
+        "op_type": "elementwise",
+    })
+
+    def input_generator(seed: int) -> tuple:
+        gen = torch.Generator(device="cuda").manual_seed(seed)
+        return (torch.randn(64, generator=gen, device="cuda"),)
+
+    def reference_fn(x):
+        return x.relu(), x.tanh()
+
+    def candidate_fn(x):
+        # First output correct; second output is sin(x), not tanh(x).
+        return x.relu(), x.sin()
+
+    result = verify_correctness(
+        candidate_fn=candidate_fn,
+        reference_fn=reference_fn,
+        input_generator=input_generator,
+        definition=definition,
+    )
+    assert not result.passed
+    assert result.failed_stage is CorrectnessStage.SMOKE_TEST
+
+
+# ── DPS (destination-passing-style) candidates ─────────────────────────────
+
+
+@pytest.mark.gpu
+def test_verify_correctness_handles_dps_multi_output_candidate():
+    """A DPS candidate (``kernel_fn(x, out_a, out_b)``) must verify against a
+    PyTorch reference that returns its outputs by value. The gate allocates
+    output buffers per call via ``allocate_outputs`` and threads them in
+    after the inputs; the filled buffers serve as the candidate's outputs
+    for the comparison."""
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required for DPS verification test")
+
+    from sol_execbench.core.data import Definition, Workload
+
+    from src.kernels.kernel import Kernel, KernelSpec, KernelType
+
+    definition = Definition.model_validate({
+        "name": "dps_two_out",
+        "axes": {"N": {"type": "var"}},
+        "inputs": {"x": {"shape": ["N"], "dtype": "float32"}},
+        "outputs": {
+            "out1": {"shape": ["N"], "dtype": "float32"},
+            "out2": {"shape": ["N"], "dtype": "float32"},
+        },
+        "reference": "def run(x):\n    return x.relu(), x.tanh()\n",
+        "op_type": "elementwise",
+    })
+    workload = Workload.model_validate({
+        "uuid": "wl-dps-1", "axes": {"N": 64}, "inputs": {},
+    })
+
+    def input_generator(seed: int) -> tuple:
+        gen = torch.Generator(device="cuda").manual_seed(seed)
+        return (torch.randn(64, generator=gen, device="cuda"),)
+
+    def reference_fn(x):
+        return x.relu(), x.tanh()
+
+    def candidate_fn(x, out_a, out_b):
+        out_a.copy_(x.relu())
+        out_b.copy_(x.tanh())
+
+    kernel = Kernel(
+        spec=KernelSpec(name="dps_two_out", kernel_type=KernelType.ELEMENTWISE),
+        source_code="",
+        dps=True,
+    )
+
+    result = verify_correctness(
+        candidate_fn=candidate_fn,
+        reference_fn=reference_fn,
+        input_generator=input_generator,
+        definition=definition,
+        kernel=kernel,
+        workload=workload,
+    )
+    assert result.passed, (
+        f"DPS verify failed at stage {result.failed_stage}: {result.error_message}"
+    )
+
+
+@pytest.mark.gpu
+def test_verify_correctness_catches_wrong_dps_second_output():
+    """A DPS candidate that writes the right buffer for output 1 but the
+    wrong tensor for output 2 must fail the gate — every named output is
+    compared, not just the first."""
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required for DPS verification test")
+
+    from sol_execbench.core.data import Definition, Workload
+
+    from src.kernels.kernel import Kernel, KernelSpec, KernelType
+
+    definition = Definition.model_validate({
+        "name": "dps_two_out_bad",
+        "axes": {"N": {"type": "var"}},
+        "inputs": {"x": {"shape": ["N"], "dtype": "float32"}},
+        "outputs": {
+            "out1": {"shape": ["N"], "dtype": "float32"},
+            "out2": {"shape": ["N"], "dtype": "float32"},
+        },
+        "reference": "def run(x):\n    return x.relu(), x.tanh()\n",
+        "op_type": "elementwise",
+    })
+    workload = Workload.model_validate({
+        "uuid": "wl-dps-2", "axes": {"N": 64}, "inputs": {},
+    })
+
+    def input_generator(seed: int) -> tuple:
+        gen = torch.Generator(device="cuda").manual_seed(seed)
+        return (torch.randn(64, generator=gen, device="cuda"),)
+
+    def reference_fn(x):
+        return x.relu(), x.tanh()
+
+    def candidate_fn(x, out_a, out_b):
+        out_a.copy_(x.relu())
+        out_b.copy_(x.sin())  # wrong: should be tanh
+
+    kernel = Kernel(
+        spec=KernelSpec(name="dps_two_out_bad", kernel_type=KernelType.ELEMENTWISE),
+        source_code="",
+        dps=True,
+    )
+
+    result = verify_correctness(
+        candidate_fn=candidate_fn,
+        reference_fn=reference_fn,
+        input_generator=input_generator,
+        definition=definition,
+        kernel=kernel,
+        workload=workload,
+    )
+    assert not result.passed
+    assert result.failed_stage is CorrectnessStage.SMOKE_TEST

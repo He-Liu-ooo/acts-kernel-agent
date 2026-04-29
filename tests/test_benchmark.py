@@ -17,7 +17,8 @@ from typing import Callable
 
 import pytest
 
-from src.benchmark.problem import Workload
+from sol_execbench.core.data import Workload
+
 from src.config import ACTSConfig
 from src.eval.benchmark import BenchmarkError, BenchmarkResult, benchmark_kernel
 from src.kernels.kernel import Kernel, KernelSpec, KernelType
@@ -63,7 +64,7 @@ def _make_kernel() -> Kernel:
 
 
 def _wl(uuid: str) -> Workload:
-    return Workload(uuid=uuid, axes={}, inputs={})
+    return Workload.model_validate({"uuid": uuid, "axes": {}, "inputs": {}})
 
 
 def _gen(seed: int) -> tuple:
@@ -391,6 +392,101 @@ def test_timer_factory_called_per_workload():
     )
 
 
+# ── DPS path: pre-allocated output buffers ────────────────────────────────
+
+
+def _dps_definition() -> "Definition":  # noqa: F821
+    """Single-output definition matching the fake DPS kernel below."""
+    from sol_execbench.core.data import Definition
+
+    return Definition.model_validate({
+        "name": "dps_unary",
+        "axes": {"N": {"type": "var"}},
+        "inputs": {"x": {"shape": ["N"], "dtype": "float32"}},
+        "outputs": {"y": {"shape": ["N"], "dtype": "float32"}},
+        "reference": "def run(x):\n    return x * 2.0\n",
+        "op_type": "elementwise",
+    })
+
+
+def _make_dps_kernel() -> Kernel:
+    spec = KernelSpec(name="dps_k", kernel_type=KernelType.ELEMENTWISE)
+    return Kernel(spec=spec, source_code="", dps=True)
+
+
+@pytest.mark.gpu
+def test_benchmark_kernel_dps_allocates_outputs():
+    """``kernel.dps=True`` → benchmark_kernel calls ``allocate_outputs`` per
+    iter, hands the resulting buffers to the kernel as positional args
+    after the inputs, and the kernel writes into them in place."""
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required for DPS allocate_outputs path")
+
+    definition = _dps_definition()
+    workload = Workload.model_validate({
+        "uuid": "wl-dps", "axes": {"N": 1024}, "inputs": {},
+    })
+    captured: dict = {"calls": 0}
+
+    def kernel_fn(x, out):
+        # DPS contract: outputs are positional args after inputs.
+        captured["calls"] += 1
+        captured["last_out_shape"] = tuple(out.shape)
+        captured["last_out_dtype"] = out.dtype
+        captured["last_out_device"] = out.device
+        out.copy_(x * 2.0)
+
+    def gen(seed: int):
+        return (torch.randn(1024, dtype=torch.float32, device="cuda"),)
+
+    config = ACTSConfig()
+    config.warmup_runs = 2
+    config.timed_runs = 3
+    result = benchmark_kernel(
+        _make_dps_kernel(),
+        config,
+        workloads=[workload],
+        input_generators=[gen],
+        kernel_fn=kernel_fn,
+        definition=definition,
+        discard_first=1,
+    )
+    assert result.is_fully_successful
+    # warmup (2) + timed+discard (3+1) = 6 kernel invocations
+    assert captured["calls"] == 6
+    assert captured["last_out_shape"] == (1024,)
+    assert captured["last_out_dtype"] is torch.float32
+    assert captured["last_out_device"].type == "cuda"
+
+
+@pytest.mark.gpu
+def test_benchmark_kernel_dps_requires_definition():
+    """Asking for the DPS path without a definition is a contract violation —
+    we can't pre-allocate output buffers without the output spec."""
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required for DPS allocate_outputs path")
+
+    workload = Workload.model_validate({
+        "uuid": "wl-dps", "axes": {"N": 1024}, "inputs": {},
+    })
+    config = ACTSConfig()
+    config.warmup_runs = 1
+    config.timed_runs = 1
+
+    with pytest.raises(ValueError, match="definition"):
+        benchmark_kernel(
+            _make_dps_kernel(),
+            config,
+            workloads=[workload],
+            input_generators=[lambda s: (torch.randn(1024, device="cuda"),)],
+            kernel_fn=lambda x, out: None,
+            # definition omitted on purpose
+            discard_first=1,
+        )
+
+
 def test_exactly_half_failure_does_not_raise():
     """2 of 4 survive (exactly 50%) → returns result with inf markers."""
 
@@ -421,3 +517,118 @@ def test_exactly_half_failure_does_not_raise():
     assert len(finite) == 2
     # Overall median computed from survivors only.
     assert math.isfinite(result.median_latency_us)
+
+
+# ── last_outputs flattening (Codex G3 regression) ──────────────────────────
+
+
+@pytest.mark.gpu
+def test_non_dps_dict_return_flattens_to_tensor_list():
+    """Non-DPS kernels that return a ``dict`` of named outputs (e.g. LayerNorm
+    returning ``{"y": ..., "mean": ..., "rstd": ...}``) must have their values
+    flattened into ``last_outputs`` so ``check_lazy_outputs_after_bench`` sees
+    real ``torch.Tensor`` instances — not the dict object itself.
+
+    Pre-fix bug (Codex G3): ``last_outputs = ret if isinstance(ret, (list,
+    tuple)) else [ret]`` wrapped a dict in a list, so the lazy-output check
+    saw a ``dict`` and raised ``RewardHackDetected`` after an otherwise
+    successful benchmark — silently pruning every dict-return branch.
+    """
+    torch = pytest.importorskip("torch")
+    from src.eval.anti_cheat import check_lazy_outputs_after_bench
+
+    def kernel_fn(x):
+        return {"y": x.relu(), "stats": x.mean()}
+
+    def gen(seed: int) -> tuple:
+        return (torch.randn(8, dtype=torch.float32),)
+
+    timer = RecordingTimer(elapsed_ms_sequence=[0.010] * 100)
+    config = ACTSConfig()
+    config.warmup_runs = 1
+    config.timed_runs = 2
+    result = benchmark_kernel(
+        _make_kernel(),
+        config,
+        workloads=[_wl("wl-dict")],
+        input_generators=[gen],
+        timer_factory=lambda: timer,
+        kernel_fn=kernel_fn,
+        discard_first=1,
+    )
+    assert result.is_fully_successful, (
+        f"benchmark errored: {result.workload_errors}"
+    )
+    # Bug repro assertion: the dict's values must be flattened, not the
+    # dict object packed into [ret].
+    assert all(isinstance(t, torch.Tensor) for t in result.last_outputs), (
+        f"expected list[Tensor], got types: "
+        f"{[type(t).__name__ for t in result.last_outputs]}"
+    )
+    assert len(result.last_outputs) == 2
+    # And the canonical post-bench check must accept these outputs.
+    check_lazy_outputs_after_bench(result.last_outputs)
+
+
+@pytest.mark.gpu
+def test_non_dps_tuple_return_flattens_to_tensor_list():
+    """Tuple returns must unpack into ``last_outputs`` (regression guard for
+    the same flatten path that handles dicts)."""
+    torch = pytest.importorskip("torch")
+    from src.eval.anti_cheat import check_lazy_outputs_after_bench
+
+    def kernel_fn(x):
+        return (x.relu(), x.abs())
+
+    def gen(seed: int) -> tuple:
+        return (torch.randn(4, dtype=torch.float32),)
+
+    timer = RecordingTimer(elapsed_ms_sequence=[0.010] * 100)
+    config = ACTSConfig()
+    config.warmup_runs = 1
+    config.timed_runs = 2
+    result = benchmark_kernel(
+        _make_kernel(),
+        config,
+        workloads=[_wl("wl-tuple")],
+        input_generators=[gen],
+        timer_factory=lambda: timer,
+        kernel_fn=kernel_fn,
+        discard_first=1,
+    )
+    assert result.is_fully_successful
+    assert all(isinstance(t, torch.Tensor) for t in result.last_outputs)
+    assert len(result.last_outputs) == 2
+    check_lazy_outputs_after_bench(result.last_outputs)
+
+
+@pytest.mark.gpu
+def test_non_dps_single_tensor_return_wraps_in_list():
+    """Single-tensor return remains wrapped in a 1-elem list (existing
+    contract — guard against over-flattening when we add the dict branch)."""
+    torch = pytest.importorskip("torch")
+    from src.eval.anti_cheat import check_lazy_outputs_after_bench
+
+    def kernel_fn(x):
+        return x.relu()
+
+    def gen(seed: int) -> tuple:
+        return (torch.randn(4, dtype=torch.float32),)
+
+    timer = RecordingTimer(elapsed_ms_sequence=[0.010] * 100)
+    config = ACTSConfig()
+    config.warmup_runs = 1
+    config.timed_runs = 2
+    result = benchmark_kernel(
+        _make_kernel(),
+        config,
+        workloads=[_wl("wl-single")],
+        input_generators=[gen],
+        timer_factory=lambda: timer,
+        kernel_fn=kernel_fn,
+        discard_first=1,
+    )
+    assert result.is_fully_successful
+    assert len(result.last_outputs) == 1
+    assert isinstance(result.last_outputs[0], torch.Tensor)
+    check_lazy_outputs_after_bench(result.last_outputs)

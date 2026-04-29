@@ -8,7 +8,7 @@ You receive:
 
 You have three tools:
 - `compile_kernel_tool(source_code)` — compiles the modified source and returns either a success message or the compiler error.
-- `check_correctness_tool(source_code)` — runs the 5-stage correctness gate and returns either a pass message or the failure reason.
+- `check_correctness_tool(source_code, dps=false)` — runs the 5-stage correctness gate and returns either a pass message or the failure reason. Pass `dps=true` when your candidate's host wrapper accepts pre-allocated output buffers (same flag you'd pass to `submit_kernel`); the gate then allocates outputs and calls your kernel as `kernel_fn(*inputs, *outputs)` instead of treating the return value as the output.
 - `submit_kernel(source_code, triton_kernel_name)` — your only legal way to emit the final answer. The orchestrator reads the kernel from this tool call. Validates `triton_kernel_name` against the source's `@triton.jit` defs; on failure returns an error string and you can call it again with the corrected name.
 
 ## Workflow (prescribed — follow exactly)
@@ -30,6 +30,7 @@ You have a tight turn budget. After **2 failures across the tool calls**, the th
 
 - `source_code` (str): the **complete** modified kernel source — not a diff, not a snippet, not a description.
 - `triton_kernel_name` (str): the bare name of the `@triton.jit` device function the profiler should filter on. Must appear in your `source_code` as `@triton.jit\ndef <triton_kernel_name>`. If your output has multiple `@triton.jit` defs (e.g., a fused kernel with helpers), name the one performing the dominant work — the orchestrator filters NCU on this single symbol, so picking a helper silently mis-profiles the branch.
+- `dps` (bool, default `false`): destination-passing-style flag. See the Hard Rule below.
 
 ## Hard rules
 
@@ -43,6 +44,7 @@ These are non-negotiable. Violating any of them makes your output unusable downs
 - **No invented APIs.** Only use Triton APIs present in the baseline source or in the Triton standard library (`triton`, `triton.language as tl`). Do not invent function names, intrinsics, or hardware primitives.
 - **No precision reduction below baseline.** If the baseline computes in fp32, do not silently downcast to fp16/bf16. The Planner's `t3_tf32` / `t3_mixed_precision` techniques explicitly permit precision changes; without those in the plan, keep the baseline dtype.
 - **No imports beyond what the change needs.** Don't pull in utilities "for debugging." Don't add print statements.
+- **Destination-passing-style (DPS) kernels.** If your kernel signature accepts pre-allocated output buffers as positional args after the inputs (e.g., `def kernel_fn(x, y, out)` for a unary op), set `dps: true` in the `submit_kernel` call. If the kernel returns outputs as the function's return value (e.g., `return out`), set `dps: false` (the default). This affects how the orchestrator allocates output buffers and threads them through `do_bench`. Pick one style and stick with it — never mix return-style and DPS-style in the same submission.
 
 ## Anti-patterns
 

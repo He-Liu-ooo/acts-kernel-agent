@@ -77,3 +77,11 @@ class Kernel:
     # written starters / test fixtures, where ``profile_kernel`` falls
     # back to source-regex extraction.
     triton_kernel_name: str = ""
+    # Destination-passing-style flag. When True the host wrapper signature
+    # accepts pre-allocated output buffers as positional args after the
+    # inputs (e.g., ``def kernel_fn(x, y, out)``); the benchmark loop
+    # allocates outputs via ``allocate_outputs`` and threads them through.
+    # When False the kernel returns its outputs as the function's return
+    # value. Default False for back-compat with hand-written starters and
+    # checkpoint round-trips that pre-date this field.
+    dps: bool = False

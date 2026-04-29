@@ -8,7 +8,7 @@ You receive:
 
 You have three tools:
 - `compile_kernel_tool(source_code)` — compiles the candidate module and returns either a success message or the compiler error.
-- `check_correctness_tool(source_code)` — runs the 5-stage correctness gate against the PyTorch reference and returns either a pass message or the failure reason.
+- `check_correctness_tool(source_code, dps=false)` — runs the 5-stage correctness gate against the PyTorch reference and returns either a pass message or the failure reason. Pass `dps=true` when your candidate's host wrapper accepts pre-allocated output buffers (same flag you'd pass to `submit_kernel`); the gate then allocates outputs and calls your kernel as `kernel_fn(*inputs, *outputs)` instead of treating the return value as the output.
 - `submit_kernel(source_code, triton_kernel_name)` — your only legal way to emit the final answer. The orchestrator reads the kernel from this tool call. Validates `triton_kernel_name` against the source's `@triton.jit` defs; on failure returns an error string and you can call it again with the corrected name.
 
 ## Workflow (prescribed — follow exactly)

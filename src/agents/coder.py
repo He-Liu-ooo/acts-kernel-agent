@@ -72,6 +72,14 @@ class KernelCodeOutput(BaseModel):
 
     source_code: str
     triton_kernel_name: str
+    # Destination-passing-style flag — see ``Kernel.dps``. The Coder sets
+    # this to True when the emitted host wrapper takes pre-allocated output
+    # buffers as positional args after the inputs; defaults to False so
+    # legacy translate paths and tests that build outputs via ``return``
+    # still validate. Heavy DPS-shape validation happens at first call
+    # site (TypeError surfaces a mismatch); the schema only carries the
+    # contract bit.
+    dps: bool = False
 
     @model_validator(mode="after")
     def _triton_kernel_name_matches_source(self) -> "KernelCodeOutput":
@@ -137,7 +145,9 @@ def _make_correctness_tool(
     *,
     cache_dir: Path | None = None,
     policy: ComparisonPolicy | None = None,
-) -> Callable[[str], str]:
+    definition: Any | None = None,
+    workloads: list[Any] | None = None,
+) -> Callable[..., str]:
     """Build a correctness tool bound to a KernelSpec + oracle + workload generators.
 
     The tool recompiles the submitted source (compile is cheap; tools
@@ -148,15 +158,28 @@ def _make_correctness_tool(
     of reproducing the same kernel when only the primary workload was
     exercised. Compile failures are surfaced before attempting
     correctness so the Coder gets the cheaper error first.
+
+    *workloads* runs parallel to *input_generators*; when supplied with
+    ``dps=True`` from the LLM tool call, each workload's resolved axes
+    feed ``allocate_outputs`` so DPS host wrappers
+    (``def kernel_fn(x, out_a, out_b)``) can be checked against the
+    PyTorch oracle that returns its outputs by value. A length mismatch
+    is a contract bug at the factory level (raised eagerly).
     """
     if not input_generators:
         raise ValueError(
             "correctness tool requires at least one input generator — "
             "got an empty list.",
         )
+    if workloads is not None and len(workloads) != len(input_generators):
+        raise ValueError(
+            f"workloads ({len(workloads)}) and input_generators "
+            f"({len(input_generators)}) must be the same length so each "
+            f"DPS allocate_outputs gets the right resolved axes."
+        )
 
-    def check_correctness_tool(source_code: str) -> str:
-        kernel = Kernel(spec=kernel_spec, source_code=source_code)
+    def check_correctness_tool(source_code: str, dps: bool = False) -> str:
+        kernel = Kernel(spec=kernel_spec, source_code=source_code, dps=dps)
         compiled = compile_kernel(kernel, cache_dir=cache_dir)
         if not compiled.success:
             return (
@@ -166,10 +189,14 @@ def _make_correctness_tool(
         total = len(input_generators)
         max_err = 0.0
         for idx, gen in enumerate(input_generators):
+            wl = workloads[idx] if workloads is not None else None
             result = verify_correctness(
                 candidate_fn=compiled.compiled_fn,
                 reference_fn=reference_fn,
                 input_generator=gen,
+                definition=definition,
+                kernel=kernel,
+                workload=wl,
                 policy=policy,
             )
             if not result.passed:
@@ -202,11 +229,16 @@ def _make_submit_tool(captured: dict) -> Callable[[str, str], str]:
     because tests construct one per call and assert via ``"output" in captured``.
     """
 
-    def submit_kernel(source_code: str, triton_kernel_name: str) -> str:
+    def submit_kernel(
+        source_code: str,
+        triton_kernel_name: str,
+        dps: bool = False,
+    ) -> str:
         try:
             captured["output"] = KernelCodeOutput(
                 source_code=source_code,
                 triton_kernel_name=triton_kernel_name,
+                dps=dps,
             )
         except ValidationError as exc:
             return format_submit_validation_error("submit_kernel", exc)
@@ -289,6 +321,8 @@ class CoderAgent:
         kernel_spec: KernelSpec,
         reference_fn: Callable[..., Any],
         input_generators: list[Callable[[int], tuple]],
+        definition: Any | None = None,
+        workloads: list[Any] | None = None,
     ) -> KernelCodeOutput:
         compile_tool = function_tool(_make_compile_tool(kernel_spec))
         correctness_tool = function_tool(
@@ -296,6 +330,8 @@ class CoderAgent:
                 kernel_spec,
                 reference_fn=reference_fn,
                 input_generators=input_generators,
+                definition=definition,
+                workloads=workloads,
             )
         )
         # Per-call capture slot for the submit tool — populated when the
@@ -345,6 +381,8 @@ class CoderAgent:
         kernel_spec: KernelSpec | None = None,
         reference_fn: Callable[..., Any] | None = None,
         input_generators: list[Callable[[int], tuple]] | None = None,
+        definition: Any | None = None,
+        workloads: list[Any] | None = None,
     ) -> KernelCodeOutput:
         """Apply the optimization plan to the kernel source code.
 
@@ -365,6 +403,7 @@ class CoderAgent:
             return KernelCodeOutput.model_construct(
                 source_code=kernel_source,
                 triton_kernel_name="",
+                dps=False,
             )
 
         if kernel_spec is None or reference_fn is None or not input_generators:
@@ -381,6 +420,8 @@ class CoderAgent:
             kernel_spec=kernel_spec,
             reference_fn=reference_fn,
             input_generators=input_generators,
+            definition=definition,
+            workloads=workloads,
         )
 
     @staticmethod
@@ -408,6 +449,8 @@ class CoderAgent:
         kernel_spec: KernelSpec,
         reference_fn: Callable[..., Any],
         input_generators: list[Callable[[int], tuple]],
+        definition: Any | None = None,
+        workloads: list[Any] | None = None,
     ) -> KernelCodeOutput:
         """Port a PyTorch reference into a Triton kernel in one agent run.
 
@@ -435,4 +478,6 @@ class CoderAgent:
             kernel_spec=kernel_spec,
             reference_fn=reference_fn,
             input_generators=input_generators,
+            definition=definition,
+            workloads=workloads,
         )

@@ -36,7 +36,8 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, Protocol
 
 if TYPE_CHECKING:
-    from src.benchmark.problem import Workload
+    from sol_execbench.core.data import Definition, Workload
+
     from src.config import ACTSConfig
     from src.kernels.kernel import Kernel
 
@@ -68,7 +69,15 @@ class BenchmarkTimer(Protocol):
 
 @dataclass
 class BenchmarkResult:
-    """Latency benchmark result for a single kernel."""
+    """Latency benchmark result for a single kernel.
+
+    ``last_outputs`` carries the *last* workload's last-iter output
+    tensors (or whatever the kernel returned, in non-DPS mode) so the
+    orchestrator can run ``check_lazy_outputs_after_bench`` on real
+    output references. We retain only the last batch — full retention
+    across all workloads × all iters would balloon GPU memory and we
+    only need *some* concrete output to validate against.
+    """
 
     median_latency_us: float = 0.0
     min_latency_us: float = 0.0
@@ -77,6 +86,7 @@ class BenchmarkResult:
     timed_runs: int = 0
     per_workload_latency_us: dict[str, float] = field(default_factory=dict)
     workload_errors: dict[str, str] = field(default_factory=dict)
+    last_outputs: list = field(default_factory=list)
 
     @property
     def is_fully_successful(self) -> bool:
@@ -95,6 +105,7 @@ def benchmark_kernel(
     input_generators: list[Callable[[int], tuple]] | None = None,
     timer_factory: Callable[[], BenchmarkTimer] | None = None,
     kernel_fn: Callable | None = None,
+    definition: Definition | None = None,
     discard_first: int = 1,
 ) -> BenchmarkResult:
     """Benchmark kernel latency via the injected timer.
@@ -103,6 +114,12 @@ def benchmark_kernel(
     100us sentinel so the pre-SOL pipeline stays runnable; 0.0 would
     collapse ``compute_sol_score`` to 1.0 and silently fabricate an
     optimum.
+
+    When ``kernel.dps`` is True, *definition* must be supplied — outputs
+    are pre-allocated per iter via ``sol_execbench.core.bench.io.allocate_outputs``
+    and threaded into ``kernel_fn(*inputs, *outputs)``. When ``kernel.dps``
+    is False (the default), ``definition`` is unused and the kernel's
+    return value is treated as the output (legacy path).
     """
     workloads = workloads or []
     input_generators = input_generators or []
@@ -122,11 +139,19 @@ def benchmark_kernel(
             f"({len(input_generators)}) must be the same length"
         )
 
+    if kernel.dps and definition is None:
+        raise ValueError(
+            "kernel.dps=True requires a Definition so allocate_outputs can "
+            "pre-allocate output buffers per iter — pass definition=... to "
+            "benchmark_kernel.",
+        )
+
     fn = kernel_fn if kernel_fn is not None else _compile_entrypoint(kernel)
     factory = timer_factory or _default_timer_factory
 
     per_wl: dict[str, float] = {}
     errors: dict[str, str] = {}
+    last_outputs: list = []
 
     for wl, gen in zip(workloads, input_generators):
         # Fresh timer per workload: a CUDA launch/event fault can leave
@@ -134,9 +159,15 @@ def benchmark_kernel(
         # would turn a workload-local failure into order-dependent false
         # failures on every later workload on the same bench pass.
         timer = factory()
-        median_ms, error = _time_workload(
+        # Wrap the input generator so DPS kernels see the inputs followed
+        # by freshly-allocated outputs on every iteration. The wrapper is
+        # outside the timed window — same shape, same dtypes, same device
+        # as the workload's outputs — so allocator pauses don't leak into
+        # the latency measurement.
+        wl_gen = _wrap_dps_generator(gen, kernel=kernel, workload=wl, definition=definition)
+        median_ms, error, captured = _time_workload(
             fn=fn,
-            input_generator=gen,
+            input_generator=wl_gen,
             timer=timer,
             warmup=config.warmup_runs,
             timed=config.timed_runs,
@@ -147,6 +178,11 @@ def benchmark_kernel(
             errors[wl.uuid] = error
         else:
             per_wl[wl.uuid] = median_ms * 1000.0
+        # Overwrite each workload so we end up with the *last* workload's
+        # last-iter outputs — matches the BenchmarkResult.last_outputs
+        # contract (used for check_lazy_outputs_after_bench).
+        if captured is not None:
+            last_outputs = captured
 
     finite_us = [v for v in per_wl.values() if math.isfinite(v)]
     survivors = len(finite_us)
@@ -164,7 +200,54 @@ def benchmark_kernel(
         timed_runs=config.timed_runs,
         per_workload_latency_us=per_wl,
         workload_errors=errors,
+        last_outputs=last_outputs,
     )
+
+
+def _wrap_dps_generator(
+    gen: Callable[[int], tuple],
+    *,
+    kernel: Kernel,
+    workload: Workload,
+    definition: Definition | None,
+) -> Callable[[int], tuple]:
+    """Return an input generator that appends pre-allocated output buffers
+    when ``kernel.dps`` is True.
+
+    ``allocate_outputs`` allocates once per iter — fresh buffers per call
+    so write-after-write hazards across iterations don't depend on the
+    kernel zeroing its outputs. The wrapper is invoked outside the timed
+    window (in ``_time_workload``), so allocator latency doesn't leak
+    into the measurement. For non-DPS kernels the original generator
+    flows through unchanged.
+    """
+    if not kernel.dps:
+        return gen
+
+    # Lazy import — keep the torch-less unit tests importing benchmark.py
+    # without paying for sol_execbench at module load.
+    from src.eval.inputs import allocate_dps_outputs
+
+    assert definition is not None  # ruled out at the benchmark_kernel call site
+
+    # Resolve a concrete device for ``allocate_dps_outputs``. We peek at the
+    # first input tensor's device on each call — keeps the wrapper agnostic
+    # to whether the input generator returns pinned-CPU or already-on-CUDA
+    # tensors. Cheap (a single attribute read).
+
+    def _wrapped(seed: int) -> tuple:
+        import torch
+
+        inputs = gen(seed)
+        device = "cuda"
+        for arg in inputs:
+            if isinstance(arg, torch.Tensor):
+                device = str(arg.device)
+                break
+        outputs = allocate_dps_outputs(definition, workload, device=device)
+        return tuple(inputs) + tuple(outputs)
+
+    return _wrapped
 
 
 def _time_workload(
@@ -175,37 +258,99 @@ def _time_workload(
     warmup: int,
     timed: int,
     discard_first: int,
-) -> tuple[float, str | None]:
+) -> tuple[float, str | None, list | None]:
+    """Returns ``(median_ms, error, last_call_outputs)``.
+
+    ``last_call_outputs`` captures the kernel's outputs from the last
+    successful timed iteration, so the caller can hand them to
+    ``check_lazy_outputs_after_bench``. For DPS kernels the wrapper
+    appends the pre-allocated output buffers to ``args``; for non-DPS
+    kernels we capture the return value of ``fn(*args)``. The list is
+    ``None`` when the workload errored out.
+    """
     try:
         for i in range(warmup):
             args = input_generator(i)
             fn(*args)
     except Exception as e:
-        return 0.0, f"warmup failed: {type(e).__name__}: {e}"
+        return 0.0, f"warmup failed: {type(e).__name__}: {e}", None
 
     samples: list[float] = []
+    last_outputs: list | None = None
     total_iters = timed + discard_first
     try:
         for i in range(total_iters):
             args = input_generator(warmup + i)
-            elapsed_ms = _time_iter(timer, fn, args)
+            elapsed_ms, ret = _time_iter(timer, fn, args)
             if i >= discard_first:
                 samples.append(elapsed_ms)
+            # Last successful iter wins. For non-DPS kernels we take the
+            # return value (flattened into a list of tensors); for DPS
+            # kernels we have no per-call return so we just hold a
+            # reference to the outputs portion of args. We can't
+            # disambiguate inputs vs outputs without reaching into the
+            # wrapper, so the simpler rule wins: capture ``ret`` when
+            # truthy, else the last arg tensor (DPS kernels write into
+            # output buffers passed last).
+            if ret is not None:
+                last_outputs = _flatten_to_output_list(ret)
+            elif args:
+                # Best-effort: pick up tensor-typed args. If nothing
+                # tensor-shaped exists, just pass the last positional
+                # arg through — ``check_lazy_outputs`` rejects non-Tensor
+                # types so a real DPS write-through-output-buffer gets
+                # validated.
+                last_outputs = [args[-1]]
     except Exception as e:
-        return 0.0, f"{type(e).__name__}: {e}"
+        return 0.0, f"{type(e).__name__}: {e}", None
 
     if not samples:
-        return 0.0, "no timed samples collected"
-    return statistics.median(samples), None
+        return 0.0, "no timed samples collected", None
+    return statistics.median(samples), None, last_outputs
 
 
-def _time_iter(timer: BenchmarkTimer, fn: Callable, args: tuple) -> float:
+def _flatten_to_output_list(ret: object) -> list:
+    """Normalize a kernel's return value to a flat list of output tensors.
+
+    Used by ``_time_workload`` so ``check_lazy_outputs_after_bench`` sees
+    actual ``torch.Tensor`` objects rather than container shells. Without
+    this, a host wrapper that returns named outputs as a ``dict`` (e.g.
+    LayerNorm returning ``{"y", "mean", "rstd"}``) would have the dict
+    itself packed into ``[ret]`` and fail the post-bench lazy-output check
+    — silently pruning every dict-return branch (fail-closed).
+
+    Shape rules:
+      * ``None`` → ``[]`` (no outputs to validate)
+      * ``tuple`` / ``list`` → ``list(ret)`` (already a sequence)
+      * ``dict`` → ``list(ret.values())`` (drop names, keep tensors)
+      * anything else (e.g. a single ``torch.Tensor``) → ``[ret]``
+
+    The unknown-shape fallback preserves prior behaviour and lets
+    ``check_lazy_outputs_after_bench`` surface the issue if the value
+    isn't a tensor.
+    """
+    if ret is None:
+        return []
+    if isinstance(ret, (list, tuple)):
+        return list(ret)
+    if isinstance(ret, dict):
+        return list(ret.values())
+    return [ret]
+
+
+def _time_iter(timer: BenchmarkTimer, fn: Callable, args: tuple) -> tuple[float, object]:
+    """Time a single call and return ``(elapsed_ms, return_value)``.
+
+    The return value is forwarded to ``_time_workload`` so non-DPS
+    kernels' output tensors flow through to ``BenchmarkResult.last_outputs``
+    for the post-bench lazy-output check.
+    """
     timer.prepare()
     timer.flush_l2()
     timer.record_start()
-    fn(*args)
+    ret = fn(*args)
     timer.record_end()
-    return timer.finalize_ms()
+    return timer.finalize_ms(), ret
 
 
 def _compile_entrypoint(kernel: Kernel) -> Callable:
