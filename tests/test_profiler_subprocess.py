@@ -456,7 +456,11 @@ def _write_sol_problem_dir(root: Path) -> Path:
         "reference": "def run(x): return x\n",
     }))
     (problem_dir / "workload.jsonl").write_text(
-        json.dumps({"uuid": "wl0", "axes": {"N": 128}}) + "\n"
+        json.dumps({
+            "uuid": "wl0",
+            "axes": {"N": 128},
+            "inputs": {"x": {"type": "random"}},
+        }) + "\n"
     )
     return problem_dir
 
@@ -491,17 +495,84 @@ def test_driver_build_inputs_loads_problem_from_directory(tmp_path, monkeypatch)
         _fake_build_input_generator,
     )
 
-    result = _profiler_driver._build_inputs(
+    definition, workload, inputs = _profiler_driver._build_inputs(
         problem_dir,
         {"uuid": "wl0", "axes": {"N": 128}},
         seed=7,
     )
 
-    assert result == ("ok", 7)
+    assert inputs == ("ok", 7)
+    assert definition.name == "elementwise_id"
+    assert workload.uuid == "wl0"
     assert captured["problem_name"] == "elementwise_id"
     assert captured["problem_op_type"] == "elementwise"
     assert captured["workload_uuid"] == "wl0"
     assert captured["workload_axes"] == {"N": 128}
+
+
+def test_driver_build_inputs_does_not_attribute_error_on_sol_load(monkeypatch):
+    """Regression pin for Codex finding F1: ``_build_inputs`` previously
+    aliased the SOL package's re-exported ``load`` *function* as
+    ``sol_load`` and then called ``sol_load.load(...)`` — which is
+    ``AttributeError: 'function' object has no attribute 'load'`` and kills
+    the profiler subprocess on every SOL-backed input rebuild.
+
+    This test exercises the exact import path the subprocess driver uses
+    against the committed ``tests/fixtures/sol_simple/`` SOL problem and
+    asserts that no ``AttributeError`` escapes the call. It also asserts
+    the returned tuple is non-empty so a future "import succeeds but
+    nothing flows through" silent regression is caught.
+
+    ``build_input_generator`` defaults to ``device='cuda'`` and would
+    require torch + a GPU to materialize tensors, so it's stubbed — the
+    bug being pinned is in the ``sol_load(...)`` call that runs *before*
+    that import is even reached.
+    """
+    from src.eval import _profiler_driver
+
+    fixture_dir = Path(__file__).parent / "fixtures" / "sol_simple"
+    assert (fixture_dir / "definition.json").is_file(), (
+        f"missing committed fixture: {fixture_dir}"
+    )
+    assert (fixture_dir / "workload.jsonl").is_file(), (
+        f"missing committed fixture: {fixture_dir}"
+    )
+
+    def _fake_build_input_generator(definition, workload, **kwargs):
+        # Returns a generator that yields a 2-tuple so the assertion below
+        # has something concrete to bind against.
+        return lambda seed: ("a_tensor", "b_tensor")
+
+    monkeypatch.setattr(
+        "src.eval.inputs.build_input_generator",
+        _fake_build_input_generator,
+    )
+
+    # The first matching workload in the committed fixture is uuid=w1, N=1024.
+    workload_dict = {
+        "uuid": "w1",
+        "axes": {"N": 1024},
+        "inputs": {"a": {"type": "random"}, "b": {"type": "random"}},
+    }
+
+    # The bug class: ``sol_load.load(...)`` raised AttributeError. We
+    # explicitly re-raise any AttributeError as a test failure with a
+    # pointer comment so a future regressor knows where to look.
+    try:
+        definition, workload, inputs = _profiler_driver._build_inputs(
+            fixture_dir,
+            workload_dict,
+            seed=0,
+        )
+    except AttributeError as exc:  # pragma: no cover — regression marker
+        pytest.fail(
+            f"_build_inputs raised AttributeError: {exc}"
+        )
+
+    assert isinstance(inputs, tuple)
+    assert len(inputs) > 0, "stubbed generator should return a non-empty tuple"
+    assert definition is not None
+    assert workload is not None
 
 
 def test_driver_build_inputs_rejects_file_path_with_clear_error(tmp_path):
@@ -519,4 +590,289 @@ def test_driver_build_inputs_rejects_file_path_with_clear_error(tmp_path):
             bad_path,
             {"uuid": "wl0", "axes": {"N": 128}},
             seed=0,
+        )
+
+
+# ── spec contract: blob_roots + dps fields (G2 + G4 driver fix) ───────────
+
+
+def test_blob_roots_serialized_into_spec_json(
+    fake_ncu_path, tmp_path, sample_kernel, sample_workload
+):
+    """When ``blob_roots`` is passed to ``_run_ncu``, the spec JSON the driver
+    reads must carry it as a list of strings under ``blob_roots``. The driver
+    rehydrates these to ``list[Path]`` and threads them into
+    ``build_input_generator`` so ``SafetensorsInput`` workloads resolve to
+    real on-disk weights inside the subprocess. Regression pin for the G2
+    follow-up: ``_profiler_driver`` was the only call site that didn't get
+    blob_roots wired in Sub-commit D.
+    """
+    install, _ = fake_ncu_path
+    capture = tmp_path / "spec_capture.json"
+    _install_json_capture(install, capture)
+
+    blob_root_a = tmp_path / "blobs_a"
+    blob_root_b = tmp_path / "blobs_b"
+    blob_root_a.mkdir()
+    blob_root_b.mkdir()
+
+    _run_ncu(
+        sample_kernel,
+        sample_workload,
+        _identity_input_generator,
+        timeout_s=10.0,
+        mode="curated",
+        blob_roots=[blob_root_a, blob_root_b],
+    )
+
+    assert capture.exists(), "fake ncu did not capture any .json argv"
+    spec = json.loads(capture.read_text())
+    assert spec["blob_roots"] == [str(blob_root_a), str(blob_root_b)]
+
+
+def test_blob_roots_absent_when_not_passed(
+    fake_ncu_path, tmp_path, sample_kernel, sample_workload
+):
+    """``blob_roots=None`` (the default) must omit the field from the spec
+    JSON entirely so the driver's back-compat default kicks in. Older
+    cached specs / hand-crafted subprocess specs from earlier sub-commits
+    must continue to parse cleanly."""
+    install, _ = fake_ncu_path
+    capture = tmp_path / "spec_capture.json"
+    _install_json_capture(install, capture)
+
+    _run_ncu(
+        sample_kernel,
+        sample_workload,
+        _identity_input_generator,
+        timeout_s=10.0,
+        mode="curated",
+    )
+
+    assert capture.exists(), "fake ncu did not capture any .json argv"
+    spec = json.loads(capture.read_text())
+    assert "blob_roots" not in spec
+
+
+def test_dps_serialized_into_spec_json_when_kernel_is_dps(
+    fake_ncu_path, tmp_path, sample_workload
+):
+    """When ``kernel.dps=True``, the spec JSON must carry ``dps: true`` so
+    the driver pre-allocates output buffers via ``allocate_outputs`` and
+    calls ``kernel_fn(*inputs, *outputs)`` instead of ``kernel_fn(*inputs)``.
+    Regression pin for the G4 follow-up: NCU profiling silently TypeErrored
+    on DPS kernels because the driver bypassed the DPS branch present in
+    benchmark.py / correctness.py.
+    """
+    install, _ = fake_ncu_path
+    capture = tmp_path / "spec_capture.json"
+    _install_json_capture(install, capture)
+
+    dps_kernel = Kernel(
+        spec=KernelSpec(
+            name="dps_elementwise",
+            kernel_type=KernelType.ELEMENTWISE,
+            entrypoint="elementwise_add_kernel",
+        ),
+        source_code="# placeholder\n",
+        dps=True,
+    )
+
+    _run_ncu(
+        dps_kernel,
+        sample_workload,
+        _identity_input_generator,
+        timeout_s=10.0,
+        mode="curated",
+    )
+
+    assert capture.exists(), "fake ncu did not capture any .json argv"
+    spec = json.loads(capture.read_text())
+    assert spec["dps"] is True
+
+
+def test_dps_default_false_when_kernel_is_not_dps(
+    fake_ncu_path, tmp_path, sample_kernel, sample_workload
+):
+    """Non-DPS kernel: spec must either carry ``dps: false`` or omit the
+    field entirely. Either is fine for back-compat; the driver defaults to
+    False on missing key. Both shapes preserve the kernel_fn(*inputs) call."""
+    install, _ = fake_ncu_path
+    capture = tmp_path / "spec_capture.json"
+    _install_json_capture(install, capture)
+
+    # ``sample_kernel`` defaults dps=False.
+    assert sample_kernel.dps is False
+
+    _run_ncu(
+        sample_kernel,
+        sample_workload,
+        _identity_input_generator,
+        timeout_s=10.0,
+        mode="curated",
+    )
+
+    spec = json.loads(capture.read_text())
+    assert spec.get("dps", False) is False
+
+
+# ── driver _build_inputs threads blob_roots (G2 follow-up) ────────────────
+
+
+def test_driver_build_inputs_threads_blob_roots(tmp_path, monkeypatch):
+    """``_build_inputs`` must rehydrate ``spec['blob_roots']`` (list[str]) to
+    ``list[Path]`` and forward it as ``blob_roots=`` into
+    ``build_input_generator``. Regression pin for the G2 follow-up: the
+    driver previously called ``build_input_generator(definition, workload)``
+    with no blob_roots, causing FileNotFoundError inside the subprocess
+    whenever the workload contained a ``SafetensorsInput``.
+    """
+    from src.eval import _profiler_driver
+
+    problem_dir = _write_sol_problem_dir(tmp_path)
+    blob_root = tmp_path / "shared_blobs"
+    blob_root.mkdir()
+
+    captured: dict = {}
+
+    def _fake_build_input_generator(definition, workload, **kwargs):
+        captured["blob_roots"] = kwargs.get("blob_roots")
+        return lambda seed: ("ok", seed)
+
+    monkeypatch.setattr(
+        "src.eval.inputs.build_input_generator",
+        _fake_build_input_generator,
+    )
+
+    _profiler_driver._build_inputs(
+        problem_dir,
+        {"uuid": "wl0", "axes": {"N": 128}},
+        seed=0,
+        blob_roots=[blob_root],
+    )
+
+    assert captured["blob_roots"] == [blob_root]
+    assert all(isinstance(p, Path) for p in captured["blob_roots"])
+
+
+def test_driver_build_inputs_blob_roots_none_default(tmp_path, monkeypatch):
+    """Back-compat: when ``blob_roots`` is absent from the spec, the driver
+    forwards ``blob_roots=None`` so older serialized specs and self-contained
+    kernels keep working unchanged."""
+    from src.eval import _profiler_driver
+
+    problem_dir = _write_sol_problem_dir(tmp_path)
+
+    captured: dict = {}
+
+    def _fake_build_input_generator(definition, workload, **kwargs):
+        captured["blob_roots"] = kwargs.get("blob_roots", "<MISSING>")
+        return lambda seed: ()
+
+    monkeypatch.setattr(
+        "src.eval.inputs.build_input_generator",
+        _fake_build_input_generator,
+    )
+
+    _profiler_driver._build_inputs(
+        problem_dir,
+        {"uuid": "wl0", "axes": {"N": 128}},
+        seed=0,
+    )
+
+    assert captured["blob_roots"] is None
+
+
+# ── driver _call_kernel: DPS branch (G4 follow-up) ────────────────────────
+
+
+def test_call_kernel_non_dps_passes_inputs_only():
+    """Non-DPS path: ``_call_kernel`` invokes ``kernel_fn(*inputs)`` and
+    returns the function's return value. No allocate_outputs, no extra
+    positional args."""
+    from src.eval import _profiler_driver
+
+    received: dict = {}
+
+    def fake_kernel(a, b):
+        received["args"] = (a, b)
+        return ("returned", a + b)
+
+    result = _profiler_driver._call_kernel(
+        fake_kernel,
+        inputs=(1, 2),
+        definition=None,
+        workload=None,
+        dps=False,
+        device="cpu",
+    )
+
+    assert received["args"] == (1, 2)
+    assert result == ("returned", 3)
+
+
+def test_call_kernel_dps_pre_allocates_outputs_and_appends(monkeypatch):
+    """DPS path: ``_call_kernel`` must invoke
+    ``kernel_fn(*inputs, *outputs)`` where ``outputs`` came from
+    ``src.eval.inputs.allocate_dps_outputs``. Returns the outputs tuple
+    (the kernel populated them in place)."""
+    from src.eval import _profiler_driver
+
+    fake_outputs = ("buf0", "buf1")
+
+    # Stub allocate_dps_outputs at the import site the driver uses (lazy
+    # import inside ``_call_kernel`` resolves against the live module object).
+    import src.eval.inputs as eval_inputs
+
+    monkeypatch.setattr(
+        eval_inputs,
+        "allocate_dps_outputs",
+        lambda definition, workload, *, device: list(fake_outputs),
+    )
+
+    class FakeDefinition:
+        pass
+
+    class FakeWorkload:
+        axes = {"N": 4}
+
+    received: dict = {}
+
+    def fake_kernel(a, b, out0, out1):
+        received["args"] = (a, b, out0, out1)
+        return "ignored"
+
+    result = _profiler_driver._call_kernel(
+        fake_kernel,
+        inputs=(10, 20),
+        definition=FakeDefinition(),
+        workload=FakeWorkload(),
+        dps=True,
+        device="cpu",
+    )
+
+    # kernel_fn was called with inputs followed by pre-allocated outputs.
+    assert received["args"] == (10, 20, "buf0", "buf1")
+    # _call_kernel returns the outputs tuple, not the kernel's return value
+    # (DPS kernels populate buffers in place; the return is conventionally None).
+    assert tuple(result) == fake_outputs
+
+
+def test_call_kernel_dps_requires_definition_and_workload():
+    """Calling ``_call_kernel(..., dps=True, definition=None, workload=None)``
+    is a contract bug — surface it loudly rather than letting a None reach
+    ``allocate_dps_outputs`` and TypeError obscurely."""
+    from src.eval import _profiler_driver
+
+    def fake_kernel(*args):
+        return None
+
+    with pytest.raises((ValueError, AttributeError, TypeError)):
+        _profiler_driver._call_kernel(
+            fake_kernel,
+            inputs=(1, 2),
+            definition=None,
+            workload=None,
+            dps=True,
+            device="cpu",
         )

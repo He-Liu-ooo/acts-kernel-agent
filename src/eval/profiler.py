@@ -395,6 +395,7 @@ def _run_ncu(
     kernel_source_path: Path | None = None,
     kernel_name: str | None = None,
     problem_definition_path: Path | None = None,
+    blob_roots: list[Path] | None = None,
 ) -> tuple[str, int, bool, str | None]:
     """Invoke ``ncu`` as a subprocess around ``_profiler_driver``.
 
@@ -416,6 +417,27 @@ def _run_ncu(
     its parent directory is serialized as ``problem_dir`` so the driver
     can call ``load_problem(<dir>)``. ``None`` omits the key and the
     driver falls back to ``module.make_inputs`` or ``spec['args']``.
+
+    ``blob_roots`` is the list of directories the driver's
+    ``build_input_generator`` consults when the workload contains a
+    ``SafetensorsInput``. Serialized as ``list[str]`` for JSON-safety;
+    the driver rehydrates back to ``list[Path]``. ``None`` omits the
+    field — the driver defaults to ``None`` so non-safetensors workloads
+    and older cached specs keep working unchanged.
+
+    Spec JSON contract (consumed by ``_profiler_driver``):
+
+    * ``kernel_source_path`` (str): compiled .py the driver imports.
+    * ``entrypoint`` (str): name of the host wrapper / kernel callable.
+    * ``workload`` (dict): pydantic ``Workload.model_dump`` shape.
+    * ``mode`` (str): ``"curated"`` or ``"full"``.
+    * ``problem_dir`` (str, optional): SOL problem directory.
+    * ``blob_roots`` (list[str], optional): forwarded to
+      ``build_input_generator(blob_roots=…)`` in the driver.
+    * ``dps`` (bool, default False): when True, the driver pre-allocates
+      output buffers via ``sol_execbench.core.bench.io.allocate_outputs``
+      and calls ``kernel_fn(*inputs, *outputs)``.
+    * ``seed`` (int, optional): RNG seed for input generation; defaults to 0.
     """
     if _discover_ncu_binary() is None:
         return "", -1, True, "ncu_binary_not_found"
@@ -425,11 +447,23 @@ def _run_ncu(
         "entrypoint": kernel.spec.entrypoint,
         "workload": workload,
         "mode": mode,
+        # ``kernel.dps`` is the source of truth for whether the host
+        # wrapper takes pre-allocated output buffers as positional args
+        # after the inputs. Threading it into the spec mirrors the DPS
+        # wiring already done in ``benchmark_kernel`` (Sub-commit C),
+        # ``verify_correctness`` (F2), and ``_reward_hack_re_eval`` (G4)
+        # so the NCU profile path doesn't silently TypeError on DPS
+        # kernels.
+        "dps": bool(kernel.dps),
     }
     if problem_definition_path is not None:
         # ``load_problem`` wants the directory (``definition.json`` +
         # sibling ``workload.jsonl``), not the definition file itself.
         spec_payload["problem_dir"] = str(Path(problem_definition_path).parent)
+    if blob_roots is not None:
+        # JSON cannot serialize ``Path`` directly — coerce to str. The
+        # driver rehydrates with ``[Path(p) for p in spec["blob_roots"]]``.
+        spec_payload["blob_roots"] = [str(p) for p in blob_roots]
     # ``input_generator`` can't cross the subprocess boundary; the driver
     # rebuilds it from the serialized problem.
     _ = input_generator
@@ -551,6 +585,7 @@ def profile_kernel(
     timeout_s: float = 60.0,
     cache_dir: Path | None = None,
     problem_definition_path: Path | None = None,
+    blob_roots: list[Path] | None = None,
 ) -> ProfilingResult:
     """Hybrid analytical + NCU profile (spec §3.2).
 
@@ -631,6 +666,7 @@ def profile_kernel(
         kernel_source_path=compile_result.source_path,
         kernel_name=kernel_name,
         problem_definition_path=problem_definition_path,
+        blob_roots=blob_roots,
     )
     if driver_degraded:
         return ProfilingResult(
