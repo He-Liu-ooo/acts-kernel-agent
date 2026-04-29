@@ -1,5 +1,7 @@
 """Tests for eval/scorer.py — SOL score computation."""
 
+import sol_execbench.sol_score
+
 from src.eval.scorer import compute_sol_score
 
 
@@ -47,3 +49,21 @@ def test_no_flags_normal_case():
     assert not result.reward_hack_suspect
     assert not result.calibration_warning
     assert 0.5 < result.sol_score < 1.0
+
+
+def test_compute_sol_score_delegates_to_sol_primitive(monkeypatch):
+    """compute_sol_score must call sol_execbench.sol_score.sol_score for the formula."""
+    captured = {}
+
+    def fake_sol_score(t_k, t_p, t_sol):
+        captured["args"] = (t_k, t_p, t_sol)
+        return 0.42
+
+    monkeypatch.setattr(sol_execbench.sol_score, "sol_score", fake_sol_score)
+
+    from src.eval.scorer import compute_sol_score
+    result = compute_sol_score(baseline_latency_us=200.0, candidate_latency_us=150.0, t_sol_us=100.0)
+
+    # Args converted µs → ms before delegation
+    assert captured["args"] == (0.150, 0.200, 0.100)
+    assert result.sol_score == 0.42

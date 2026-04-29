@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import sol_execbench.sol_score
+
 
 @dataclass
 class ScoreResult:
@@ -31,29 +33,22 @@ def compute_sol_score(
     candidate_latency_us: float,
     t_sol_us: float,
 ) -> ScoreResult:
-    """Compute the SOL score for a candidate kernel.
+    """Compute SOL score by delegating the formula to sol_execbench.sol_score.
 
-    S(T_k) = (T_b - T_SOL) / ((T_k - T_SOL) + (T_b - T_SOL))
-
-    Where T_b = baseline, T_SOL = hardware limit, T_k = candidate.
+    The wrapper layers ACTS's audit flags (reward_hack_suspect / calibration_warning)
+    on top of SOL's pure-formula primitive.
     """
-    calibration_warning = baseline_latency_us <= t_sol_us
-    reward_hack_suspect = candidate_latency_us < t_sol_us
-
-    gap = baseline_latency_us - t_sol_us
-    if gap <= 0:
-        # Baseline is already at or below hardware limit
-        sol_score = 1.0
-    else:
-        denom = (candidate_latency_us - t_sol_us) + gap
-        sol_score = gap / denom if denom > 0 else 1.0
-    speedup = baseline_latency_us / candidate_latency_us if candidate_latency_us > 0 else 0.0
+    raw = sol_execbench.sol_score.sol_score(
+        t_k=candidate_latency_us / 1000,  # µs → ms
+        t_p=baseline_latency_us / 1000,
+        t_sol=t_sol_us / 1000,
+    )
     return ScoreResult(
-        sol_score=sol_score,
+        sol_score=raw,
         baseline_latency_us=baseline_latency_us,
         candidate_latency_us=candidate_latency_us,
         t_sol_us=t_sol_us,
-        speedup=speedup,
-        reward_hack_suspect=reward_hack_suspect,
-        calibration_warning=calibration_warning,
+        speedup=baseline_latency_us / candidate_latency_us if candidate_latency_us > 0 else 0.0,
+        reward_hack_suspect=candidate_latency_us < t_sol_us,
+        calibration_warning=baseline_latency_us <= t_sol_us,
     )
