@@ -14,6 +14,6 @@ Split across three call sites:
 
   Orchestrator-side eval (after Coder returns, every iteration):
     - benchmark.py: latency measurement (CUDA events)
-    - profiler.py: NCU profiling + per-iteration bottleneck classification
+    - profiler.py: NCU + analytical-roofline runtime profiling
     - scorer.py: SOL score (T_b from Triton baseline, T_SOL from roofline)
 """

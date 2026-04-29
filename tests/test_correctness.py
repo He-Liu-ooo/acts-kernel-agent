@@ -79,10 +79,10 @@ def test_verify_fails_shape_sweep_when_only_some_seeds_match():
 
 def test_verify_fails_numerical_stability_on_nan_output():
     """Candidate that matches reference numerically but produces NaN fails stage 3."""
-    # Craft: reference returns NaN, candidate returns NaN. Both match under
-    # ScalarPolicy because NaN == NaN via abs() returns NaN which is not <=,
-    # so compare would fail. Instead, use a candidate that matches ref for
-    # trials but returns NaN at the stability seed (7).
+    # Stage 3 runs a fixed stability seed (7 → x=8). Candidate matches the
+    # reference on smoke (42) and sweep (0..4) inputs but returns NaN at the
+    # stability seed; verification must catch the NaN even though earlier
+    # stages saw clean numerics.
     def cand(x):
         if x == 8.0:  # seed 7 → x=8
             return float("nan")

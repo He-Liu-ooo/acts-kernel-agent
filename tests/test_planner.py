@@ -138,7 +138,6 @@ def test_build_user_prompt_omits_empty_sections():
 # ── plan() with mocked LLM ─────────────────────────────────────────────
 
 
-@pytest.mark.asyncio
 def _simulate_plan_submission(**fields):
     """Test helper: returns (capture_factory, fake_run) that together
     simulate a submit_plan tool call inside Runner.run. Mirrors

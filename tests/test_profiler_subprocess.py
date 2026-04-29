@@ -511,11 +511,11 @@ def test_driver_build_inputs_loads_problem_from_directory(tmp_path, monkeypatch)
 
 
 def test_driver_build_inputs_does_not_attribute_error_on_sol_load(monkeypatch):
-    """Regression pin for Codex finding F1: ``_build_inputs`` previously
-    aliased the SOL package's re-exported ``load`` *function* as
-    ``sol_load`` and then called ``sol_load.load(...)`` — which is
-    ``AttributeError: 'function' object has no attribute 'load'`` and kills
-    the profiler subprocess on every SOL-backed input rebuild.
+    """Regression: ``_build_inputs`` must call the SOL-package
+    re-exported ``load`` function directly — not as ``sol_load.load(...)``
+    against an alias of the function itself. The latter raises
+    ``AttributeError: 'function' object has no attribute 'load'`` and
+    kills the profiler subprocess on every SOL-backed input rebuild.
 
     This test exercises the exact import path the subprocess driver uses
     against the committed ``tests/fixtures/sol_simple/`` SOL problem and
@@ -603,9 +603,9 @@ def test_blob_roots_serialized_into_spec_json(
     reads must carry it as a list of strings under ``blob_roots``. The driver
     rehydrates these to ``list[Path]`` and threads them into
     ``build_input_generator`` so ``SafetensorsInput`` workloads resolve to
-    real on-disk weights inside the subprocess. Regression pin for the G2
-    follow-up: ``_profiler_driver`` was the only call site that didn't get
-    blob_roots wired in Sub-commit D.
+    real on-disk weights inside the subprocess. ``_profiler_driver`` is one
+    of the parallel call sites that needs the same blob_roots thread-through
+    every other input-generator construction site already has.
     """
     install, _ = fake_ncu_path
     capture = tmp_path / "spec_capture.json"

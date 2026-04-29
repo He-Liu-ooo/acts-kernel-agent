@@ -20,11 +20,11 @@ _DEFAULT_BOTTLENECK = BottleneckType.BALANCED.value
 def _parse_bottleneck(value: str) -> BottleneckType:
     """Tolerant parse for legacy / malformed bottleneck strings.
 
-    Pre-profiler-PR records persisted ``bottleneck_*`` as ``""`` (the old
-    Experience dataclass default) — those fall through silently. Unknown
-    tokens are schema drift (hand-edited file, version skew) and get
-    logged before falling back to ``BALANCED`` so the signal doesn't
-    disappear into an opaque default.
+    Older records / earlier schemas persisted ``bottleneck_*`` as ``""``
+    (the prior Experience dataclass default) — those fall through
+    silently. Unknown tokens are schema drift (hand-edited file, version
+    skew) and get logged before falling back to ``BALANCED`` so the
+    signal doesn't disappear into an opaque default.
     """
     if not value:
         return BottleneckType.BALANCED

@@ -89,9 +89,9 @@ def test_close_is_idempotent(tmp_path):
 def test_create_mid_setup_osError_falls_back_to_null_context(tmp_path, monkeypatch, caplog):
     """A failure AFTER mkdir (disk quota hit between mkdir and events FH
     open, FD exhaustion, mid-setup perm change) must degrade to the same
-    null-context fallback as an mkdir failure. Before this fix the error
-    propagated and aborted the entire run — Codex review 2026-04-23
-    Finding 3."""
+    null-context fallback as an mkdir failure. Regression: a propagated
+    OSError here aborts the entire run instead of degrading the single
+    context."""
     import src.runtime.run_context as rc_mod
 
     # Let mkdir succeed, then make FileHandler construction (which opens

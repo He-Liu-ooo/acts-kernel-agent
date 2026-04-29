@@ -20,10 +20,8 @@ class ScoreResult:
     candidate_latency_us: float
     t_sol_us: float
     speedup: float  # baseline / candidate
-    # Audit flags (SOL-ExecBench paper, Section 4.3):
-    # "If either assumption is violated in practice, we treat the case as an
-    #  audit signal and report it for SOLAR bound review and reward-hacking
-    #  inspection."
+    # Audit flags (SOL-ExecBench §4.3): surface SOLAR-bound / reward-hack
+    # violations for review rather than silently passing them through.
     reward_hack_suspect: bool = False  # T_k < T_SOL — candidate beats physics
     calibration_warning: bool = False  # T_b <= T_SOL — baseline already at limit
 

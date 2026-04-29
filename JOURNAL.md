@@ -1218,3 +1218,19 @@ A new caller almost always means either a third `profile_kernel` site (legitimat
 **Trigger for revisit.**
 - A live run where Phase C report's per-workload SOLAR runs are too slow on a problem with many selected workloads (>10s aggregate). Then either cache by `(op_type, axes_signature)` or fall back to a coarse analytical first pass with SOLAR on disagreement only.
 - A SOLAR upgrade that introduces a per-workload-classification fast path. Adopt directly instead of going through the full pipeline N times.
+
+### 2026-04-29 — SOL migration retrospective: superseding notes
+
+Pointer entry consolidating six earlier notes that the SOL-ExecBench integration (PR2, commits through `a305be1`) made factually stale. Past entries are not edited — read them in chronological order; this section is the terminal correction.
+
+**SDK choice (2026-04-13 entry, "3 LLM agents + deterministic orchestrator")**. The line "ACTS follows Astra's pattern for the Coder (tool-using) and AccelOpt's pattern for Planner/Reviewer (single-call, no tools)" is no longer true. All three agents are tool-using: Planner emits via `submit_plan`, Reviewer via `submit_review` (plus optional `query_metric` for multi-turn metric queries, commit `6d6e62d`), Coder via `submit_kernel`. The single-call/no-tools shape was abandoned during the option-α migration (2026-04-26) for SDK strict-schema reasons already documented in the "Planner + Reviewer submit-tool migration" entry.
+
+**Tier 1 `torch.allclose` fallback (2026-04-18 entry, "SOL-ExecBench tiered adoption")**. The clause "Falls back to `torch.allclose` when SOL isn't installed" no longer holds. `TorchComparisonPolicy.compare` now requires `sol_execbench` and fails closed when it is absent — non-SOL benchmarks are expected to provide their own `ComparisonPolicy`. Removed during the SOL-everywhere tightening so that a missing SOL install can never silently degrade the correctness gate.
+
+**Install strategy on cu12.8 (2026-04-22 entry, "SOL integration tightening — CUDA 12.8 plan")**. The `sudo add-apt-repository ppa:deadsnakes/ppa` + `python3.12 -m venv` + manual `pip install` recipe is superseded. Canonical recipe is now `configs/venvs/3.12.md` — Python 3.12 + `uv` + editable `sol_execbench` install (`uv pip install -e ...`). The deadsnakes/sudo path still works on hosts without `uv`, but the project recipe and CI assume the `uv`-based flow.
+
+**Tier 2 timing claim (2026-04-22 retrospective, "Plan landed as designed")**. The retrospective listed "Tier 2 (timing via `do_bench`/`time_runnable`)" as shipped. This is incorrect — Tier 2 GPU timing was *not* migrated to SOL's `do_bench`/`time_runnable`. Source still uses `_TorchCudaTimer` for end-to-end kernel timing; SOL's timing primitives are referenced only in tests/specs. Tier 2 timing is deferred (tracked in PROCESS Deferred Improvements). The other tiers in that retrospective (1, 3, 4, 5) shipped as described.
+
+**SOLAR adapter bridge (2026-04-27 entry, "SOLAR adapter design")**. The bridge no longer synthesizes from `Problem` + representative `Workload`; it synthesizes from SOL's pydantic `Definition` + `Workload`. The `Problem` dataclass and `src/benchmark/problem.py` / `problem_loader.py` / `solution_formatter.py` were deleted in the schema migration — `Definition` is now the single benchmark-agnostic kernel IR, loaded via `src/benchmarks/sol_execbench.py::load`.
+
+**Backward-pass schema question (2026-04-27 entry, "Backward-pass kernels deferred")**. The open question "parse `Problem.op_type` suffix vs add explicit `Problem.kind` field" is now closed by elimination: `Problem` no longer exists, and `Definition` carries no `op_type` / `kind` field. Backward kernels are identified by spec name suffix (e.g. `*_backward`). Filed-in-backlog wording for "Backward-kernel SOLAR support" should be read with this convention in mind.

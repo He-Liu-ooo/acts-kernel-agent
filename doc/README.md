@@ -8,7 +8,7 @@ Component documentation for implemented features. Updated as each feature is com
 | Kernels | [kernels.md](kernels.md) | Kernel abstraction, Triton compilation |
 | Eval | [eval.md](eval.md) | Correctness verification, benchmarking, profiling, roofline, scoring |
 | Search | [search.md](search.md) | Tree search, beam pruning, orchestrator (3-agent) |
-| Agents | [agents.md](agents.md) | Planner (single-call), Coder (tool-using), Reviewer (single-call); OpenAI Agents SDK |
+| Agents | [agents.md](agents.md) | Planner (submit-tool), Coder (tool-using), Reviewer (submit-tool, optional `query_metric`); OpenAI Agents SDK |
 | LLM Backend | [llm_backend.md](llm_backend.md) | SDK integration, model config, runner utilities, provider swapping |
 | Actions | [actions.md](actions.md) | Action registry, tier system, recipes |
 | Memory | [memory.md](memory.md) | Optimization memory store, retrieval, experiences |

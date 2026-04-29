@@ -1,7 +1,9 @@
 """Planner agent — analyzes profiling data + memory, produces structured plan.
 
-Single-call agent (no tools). Uses OpenAI Agents SDK Agent + Runner.run
-with Pydantic output_type for structured output.
+Uses the OpenAI Agents SDK with a single ``submit_plan`` tool: the LLM
+calls ``submit_plan`` with the structured payload, which is validated by
+the matching Pydantic model inside the tool body before being returned
+to the caller.
 """
 
 from __future__ import annotations
@@ -47,7 +49,7 @@ PROMPT_DIR = Path(__file__).resolve().parent.parent / "prompts" / "planner"
 
 
 class OptimizationPlanOutput(BaseModel):
-    """Structured output schema sent to the LLM via output_type."""
+    """Structured output schema validated on the submit_plan tool payload."""
 
     tier: int
     technique: str
@@ -148,7 +150,9 @@ class PlannerAgent:
     """Selects optimization technique from action library based on
     profiling data, past experiences, and Reviewer feedback.
 
-    Single-call, no tools — the orchestrator provides all context.
+    The orchestrator provides all context in the prompt; the agent's
+    only tool is ``submit_plan`` (no compile / correctness tools — those
+    belong to the Coder).
     """
 
     def __init__(self, model: OpenAIChatCompletionsModel | None = None) -> None:
@@ -239,7 +243,9 @@ class PlannerAgent:
         ``response_format=json_schema`` (which DeepSeek-reasoner rejects and
         which the SDK's strict-schema validator rejects on
         ``params: dict[str, str]``). Pydantic validation still runs inside
-        the tool body. Mirrors Coder's option α / γ failure contract.
+        the tool body. Failure contract: a missing submission raises
+        ``PlanningError``; if the turn budget is exhausted but a valid
+        submission was already captured, that captured output is returned.
         """
         if not self.has_model:
             return _DEFAULT_PLAN
@@ -273,8 +279,8 @@ class PlannerAgent:
         # turns for: 1 invalid submit + 1 corrected submit + 1 confirmation,
         # plus the +1 buffer the SDK needs to land confirmation cleanly.
         # Without the retry budget, a single Pydantic validation slip
-        # downgrades to MaxTurnsExceeded and the option-γ recovery path
-        # has to catch it implicitly.
+        # downgrades to MaxTurnsExceeded; the captured-output recovery
+        # below would then have to catch it implicitly.
         try:
             result = await run_agent(
                 agent,

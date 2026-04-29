@@ -13,7 +13,7 @@ from enum import Enum
 
 
 class BottleneckType(Enum):
-    """Kernel bottleneck classification from roofline model."""
+    """Kernel bottleneck classification from SOLAR / built-in roofline."""
 
     MEMORY_BOUND = "memory_bound"
     COMPUTE_BOUND = "compute_bound"

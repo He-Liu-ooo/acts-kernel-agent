@@ -1,8 +1,12 @@
 """Reviewer agent — interprets eval results into structured feedback.
 
-Single-call agent (no tools). Uses OpenAI Agents SDK Agent + Runner.run with a
-Pydantic output_type. Falls back to rule-based feedback when the LLM is
-unavailable or its call fails after all retries.
+Uses the OpenAI Agents SDK with a ``submit_review`` tool: the LLM emits
+its structured payload through that tool, and Pydantic validation runs
+inside the tool body. An optional ``query_metric`` tool (gated by
+``ACTSConfig.reviewer_metric_queries``) lets the LLM pull specific raw
+NCU metrics for the current iteration before submitting. Falls back to
+rule-based feedback when the LLM is unavailable or its call fails after
+all retries.
 
 Designed for future split into Compute-Reviewer and Memory-Reviewer sub-agents:
 `prompt_dir` is a constructor parameter, so a specialized instance is one call
@@ -73,11 +77,11 @@ class BranchQuality(str, Enum):
     DEAD_END = "dead_end"
 
 
-# ── Pydantic output model (schema sent to LLM via output_type) ─────────
+# ── Pydantic output model (validated on submit_review payload) ─────────
 
 
 class ReviewerFeedbackOutput(BaseModel):
-    """Structured output schema enforced on the LLM response."""
+    """Structured output schema validated on the submit_review tool payload."""
 
     outcome: str  # non-strict: accept free-form strings (e.g. "partially_improved")
     metric_deltas: dict[str, float] = Field(default_factory=dict)
@@ -335,7 +339,11 @@ class ReviewerAgent:
     """Interprets evaluation results and produces structured feedback.
 
     Acts as intelligent filter between raw profiling data and the Planner.
-    Single-call, no tools — receives all eval data in the prompt.
+    The default path is submit-only: the agent is given a ``submit_review``
+    tool and receives all eval data in the prompt. When
+    ``ACTSConfig.reviewer_metric_queries`` is enabled, it additionally gets
+    a ``query_metric`` tool to pull specific raw NCU metrics for the
+    current iteration before submitting.
 
     `prompt_dir` is configurable so future Compute-Reviewer / Memory-Reviewer
     sub-agents can load specialized system prompts without subclassing.
@@ -413,7 +421,7 @@ class ReviewerAgent:
                 sections.append(
                     "## Available raw metrics (queryable)\n"
                     "[no NCU data — profiling degraded; "
-                    "query_metric will return empty]"
+                    "query_metric will return \"[no data]\" for every requested name]"
                 )
 
         return "\n\n".join(sections)
@@ -442,13 +450,21 @@ class ReviewerAgent:
         ``metric_deltas: dict[str, float]``). Pydantic validation still
         runs inside the tool body.
 
-        Falls back to rule-based degraded feedback when no model is
-        configured, when run_agent returns None (transient retries
-        exhausted), when MaxTurnsExceeded fires with no captured
-        submission, or when the loop ends cleanly without calling
-        submit_review. The rule-based fallback's bottleneck label is the
-        caller-provided ``bottleneck`` — the once-per-run classification,
-        invariant across iterations (see ``classify_run``).
+        Two distinct fallback paths to ``rule_based_feedback``:
+
+        - **No model configured** (``has_model`` is False): returns
+          rule-based feedback with ``degraded=False`` — this is the
+          expected stub mode, not a failure.
+        - **LLM-failure fallback** (``run_agent`` returns None, or
+          MaxTurnsExceeded fires with no captured submission, or the
+          loop ends cleanly without calling submit_review): returns
+          rule-based feedback with ``degraded=True`` and a short
+          ``error_reason`` tag, so the orchestrator can surface the
+          broken signal instead of silently trusting it.
+
+        The rule-based fallback's bottleneck label is the caller-provided
+        ``bottleneck`` — the once-per-run classification, invariant
+        across iterations (see ``classify_run``).
         """
         if not self.has_model:
             return rule_based_feedback(
@@ -504,11 +520,12 @@ class ReviewerAgent:
                 error_reason=reason,
             )
 
-        # Turn budget: ``max_turns`` is 4 (single-call) or 6 (multi-turn).
-        # The single-call path (2*N+2 with N=1) reserves room for one
-        # invalid submit + corrected submit + confirmation, so a single
-        # Pydantic slip self-corrects in-loop instead of degrading to
-        # rule-based. The multi-turn path adds room for one fetch.
+        # Turn budget: ``max_turns`` is 4 (submit-only) or 6 (multi-turn,
+        # query_metric enabled). The submit-only path (2*N+2 with N=1)
+        # reserves room for one invalid submit + corrected submit +
+        # confirmation, so a single Pydantic slip self-corrects in-loop
+        # instead of degrading to rule-based. The multi-turn path adds
+        # room for one query_metric fetch.
         try:
             result = await run_agent(
                 agent,

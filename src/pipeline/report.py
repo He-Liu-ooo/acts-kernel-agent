@@ -37,13 +37,15 @@ def _resolve_workload_roofline(
 class OptimizationReport:
     """Final report of an ACTS optimization run.
 
-    ``bottleneck`` is the once-per-run classification from ``classify_run``
-    — invariant across iterations because the problem + representative
-    workload + hardware don't change. ``winner_per_workload_bottlenecks``
-    maps a workload UUID to its SOLAR-derived bottleneck (one
-    ``derive_t_sol_from_solar`` call per selected workload), capturing
-    how individual workloads land under SOLAR's graph analysis rather
-    than the analytical band classifier the run-level path uses.
+    ``bottleneck`` is the once-per-run classification — sourced from
+    SOLAR when available (``derive_t_sol_from_solar`` on the
+    representative workload), otherwise from the analytical band
+    classifier. Invariant across iterations because the problem +
+    representative workload + hardware don't change.
+    ``winner_per_workload_bottlenecks`` maps a workload UUID to its
+    SOLAR-derived bottleneck (one ``derive_t_sol_from_solar`` call per
+    selected workload), so individual workloads can disagree with the
+    run-level summary above.
     ``winner_profiling_per_workload`` maps a workload UUID to the
     ``ProfilingResult`` captured by re-profiling the winning kernel on
     every selected workload.
@@ -106,9 +108,22 @@ def generate_report(
     field is omitted from the spec JSON entirely.
     """
     best = result.best_node
+    termination = result.termination_reason.value
+    if best is None:
+        # Degenerate run — search produced no scored node. Match the
+        # ``score is None`` branch below: empty trace, no scoring fields,
+        # bottleneck/run-level info still threaded through so the caller
+        # at least sees the termination reason.
+        return OptimizationReport(
+            technique_trace=[],
+            bottleneck=result.run_bottleneck,
+            winner_per_workload_bottlenecks={},
+            winner_profiling_per_workload={},
+            total_iterations=result.total_iterations,
+            termination_reason=termination,
+        )
     path = result.tree.path_to_node(best.id)
     trace = [n.action_applied for n in path if n.action_applied]
-    termination = result.termination_reason.value
 
     per_workload_bottlenecks: dict[str, BottleneckType] = {}
     per_workload_profiling: dict[str, ProfilingResult] = {}
@@ -123,6 +138,14 @@ def generate_report(
                 else 1e-6
             )
             per_workload_latency_us = best.per_workload_latency_us or {}
+
+            if len(input_generators) != len(workloads):
+                raise ValueError(
+                    "input_generators length must match workloads length "
+                    f"(got {len(input_generators)} generators for "
+                    f"{len(workloads)} workloads); the per-workload re-profile "
+                    "pass would otherwise silently truncate via zip()."
+                )
 
         if definition is not None:
             from src.eval.roofline import derive_t_sol_from_solar

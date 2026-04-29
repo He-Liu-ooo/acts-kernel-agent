@@ -516,9 +516,9 @@ def test_main_emits_run_start_and_run_end(tmp_path, monkeypatch):
     ``run_end`` reads the real ``SearchResult`` field names
     (``total_iterations``, ``best_node.score.sol_score``) and the
     ``TerminationReason`` enum's ``.value``. Using ``MagicMock()`` here
-    would silently mask attribute-name bugs (see Codex review 2026-04-23:
-    the earlier version used ``getattr`` with defaults and would emit
-    ``best_score=0.0, total_iters=0`` even after real iterations)."""
+    would silently mask attribute-name bugs — a previous getattr-with-
+    defaults variant would emit ``best_score=0.0, total_iters=0`` even
+    after real iterations. Use a SimpleNamespace stand-in instead."""
     import json
     from types import SimpleNamespace
 

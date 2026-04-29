@@ -3,8 +3,7 @@
 One ``emit()`` call fans out to two sinks: stdlib ``logger.info`` (human
 text -> stderr + run.log) and a module-level JSONL file handle
 (structured -> events.jsonl). Unbound => JSONL write is skipped; the
-logger line still goes out. See ``doc/specs/2026-04-22-logger-system-design.md``
-§5.2 for full semantics.
+logger line still goes out. See ``doc/runtime.md`` for full semantics.
 """
 from __future__ import annotations
 
@@ -53,6 +52,7 @@ CORE_EVENT_KINDS: frozenset[str] = frozenset({
     # bit is set (T_k < ~T_SOL margin).
     "trace_emitted",
     "clock_lock_unavailable",
+    # Reserved — emission deferred to clock-lock implementation.
     "clock_drift_detected",
     "reward_hack_detected",
     "reward_hack_confirmed",
@@ -78,6 +78,7 @@ DEAD_CUDA_ERROR = "cuda_error"
 DEAD_PROFILER_ERROR = "profiler_error"
 DEAD_BENCH_FAILURE = "bench_failure"
 DEAD_REPR_LATENCY_UNAVAILABLE = "repr_workload_latency_unavailable"
+# Reserved — emission deferred to dead-agent failure handling.
 DEAD_AGENT_FAILURE = "agent_failure"
 
 DEAD_REASONS: frozenset[str] = frozenset({
@@ -151,7 +152,11 @@ def emit(kind: str, *, iter: int | None = None, **fields: Any) -> None:
     # contending threads don't serialize on datetime formatting.
     try:
         record = {"ts": iso_ts(), "kind": kind, "iter": iter, **fields}
-        payload = json.dumps(record, default=str) + "\n"
+        # ``allow_nan=False`` enforces RFC-8259: NaN/Inf raise ValueError
+        # rather than emitting the non-standard ``NaN``/``Infinity`` tokens
+        # that strict parsers reject. ``finite_or_none`` is the upstream
+        # sanitizer; this is the backstop.
+        payload = json.dumps(record, default=str, allow_nan=False) + "\n"
     except Exception:
         return
     try:

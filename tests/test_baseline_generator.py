@@ -12,9 +12,10 @@ Covers:
   KernelSpec, and an input generator built from the first selected workload
 - ``blob_roots`` kwarg is forwarded to ``build_input_generator`` so safetensors-
   backed workloads resolve their on-disk weights before Phase B starts
-  (regression test for Codex G2: prior code dropped this kwarg in
-  ``generate_triton_baseline``'s rebuild path even though
-  ``_load_sol_problem`` threaded it into the search-loop generators).
+  (regression: ``generate_triton_baseline``'s rebuild path must preserve the
+  same ``blob_roots`` thread-through that ``_load_sol_problem`` does for the
+  search-loop generators; dropping it makes safetensors-backed workloads
+  fail to load on the baseline path).
 """
 
 from __future__ import annotations
@@ -465,23 +466,23 @@ async def test_generate_triton_baseline_emits_attempt_events(tmp_path, patched_i
     assert all("ImplementationError" in r["reason"] for r in failures)
 
 
-# ── G2 regression: blob_roots threading for safetensors workloads ─────
+# ── blob_roots threading for safetensors workloads ────────────────────
 
 
 @pytest.mark.asyncio
 async def test_blob_roots_forwarded_to_build_input_generator():
-    """Regression for Codex G2 (P1-2).
-
-    ``_load_sol_problem`` computes ``blob_roots = config.safetensors_blob_roots
+    """``_load_sol_problem`` computes ``blob_roots = config.safetensors_blob_roots
     or [problem_dir]`` and must thread it into every input-generator
-    construction site. The earlier fix only patched the search-loop site;
-    ``generate_triton_baseline`` rebuilt its own generators and dropped
-    the kwarg, so any safetensors-bearing workload tripped a
-    FileNotFoundError before Phase B could start.
+    construction site. ``generate_triton_baseline`` rebuilds its own
+    generators in the baseline path, so it must preserve the kwarg too —
+    without it, any safetensors-bearing workload trips
+    FileNotFoundError before Phase B can start.
 
     This test mocks ``build_input_generator`` and asserts the kwarg
-    survives the call so the missing-kwarg form (which used to raise
-    TypeError under the strict-spy below) cannot regress silently.
+    survives the call. The strict spy signature below (keyword-only
+    ``blob_roots``) raises TypeError if a future refactor drops the
+    kwarg, surfacing the regression on import-time behavior rather than
+    on the safetensors filesystem branch.
     """
     workloads = _make_workloads(n=2)
     coder = CoderAgent(model=MagicMock())
@@ -562,15 +563,15 @@ async def test_safetensors_workload_resolves_blob_with_roots(monkeypatch):
     the input-generator construction step in ``generate_triton_baseline``
     iff ``blob_roots`` points at the staging directory.
 
-    On the broken pre-fix code (no kwarg threading), this raises
-    ``FileNotFoundError`` at line 66 because ``load_safetensors`` falls
-    back to resolving ``"weights.safetensors"`` against CWD. We swap CWD
-    to a temp directory to guarantee the relative path can't accidentally
-    resolve, then run the baseline far enough to confirm the input-
-    generator stage succeeds. The Coder is mocked to return failing
-    source so the test exits via ``BaselineGenerationError`` rather than
-    a fake-success path — what matters is that the FileNotFoundError
-    from the pre-fix code never surfaces.
+    Without ``blob_roots`` threaded through, ``load_safetensors`` falls
+    back to resolving ``"weights.safetensors"`` against CWD and raises
+    ``FileNotFoundError``. We swap CWD to a temp directory to guarantee
+    the relative path can't accidentally resolve, then run the baseline
+    far enough to confirm the input-generator stage succeeds. The Coder
+    is mocked to return failing source so the test exits via
+    ``BaselineGenerationError`` rather than a fake-success path — what
+    matters is that ``FileNotFoundError`` does not surface on the
+    safetensors-resolution path.
     """
     import tempfile
 

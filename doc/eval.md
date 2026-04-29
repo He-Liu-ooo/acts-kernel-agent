@@ -185,7 +185,7 @@ NCU wraps a fresh Python subprocess that imports the compiled kernel and launche
 }
 ```
 
-Input resolution priority: (1) `problem_dir` → `load_problem(dir)` + `build_input_generator(problem, workload)(seed)` (orchestrator path); (2) `module.make_inputs(seed)` if the source exposes it (self-contained kernel convention — primary Tier 2 path); (3) `spec["args"]` as last-resort literal; (4) `()`.
+Input resolution priority: (1) `problem_dir` → `src.benchmarks.sol_execbench.load(dir)` + `build_input_generator(definition, workload)(seed)` (orchestrator path); (2) `module.make_inputs(seed)` if the source exposes it (self-contained kernel convention — primary Tier 2 path); (3) `spec["args"]` as last-resort literal; (4) `()`.
 
 Host-callable resolution: prefers `module.run` (the Triton host wrapper that launches the JIT'd kernel via `fn[grid](...)`), falls back to `module.<entrypoint>`. `spec.entrypoint` is the host-wrapper name — **not** the GPU kernel symbol NCU filters on.
 
@@ -226,7 +226,7 @@ Shared eval primitives imported across memory / search / pipeline without pullin
 
 Two paths, each returning both T_SOL and bottleneck classification — no hybrid:
 
-1. **SOLAR** (preferred): `derive_t_sol_from_solar(problem, workload, hardware, *, arch_yaml_path=None)` calls the SOLAR adapter on the PyTorch reference. Returns tight, hardware-grounded T_SOL + bottleneck. `arch_yaml_path` is set when the caller forwards `config.arch_config_path` from the .cfg so SOLAR's arch resolution can pick up an explicit YAML; left `None` triggers the name/fallback resolution path below. On bridge failure (e.g. unresolvable expr axis) the adapter logs a warning and returns `None`, and the caller falls back to the built-in roofline rather than crashing the load path. The returned `RooflineResult.source` is set to `"solar"`.
+1. **SOLAR** (preferred): `derive_t_sol_from_solar(definition, workload, hardware_spec, arch_yaml_path=None)` calls the SOLAR adapter on the PyTorch reference. Returns tight, hardware-grounded T_SOL + bottleneck. `arch_yaml_path` is set when the caller forwards `config.arch_config_path` from the .cfg so SOLAR's arch resolution can pick up an explicit YAML; left `None` triggers the name/fallback resolution path below. On bridge failure (e.g. unresolvable expr axis) the adapter logs a warning and returns `None`, and the caller falls back to the built-in roofline rather than crashing the load path. The returned `RooflineResult.source` is set to `"solar"`.
 2. **Built-in** (fallback): `compute_roofline()` does `T_SOL = max(FLOPs / peak_compute, bytes / peak_bandwidth)` from `KernelSpec` fields + `HardwareSpec` (loaded from SOLAR arch YAML). Used when SOLAR is not installed or when the SOLAR path soft-fails. Sets `RooflineResult.source = "builtin"`.
 
 Both classify the kernel as `MEMORY_BOUND`, `COMPUTE_BOUND`, or `BALANCED`.
@@ -240,7 +240,7 @@ Drives SOLAR via its published Python API (no subprocess) in four stages:
 3. `EinsumGraphAnalyzer.analyze_graph` — count MACs and memory elements
 4. `EinsumGraphPerfModel.predict` — apply the arch YAML's roofline; reads the `fused` section's `runtime_ms`, `bottleneck`, and `arithmetic_intensity`
 
-`_write_model_bridge_file` synthesizes a SOLAR-shaped `Model(nn.Module)` + `get_inputs()` from the ACTS `Problem` + a representative `Workload`. Handles const, var, and expr axes (fixed-point eval); 0-D tensors via `shape=[]`; and int/bool dtypes via `_tensor_constructor_call` (since `torch.randn` doesn't support those).
+`_write_model_bridge_file` synthesizes a SOLAR-shaped `Model(nn.Module)` + `get_inputs()` from the SOL `Definition` + a representative `Workload`. Handles const, var, and expr axes (fixed-point eval); 0-D tensors via `shape=[]`; and int/bool dtypes via `_tensor_constructor_call` (since `torch.randn` doesn't support those).
 
 **Arch resolution priority** (in `_resolve_arch_config`):
 

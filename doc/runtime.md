@@ -105,7 +105,7 @@ Public fields:
 | `events_path` | `Path` | `run_dir / "events.jsonl"`. |
 | `log_path` | `Path` | `run_dir / "run.log"`. |
 | `traces_dir` | `Path` | `run_dir / "traces"` (or the explicit override). |
-| `started_at` | `str` | `iso_ts()` captured at create-time. |
+| `started_at` | `datetime` | `datetime.now(timezone.utc)` captured at create-time (timezone-aware UTC). |
 | `trace_processor` | property | The wired `JSONLTraceProcessor`, or `None` if `capture_traces=False` or setup fell back. |
 
 ### `RunContext.create(root=None, *, trace_dir=None, capture_traces=True)`

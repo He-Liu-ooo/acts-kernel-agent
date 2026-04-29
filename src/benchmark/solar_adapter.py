@@ -122,7 +122,8 @@ _PRECISION_FOR_DTYPE = {
 def _dtype_str(dtype) -> str:
     """Coerce a SOL ``DType`` enum (or any string-like) to a lower-case
     string suitable for dtype lookups. ``DType`` is a ``str``-subclass
-    enum, so ``getattr(value)`` returns the underlying string."""
+    enum, so ``getattr(dtype, "value", None)`` returns the underlying
+    string; we fall through to ``str(dtype)`` for plain strings."""
     value = getattr(dtype, "value", None)
     return value if isinstance(value, str) else str(dtype)
 
@@ -159,9 +160,13 @@ def _write_model_bridge_file(
     """
     try:
         concrete = definition.get_resolved_axes_values(workload.axes)
-    except (KeyError, ValueError) as exc:
+    except (KeyError, NameError, ValueError) as exc:
+        # SOL's shape-expression evaluator raises NameError for
+        # unresolved symbols and ValueError for malformed expressions;
+        # we collapse both at the adapter boundary so derive_t_sol can
+        # fall back to the built-in roofline on either failure mode.
         raise ValueError(
-            f"could not resolve axes for {definition.name!r} "
+            f"unresolved axes for {definition.name!r} "
             f"(workload axes={workload.axes}): {exc}"
         ) from exc
 
@@ -315,16 +320,6 @@ def derive_t_sol(
             return None
 
         # Stage 1 — graph extraction.
-        # """Configuration for processing models.
-    
-        # Attributes:
-        #     save_graph: Whether to save graph visualizations.
-        #     force_rerun: Force reprocessing even if output exists.
-        #     batch_size: Number of models to process in parallel.
-        #     timeout: Timeout for processing in seconds.
-        #     output_dir: Directory for output files.
-        #     debug: Enable debug output.
-        # """
         proc = PyTorchProcessor(
             ProcessingConfig(
                 save_graph=False, force_rerun=True, output_dir=str(tmp / "graph"),

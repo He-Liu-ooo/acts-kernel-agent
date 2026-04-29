@@ -13,6 +13,8 @@ Confirm your understanding of the project state and tell me where we left off.
 
 Each step is user-triggered — Claude does not auto-advance.
 
+> **Harness note**: this workflow assumes the Claude Code harness. References to the `Skill` tool, the `Agent` tool, and the `superpowers:*` / `codex:review` / `codex:rescue` skills are Claude-Code-specific invocation surfaces. When working under Codex directly, the equivalents are: design-phase brainstorming → an inline options/tradeoffs discussion before code; parallel subagent dispatch → sequential or manually parallelized terminal sessions; `codex:review` → invoking Codex directly for review (which is exactly what the skill wraps). The governance rules — user-triggered steps, test-first, commit-split approval, no auto-advance — apply in either harness.
+
 1. **Pick feature** — next item from the dependency-ordered list in PROCESS.md.
 2. **Design discussion** (if non-trivial) — align on approach before writing code. For any feature that is not mechanical (new module, new data surface, cross-module refactor, anything touching GPU / eval / search / agent contracts), **invoke the `superpowers:brainstorming` skill** via the `Skill` tool before proposing an approach. Default to brainstorming; skip it only for trivially mechanical changes (typo fix, single-call-site rename, one-line bug fix). The settled design + rationale gets recorded in JOURNAL.md before any code is written.
 3. **Write tests** — test-first; define expected behavior before implementation.
@@ -82,9 +84,18 @@ Run a consistency check across src/, doc/, PRD.md, JOURNAL.md, and PROCESS.md. V
 
 ### Test Environment
 
-Tests run via: `source /tmp/acts_test_venv/bin/activate && python -m pytest tests/ -v`
+Two venvs, split by tier:
 
-Venv has: pytest, pyyaml. Add new deps to both pyproject.toml AND the venv.
+- **Tier 1 — torchless unit tests** (`/tmp/acts_test_venv`, Python 3.10): pytest + pyyaml only, no torch. Default for deterministic / mocked tests.
+  ```
+  source /tmp/acts_test_venv/bin/activate && python -m pytest tests/ -v
+  ```
+- **Tier 2 — SOL/torch integration + real-GPU tests** (`/tmp/acts_run_venv`, Python 3.12 + cu128 torch + editable `sol_execbench`): required for `@pytest.mark.gpu` suites and any test that imports SOL types or runs on GPU. Setup recipe + smoke test live in [`configs/venvs/3.12.md`](configs/venvs/3.12.md).
+  ```
+  source /tmp/acts_run_venv/bin/activate && python -m pytest tests/ -v
+  ```
+
+Add new deps to `pyproject.toml` AND to whichever venv(s) the new tests target.
 
 ### Test delegation
 
@@ -104,12 +115,7 @@ Keep inline: step 1 (pick feature), step 2 (design discussion / brainstorming), 
 
 ### Doc mapping
 
-- `doc/eval.md` — eval harness (correctness, benchmark, profiler, roofline, scorer)
-- `doc/config.md` — HardwareSpec, ACTSConfig, load paths
-- `doc/search.md` — tree, beam, orchestrator
-- `doc/memory.md` — experience, store, retriever
-- `doc/pipeline.md` — optimize, verify, report
-- `doc/runtime.md` — run context, events stream, timestamp helpers (src/runtime/)
+See [`doc/README.md`](doc/README.md) for the per-component file index (config, kernels, eval, search, agents, llm_backend, actions, memory, pipeline, runtime). Updated as each feature lands; treat that file as canonical instead of duplicating the map here.
 
 ### Upstream reference repos
 

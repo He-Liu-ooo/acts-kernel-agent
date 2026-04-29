@@ -106,13 +106,25 @@ class SearchTree:
     def best_node(self) -> TreeNode:
         """Return the node with the highest SOL score.
 
+        DEAD_END nodes are excluded — a branch killed by reward-hack
+        confirmation, compile failure, or the profile gauntlet may still
+        carry the score its bench produced, but that score is invalid as
+        a final answer (the kernel is either incorrect or hardware-cap-
+        violating).
+
         Quarantined nodes (``consecutive_agent_failures >= QUARANTINE_THRESHOLD``)
         are intentionally still candidates here — quarantine prevents a
         deterministically-failing parent from being re-selected for
         further expansion, but its own measured score remains a valid
         final answer if it happens to be the run's best.
         """
-        scored = [n for n in self._nodes.values() if n.score is not None]
+        from src.agents.reviewer import BranchQuality
+
+        scored = [
+            n for n in self._nodes.values()
+            if n.score is not None
+            and n.branch_quality != BranchQuality.DEAD_END
+        ]
         if not scored:
             # Fall back to root
             return self._nodes[0]
@@ -287,6 +299,7 @@ def _serialize_kernel(kernel: Kernel) -> dict:
         "num_stages": kernel.num_stages,
         "block_size": kernel.block_size,
         "triton_kernel_name": kernel.triton_kernel_name,
+        "dps": kernel.dps,
     }
 
 
@@ -330,9 +343,13 @@ def _deserialize_node(data: dict) -> TreeNode:
         num_warps=k["num_warps"],
         num_stages=k["num_stages"],
         block_size=k["block_size"],
-        # ``.get`` with empty-string default keeps legacy checkpoints
-        # (pre-T4) loadable; the profiler's regex fallback handles them.
+        # ``.get`` with empty-string default keeps older checkpoints
+        # loadable; the profiler's regex fallback handles them.
         triton_kernel_name=k.get("triton_kernel_name", ""),
+        # ``.get`` with False default for older checkpoints written before
+        # the DPS field existed. Losing dps on reload would silently
+        # change correctness/profiling behavior on the resumed run.
+        dps=k.get("dps", False),
     )
 
     return TreeNode(

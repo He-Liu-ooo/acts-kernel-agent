@@ -457,9 +457,10 @@ class TestTreeCheckpoint:
         assert loaded.get_node(1).kernel.triton_kernel_name == ""  # default
 
     def test_load_legacy_checkpoint_without_triton_kernel_name(self, tmp_path: Path):
-        """A pre-T4 checkpoint that was written before the ``triton_kernel_name``
-        field existed must still load cleanly — the profiler's regex fallback
-        is the safety net for legacy state."""
+        """Compatibility contract: checkpoints written without the
+        ``triton_kernel_name`` field (still emitted by older runs) must
+        load cleanly — the profiler's regex fallback is the safety net
+        for that state."""
         import json
         legacy_payload = {
             "next_id": 1,
@@ -487,7 +488,7 @@ class TestTreeCheckpoint:
                         "num_warps": 4,
                         "num_stages": 2,
                         "block_size": {},
-                        # No "triton_kernel_name" key — pre-T4 shape.
+                        # No "triton_kernel_name" key — legacy schema shape.
                     },
                     "profiling": None,
                     "per_workload_latency_us": None,
@@ -1001,10 +1002,10 @@ class TestOrchestratorBenchmarkFailure:
 
 class TestOrchestratorCoderFailure:
     """Coder-side failures (turn-budget exhaustion, transient retry exhaustion,
-    missing submit_kernel call) are branch-local. Option γ (2026-04-22)
-    converts SDK ``MaxTurnsExceeded`` to ``ImplementationError`` at the
-    Coder boundary and the orchestrator catches it here. Without this, one
-    bad LLM call would unwind the entire search run."""
+    missing submit_kernel call) are branch-local. The Coder boundary
+    converts SDK ``MaxTurnsExceeded`` to ``ImplementationError`` and the
+    orchestrator catches it here. Without this, one bad LLM call would
+    unwind the entire search run."""
 
     @pytest.mark.asyncio
     async def test_implementation_error_skips_iteration_and_continues(

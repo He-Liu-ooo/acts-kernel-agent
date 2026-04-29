@@ -8,7 +8,7 @@ Kernel abstraction and Triton compilation.
 
 Enum of known kernel archetypes. Used by `MemoryRetriever` to filter past experiences by type.
 
-Values: `MATMUL`, `SOFTMAX`, `LAYERNORM`, `ATTENTION`, `REDUCTION`, `ELEMENTWISE`, `CUSTOM`.
+Values: `MATMUL`, `GEMM`, `SOFTMAX`, `LAYERNORM`, `RMSNORM`, `ATTENTION`, `GQA`, `MOE`, `EMBEDDING`, `LINEAR`, `FUSED_BLOCK`, `MLP`, `CONV`, `SSM`, `REDUCTION`, `ELEMENTWISE`, `CUSTOM`. SOL-ExecBench `op_type` strings (`gemm`, `rmsnorm`, `gqa`, `moe`, …) map to these via `_OP_TYPE_TO_KERNEL_TYPE` in `src/pipeline/optimize.py`.
 
 ### KernelSpec
 
@@ -18,9 +18,12 @@ Static metadata about the kernel *problem* — stays the same across all optimiz
 |-------|------|---------|
 | `name` | str | Logging, reports |
 | `kernel_type` | KernelType | Memory retrieval filtering |
-| `flop_count` | int | `roofline.py` for T_SOL derivation |
-| `memory_bytes` | int | `roofline.py` for T_SOL derivation |
-| `input_shapes` | list[dict] | `correctness.py` for test input generation |
+| `flop_count` | int | `roofline.py` for T_SOL derivation (left at `0` on the SOL path — SOLAR + `compute_roofline_inputs(definition, workload)` derive FLOPs from workload axes; only the placeholder starters populate it directly) |
+| `memory_bytes` | int | `roofline.py` for T_SOL derivation (same SOL-vs-placeholder split as `flop_count`) |
+| `input_shapes` | list[dict] | `correctness.py` test input generation for placeholder starters; on the SOL path this carries `definition.const_axes` only (variable + expr axes resolve from each `Workload`, not the spec) |
+| `definition_path` | `Path \| None` | SOL-ExecBench `definition.json` path. Threaded into the profiler subprocess driver so it can re-load the problem and rebuild the (unpicklable) input generator. `None` on the placeholder path. |
+| `pytorch_reference` | str | PyTorch `run()` source from `definition.json` — the correctness oracle. Empty string for placeholder starters. |
+| `t_sol_us` | `float \| None` | SOLAR-derived hardware bound, populated at problem-load time when SOLAR returns a result. `None` when SOLAR is unavailable or soft-fails (caller falls back to `compute_roofline()`). |
 | `entrypoint` | str | Callable name the compiler resolves via `getattr` (default `"kernel_fn"`). Overridable for fused ops where the launchable symbol is a host wrapper. |
 
 ### Kernel
@@ -35,6 +38,7 @@ A single *version*: source code + Triton tuning parameters. Every search tree no
 | `num_stages` | int | Triton num_stages for pipelining |
 | `block_size` | dict[str,int] | Block dimensions (e.g., BLOCK_M, BLOCK_N) |
 | `triton_kernel_name` | str | Bare name of the `@triton.jit` device function the profiler filters NCU on. Defaults to `""` for hand-written starters / test fixtures — the profiler's priority chain (`Kernel.triton_kernel_name` → source-regex → `spec.entrypoint`) handles the empty case via the fallback. Coder-produced kernels populate it via the `submit_kernel` tool's Pydantic-validated argument. |
+| `dps` | bool | Destination-passing-style flag. `True` means the host wrapper takes pre-allocated outputs after the inputs (`def kernel_fn(x, y, out)`) and the benchmark / correctness loops allocate buffers via `allocate_outputs(definition, workload, device)` and thread them through. `False` (default) means the wrapper returns its outputs as the function's return value. Default preserves back-compat with hand-written starters and pre-`dps` checkpoint round-trips. |
 
 Read `source_code` directly — it's the full Triton source string.
 
@@ -56,7 +60,7 @@ Parse-time errors (syntax, imports, missing/non-callable entrypoint) surface as 
 
 ## Starters — `starters/`
 
-Factory functions creating baseline `Kernel` instances for common operations. These are the root nodes of the search tree.
+Factory functions producing **placeholder/metadata-only** `Kernel` instances for common operations. Each factory builds a `KernelSpec` (name, kernel_type, flop_count, memory_bytes, input_shapes) and returns a `Kernel` whose `source_code` is a literal comment stub like `"# placeholder matmul kernel"` — they are *not* compilable Triton baselines. Their real role is the placeholder CLI smoke path (`pipeline/optimize.py`'s `_load_placeholder` constructs `make_matmul_kernel(1024, 1024, 1024)` so the scaffold runs end-to-end without a model / SOL problem); on the SOL path the search tree's root kernel comes from `generate_triton_baseline`'s LLM-driven PyTorch→Triton port, not from these starters.
 
 | File | Function | FLOPs estimate |
 |------|----------|---------------|

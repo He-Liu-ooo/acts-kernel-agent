@@ -5,6 +5,12 @@ from a real ``ncu --csv --print-metric-name=name`` run on RTX 6000 Ada
 (CUDA 12.8, NCU 2025.1.1.0) profiling a 1-D torch elementwise kernel.
 Keep it verbatim — it's documentation of NCU's on-disk format.
 
+Note: the captured kernel name in the fixture is
+``vectorized_elementwise_kernel`` (PyTorch's compiled launch symbol),
+not ``elementwise_add``. The fixture basename refers to the workload
+shape, not the kernel symbol — this is intentional; do not rename to
+match (the path is referenced from tests).
+
 Edge cases (missing metric, no matching kernel, multi-launch, stall
 rank) are synthesized inline from the golden header to avoid tracking
 six near-identical files.

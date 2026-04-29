@@ -46,10 +46,12 @@ def verify_optimized_kernel(
     failures surface as ``passed=False`` with a compile-phrased detail
     string.
 
-    *workload* is required when ``optimized.dps`` is True so the gate can
-    pre-allocate output buffers via ``allocate_outputs(definition,
-    resolved_axes, device)``; the kernel object itself carries the DPS
-    flag and is threaded through to ``verify_correctness``.
+    When ``optimized.dps`` is True, both *definition* and *workload* are
+    required so the gate can pre-allocate output buffers via
+    ``allocate_outputs(definition, resolved_axes, device)`` (the resolved
+    axes come from the workload, the dtype/shape spec from the
+    definition); the kernel object itself carries the DPS flag and is
+    threaded through to ``verify_correctness``.
     """
     from src.eval.correctness import verify_correctness
     from src.kernels.compiler import compile_kernel

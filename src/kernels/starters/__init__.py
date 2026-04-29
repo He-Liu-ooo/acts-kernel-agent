@@ -1,1 +1,1 @@
-"""Baseline starter kernels for common operations."""
+"""Placeholder/metadata-only starter kernels for common operations."""

@@ -29,16 +29,16 @@ Spec JSON contract (mirror of the docstring on ``_run_ncu``):
   the driver allocates them via ``src.eval.inputs.allocate_dps_outputs``
   and calls ``kernel_fn(*inputs, *outputs)``. Mirrors the wiring in
   ``src/eval/benchmark.py::_wrap_dps_generator`` and
-  ``src/eval/correctness.py::_maybe_wrap_dps_candidate``.
+  ``src/eval/correctness.py::maybe_wrap_dps_candidate``.
 
 Input resolution priority:
 
 1. ``problem_dir`` present → build via
    ``src.eval.inputs.build_input_generator`` (orchestrator path). The
    directory must contain ``definition.json`` + ``workload.jsonl``; the
-   driver calls ``load_problem`` on it.
+   driver calls ``src.benchmarks.sol_execbench.load`` on it.
 2. ``module.make_inputs(seed)`` defined in the kernel source → call it
-   (self-contained kernel convention — primary Tier 2 path).
+   (self-contained kernel fallback).
 3. ``spec["args"]`` present → use as positional args (ad-hoc smoke tests).
 4. Otherwise ``()`` — only safe when ``run()`` takes no arguments.
 
@@ -111,10 +111,10 @@ def _build_inputs(
     ``workload`` are reused by the DPS path in ``main()`` to allocate output
     buffers; ``inputs`` is the tuple produced by the generator at ``seed``.
 
-    Torch + sol_execbench are imported lazily here so Tier 1 tests can
-    import the driver without the GPU stack installed.
+    Torch + sol_execbench are imported lazily here so the driver can be
+    imported without the GPU stack installed.
     """
-    # Lazy imports — not available in the Tier 1 test venv.
+    # Lazy imports — keep module import GPU-stack-free.
     from sol_execbench.core.data import Workload
 
     from src.benchmarks.sol_execbench import load as sol_load
@@ -159,7 +159,7 @@ def _call_kernel(
     if not dps:
         return kernel_fn(*inputs)
 
-    # Lazy import — sol_execbench is not in the Tier 1 test venv.
+    # Lazy import — keep module import GPU-stack-free.
     from src.eval.inputs import allocate_dps_outputs
 
     if definition is None or workload is None:
@@ -187,7 +187,7 @@ def main(argv: list[str]) -> int:
     seed = spec.get("seed", 0)
     dps = bool(spec.get("dps", False))
     # Rehydrate blob_roots back to ``list[Path] | None``. Absent → ``None``
-    # for back-compat with cached profiler specs that predate the field.
+    # for back-compat with older spec payloads that predate the field.
     blob_roots: list[Path] | None
     raw_blob_roots = spec.get("blob_roots")
     if raw_blob_roots:

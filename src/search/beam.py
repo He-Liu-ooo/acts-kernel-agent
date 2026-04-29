@@ -7,7 +7,7 @@ import random
 from src.agents.reviewer import BranchQuality
 from src.search.tree import SearchTree, TreeNode
 
-# B3: branch-quality bonus added to raw SOL score for ranking.
+# Branch-quality bonus added to raw SOL score for ranking.
 # Small enough that large score gaps still dominate.
 _QUALITY_BONUS = {
     BranchQuality.PROMISING: 0.05,
@@ -15,7 +15,7 @@ _QUALITY_BONUS = {
     BranchQuality.PLATEAU: -0.02,
 }
 
-# B2: max score gap for a diversity swap. A minority-action node must be
+# Max score gap for a diversity swap. A minority-action node must be
 # within this distance of the worst kept node to earn a rescue slot.
 _DIVERSITY_GAP_LIMIT = 0.3
 
@@ -36,11 +36,17 @@ def beam_prune(tree: SearchTree, beam_width: int, *, enable_diversity: bool = Tr
     ``_DIVERSITY_GAP_LIMIT`` of the cutoff and a redundant action has
     a node to swap out.
     """
+    if beam_width <= 0:
+        raise ValueError(
+            f"beam_prune requires beam_width > 0 (got {beam_width}); "
+            "the diversity-rescue cutoff indexes frontier[beam_width - 1]."
+        )
+
     frontier = tree.frontier()
     if len(frontier) <= beam_width:
         return []
 
-    # B3: sort by quality-weighted effective score
+    # Sort by quality-weighted effective score (descending).
     frontier.sort(key=_effective_score, reverse=True)
 
     kept = {n.id for n in frontier[:beam_width]}
@@ -52,7 +58,9 @@ def beam_prune(tree: SearchTree, beam_width: int, *, enable_diversity: bool = Tr
             pruned_ids.append(node.id)
         return pruned_ids
 
-    # B2: diversity rescue pass
+    # Diversity rescue pass: swap in minority-action candidates within the
+    # gap limit, evicting the lowest-scoring node of the most-represented
+    # action.
     kept_actions = {n.action_applied for n in frontier if n.id in kept and n.action_applied}
     cutoff = _effective_score(frontier[beam_width - 1])
 

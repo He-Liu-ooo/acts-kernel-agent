@@ -149,7 +149,6 @@ def test_build_user_prompt_escapes_backticks_in_kernel_source():
 # ── review() with mocked LLM ───────────────────────────────────────────
 
 
-@pytest.mark.asyncio
 def _simulate_review_submission(**fields):
     """Test helper: returns (capture_factory, fake_run) that together
     simulate a submit_review tool call inside Runner.run. Mirrors
@@ -966,13 +965,13 @@ async def test_review_flag_on_threads_raw_metrics_into_prompt_menu():
 
 @pytest.mark.asyncio
 async def test_review_flag_on_two_queries_plus_invalid_submit_busts_budget():
-    """Codex review regression test (2026-04-27): with the flag on, the
-    worst-case path of `2 query_metric calls + invalid submit_review +
-    corrected submit_review` requires more than `max_turns=6` turns. The
-    prompt now caps fetches at one per review precisely to preserve
-    submit-retry headroom; this test confirms the degraded fallback fires
-    cleanly when an LLM ignores the heuristic and walks the budget-bust
-    path, rather than raising or returning a partially-formed feedback."""
+    """Budget regression: with the flag on, the worst-case path of
+    `2 query_metric calls + invalid submit_review + corrected submit_review`
+    requires more than `max_turns=6` turns. The prompt caps fetches at one
+    per review precisely to preserve submit-retry headroom; this test
+    confirms the degraded fallback fires cleanly when an LLM ignores the
+    heuristic and walks the budget-bust path, rather than raising or
+    returning a partially-formed feedback."""
     from src.agents.reviewer import MaxTurnsExceeded
 
     with (
@@ -1100,7 +1099,7 @@ def test_build_user_prompt_menu_degraded_notice_when_raw_metrics_empty():
     )
     assert "## Available raw metrics (queryable)" in prompt
     assert "[no NCU data" in prompt
-    assert "query_metric will return empty" in prompt
+    assert 'query_metric will return "[no data]"' in prompt
 
 
 def test_build_user_prompt_menu_degraded_notice_when_profiling_none():
@@ -1120,9 +1119,9 @@ def test_build_user_prompt_menu_degraded_notice_when_profiling_none():
 
 @pytest.mark.asyncio
 async def test_review_partial_ncu_degradation_still_exposes_raw_metrics():
-    """Codex review regression test (2026-04-27): `ProfilingResult.degraded`
-    and `raw_metrics` are independent surfaces. A partial NCU parse failure
-    sets `degraded_reason` while still leaving `raw_metrics` populated with
+    """Invariant: `ProfilingResult.degraded` and `raw_metrics` are
+    independent surfaces. A partial NCU parse failure sets
+    `degraded_reason` while still leaving `raw_metrics` populated with
     whatever was successfully extracted. The multi-turn path must:
 
     1. show the menu with real keys (not the degraded notice), and
@@ -1292,7 +1291,7 @@ def test_make_query_metric_tool_non_list_names_returns_error_dict():
     from src.agents.reviewer import _make_query_metric_tool
 
     tool = _make_query_metric_tool(raw_metrics={"foo": 1.0}, iter_idx=0)
-    out = tool(names="foo")  # bare string — the failure mode Codex flagged
+    out = tool(names="foo")  # bare string — the failure mode this guard pins
     assert "_error" in out
     assert "list" in out["_error"].lower()
     assert "str" in out["_error"].lower()  # mentions actual type received

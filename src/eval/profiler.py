@@ -32,11 +32,11 @@ if TYPE_CHECKING:
 # Cache-bust token. Bump when the curated metric map, stall reasons,
 # parser contract, or *cache-key shape* changes. Embedded in every
 # cache key so stale entries are unreachable from the new version and
-# naturally evicted. ``v2`` (2026-04-22): added ``kernel_name`` to the
-# key blob so two Kernels with identical source but different declared
-# ``triton_kernel_name`` values can no longer alias to one entry (Codex
-# P2 fix — was returning helper-kernel metrics when the run requested
-# the dominant-kernel filter).
+# naturally evicted. ``v2`` includes ``kernel_name`` in the key blob so
+# two Kernels with identical source but different declared
+# ``triton_kernel_name`` values cannot alias to one entry (otherwise the
+# helper-kernel metrics would be returned when the run requested the
+# dominant-kernel filter).
 _METRIC_SET_VERSION: str = "v2"
 
 # ``_UNSET`` sentinel distinguishes "not yet probed" from "probed → missing".
@@ -415,8 +415,9 @@ def _run_ncu(
     ``None`` falls back to ``kernel.spec.entrypoint``.
     ``problem_definition_path`` is the SOL-ExecBench ``definition.json``;
     its parent directory is serialized as ``problem_dir`` so the driver
-    can call ``load_problem(<dir>)``. ``None`` omits the key and the
-    driver falls back to ``module.make_inputs`` or ``spec['args']``.
+    can call ``src.benchmarks.sol_execbench.load(<dir>)``. ``None`` omits
+    the key and the driver falls back to ``module.make_inputs`` or
+    ``spec['args']``.
 
     ``blob_roots`` is the list of directories the driver's
     ``build_input_generator`` consults when the workload contains a
@@ -450,15 +451,15 @@ def _run_ncu(
         # ``kernel.dps`` is the source of truth for whether the host
         # wrapper takes pre-allocated output buffers as positional args
         # after the inputs. Threading it into the spec mirrors the DPS
-        # wiring already done in ``benchmark_kernel`` (Sub-commit C),
-        # ``verify_correctness`` (F2), and ``_reward_hack_re_eval`` (G4)
-        # so the NCU profile path doesn't silently TypeError on DPS
-        # kernels.
+        # wiring already done in ``benchmark_kernel``,
+        # ``verify_correctness``, and ``_reward_hack_re_eval`` so the NCU
+        # profile path doesn't silently TypeError on DPS kernels.
         "dps": bool(kernel.dps),
     }
     if problem_definition_path is not None:
-        # ``load_problem`` wants the directory (``definition.json`` +
-        # sibling ``workload.jsonl``), not the definition file itself.
+        # ``src.benchmarks.sol_execbench.load`` wants the directory
+        # (``definition.json`` + sibling ``workload.jsonl``), not the
+        # definition file itself.
         spec_payload["problem_dir"] = str(Path(problem_definition_path).parent)
     if blob_roots is not None:
         # JSON cannot serialize ``Path`` directly — coerce to str. The
@@ -519,16 +520,20 @@ def _cache_key(
     kernel_source: str, workload: dict, mode: str, kernel_name: str
 ) -> str:
     """Deterministic 16-hex-char key mixing source hash + workload + mode
-    + resolved ``kernel_name`` + ``_METRIC_SET_VERSION``. ``repr()`` of a
-    dict is insertion-order-stable on Python 3.7+ — sufficient within one
-    process. Including ``kernel_name`` keeps multi-jit fused outputs from
+    + resolved ``kernel_name`` + ``_METRIC_SET_VERSION``. The workload is
+    serialized via ``json.dumps(..., sort_keys=True)`` so the cache key is
+    invariant under dict insertion order — required because the cache
+    persists across processes (``.acts_cache/``) and dict ordering on the
+    JSON re-load path is not the same as on the original construction
+    path. Including ``kernel_name`` keeps multi-jit fused outputs from
     aliasing — the resolved name (Coder-declared, regex fallback, or
     entrypoint last-ditch) is what NCU's ``--kernel-name regex:`` filter
     actually targets, so two runs with the same source but different
     targets must produce distinct cache entries."""
     source_hash = hashlib.sha256(kernel_source.encode("utf-8")).hexdigest()
+    workload_repr = json.dumps(workload, sort_keys=True, default=str)
     blob = (
-        source_hash + repr(workload) + mode + kernel_name + _METRIC_SET_VERSION
+        source_hash + workload_repr + mode + kernel_name + _METRIC_SET_VERSION
     )
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 
@@ -614,12 +619,12 @@ def profile_kernel(
     # Resolve the NCU-target kernel name BEFORE the cache check so it
     # participates in the cache key — otherwise two Kernels with identical
     # source but different declared ``triton_kernel_name`` values alias
-    # to one cache entry (Codex P2 fix). Priority: Coder-declared name
-    # (validated upstream) → source-regex fallback (hand-written starters
-    # / test fixtures with an empty declared name) → entrypoint last-ditch
-    # (so we degrade to ``no_matching_kernel`` rather than crash when
-    # neither source has a ``@triton.jit`` def at all). Pure-Python
-    # resolution; no I/O cost added to the cache-hit path.
+    # to one cache entry. Priority: Coder-declared name (validated
+    # upstream) → source-regex fallback (hand-written starters / test
+    # fixtures with an empty declared name) → entrypoint last-ditch (so
+    # we degrade to ``no_matching_kernel`` rather than crash when neither
+    # source has a ``@triton.jit`` def at all). Pure-Python resolution;
+    # no I/O cost added to the cache-hit path.
     kernel_name = (
         kernel.triton_kernel_name
         or _extract_triton_kernel_name(kernel.source_code)

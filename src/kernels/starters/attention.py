@@ -1,4 +1,4 @@
-"""Baseline Triton attention kernel."""
+"""Metadata-only placeholder for an attention kernel."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from src.kernels.kernel import Kernel, KernelSpec, KernelType
 def make_attention_kernel(
     batch: int, heads: int, seq_len: int, head_dim: int
 ) -> Kernel:
-    """Create a baseline attention kernel for the given dimensions."""
+    """Create a metadata-only placeholder attention kernel for the given dimensions."""
     spec = KernelSpec(
         name=f"attention_{batch}x{heads}x{seq_len}x{head_dim}",
         kernel_type=KernelType.ATTENTION,

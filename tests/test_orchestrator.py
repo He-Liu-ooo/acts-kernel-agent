@@ -1,4 +1,4 @@
-"""Sub-commit E orchestrator tests: anti-cheat wrap, reward-hack handling,
+"""Orchestrator tests for anti-cheat wrap, reward-hack re-evaluation,
 and CUDA sticky-state recovery.
 
 Reuses the mock-agents harness pattern from ``test_orchestrator_events.py``
@@ -441,26 +441,23 @@ async def test_orchestrator_emits_trace_emitted_per_evaluation(tmp_path, harness
     assert kinds.count("trace_emitted") == 1, kinds
 
 
-# ── dps thread-through ─────────────────────────────────────────────────
-
-
 # ── reward_hack re-eval: multi-output (tuple/dict) shape handling ──────
 #
-# Codex F3: prior to the fix, ``_reward_hack_re_eval`` only ran the strict
-# tolerance check when both candidate and reference outputs were single
-# tensors. Tuple/dict outputs fell through and the function returned True,
-# fail-OPEN: a suspect multi-output kernel was automatically cleared
-# without any output comparison. The fix routes multi-output through the
-# same normalized comparator that ``verify_correctness`` uses (Sub-commit
-# C's ``_compare_outputs`` + ``_build_normalize_context``) so each named
-# output is compared name-by-name under the strict tolerance.
+# Invariant: ``_reward_hack_re_eval`` must run the strict tolerance check
+# for multi-output kernels (tuple/dict), not just single-tensor outputs.
+# Tuple/dict outputs route through the same normalized comparator that
+# ``verify_correctness`` uses (``_compare_outputs`` +
+# ``_build_normalize_context``); each named output is compared
+# name-by-name under the strict tolerance. A bypass that returned True
+# unconditionally for multi-output candidates would fail-OPEN: a suspect
+# kernel cleared without any output comparison.
 
 
 def _two_out_definition():
     """Synthetic ``Definition`` with two named outputs.
 
-    Mirrors the multi-output schema used by Sub-commit C's correctness
-    integration tests — two float32 outputs, one shape axis. The reference
+    Mirrors the multi-output schema used by the correctness integration
+    tests — two float32 outputs, one shape axis. The reference
     body is irrelevant to the re-eval (it doesn't exec the source); we
     inject candidate / reference callables directly.
     """
@@ -590,25 +587,26 @@ async def test_reward_hack_re_eval_rejects_mismatched_tuple_output(harness):
 
     assert cleared is False, (
         "mismatched multi-output tuple must be fail-closed (not cleared) "
-        "by the re-eval — Codex F3 was about exactly this fail-open hole"
+        "by the re-eval — guards against the fail-open hole where any "
+        "non-single-tensor output was auto-cleared without comparison"
     )
 
 
 # ── reward_hack re-eval: DPS kernel call shape ────────────────────────
 #
-# Codex G4: prior to the fix, ``_reward_hack_re_eval`` called the candidate
-# as ``cand_fn(*inputs)`` regardless of ``kernel.dps``. For DPS kernels the
-# host wrapper signature is ``kernel_fn(*inputs, *outputs)`` — calling it
-# with only inputs raises TypeError, the catch-all ``except Exception``
-# returns False, and any DPS branch that trips ``reward_hack_suspect`` is
-# auto-confirmed as a hack even when its outputs match the reference. The
-# fix wraps the candidate per-workload via F2's ``_maybe_wrap_dps_candidate``
-# (which calls ``allocate_outputs`` to provision fresh output buffers and
-# invokes ``candidate_fn(*inputs, *outputs)``).
+# Invariant: ``_reward_hack_re_eval`` must respect ``kernel.dps`` when
+# calling the candidate. DPS kernels expose the signature
+# ``kernel_fn(*inputs, *outputs)`` — calling them with only ``*inputs``
+# raises TypeError, the catch-all ``except Exception`` returns False, and
+# any DPS branch that trips ``reward_hack_suspect`` is auto-confirmed as
+# a hack even when its outputs match the reference. The candidate must
+# be wrapped per-workload via ``_maybe_wrap_dps_candidate`` so
+# ``allocate_outputs`` provisions fresh buffers and the candidate is
+# invoked as ``candidate_fn(*inputs, *outputs)``.
 
 
 def _dps_one_out_definition():
-    """Synthetic ``Definition`` with one DPS output for the G4 fix tests.
+    """Synthetic ``Definition`` with one DPS output for the DPS re-eval tests.
 
     Single float32 output of shape ``[N]``, matching the relu/tanh kernels
     we use as test candidates (single-input → single-output).
@@ -643,12 +641,13 @@ def _dps_workload(n: int = 64):
 async def test_reward_hack_re_eval_dps_clears_matching_kernel(harness):
     """DPS candidate writing into pre-allocated output buffer must be CLEARED.
 
-    Pre-fix: ``cand_fn(*inputs)`` raised TypeError because the DPS host
-    wrapper expects ``kernel_fn(x, out)`` — the catch-all ``except Exception``
-    fail-closed and returned False even though the kernel was correct. The
-    branch was incorrectly confirmed as a hack.
+    Regression: an unwrapped ``cand_fn(*inputs)`` call would raise
+    TypeError (the DPS host wrapper expects ``kernel_fn(x, out)``); the
+    catch-all ``except Exception`` would fail-closed and return False
+    even though the kernel was correct, incorrectly confirming the
+    branch as a hack.
 
-    Post-fix: F2's ``_maybe_wrap_dps_candidate`` allocates the output buffer,
+    Contract: ``_maybe_wrap_dps_candidate`` allocates the output buffer,
     calls ``kernel_fn(x, out)``, and the normalized comparator sees
     ``out`` matching ``reference_fn(x)`` — cleared.
     """
@@ -705,10 +704,10 @@ async def test_reward_hack_re_eval_dps_clears_matching_kernel(harness):
         )
 
     assert cleared is True, (
-        "DPS candidate matching the reference must be cleared. Pre-G4-fix "
-        "the unwrapped ``cand_fn(*inputs)`` raised TypeError and the "
-        "fail-closed branch returned False — auto-confirming a valid kernel "
-        "as a reward hack."
+        "DPS candidate matching the reference must be cleared. Without "
+        "the DPS wrap, ``cand_fn(*inputs)`` raises TypeError and the "
+        "fail-closed branch returns False — auto-confirming a valid "
+        "kernel as a reward hack."
     )
 
 

@@ -7,21 +7,17 @@ import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Iterator
+from typing import Any, Iterator
 
 import torch
 
 from sol_execbench.core.bench.reward_hack import (
-    RewardHackDetected,
     check_eval_integrity,
     check_lazy_outputs as _sol_check_lazy_outputs,
     check_monkey_patch,
     check_thread_injection,
     snapshot_critical_functions,
 )
-
-if TYPE_CHECKING:
-    from src.kernels.kernel import Kernel
 
 
 @dataclass

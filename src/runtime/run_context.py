@@ -1,6 +1,5 @@
 """Per-run lifecycle: run_<UTC>/ directory, stdlib-logging config, events
-FH binding, SDK trace processor wire-up. See
-``doc/specs/2026-04-22-logger-system-design.md`` §5.1.
+FH binding, SDK trace processor wire-up. See ``doc/runtime.md``.
 """
 from __future__ import annotations
 
@@ -60,20 +59,38 @@ class RunContext:
         """
         root = Path(root) if root is not None else Path("./runs")
         run_dir = root / f"run_{filename_ts()}"
-        traces_dir = run_dir / "traces"
         events_path = run_dir / "events.jsonl"
         log_path = run_dir / "run.log"
+        # Resolve the effective trace target so the reported ``traces_dir``
+        # matches where traces actually land. ``trace_dir`` override wins;
+        # otherwise the in-run-dir default applies. ``capture_traces=False``
+        # disables capture entirely → no reported path, no mkdir.
+        if not capture_traces:
+            traces_dir: Path | None = None
+        elif trace_dir is not None:
+            traces_dir = Path(trace_dir)
+        else:
+            traces_dir = run_dir / "traces"
 
         # Guard the full file-backed setup, not just mkdir. Disk quota /
         # FD exhaustion / mid-setup permissions issues between mkdir and
         # FileHandler construction would otherwise propagate and abort
         # the run — violating the "best-effort diagnostics, never kill a
-        # run" contract (Codex review 2026-04-23 Finding 3).
+        # run" contract.
         events_fh: IO[str] | None = None
         file_handler: logging.Handler | None = None
         stream_handler: logging.Handler | None = None
         try:
-            traces_dir.mkdir(parents=True, exist_ok=False)
+            # Always materialize ``run_dir`` so events.jsonl + run.log can be
+            # opened. The default-traces branch below does this transitively
+            # via ``traces_dir.mkdir(parents=True)`` (since traces_dir is
+            # under run_dir), but the override and capture-disabled branches
+            # need an explicit mkdir.
+            run_dir.mkdir(parents=True, exist_ok=False)
+            # Only create the default in-run-dir traces/ ourselves; an
+            # explicit ``trace_dir`` override is the caller's path to own.
+            if capture_traces and trace_dir is None:
+                traces_dir.mkdir(parents=True, exist_ok=False)
             events_fh = events_path.open("w", buffering=1)
             events.bind(events_fh)
             log_path.touch()
@@ -109,9 +126,9 @@ class RunContext:
         if capture_traces:
             # SDK gate is inside the helper so test patches of
             # ``_SDK_AVAILABLE`` continue to work the same way.
-            trace_processor = cls._wire_trace_capture(
-                trace_dir if trace_dir is not None else traces_dir
-            )
+            # ``traces_dir`` already reflects the override, resolved above.
+            assert traces_dir is not None  # guaranteed by capture_traces branch
+            trace_processor = cls._wire_trace_capture(traces_dir)
 
         return cls(
             run_dir=run_dir,

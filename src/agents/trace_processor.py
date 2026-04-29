@@ -1,9 +1,9 @@
 """Local JSONL trace capture for the OpenAI Agents SDK.
 
-Without this the SDK's default tracing path ships every span to
-``api.openai.com/v1/traces/ingest``, which is unreachable for non-OpenAI
-providers (DeepSeek key → 401) and routes prompts/responses through a
-third-party service we have no business using.
+Without this the SDK's default tracing path ships every span to its
+hosted ingest endpoint, which is not reachable when using non-OpenAI
+model providers (the API key is rejected) and would also route prompts
+and responses through an external service the run does not depend on.
 
 This module provides ``JSONLTraceProcessor``, a ``TracingProcessor``
 implementation that writes one newline-delimited JSON record per trace /
@@ -21,6 +21,11 @@ Captured fields (per record):
   ``input`` / ``output`` arrays, ``model``, ``model_config``, ``usage``
   for ``GenerationSpanData``; tool name / arguments / result for
   ``FunctionSpanData``; etc.
+  TODO: this captures full prompts, responses, and tool arguments
+  verbatim. Add a config-gated redaction layer (e.g.
+  ``ACTSConfig.trace_redact_llm_io`` to drop ``input`` / ``output``
+  bodies, retaining only token counts and span shape) before this is
+  used in any environment where the trace files might be shared.
 - ``error``: populated when the span ends with an error set.
 - ``metadata``: trace-level metadata (workflow tags etc.) on ``trace_end``.
 
@@ -40,7 +45,7 @@ from src.runtime.timefmt import filename_ts
 
 try:
     from agents.tracing.processor_interface import TracingProcessor
-except ModuleNotFoundError:  # pragma: no cover — Tier 1 venv has no SDK
+except ModuleNotFoundError:  # pragma: no cover — test venv (no agents-sdk)
     class TracingProcessor:  # type: ignore[no-redef]
         """SDK-absent stand-in. Concrete tests subclass this directly."""
 
@@ -150,15 +155,15 @@ def enable_local_trace_capture(out_dir: Path) -> JSONLTraceProcessor:
     Replaces (not augments) the default OpenAI exporter so traces stay
     on-host. Returns the processor so the caller can inspect ``.path``
     or wire ``shutdown`` into atexit. Raises ``RuntimeError`` if the SDK
-    isn't installed — callers that may run in the Tier 1 venv should
-    gate on SDK availability before calling.
+    isn't installed — callers that may run in the test venv (no
+    agents-sdk) should gate on SDK availability before calling.
     """
     try:
         from agents import set_trace_processors
     except ModuleNotFoundError as exc:  # pragma: no cover
         raise RuntimeError(
             "openai-agents SDK not installed; trace capture requires the "
-            "GPU venv (see auto-memory ``reference_test_venv.md``)."
+            "run venv (with agents-sdk + torch)."
         ) from exc
 
     processor = JSONLTraceProcessor(out_dir=out_dir)

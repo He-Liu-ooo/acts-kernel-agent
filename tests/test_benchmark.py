@@ -519,7 +519,7 @@ def test_exactly_half_failure_does_not_raise():
     assert math.isfinite(result.median_latency_us)
 
 
-# ── last_outputs flattening (Codex G3 regression) ──────────────────────────
+# ── last_outputs flattening (dict return → tensor list) ──────────────────
 
 
 @pytest.mark.gpu
@@ -529,10 +529,11 @@ def test_non_dps_dict_return_flattens_to_tensor_list():
     flattened into ``last_outputs`` so ``check_lazy_outputs_after_bench`` sees
     real ``torch.Tensor`` instances — not the dict object itself.
 
-    Pre-fix bug (Codex G3): ``last_outputs = ret if isinstance(ret, (list,
-    tuple)) else [ret]`` wrapped a dict in a list, so the lazy-output check
-    saw a ``dict`` and raised ``RewardHackDetected`` after an otherwise
-    successful benchmark — silently pruning every dict-return branch.
+    Regression: a naive ``last_outputs = ret if isinstance(ret, (list,
+    tuple)) else [ret]`` wraps a dict in a list, so the lazy-output check
+    sees a ``dict`` (not a ``Tensor``) and raises ``RewardHackDetected``
+    after an otherwise successful benchmark — silently pruning every
+    dict-return branch.
     """
     torch = pytest.importorskip("torch")
     from src.eval.anti_cheat import check_lazy_outputs_after_bench

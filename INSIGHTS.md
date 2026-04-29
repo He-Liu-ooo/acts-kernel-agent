@@ -109,7 +109,7 @@ Three-layer stack: Method → MethodInterface → Task.
 | KernelEvolve | Meta | Heterogeneous accelerator support + persistent knowledge base | Tree search | Triton |
 | CUDA-Agent | ByteDance | Only RL-trained approach; SKILL.md structured skills | PPO training | CUDA C++ |
 | STARK | Meta AI/Duke | Grounded instruction markers; multi-agent | Epsilon-greedy tree | CUDA C++ |
-| Astra | Stanford | Production SGLang kernels; 4-agent system | Iterative refinement | CUDA C++ |
+| Astra | Stanford | Production SGLang kernels; 5-agent system | Iterative refinement | CUDA C++ |
 | AVO | NVIDIA | Beats cuDNN/FlashAttention-4 via inline PTX | Evolutionary | CUDA + PTX |
 | EvoEngineer | Anonymous | Structured mutations via traverse techniques | Evolutionary | CUDA C++ |
 | AccelOpt | Stanford/AWS | First non-NVIDIA framework; beam search + optimization memory | Beam search | NKI |
@@ -172,6 +172,6 @@ Better alternatives:
 
 ### 6. Multi-Agent vs. Single-Agent is Unresolved
 
-**Multi-agent** (Astra 4-agent, STARK 3-agent): Role specialization, interpretability, different models per role. But communication overhead and coordination complexity.
+**Multi-agent** (Astra 5-agent, STARK 3-agent): Role specialization, interpretability, different models per role. But communication overhead and coordination complexity.
 
 **Single-agent with structured actions** (CUDA-Agent, AutoKernel): Similar decomposition without communication cost.

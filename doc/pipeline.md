@@ -27,8 +27,8 @@ python -m src.pipeline.optimize [problem_path] [--run-dir DIR] [--trace-dir DIR]
 
 **SOL mode** (`_load_sol_problem`, dispatched from `_load_problem`):
 
-1. `load_problem()` parses the SOL definition + workloads.
-2. `problem_to_kernel_spec()` derives the `KernelSpec` (name, entrypoint, kernel_type).
+1. `src.benchmarks.sol_execbench.load(path)` parses the SOL definition + workloads into the pydantic `Definition` + `list[Workload]` pair.
+2. `_definition_to_kernel_spec(definition, definition_path)` (in `pipeline/optimize.py`) derives the `KernelSpec` (name, kernel_type, `definition_path`, `pytorch_reference`); `flop_count` / `memory_bytes` stay 0 because SOLAR / `compute_roofline_inputs` derive them from workload axes, not the static definition.
 3. `derive_t_sol_from_solar()` produces the roofline result; `spec.t_sol_us` is populated when SOLAR returns data.
 4. `select_workloads()` samples `config.benchmark_workload_count` representative workloads.
 5. **`generate_triton_baseline()`** (see `baseline_generator.py` below) drives `CoderAgent.translate()` to port the PyTorch reference into a Triton kernel, post-verifying on every selected workload. The returned `Kernel` is the search-tree root.
@@ -52,7 +52,7 @@ SOL `Trace` payloads are emitted per evaluation (`trace_emitted` event, built by
 
 ## baseline_generator.py — Triton Baseline Generation
 
-`generate_triton_baseline(problem, spec, *, coder, workloads, max_retries, cache_dir=None, policy=None) -> Kernel`
+`generate_triton_baseline(definition, spec, *, coder, workloads, max_retries=3, cache_dir=None, policy=None, blob_roots=None) -> Kernel`
 
 Runs at problem-load time. Drives `CoderAgent.translate()` to port the PyTorch reference into Triton, then post-verifies: recompiles the returned source and reruns the 5-stage correctness gate against every workload in *workloads*. The post-verify catches SDK best-effort output when the Coder's turn budget was exhausted. Returns the first candidate that compiles and passes correctness on all workloads.
 
@@ -66,7 +66,9 @@ Runs at problem-load time. Drives `CoderAgent.translate()` to port the PyTorch r
 
 Re-runs the correctness gate on the best kernel to confirm results are reproducible. Recompiles the winner, then delegates to `verify_correctness` against the PyTorch reference. Compile failures surface as `passed=False` with a compile-phrased detail string.
 
-`verify_optimized_kernel(optimized, *, reference_fn, input_generator, policy=None, cache_dir=None) -> VerificationResult`
+`verify_optimized_kernel(optimized, *, reference_fn, input_generator, definition=None, workload=None, policy=None, cache_dir=None) -> VerificationResult`
+
+`definition` + `workload` are required when `optimized.dps` is True so the gate can pre-allocate output buffers via `allocate_outputs(definition, resolved_axes, device)`; both are passed through to `verify_correctness`.
 
 ## report.py — Report Generation
 
@@ -84,7 +86,7 @@ When `workloads` + `hardware_spec` are supplied, `generate_report` iterates the 
 | `speedup` | float | Baseline / best |
 | `technique_trace` | `list[str]` | Root-to-best action sequence (root baseline filtered out) |
 | `bottleneck` | `BottleneckType \| None` | Once-per-run classification, copied verbatim from `SearchResult.run_bottleneck` (produced by `classify_run` in `eval/roofline.py`). `None` on the placeholder path that has no roofline. |
-| `winner_per_workload_bottlenecks` | `dict[str, BottleneckType]` | Per-workload classification sourced from SOLAR via `derive_t_sol_from_solar(...).bottleneck`, keyed by `Workload.uuid`. Populated only when `workloads` + `hardware_spec` + `definition` are all provided. Workloads where SOLAR returns `None` (or `definition is None`) are **omitted** — there is no fallback to the analytical band classifier. (The previous `classify_workload` helper was deleted on 2026-04-28; SOLAR is now the authoritative per-workload source.) Replaces the removed `bottleneck_transitions` (classification is invariant within a run — the per-workload view is the only non-trivial axis left for diagnostics). |
+| `winner_per_workload_bottlenecks` | `dict[str, BottleneckType]` | Per-workload classification sourced from SOLAR via `derive_t_sol_from_solar(...).bottleneck`, keyed by `Workload.uuid`. Populated only when `workloads` + `hardware_spec` + `definition` are all provided; workloads where SOLAR returns `None` (or `definition is None`) are **omitted** — no analytical-band fallback. |
 | `winner_profiling_per_workload` | `dict[str, ProfilingResult]` | Phase C re-profile of the winning kernel on every selected workload (spec §3.4). Empty when `input_generators` is missing. |
 | `remaining_headroom_pct` | float | Distance to hardware limit, `(1 - sol_score) * 100` |
 | `total_iterations` | int | Search iterations run |

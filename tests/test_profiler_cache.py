@@ -300,11 +300,11 @@ def test_cache_key_metric_set_version_bust(
     assert _reads_counter(counter) == 2
 
 
-# ── Codex P2: kernel_name participates in the cache key ────────────────
+# ── kernel_name participates in the cache key ─────────────────────────
 
 
 def test_cache_key_distinct_for_different_declared_kernel_names(sample_workload):
-    """Codex P2 fix: two Kernels with identical source but different declared
+    """Two Kernels with identical source but different declared
     ``triton_kernel_name`` values must produce distinct cache keys. Without
     this, profiling a fused kernel renamed by the Coder would silently return
     metrics NCU collected on a different jit'd function in the same source."""

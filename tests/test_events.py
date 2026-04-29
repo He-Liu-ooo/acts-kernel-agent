@@ -67,8 +67,8 @@ def test_emit_log_line_includes_iter_for_iter_scoped_events(caplog):
     """run.log must surface ``iter`` for iteration-scoped events so
     operators tailing the file during a multi-iter run can tell which
     iteration produced each line. The JSONL sink always carried ``iter``;
-    the human log sink previously dropped it because ``emit`` serialized
-    only ``**fields`` (Codex review 2026-04-23)."""
+    the human log sink must include it too — a serialization that emits
+    only ``**fields`` would drop ``iter`` from the log line."""
     events.unbind()
     with caplog.at_level(logging.INFO, logger="src.runtime.events"):
         events.emit("iter_start", iter=3, parent_node_id="abc", parent_score=0.5)

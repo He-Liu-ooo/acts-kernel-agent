@@ -1,6 +1,6 @@
 """Derive per-workload ``(flops, nbytes)`` for the analytical profiler.
 
-``problem_to_kernel_spec`` deliberately leaves ``KernelSpec.flop_count``
+``_definition_to_kernel_spec`` deliberately leaves ``KernelSpec.flop_count``
 and ``memory_bytes`` at 0 because SOLAR supplies ``T_SOL`` directly. But
 the hybrid profiler's arithmetic-intensity + achieved-peak math needs
 nonzero counts, and zeros make ``_compute_analytical`` raise
@@ -60,25 +60,9 @@ def compute_roofline_inputs(
     that as a signal to skip analytical profiling rather than feed zeros
     into ``_compute_analytical`` (which would raise).
 
-    Call sites — ONLY two production paths, both feed
-    ``profile_kernel(flops=, nbytes=)`` → ``_compute_analytical`` for
-    arithmetic-intensity / %peak-compute / %peak-bandwidth math. **Not**
-    used for bottleneck classification — SOLAR (``derive_t_sol_from_solar``)
-    is the sole bottleneck source post-2026-04-28 (see JOURNAL "SOLAR as
-    sole bottleneck source"):
-
-    1. ``src/search/orchestrator.py::Orchestrator.run`` — per iteration
-       on the representative workload, threading flops/nbytes into the
-       per-iter profiler call.
-    2. ``src/pipeline/report.py::_resolve_workload_roofline`` — Phase C
-       re-profile, called once per selected workload when the winner
-       runs the full-suite re-profile pass.
-
-    A new caller almost certainly means one of: (a) a third profile_kernel
-    invocation has been added (legitimate — extend this list), or (b)
-    bottleneck classification has accidentally been re-routed away from
-    SOLAR (regression — fix instead). Verify before adding the third
-    site.
+    Used only to feed ``profile_kernel(flops=, nbytes=)`` for analytical
+    arithmetic-intensity / %peak math. Bottleneck classification goes
+    through SOLAR (``derive_t_sol_from_solar``), not these counts.
     """
     nbytes = _io_bytes(definition, workload)
     flops = _flops(definition, workload)

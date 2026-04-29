@@ -60,6 +60,6 @@ MemoryRetriever(store: MemoryStore, top_k: int = 5)
     ) -> list[Experience]
 ```
 
-`hardware` is optional — the orchestrator currently omits it (skeleton phase). When the orchestrator gets its real implementation, it will pass the hardware identifier from config.
+`hardware` is optional. The orchestrator threads the hardware identifier from `ACTSConfig.hardware` so retrieval prefers same-hardware experiences; callers without a configured hardware spec can still pass an empty string to fall through to cross-hardware ranking.
 
 Injected into Planner only — not Coder (has the plan), not Reviewer (evaluates independently).

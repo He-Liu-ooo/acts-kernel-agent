@@ -1,4 +1,4 @@
-"""Baseline Triton layer normalization kernel."""
+"""Metadata-only placeholder for a layer normalization kernel."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ from src.kernels.kernel import Kernel, KernelSpec, KernelType
 
 
 def make_layernorm_kernel(batch: int, hidden: int) -> Kernel:
-    """Create a baseline layernorm kernel for the given dimensions."""
+    """Create a metadata-only placeholder layernorm kernel for the given dimensions."""
     spec = KernelSpec(
         name=f"layernorm_{batch}x{hidden}",
         kernel_type=KernelType.LAYERNORM,

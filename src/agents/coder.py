@@ -13,13 +13,13 @@ tool closures bound to the right oracle and the right capture slot.
 
 Error strings follow Astra's pattern: tools return failure messages
 so the agent can self-correct within the same turn. Submission goes
-through a tool call rather than ``output_type=`` Pydantic enforcement
-because reasoning-model providers (DeepSeek-reasoner, etc.) reject the
-``response_format=json_schema`` request the SDK derives from
-``output_type=``; tool-call schemas are universally supported. The
-Pydantic ``KernelCodeOutput`` validator still runs — invoked by the
-submit tool body — so T4's "validation failure → in-loop tool retry"
-guarantee is preserved verbatim.
+through a ``submit_kernel`` tool call rather than a Pydantic
+``output_type=`` schema because reasoning-model providers
+(DeepSeek-reasoner, etc.) reject the ``response_format=json_schema``
+request the SDK derives from ``output_type=``; tool-call schemas are
+universally supported. The Pydantic ``KernelCodeOutput`` validator
+still runs — invoked by the submit tool body — preserving the
+"validation failure → in-loop tool retry" guarantee.
 """
 
 from __future__ import annotations
@@ -60,14 +60,14 @@ PROMPT_DIR = Path(__file__).resolve().parent.parent / "prompts" / "coder"
 
 
 class KernelCodeOutput(BaseModel):
-    """Structured output schema enforced on the LLM's final response.
+    """Structured output schema validated on the submit_kernel tool payload.
 
     ``triton_kernel_name`` is the bare name of the ``@triton.jit`` device
     function the profiler should filter NCU on. Cross-validated against
     ``source_code``: must appear in the source as ``@triton.jit def
     <name>``. When the kernel is fused (multiple ``@triton.jit`` defs),
     the Coder names the one performing the dominant work — picking the
-    wrong one silently mis-profiles the branch (T4 design rationale).
+    wrong one silently mis-profiles the branch.
     """
 
     source_code: str
@@ -217,9 +217,9 @@ def _make_correctness_tool(
 def _make_submit_tool(captured: dict) -> Callable[[str, str], str]:
     """Build a submit tool that captures the LLM's final ``KernelCodeOutput``.
 
-    The tool runs the same Pydantic validator that ``output_type=KernelCodeOutput``
-    used to trigger inside the SDK. On success it stores the validated output
-    in ``captured["output"]`` and returns a sentinel string instructing the
+    The tool runs the ``KernelCodeOutput`` Pydantic validator inside the
+    tool body. On success it stores the validated output in
+    ``captured["output"]`` and returns a sentinel string instructing the
     LLM to emit a one-word confirmation so the SDK tool loop terminates.
     On validation failure it returns the error string — the SDK will hand
     that back to the LLM as the tool-call response, prompting an in-loop
@@ -259,11 +259,12 @@ class CoderAgent:
     tool call plus one final plain-text confirmation. Default config gives
     8 (= 2×3 + 2).
 
-    If the retry budget is exhausted (tools keep returning errors), the
-    SDK returns whatever final_output the agent produced — the orchestrator
-    will surface a degraded kernel through the existing correctness/score
-    signal path. If the LLM call itself fails (transient errors exhausted),
-    ``implement()`` raises ``ImplementationError``.
+    If the turn budget is exhausted, ``implement()`` raises
+    ``ImplementationError`` unless a Pydantic-valid ``submit_kernel``
+    payload was already captured before the budget ran out — in which
+    case that captured output is returned. If the LLM call itself fails
+    (transient errors exhausted), ``implement()`` also raises
+    ``ImplementationError``.
     """
 
     def __init__(
@@ -349,7 +350,7 @@ class CoderAgent:
         # callers (orchestrator iteration loop, baseline_generator retry loop)
         # have a single typed failure to catch. If the LLM submitted a valid
         # kernel before burning the budget, return that — the run merely went
-        # over budget after the answer was already in hand. (Option γ, 2026-04-22.)
+        # over budget after the answer was already in hand.
         try:
             result = await run_agent(
                 agent,
@@ -389,12 +390,13 @@ class CoderAgent:
         Returns the structured Coder output (``source_code`` plus a
         Pydantic-validated ``triton_kernel_name``) so the caller can
         thread the declared kernel symbol into a fresh ``Kernel`` for
-        downstream profiling. The result may be a degraded best-effort
-        if the SDK tool loop exhausted the turn budget — downstream
-        verification handles that. In the no-model placeholder path the
-        method returns a stub ``KernelCodeOutput`` with the unchanged
-        source and an empty kernel-name (validation skipped via
-        ``model_construct``); the orchestrator's profiler-resolution
+        downstream profiling. If the turn budget is exhausted, the
+        captured ``submit_kernel`` payload is returned when one exists
+        (so a valid late submission isn't discarded); otherwise
+        ``ImplementationError`` is raised. In the no-model placeholder
+        path the method returns a stub ``KernelCodeOutput`` with the
+        unchanged source and an empty kernel-name (validation skipped
+        via ``model_construct``); the orchestrator's profiler-resolution
         chain falls back to source-regex extraction in that case.
         Raises ``ImplementationError`` when the LLM call exhausts retries
         or when the correctness context is missing while a model is configured.
@@ -458,9 +460,12 @@ class CoderAgent:
         Returns the structured Coder output so the baseline ``Kernel``
         carries the Pydantic-validated ``triton_kernel_name`` from the
         moment it enters the search tree. Callers post-verify after
-        translation because the SDK may emit a degraded best-effort when
-        the turn budget is exhausted. Raises ``ImplementationError`` when
-        no model is configured or when the LLM call exhausts its retries.
+        translation because the in-loop correctness tool only runs on
+        whatever workloads the Coder chose to call it with; a final
+        oracle check on the submitted kernel is still the caller's
+        responsibility. Raises ``ImplementationError`` when no model is
+        configured, when the LLM call exhausts its retries, or when the
+        turn budget is exhausted with no captured submission.
         """
         if self._model is None:
             raise ImplementationError(

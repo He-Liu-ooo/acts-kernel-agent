@@ -1,4 +1,6 @@
-"""Tests for src.benchmarks.sol_execbench.load."""
+"""Tests for src.benchmarks.sol_execbench.load (the SOL ExecBench
+fixture loader). Despite the filename, this module does NOT cover the
+SOLAR adapter — see test_solar_adapter.py for that surface."""
 from pathlib import Path
 
 import pydantic

@@ -371,10 +371,9 @@ async def test_dead_end_iteration_event_sequence(tmp_path, harness):
         fh.close()
 
     # Use strict JSON parsing to catch any Infinity/NaN tokens that
-    # would slip into events.jsonl — these break RFC-8259 consumers
-    # (see Codex review 2026-04-23 Finding 2). Python's default
-    # ``json.loads`` allows Infinity; we force-reject it here to act
-    # as a regression guard.
+    # would slip into events.jsonl — these break RFC-8259 consumers.
+    # Python's default ``json.loads`` allows Infinity; we force-reject
+    # it here to act as a regression guard.
     def _strict_loads(s: str):
         return json.loads(
             s,

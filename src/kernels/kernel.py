@@ -12,7 +12,8 @@ class KernelType(Enum):
 
     Core types cover common kernel patterns.  SOL-ExecBench op_type values
     (gemm, rmsnorm, gqa, moe, …) are mapped to these via
-    ``map_op_type_to_kernel_type`` in ``src.benchmark.problem_loader``.
+    ``_OP_TYPE_TO_KERNEL_TYPE`` / ``_definition_to_kernel_spec`` in
+    ``src.pipeline.optimize``.
     """
 
     MATMUL = "matmul"

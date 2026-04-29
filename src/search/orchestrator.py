@@ -779,28 +779,16 @@ class Orchestrator:
             )
             child.per_workload_latency_us = bench.per_workload_latency_us
 
-            is_new_best = child.score.sol_score > running_best_score
-            if is_new_best:
-                running_best_score = child.score.sol_score
-            emit(
-                "score_computed",
-                iter=iter_no,
-                score=child.score.sol_score,
-                is_new_best=is_new_best,
-                reward_hack_suspect=child.score.reward_hack_suspect,
-                calibration_warning=child.score.calibration_warning,
-                t_k_us=bench.median_latency_us,
-                t_p_us=baseline_bench.median_latency_us,
-                t_sol_us=roofline.t_sol_us,
-                t_sol_source=roofline.source,
-            )
-
             # Channel B reward-hack flow: ``reward_hack_suspect`` is the
             # SOL scorer's "T_k < ~T_SOL margin" signal. Re-eval with
             # strict tolerance + a fresh anti_cheat snapshot. If cleared,
             # accept the original score. If still flagged, mark the
             # branch DEAD_END so a candidate that beats the hardware
-            # bound by gaming the bench doesn't propagate.
+            # bound by gaming the bench doesn't propagate. We re-eval
+            # BEFORE updating ``running_best_score`` and emitting
+            # ``score_computed``: a confirmed hack must not be reported
+            # as the run's new best, since downstream consumers track
+            # that flag to update their own running-best mirror.
             if child.score.reward_hack_suspect:
                 cleared = await self._reward_hack_re_eval(
                     child, child_kernel, workloads, input_generators,
@@ -820,6 +808,22 @@ class Orchestrator:
                     epsilon = max(self._config.epsilon_end, epsilon - decay)
                     continue
                 emit("reward_hack_cleared", iter=iter_no, child_id=str(child.id))
+
+            is_new_best = child.score.sol_score > running_best_score
+            if is_new_best:
+                running_best_score = child.score.sol_score
+            emit(
+                "score_computed",
+                iter=iter_no,
+                score=child.score.sol_score,
+                is_new_best=is_new_best,
+                reward_hack_suspect=child.score.reward_hack_suspect,
+                calibration_warning=child.score.calibration_warning,
+                t_k_us=bench.median_latency_us,
+                t_p_us=baseline_bench.median_latency_us,
+                t_sol_us=roofline.t_sol_us,
+                t_sol_source=roofline.source,
+            )
 
             if child.score.calibration_warning:
                 emit(

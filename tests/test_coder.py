@@ -31,15 +31,14 @@ from tests.conftest import (
 )
 
 
-# ── test helpers for the option-α submit-tool flow ─────────────────────
+# ── test helpers for the submit-tool flow ──────────────────────────────
 #
-# The Coder used to expose its final answer via Pydantic ``output_type=``
-# enforcement; option α (DeepSeek-reasoner compatibility) routes the same
-# (source, name) pair through a ``submit_kernel`` tool call instead. To
-# simulate the LLM calling that tool inside the SDK loop, tests pair a
-# synthetic ``Agent`` factory that captures the constructed tools list
-# with a synthetic ``run_agent`` that finds ``submit_kernel`` in that
-# list and invokes it directly.
+# The Coder routes its final answer through a ``submit_kernel`` tool
+# call (DeepSeek-reasoner compatibility), not Pydantic ``output_type=``
+# enforcement. To simulate the LLM calling that tool inside the SDK
+# loop, tests pair a synthetic ``Agent`` factory that captures the
+# constructed tools list with a synthetic ``run_agent`` that finds
+# ``submit_kernel`` in that list and invokes it directly.
 
 
 def _simulate_submission(source_code: str, triton_kernel_name: str):
@@ -66,8 +65,8 @@ def _simulate_submission(source_code: str, triton_kernel_name: str):
                     triton_kernel_name=triton_kernel_name,
                 )
                 break
-        # The SDK's ``RunResult.final_output`` is a plain text confirmation
-        # under option α — coder.py reads from the captured submission, not
+        # The SDK's ``RunResult.final_output`` is a plain text confirmation;
+        # coder.py reads from the captured submission via the tool call, not
         # from ``result.final_output``, so its content is irrelevant.
         return MagicMock(final_output="done")
 
@@ -587,10 +586,10 @@ async def test_implement_uses_zero_temperature():
 
 @pytest.mark.asyncio
 async def test_implement_raises_when_agent_terminates_without_submitting():
-    """Option-α invariant: if the LLM exits the tool loop without ever calling
-    submit_kernel, we have no Coder output. Raising ImplementationError lets
-    the caller surface the failure rather than silently treating an empty
-    submission as a degraded best-effort."""
+    """Submit-tool contract: if the LLM exits the tool loop without ever
+    calling submit_kernel, we have no Coder output. Raising
+    ImplementationError lets the caller surface the failure rather than
+    silently treating an empty submission as a degraded best-effort."""
     # Capture-agent path (no fake_run side_effect that calls submit_kernel) —
     # mock_run returns a normal RunResult but the captured dict stays empty.
     with (
@@ -612,18 +611,18 @@ async def test_implement_raises_when_agent_terminates_without_submitting():
             )
 
 
-# ── option γ: MaxTurnsExceeded handling ────────────────────────────────
+# ── MaxTurnsExceeded handling ──────────────────────────────────────────
 
 
 @pytest.mark.asyncio
 async def test_implement_converts_max_turns_exceeded_to_implementation_error():
-    """Option γ invariant: SDK ``MaxTurnsExceeded`` (raised mid-tool-loop
-    when the LLM burns through the budget without ever submitting) must
-    be converted to ``ImplementationError`` at the Coder boundary so the
-    orchestrator / baseline_generator catch sites work uniformly. Without
-    this conversion, the SDK exception propagates straight out of
+    """SDK ``MaxTurnsExceeded`` (raised mid-tool-loop when the LLM burns
+    through the budget without ever submitting) must be converted to
+    ``ImplementationError`` at the Coder boundary so the orchestrator /
+    baseline_generator catch sites work uniformly. Without this
+    conversion, the SDK exception propagates straight out of
     ``optimize()`` and aborts the entire run instead of dead-ending one
-    branch (live-GPU-run #2 trigger, 2026-04-22)."""
+    branch."""
     from src.agents.coder import MaxTurnsExceeded
 
     with (
@@ -835,7 +834,7 @@ async def test_translate_uses_zero_temperature():
     mock_cfg.assert_called_once_with(temperature=0.0)
 
 
-# ── submit-tool factory (option α) ─────────────────────────────────────
+# ── submit-tool factory ────────────────────────────────────────────────
 
 
 def test_make_submit_tool_captures_valid_output():

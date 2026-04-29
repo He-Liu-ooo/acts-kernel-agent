@@ -445,7 +445,7 @@ def _write_vecadd_sol_problem(root: Path, n: int = 524_288) -> Path:
     """Write a minimal SOL-ExecBench problem matching the elementwise
     kernel's ``run(x, y)`` signature: two fp32 vectors of length ``n`` in,
     one out. Returns the directory (the driver expects a *directory*,
-    not the definition.json path — regression pin from Codex review)."""
+    not the definition.json path — regression pin)."""
     problem_dir = root / "sol_vecadd"
     problem_dir.mkdir()
     (problem_dir / "definition.json").write_text(json.dumps({
@@ -476,7 +476,7 @@ def _write_vecadd_sol_problem(root: Path, n: int = 524_288) -> Path:
 def test_profile_with_problem_definition_path_is_not_degraded(
     tmp_path, tier2_kernel, measured_latency_s
 ):
-    """End-to-end regression for two Codex review findings:
+    """End-to-end regression for two contracts on the SOL problem path:
 
     1. ``_run_ncu`` must serialize the problem *directory* (not
        ``definition.json``) into the spec JSON so the driver's
@@ -523,8 +523,9 @@ def test_profile_with_problem_definition_path_is_not_degraded(
 
     assert result.degraded is False, (
         f"SOL problem_dir path degraded: {result.degraded_reason} "
-        "— driver likely crashed on load_problem (pre-Codex-fix regression) "
-        "or sol_execbench input generation failed"
+        "— driver likely crashed on load_problem (regression on the "
+        "directory-vs-definition.json contract) or sol_execbench input "
+        "generation failed"
     )
     assert result.ncu is not None
     assert result.analytical is not None

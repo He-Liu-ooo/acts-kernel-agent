@@ -111,9 +111,9 @@ def benchmark_kernel(
     """Benchmark kernel latency via the injected timer.
 
     When ``workloads`` / ``input_generators`` are both empty, returns a
-    100us sentinel so the pre-SOL pipeline stays runnable; 0.0 would
-    collapse ``compute_sol_score`` to 1.0 and silently fabricate an
-    optimum.
+    100us sentinel so the placeholder/no-workload smoke path stays
+    runnable; 0.0 would collapse ``compute_sol_score`` to 1.0 and
+    silently fabricate an optimum.
 
     When ``kernel.dps`` is True, *definition* must be supplied — outputs
     are pre-allocated per iter via ``sol_execbench.core.bench.io.allocate_outputs``
@@ -290,7 +290,7 @@ def _time_workload(
             # reference to the outputs portion of args. We can't
             # disambiguate inputs vs outputs without reaching into the
             # wrapper, so the simpler rule wins: capture ``ret`` when
-            # truthy, else the last arg tensor (DPS kernels write into
+            # not None, else the last arg tensor (DPS kernels write into
             # output buffers passed last).
             if ret is not None:
                 last_outputs = _flatten_to_output_list(ret)

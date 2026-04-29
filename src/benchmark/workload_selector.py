@@ -1,8 +1,9 @@
 """Select representative workloads for iterative benchmarking.
 
-SOL-ExecBench problems ship 7-48 workloads per problem.  Running all of
-them every iteration is too slow, so we pick a small representative subset
-(default 2-3) that spans the dynamic-axis range.
+SOL-ExecBench problems ship many workloads per problem; running all of
+them every iteration is too slow, so we pick a small representative
+subset (size is configurable; current default 3) that spans the
+dynamic-axis range.
 """
 
 from __future__ import annotations

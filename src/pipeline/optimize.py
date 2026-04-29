@@ -1,4 +1,5 @@
-"""Main search loop entry point — Phase A + B.
+"""Main pipeline entry point — Phase A (load + baseline), Phase B
+(orchestrator search loop), and Phase C (report generation).
 
 Import-order contract: ``import sol_execbench`` MUST be the first
 non-stdlib import. SOL's ``core.bench.reward_hack`` snapshots
@@ -84,12 +85,9 @@ class UnknownBenchmarkFormat(RuntimeError):
     """
 
 
-# Populated stand-in used when ``detect_hardware()`` still returns a zeroed
-# spec (the placeholder path has no arch YAML on a dev machine). The
-# orchestrator's profiler guard rejects zero peaks, so without this the
-# default ``python -m src.pipeline.optimize`` smoke run would die on the
-# first iteration. Values mirror ``_rtx6000_ada()`` in the Tier 1/2 test
-# fixtures so the placeholder run produces representative roofline math.
+# Stand-in HardwareSpec for the smoke path when detect_hardware() returns
+# zeroed peaks. Mirrors the RTX 6000 Ada test fixture so the placeholder
+# run produces representative roofline math.
 _PLACEHOLDER_HARDWARE_SPEC = HardwareSpec(
     name="placeholder-RTX6000Ada",
     freq_GHz=2.5,
@@ -117,7 +115,7 @@ async def optimize(
       - A directory containing ``definition.json`` + ``workload.jsonl``
         (SOL-ExecBench mode).
       - The literal string ``"placeholder"`` for the built-in demo
-        (matmul starter, no SOL-ExecBench dependency).
+        (matmul starter, no SOL problem data).
 
     This is the main entry point: ``python -m src.pipeline.optimize``.
     An LLM is used when ``configs/models/<provider>.json`` exists (default
@@ -281,12 +279,9 @@ async def _load_sol_problem(
     """
     from src.benchmark.baseline_generator import generate_triton_baseline
     from src.benchmark.workload_selector import select_workloads
-    # Import the ``load`` callable directly. The package re-exports
-    # ``load`` (the function) from ``src/benchmarks/sol_execbench/__init__.py``,
-    # so ``from src.benchmarks.sol_execbench import load`` resolves to
-    # the function. The previous ``import load as sol_load`` form
-    # accidentally referenced the function and then tried ``sol_load.load(…)``,
-    # which failed because functions don't have a ``.load`` attribute.
+    # ``load`` is re-exported as a function from
+    # ``src/benchmarks/sol_execbench/__init__.py``; bind it directly so
+    # we can call ``sol_load(problem_dir)`` below.
     from src.benchmarks.sol_execbench import load as sol_load
     from src.eval.inputs import build_input_generator, build_reference_fn
     from src.eval.roofline import derive_t_sol_from_solar
@@ -296,10 +291,13 @@ async def _load_sol_problem(
     spec = _definition_to_kernel_spec(definition, definition_path)
 
     workloads = select_workloads(all_workloads, count=config.benchmark_workload_count)
-    # Pick the median-size workload as representative for SOLAR's static
-    # roofline analysis. Full per-workload re-derivation would re-run
-    # SOLAR's 4-stage pipeline N times for one number that's roughly
-    # invariant across shapes anyway.
+    # Pick the median-size workload as the representative for SOLAR's
+    # static roofline analysis — a startup-cost tradeoff. Re-deriving
+    # per workload would re-run SOLAR's 4-stage pipeline N times during
+    # Phase A; per-workload reporting is handled later in Phase C
+    # (``report.generate_report`` calls ``derive_t_sol_from_solar`` on
+    # each selected workload when populating
+    # ``winner_per_workload_bottlenecks``).
     representative = workloads[len(workloads) // 2] if workloads else None
     arch_yaml_path = Path(config.arch_config_path) if config.arch_config_path else None
     roofline = (
@@ -380,7 +378,8 @@ def _definition_to_kernel_spec(definition: Definition, definition_path: Path) ->
 
 
 def _load_placeholder(config: ACTSConfig) -> tuple:
-    """Phase A fallback — matmul starter, no SOL-ExecBench dependency."""
+    """Phase A fallback — matmul starter, no SOL problem data."""
+    _ = config  # accepted for caller-site symmetry with _load_problem; currently unused
     from src.kernels.starters.matmul import make_matmul_kernel
 
     baseline = make_matmul_kernel(1024, 1024, 1024)

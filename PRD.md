@@ -39,7 +39,7 @@ Best-first tree search with beam constraint.
 
 Plus a deterministic orchestrator (code, not LLM) that manages tree state, beam selection, and move-on criteria.
 
-**LLM SDK**: Agents are built on the OpenAI Agents SDK. The SDK provides the agent runtime (`Agent`, `Runner.run`, `function_tool`) and model-swapping via `OpenAIChatCompletionsModel` — any OpenAI-compatible API works by changing the base URL. Coder is the only multi-tool agent (compile + correctness + submit_kernel). Planner and Reviewer each carry a single `submit_plan` / `submit_review` tool that delivers their structured output, retrying in-loop on Pydantic validation failure within a 4-turn budget.
+**LLM SDK**: Agents are built on the OpenAI Agents SDK. The SDK provides the agent runtime (`Agent`, `Runner.run`, `function_tool`) and model-swapping via `OpenAIChatCompletionsModel` — any OpenAI-compatible API works by changing the base URL. All three agents are tool-using: Coder carries compile + correctness + `submit_kernel`; Planner carries `submit_plan`; Reviewer carries `submit_review` plus the optional `query_metric` tool (gated by `ACTSConfig.reviewer_metric_queries`, default off). Submit tools deliver each agent's structured output, retrying in-loop on Pydantic validation failure within a per-agent turn budget (4 by default; 6 for Reviewer when `query_metric` is enabled). Callers still treat each agent as one external call — multi-turn behavior is internal to the agent's tool loop.
 
 **LLM Backend**: Default model is **DeepSeek V3** for all three agents. Selection rationale:
 - Triton/CUDA knowledge is strong and well-represented in pretraining data
@@ -142,13 +142,13 @@ The orchestrator runs benchmarking and profiling on the Coder's output. These ar
 | Module | Called by | Purpose |
 |--------|-----------|---------|
 | `benchmark.py` | Orchestrator | Latency measurement (CUDA events) |
-| `profiler.py` | Orchestrator | Analytical roofline classification (every iter, free) + curated NCU section subprocess for occupancy/L2/TC/stall (every iter, representative workload); full-workload re-profile at Phase C. See JOURNAL "Profiler approach: analytical classification + curated NCU section (2026-04-20)". |
+| `profiler.py` | Orchestrator | Per-iter analytical roofline diagnostics (arithmetic intensity, achieved TFLOPs / GB·s, pct-of-peak — free) + curated NCU section subprocess for occupancy/L2/TC/stall (every iter, representative workload); full-workload re-profile at Phase C. Bottleneck *classification* is computed once-per-run by `eval/roofline.py::classify_run` (Phase A) and threaded through; the per-iter analytical block refines diagnosis but never re-classifies. See JOURNAL "Profiler approach: analytical classification + curated NCU section (2026-04-20)" and "Bottleneck classify-once (2026-04-22)". |
 | `scorer.py` | Orchestrator | SOL score computation (using static T_SOL from roofline.py) |
 
 | Metric | Tool | Method |
 |--------|------|--------|
 | **Latency** | CUDA Events | Median of N trials, 20 warmup + 100 timed |
-| **Bottleneck classification** | Analytical (free) | `arithmetic_intensity vs ridge_point` from `(flops, bytes, measured latency, hardware_spec)`; yields `memory_bound` / `compute_bound` / `balanced` + achieved TFLOPs + achieved GB·s. Always populated. |
+| **Bottleneck classification** | SOLAR / built-in roofline (run-level, Phase A) | `classify_run` computes `memory_bound` / `compute_bound` / `balanced` once per `(problem, representative workload, hardware)` and threads the label through every iteration via `SearchResult.run_bottleneck`. Per-iter analytical diagnostics (arithmetic intensity, achieved TFLOPs, achieved GB·s) refine the picture without re-classifying. |
 | **Hardware profiling** | NCU subprocess, curated sections (`Occupancy`, `WarpStateStats`, `MemoryWorkloadAnalysis`, `ComputeWorkloadAnalysis`) | SM occupancy, L2 hit rate, tensor-core utilization, dominant + runner-up warp stall class. Best-effort — NCU failures degrade the signal; analytical classification remains the floor. `ACTS_PROFILER_MODE=full` swaps to `--set full` for debug. |
 
 ### Profiling Feedback Pipeline
@@ -167,7 +167,7 @@ ACTS uses SOL-ExecBench (NVIDIA, 2026) as its benchmark suite. SOL-ExecBench pro
 
 **In-memory representation**: ACTS adopts SOL's pydantic models (`sol_execbench.core.data.{Definition, Workload, Solution, Trace}` plus all input variants and trace types) directly as the canonical schema. There is no parallel ACTS dataclass layer — a `Definition` parsed from disk flows unchanged through orchestrator, agents, and report. Other benchmarks (KernelBench, custom problem sets) plug in via per-benchmark adapters under `src/benchmarks/<name>/load.py` that produce `tuple[Definition, list[Workload]]` from their native format.
 
-**Benchmark-agnosticism guarantee** (architectural commitment, added 2026-04-27 scope expansion): the pipeline (`src/pipeline/`, `src/search/`, `src/eval/`, `src/agents/`, `src/kernels/`, `src/memory/`, `src/actions/`) operates exclusively on SOL pydantic types and does not import or reference any benchmark-specific on-disk format. The only place benchmark-format knowledge is allowed to live is `src/benchmarks/<name>/load.py`. Adding SOL-specific code paths outside the adapter (e.g., parsing `definition.json` directly in the orchestrator, or branching on benchmark category in `eval/`) is a violation of this contract. Adding a new benchmark is a one-file change: write `src/benchmarks/<name>/load.py` returning `tuple[Definition, list[Workload]]` from the native format. KernelBench's `Model.forward` wraps into a `def run(...)` string in `Definition.reference` with init params handled via `custom_inputs_entrypoint`; custom one-off kernels use `src/benchmarks/custom/` by dropping `definition.json` + `workload.jsonl` in a directory.
+**Benchmark-agnosticism guarantee** (architectural commitment, added 2026-04-27 scope expansion): the pipeline (`src/pipeline/`, `src/search/`, `src/eval/`, `src/agents/`, `src/kernels/`, `src/memory/`, `src/actions/`) operates exclusively on SOL pydantic types and does not import or reference any benchmark-specific on-disk format. The only place benchmark-format knowledge is allowed to live is `src/benchmarks/<name>/load.py`. Adding SOL-specific code paths outside the adapter (e.g., parsing `definition.json` directly in the orchestrator, or branching on benchmark category in `eval/`) is a violation of this contract. Adding a new benchmark is a one-file change: write `src/benchmarks/<name>/load.py` returning `tuple[Definition, list[Workload]]` from the native format. Today only the SOL-ExecBench adapter is real; `src/benchmarks/kernelbench/` and `src/benchmarks/custom/` are placeholder packages (future/scaffold). The intended KernelBench shape — wrapping `Model.forward` into a `def run(...)` string in `Definition.reference` with init params handled via `custom_inputs_entrypoint` — and the custom path (drop `definition.json` + `workload.jsonl` in a directory) are documented here as the target contract; both will land when those adapters are written.
 
 **Constraints inherent to the canonical schema** (apply to all benchmarks, not just SOL-ExecBench):
 
@@ -343,7 +343,7 @@ Triton coverage by tier:
 2. **Use specs internally** — feed hardware spec to SOLAR for `T_SOL` derivation, and to the built-in roofline fallback for bottleneck classification. Compute SOL Score for each candidate kernel.
 3. **Reviewer sees** profiling results + roofline classification + SOL score + remaining headroom.
 4. **Planner sees** Reviewer's distilled summary only. Agents never see raw hardware specs.
-5. **Fallback** — when no arch YAML is provided, `detect_hardware()` queries the CUDA runtime (placeholder in V1).
+5. **Fallback** — when no arch YAML is provided, `detect_hardware()` queries `torch.cuda` (best-effort) and returns a partially-populated `HardwareSpec` with the runtime-knowable fields filled (`name`, `freq_GHz` from boost clock, `SRAM_capacity` from L2, `DRAM_capacity`). Per-precision throughput tables (`MAC_per_cycle_*`) and bandwidth coefficients stay zero — those are arch-specific and `torch.cuda` cannot infer them, so real T_SOL / roofline math still requires a SOLAR arch YAML. When `torch` is unavailable, no CUDA device is visible, or the probe raises, a fully-zeroed `HardwareSpec` is returned (the orchestrator's zero-peak handling substitutes a populated placeholder downstream). When both an `arch_config_path` YAML and a runtime detection are available, `validate_hardware_spec()` cross-checks `DRAM_capacity` / `SRAM_capacity` / `freq_GHz` and warns on >10% mismatch — catches the silent-miscalibration case where the YAML doesn't match the GPU actually in the box.
 
 **Clock locking** (added 2026-04-27 scope expansion): GPU clocks are actively locked at startup via the `sol_execbench.core.bench.clock_lock` primitives — `lock_clocks` / `verify_clocks` / `unlock_clocks` / `probe_clock_lock_available` — paired with `device_config.get_clock_preset(device_name)` (preset table per GPU model). The pipeline calls these directly (see `_try_acquire_clock_lock` and `_unlock_clocks_safe` in `src/pipeline/optimize.py`); `unlock_clocks` is also registered on `atexit` for safety. Requires `sudo nvidia-smi --lock-gpu-clocks`; falls back to warn-only on permission denial via `probe_clock_lock_available()`. Removes boost-clock variance as a real source of timing noise on Ada / H100 — without this, T_k measurements drift run-to-run and the SOL score plateau detection fires on noise rather than real plateaus.
 
@@ -357,6 +357,7 @@ Run parameters are set through `.cfg` files (INI format, parsed via Python's `co
 [search]
 beam_width = 3
 beam_diversity = true
+reviewer_metric_queries = false   ; opt-in: registers Reviewer's `query_metric` tool, max_turns=6
 max_depth = 20
 epsilon_start = 0.3
 epsilon_end = 0.05
@@ -384,21 +385,23 @@ benchmark_workload_count = 3
 arch_config_path = configs/arch/H100_PCIe.yaml
 ```
 
+Several `ACTSConfig` fields are not surfaced via `.cfg` and are set programmatically: `benchmark_adapter` (`"sol_execbench"` / `"kernelbench"` override for `_load_problem` auto-detection), `safetensors_blob_roots` (override for safetensors blob lookup paths), and `anti_cheat_critical_names` (the list of `torch.cuda.Event` method names whose `id()` is snapshotted in the per-iteration anti-cheat context).
+
 ---
 
 ## Pipeline Flow
 
 ```
-Phase A: Load Problem
+Phase A: Load SOL Definition + Workloads
   `_load_problem` dispatcher (`src/pipeline/optimize.py`): adapter selection
      1. `ACTSConfig.benchmark_adapter` override -> `'sol_execbench'` |
         `'kernelbench'` (NotImplementedError until that adapter ships).
      2. else `definition.json` present -> SOL-ExecBench adapter.
      3. else `model.py` present -> KernelBench (NotImplementedError).
      4. else raise `UnknownBenchmarkFormat`.
-  SOL-ExecBench path -> `src/benchmarks/sol_execbench/load.py` parses
-       definition.json, reference.py, workload.jsonl; classify via
-       `classify_run` once-per-run.
+  SOL-ExecBench path -> `src/benchmarks/sol_execbench/load.py::load(...)`
+       parses definition.json, reference.py, workload.jsonl into SOL pydantic
+       `Definition` + `list[Workload]`; classify via `classify_run` once-per-run.
   -> derive T_SOL via SOLAR (PyTorch reference + hardware arch config)
   -> generate Triton baseline via Coder (PyTorch -> Triton one-shot translation)
   -> verify Triton baseline correctness against PyTorch reference
@@ -455,6 +458,7 @@ acts-kernel-agent/
 |   |   |-- planner.py
 |   |   |-- coder.py
 |   |   |-- reviewer.py
+|   |   |-- trace_processor.py  (SDK trace -> JSONL bridge for run-context tracing)
 |   |   +-- llm_backend.py
 |   |
 |   |-- search/
@@ -465,10 +469,13 @@ acts-kernel-agent/
 |   |
 |   |-- eval/
 |   |   |-- __init__.py
+|   |   |-- types.py            (BottleneckType + small shared enums; importable without roofline)
 |   |   |-- correctness.py
 |   |   |-- benchmark.py
+|   |   |-- inputs.py           (input-tensor materialization for correctness/benchmark)
 |   |   |-- (power.py — V2, not in V1)
 |   |   |-- profiler.py
+|   |   |-- _profiler_driver.py (subprocess entrypoint for NCU profiler runs)
 |   |   |-- roofline.py
 |   |   |-- scorer.py
 |   |   +-- anti_cheat.py
@@ -512,21 +519,30 @@ acts-kernel-agent/
 |   |   |-- events.py           (emit/bind/unbind event bus + CORE_EVENT_KINDS + iter constants)
 |   |   +-- run_context.py      (RunContext dataclass + create/close for trace capture)
 |   |
+|   |-- benchmark/              (kernel-side helpers — not benchmark-source loaders)
+|   |   |-- __init__.py
+|   |   |-- baseline_generator.py
+|   |   |-- roofline_shapes.py
+|   |   |-- solar_adapter.py
+|   |   +-- workload_selector.py
+|   |
+|   |-- benchmarks/             (benchmark-source loaders — one adapter per source)
+|   |   |-- sol_execbench/      (real adapter — load.py returns Definition + list[Workload])
+|   |   |-- kernelbench/        (placeholder — NotImplementedError until adapter ships)
+|   |   +-- custom/             (placeholder — drop definition.json + workload.jsonl)
+|   |
 |   +-- prompts/
 |       |-- planner/
 |       |   |-- system.md
 |       |   +-- technique_select.md
 |       |-- coder/
 |       |   |-- system.md
-|       |   +-- implement.md
+|       |   |-- implement.md
+|       |   +-- translate.md    (PyTorch -> Triton baseline translation prompt)
 |       |-- reviewer/
 |       |   |-- system.md
 |       |   +-- interpret.md
 |       +-- debugger/           (reserved — Coder handles debugging via tools)
-|
-|-- benchmarks/
-|   |-- sol_execbench/
-|   +-- custom/
 |
 +-- tests/
     |-- test_correctness.py
@@ -539,12 +555,7 @@ acts-kernel-agent/
 
 ## Development Constraint: Always-Runnable Framework
 
-The framework must remain runnable at every development iteration. Unimplemented modules use placeholders so the full pipeline can execute end-to-end at all times.
-
-- Iteration 0: All modules are placeholders, but `python -m src.pipeline.optimize` runs
-- Iteration 1: Real eval/correctness.py, everything else placeholder
-- Iteration 2: Real agents/coder.py, everything else placeholder or previously implemented
-- ...each iteration deepening one module
+`python -m src.pipeline.optimize` must execute end-to-end on a representative SOL-ExecBench problem at every development iteration — the smoke path. Modules under active development carry the smallest viable implementation (no full placeholders); any not-yet-real surface degrades to a documented no-op rather than blocking the run.
 
 ---
 
@@ -609,4 +620,6 @@ Three-tier KB: Compute-Reviewer KB, Memory-Reviewer KB, Shared Interaction KB. T
 
 ### Multi-Turn Reviewer with On-Demand Profiling Queries
 
-Reviewer upgrades from single-call agent to tool-using agent (Coder-style) with bounded turn budget. Two query shapes: (A) lookup into `ProfilingResult.raw_metrics` for NCU metrics captured in the initial run but outside the curated subset (free, in-memory), and (B) on-demand re-profile with caller-specified `--section` / `--metrics` (expensive subprocess, cache-key expansion to include the metric set requested). Lets the Reviewer recover when the curated signals (occupancy, L2, tensor-core util, top-2 stalls) don't match the kernel's actual bottleneck signature. See JOURNAL → Agents → "Multi-turn Reviewer deferred" for why this is post-V1 and PROCESS.md Deferred Improvements for the trigger.
+**Variant A — shipped (commit 6d6e62d).** The Reviewer is now a tool-using agent with a bounded turn budget (4 default, 6 when `query_metric` is enabled). Variant A is the in-memory lookup: `query_metric` reads `ProfilingResult.raw_metrics` for NCU metrics captured in the initial run but outside the curated subset (free, no subprocess). Gated by `ACTSConfig.reviewer_metric_queries` (default off) — the existing single-submit path remains the verified default.
+
+**Variant B — future work / on-demand reprofile.** On-demand re-profile with caller-specified `--section` / `--metrics` (expensive subprocess, cache-key expansion to include the metric set requested). Lets the Reviewer recover when the curated signals (occupancy, L2, tensor-core util, top-2 stalls) and the in-memory `raw_metrics` block both miss the kernel's actual bottleneck signature. See PROCESS.md Deferred Improvements for the trigger.

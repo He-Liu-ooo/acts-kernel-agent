@@ -1,7 +1,7 @@
 """Triton kernel compilation.
 
-Called by Coder's compile_kernel_tool during its turn, not by the
-orchestrator. By the time the Coder returns, compilation is guaranteed.
+Used by both the Coder's compile_kernel_tool (during its turn) and the
+orchestrator (when materializing kernels for benchmarking / profiling).
 
 Strategy (matches AutoKernel/Astra pattern):
 1. Write source to a file under ``cache_dir`` so tracebacks carry real

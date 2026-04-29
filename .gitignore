@@ -26,6 +26,17 @@ Thumbs.db
 # Claude Code
 .claude/
 
+# Codex local state
+.codex
+.codex/
+
+# Cleanup audit artifact (uncommitted scratch)
+CLEANUP.md
+
+# Brainstorm/plan scratch (per CLAUDE.md, never committed)
+doc/specs/
+doc/plans/
+
 # Project-specific
 others/
 meeting-log.md
