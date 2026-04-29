@@ -1,0 +1,15 @@
+{
+  "name": "test_safetensors_input",
+  "op_type": "matmul",
+  "axes": {
+    "M": {"type": "const", "value": 128},
+    "N": {"type": "const", "value": 256},
+    "B": {"type": "var"}
+  },
+  "inputs": {
+    "x": {"shape": ["B", "N"], "dtype": "float32"},
+    "frozen_weight": {"shape": ["M", "N"], "dtype": "float32"}
+  },
+  "outputs": {"y": {"shape": ["B", "M"], "dtype": "float32"}},
+  "reference": "import torch\n\ndef run(x, frozen_weight):\n    return x @ frozen_weight.T\n"
+}

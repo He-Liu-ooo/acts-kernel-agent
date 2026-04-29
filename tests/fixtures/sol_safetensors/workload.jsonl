@@ -1,0 +1,1 @@
+{"uuid":"w1","axes":{"B":32},"inputs":{"x":{"type":"random"},"frozen_weight":{"type":"safetensors","path":"weights.safetensors","tensor_key":"frozen_weight"}}}

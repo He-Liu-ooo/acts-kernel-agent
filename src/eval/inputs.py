@@ -1,7 +1,7 @@
 """Reference-function and input-generator helpers for correctness verification.
 
-Bridges the gap between a SOL-ExecBench ``Problem`` and the pair of
-callables consumed by ``verify_correctness``:
+Bridges the gap between a SOL ``Definition`` + ``Workload`` and the pair
+of callables consumed by ``verify_correctness``:
 
 - ``reference_fn(*args) -> output`` — the PyTorch oracle from definition.json.
 - ``input_generator(seed) -> args`` — fresh input tuple for a trial.
@@ -10,16 +10,16 @@ callables consumed by ``verify_correctness``:
 source into a namespace), so the module imports cleanly in torch-less
 test venvs. ``build_input_generator`` requires ``torch`` +
 ``sol_execbench`` — those imports happen at call time (not at module
-import), and the SOL pydantic models are validated once so per-seed
-calls stay tight.
+import). The SOL pydantic models flow through directly, no shim needed.
 """
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
 if TYPE_CHECKING:
-    from src.benchmark.problem import Problem, Workload
+    from sol_execbench.core.data import Definition, Workload
 
 
 class ReferenceLoadError(RuntimeError):
@@ -58,10 +58,11 @@ def build_reference_fn(
 
 
 def build_input_generator(
-    problem: Problem,
+    definition: Definition,
     workload: Workload,
     *,
     device: str = "cuda",
+    blob_roots: list[Path] | None = None,
 ) -> Callable[[int], tuple]:
     """Build an input generator backed by ``sol_execbench.core.bench.io.gen_inputs``.
 
@@ -71,59 +72,50 @@ def build_input_generator(
     reference and the candidate.
 
     Requires ``torch`` and ``sol_execbench`` installed — lazy-imported
-    so this module stays importable in torch-less environments. SOL's
-    pydantic models are validated once at build time so per-seed calls
-    only pay the RNG reset + input generation.
+    so this module stays importable in torch-less environments. SOL
+    pydantic types flow through unchanged (no dict shimming needed).
+
+    *blob_roots* is forwarded to ``load_safetensors`` when the workload
+    declares any ``SafetensorsInput``: blobs are resolved against these
+    roots in order, with the first existing match winning. The blobs are
+    loaded once at build time (not per ``_generator(seed)`` call) so the
+    on-disk read does not enter the per-iteration timing path.
     """
     from sol_execbench.core.bench.correctness import set_seed
     from sol_execbench.core.bench.io import gen_inputs
-    from sol_execbench.core.data.definition import Definition
-    from sol_execbench.core.data.workload import Workload as SOLWorkload
+    from sol_execbench.core.data.workload import SafetensorsInput
 
-    sol_def = Definition.model_validate(_problem_to_sol_dict(problem))
-    sol_wkl = SOLWorkload.model_validate(_workload_to_sol_dict(workload))
+    safe_tensors: dict | None = None
+    if any(isinstance(v, SafetensorsInput) for v in workload.inputs.values()):
+        from sol_execbench.core.bench.io import load_safetensors
+
+        safe_tensors = load_safetensors(
+            definition, workload, blob_roots=blob_roots or []
+        )
 
     def _generator(seed: int) -> tuple:
         set_seed(seed)
-        return tuple(gen_inputs(sol_def, sol_wkl, device=device))
+        return tuple(
+            gen_inputs(definition, workload, device=device, safe_tensors=safe_tensors)
+        )
 
     return _generator
 
 
-def _problem_to_sol_dict(problem: Problem) -> dict:
-    """Convert an ACTS ``Problem`` dataclass to a dict compatible with SOL's Definition."""
-    axes: dict[str, dict] = {}
-    for name, axis in problem.axes.items():
-        entry: dict[str, Any] = {"type": axis.type, "description": axis.description or None}
-        if axis.value is not None:
-            entry["value"] = axis.value
-        if axis.expression is not None:
-            entry["expression"] = axis.expression
-        axes[name] = entry
+def allocate_dps_outputs(
+    definition: Definition,
+    workload: Workload,
+    *,
+    device: str = "cuda",
+) -> list:
+    """Pre-allocate DPS output buffers for ``kernel_fn(*inputs, *outputs)`` calls.
 
-    def _tensor_spec(defn) -> dict:
-        return {
-            "shape": defn.shape,
-            "dtype": defn.dtype,
-            "description": defn.description or None,
-        }
+    Resolves the workload's axes against the definition once, then delegates to
+    ``sol_execbench.core.bench.io.allocate_outputs``. Single source of truth for
+    the DPS allocation shape — used by the correctness gate, the benchmark loop,
+    and the NCU profiler subprocess.
+    """
+    from sol_execbench.core.bench.io import allocate_outputs as _allocate_outputs
 
-    return {
-        "name": problem.name,
-        "op_type": problem.op_type,
-        "axes": axes,
-        "inputs": {k: _tensor_spec(v) for k, v in problem.inputs.items()},
-        "outputs": {k: _tensor_spec(v) for k, v in problem.outputs.items()},
-        "reference": problem.reference_source,
-        "description": problem.description or None,
-        "custom_inputs_entrypoint": problem.custom_inputs_entrypoint,
-    }
-
-
-def _workload_to_sol_dict(workload: Workload) -> dict:
-    """Convert an ACTS ``Workload`` dataclass to a dict compatible with SOL's Workload."""
-    return {
-        "uuid": workload.uuid,
-        "axes": workload.axes,
-        "inputs": workload.inputs,
-    }
+    resolved_axes = definition.get_resolved_axes_values(workload.axes)
+    return _allocate_outputs(definition, resolved_axes, device=device)
