@@ -27,7 +27,8 @@ from typing import TYPE_CHECKING
 from src.eval.types import BottleneckType
 
 if TYPE_CHECKING:
-    from src.benchmark.problem import Problem, Workload
+    from sol_execbench.core.data import Definition, Workload
+
     from src.config import HardwareSpec
     from src.kernels.kernel import KernelSpec
 
@@ -36,7 +37,6 @@ __all__ = [
     "RooflineResult",
     "classify_bottleneck",
     "classify_run",
-    "classify_workload",
     "compute_roofline",
     "derive_t_sol_from_solar",
 ]
@@ -54,7 +54,7 @@ class RooflineResult:
 
 
 def derive_t_sol_from_solar(
-    problem: Problem,
+    definition: Definition,
     workload: Workload,
     hardware_spec: HardwareSpec,
     arch_yaml_path: Path | None = None,
@@ -62,7 +62,7 @@ def derive_t_sol_from_solar(
     """Derive T_SOL via the SOLAR pipeline (optional dependency).
 
     Bridges to ``solar_adapter.derive_t_sol`` which drives SOLAR's
-    4-stage Python pipeline against the problem's reference + a
+    4-stage Python pipeline against the definition's reference + a
     representative workload's concrete shapes.
 
     *arch_yaml_path* overrides the arch resolution; otherwise the
@@ -75,7 +75,7 @@ def derive_t_sol_from_solar(
     from src.benchmark.solar_adapter import derive_t_sol
 
     solar_result = derive_t_sol(
-        problem, workload, hardware_spec, arch_yaml_path=arch_yaml_path,
+        definition, workload, hardware_spec, arch_yaml_path=arch_yaml_path,
     )
     if solar_result is None:
         return None
@@ -169,36 +169,3 @@ def classify_run(
     return compute_roofline(baseline_spec, hardware).bottleneck
 
 
-def classify_workload(
-    problem: Problem,
-    workload: Workload,
-    hardware: HardwareSpec,
-) -> BottleneckType:
-    """Per-workload bottleneck classification from shape-derived flops/bytes.
-
-    Uses ``compute_roofline_inputs`` to get ``(flops, nbytes)`` from the
-    problem's op type + the concrete workload axes, then classifies via
-    the shared ``classify_bottleneck`` band so thresholds stay consistent
-    with the analytical profiler.
-
-    Raises ``ValueError`` if ``problem.op_type`` has no roofline formula
-    (``compute_roofline_inputs`` returns ``(0, 0)``) or if the hardware
-    spec has zero peaks — both are config errors that should fail loud
-    rather than silently returning ``MEMORY_BOUND``.
-    """
-    # Lazy import to keep module-load light and avoid any benchmark-side
-    # import cycles on future refactors.
-    from src.benchmark.roofline_shapes import compute_roofline_inputs
-
-    flops, nbytes = compute_roofline_inputs(problem, workload)
-    if flops == 0 and nbytes == 0:
-        raise ValueError(f"no roofline formula for op_type={problem.op_type!r}")
-
-    peak_compute = hardware.peak_flops_fp32  # TFLOPS
-    peak_bw = hardware.peak_memory_bandwidth_gb_s  # GB/s
-    if peak_compute <= 0 or peak_bw <= 0:
-        raise ValueError("hardware peaks are zero")
-
-    arithmetic_intensity = flops / nbytes
-    ridge_point = (peak_compute * 1e12) / (peak_bw * 1e9)
-    return classify_bottleneck(arithmetic_intensity, ridge_point)
