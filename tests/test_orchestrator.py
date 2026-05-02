@@ -46,8 +46,6 @@ def _make_kernel(name: str = "root") -> Kernel:
 def _make_profile() -> ProfilingResult:
     return ProfilingResult(
         analytical=AnalyticalMetrics(
-            arithmetic_intensity=10.0,
-            ridge_point=20.0,
             achieved_tflops=1.0,
             achieved_bandwidth_gb_s=100.0,
             pct_peak_compute=0.1,
@@ -102,7 +100,6 @@ def harness():
     baseline = _make_kernel("root")
     roofline = RooflineResult(
         t_sol_us=50.0,
-        arithmetic_intensity=1.0,
         bottleneck=BottleneckType.MEMORY_BOUND,
     )
 

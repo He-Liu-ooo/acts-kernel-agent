@@ -131,19 +131,23 @@ def _representative_latency_s(bench, workloads, repr_idx: int) -> float | None:
     return latency_us / 1e6
 
 
-def _render_profiling_for_planner(profiling) -> str:
+def _render_profiling_for_planner(profiling, roofline=None) -> str:
     """Lightweight summary for the Planner's prompt. The Reviewer owns the
     full analytical + NCU rendering via ``reviewer.render_profiling_summary``;
     the Planner only needs a couple of numbers to reason about the *next*
     technique to try. Bottleneck classification is hoisted to a dedicated
     "Run context" section by the Planner prompt, so it's not repeated here.
+
+    ``arithmetic_intensity`` is sourced from ``roofline`` (run-level
+    invariant in MACs/byte). Omitted when ``roofline`` is None.
     """
     a = profiling.analytical
     lines = [
         f"pct_peak_compute={a.pct_peak_compute * 100:.1f}%",
         f"pct_peak_bandwidth={a.pct_peak_bandwidth * 100:.1f}%",
-        f"arithmetic_intensity={a.arithmetic_intensity:.3f}",
     ]
+    if roofline is not None:
+        lines.append(f"arithmetic_intensity={roofline.arithmetic_intensity:.3f}")
     if profiling.ncu is not None:
         n = profiling.ncu
         lines.append(f"sm_occupancy={n.sm_occupancy_pct:.1f}%")
@@ -464,7 +468,7 @@ class Orchestrator:
             # Root-to-parent trajectory — consumed by the Planner so it can
             # reason about which actions have already been tried on this branch.
             parent_profiling_summary = (
-                _render_profiling_for_planner(parent.profiling)
+                _render_profiling_for_planner(parent.profiling, roofline)
                 if parent.profiling is not None
                 else _NO_PROFILE_SUMMARY
             )
@@ -820,7 +824,7 @@ class Orchestrator:
                 reward_hack_suspect=child.score.reward_hack_suspect,
                 calibration_warning=child.score.calibration_warning,
                 t_k_us=bench.median_latency_us,
-                t_p_us=baseline_bench.median_latency_us,
+                t_b_us=baseline_bench.median_latency_us,
                 t_sol_us=roofline.t_sol_us,
                 t_sol_source=roofline.source,
             )
@@ -870,6 +874,7 @@ class Orchestrator:
                     tree_context=tree.render_path(child.id),
                     prev_sol_score=prev_sol,
                     profiling=profiling,
+                    roofline=roofline,
                     reviewer_metric_queries=self._config.reviewer_metric_queries,
                     iter_idx=iter_no,
                 )

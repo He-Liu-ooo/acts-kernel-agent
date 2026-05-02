@@ -380,11 +380,11 @@ def _deserialize_profiling(data):
     from src.eval.profiler import AnalyticalMetrics, NCUMetrics, ProfilingResult
 
     a = data["analytical"]
-    # Stale ``classification`` keys on legacy checkpoints are silently
-    # ignored — the field lives at the run level now (see ``classify_run``).
+    # Stale ``classification`` / ``arithmetic_intensity`` / ``ridge_point``
+    # keys on legacy checkpoints are silently ignored — those fields live at
+    # the run level now (see ``classify_run`` for classification,
+    # ``RooflineResult`` for AI / ridge_point).
     analytical = AnalyticalMetrics(
-        arithmetic_intensity=a["arithmetic_intensity"],
-        ridge_point=a["ridge_point"],
         achieved_tflops=a["achieved_tflops"],
         achieved_bandwidth_gb_s=a["achieved_bandwidth_gb_s"],
         pct_peak_compute=a["pct_peak_compute"],

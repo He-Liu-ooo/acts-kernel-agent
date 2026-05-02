@@ -405,8 +405,6 @@ class TestTreeCheckpoint:
         # field in the (de)serializer sees a non-default value.
         tree.get_node(1).profiling = ProfilingResult(
             analytical=AnalyticalMetrics(
-                arithmetic_intensity=0.25,
-                ridge_point=16.0,
                 achieved_tflops=0.9,
                 achieved_bandwidth_gb_s=450.0,
                 pct_peak_compute=0.08,
@@ -699,7 +697,6 @@ def _orch_harness():
         baseline=baseline,
         roofline=RooflineResult(
             t_sol_us=50.0,
-            arithmetic_intensity=1.0,
             bottleneck=BottleneckType.MEMORY_BOUND,
         ),
         bench=BenchmarkResult(median_latency_us=100.0, timed_runs=1),
@@ -720,8 +717,6 @@ async def _run_orch(h):
     # mock.
     stub_profile = ProfilingResult(
         analytical=AnalyticalMetrics(
-            arithmetic_intensity=1.0,
-            ridge_point=1.0,
             achieved_tflops=1.0,
             achieved_bandwidth_gb_s=1.0,
             pct_peak_compute=0.5,
