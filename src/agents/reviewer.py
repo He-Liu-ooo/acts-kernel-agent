@@ -23,7 +23,13 @@ from typing import TYPE_CHECKING, Callable, Literal
 from pydantic import BaseModel, Field, ValidationError
 
 try:
-    from agents import Agent, MaxTurnsExceeded, OpenAIChatCompletionsModel, function_tool
+    from agents import (
+        Agent,
+        MaxTurnsExceeded,
+        ModelBehaviorError,
+        OpenAIChatCompletionsModel,
+        function_tool,
+    )
 
     _SDK_AVAILABLE = True
 except ModuleNotFoundError:  # pragma: no cover
@@ -31,6 +37,9 @@ except ModuleNotFoundError:  # pragma: no cover
     function_tool = None  # type: ignore[assignment]
 
     class MaxTurnsExceeded(Exception):  # type: ignore[no-redef]
+        """SDK-absent test stand-in. The real exception lives in ``agents``."""
+
+    class ModelBehaviorError(Exception):  # type: ignore[no-redef]
         """SDK-absent test stand-in. The real exception lives in ``agents``."""
 
     _SDK_AVAILABLE = False
@@ -52,6 +61,7 @@ from src.runtime.events import emit as events_emit
 
 if TYPE_CHECKING:
     from src.eval.profiler import ProfilingResult
+    from src.eval.roofline import RooflineResult
     from src.eval.types import BottleneckType
 
 PROMPT_DIR = Path(__file__).resolve().parent.parent / "prompts" / "reviewer"
@@ -118,11 +128,20 @@ class ReviewerFeedback:
     error_reason: str = ""
 
 
-def render_profiling_summary(profiling: "ProfilingResult | None") -> str:
+def render_profiling_summary(
+    profiling: "ProfilingResult | None",
+    roofline: "RooflineResult | None" = None,
+) -> str:
     """Render a ``ProfilingResult`` into the two-block text the Reviewer
     prompt expects. Used both by ``ReviewerAgent.build_user_prompt`` and
     by ``pipeline.report.render_report`` so the format is consistent
     across the reviewer and the final operator-facing summary.
+
+    ``arithmetic_intensity`` and ``ridge_point`` are sourced from
+    ``roofline`` (run-level invariants); ``achieved_*`` and ``pct_peak_*``
+    come from ``profiling.analytical`` (per-iter dynamics). When
+    ``roofline`` is ``None`` the AI / ridge_point lines are omitted —
+    callers that have a roofline should pass it.
 
     When ``profiling`` is ``None``, returns a one-line notice so the
     Reviewer knows it's operating without profile data (rather than
@@ -132,13 +151,16 @@ def render_profiling_summary(profiling: "ProfilingResult | None") -> str:
         return "[no profiling data — profile_kernel did not run]"
 
     a = profiling.analytical
-    lines = [
-        "### Analytical (roofline)",
-        f"- arithmetic_intensity: {a.arithmetic_intensity:.3f} FLOP/byte",
-        f"- ridge_point: {a.ridge_point:.3f} FLOP/byte",
+    lines = ["### Analytical (roofline)"]
+    if roofline is not None:
+        lines.extend([
+            f"- arithmetic_intensity: {roofline.arithmetic_intensity:.3f} MACs/byte",
+            f"- ridge_point: {roofline.ridge_point:.3f} MACs/byte",
+        ])
+    lines.extend([
         f"- achieved: {a.achieved_tflops:.2f} TFLOPS / {a.achieved_bandwidth_gb_s:.2f} GB/s",
         f"- pct_peak: compute {a.pct_peak_compute * 100:.1f}% · bw {a.pct_peak_bandwidth * 100:.1f}%",
-    ]
+    ])
 
     ncu = profiling.ncu
     if ncu is not None:
@@ -357,8 +379,25 @@ class ReviewerAgent:
         self._model = model
         self._prompt_dir = prompt_dir
         if model is not None and _SDK_AVAILABLE:
-            self._instructions = (prompt_dir / "system.md").read_text()
+            # ``system.md`` is the always-on submit-only contract — it must
+            # NOT mention ``query_metric``, otherwise the LLM rationally
+            # tries to call a tool that's unregistered (the live-run
+            # ``ModelBehaviorError: Tool query_metric not found`` regression).
+            # ``system_metric_queries.md`` is the optional addendum
+            # appended in ``review()`` only when the matching tool is
+            # registered, keeping prompt mention symmetric with tool
+            # registration.
+            self._instructions_base = (prompt_dir / "system.md").read_text()
+            self._instructions_metric_queries = (
+                prompt_dir / "system_metric_queries.md"
+            ).read_text()
+            # Back-compat: callers / tests that read ``_instructions``
+            # directly see the submit-only path (the multi-turn flag is
+            # off by default).
+            self._instructions = self._instructions_base
         else:
+            self._instructions_base = ""
+            self._instructions_metric_queries = ""
             self._instructions = ""
 
     @property
@@ -380,6 +419,7 @@ class ReviewerAgent:
         tree_context: str = "",
         kb_context: str = "",
         profiling: "ProfilingResult | None" = None,
+        roofline: "RooflineResult | None" = None,
         reviewer_metric_queries: bool = False,
     ) -> str:
         """Assemble the user prompt from runtime data.
@@ -396,7 +436,10 @@ class ReviewerAgent:
         sections.append(render_kernel_section(kernel_source))
         sections.append(render_run_context(bottleneck))
         if profiling is not None:
-            sections.append("## Profiling summary\n" + render_profiling_summary(profiling))
+            sections.append(
+                "## Profiling summary\n"
+                + render_profiling_summary(profiling, roofline)
+            )
         else:
             sections.append("## Profiling summary\n" + profiling_summary)
         sections.append(
@@ -439,6 +482,7 @@ class ReviewerAgent:
         kb_context: str = "",
         prev_sol_score: float | None = None,
         profiling: "ProfilingResult | None" = None,
+        roofline: "RooflineResult | None" = None,
         reviewer_metric_queries: bool = False,
         iter_idx: int = 0,
     ) -> ReviewerFeedback:
@@ -483,6 +527,7 @@ class ReviewerAgent:
             tree_context=tree_context,
             kb_context=kb_context,
             profiling=profiling,
+            roofline=roofline,
             reviewer_metric_queries=reviewer_metric_queries,
         )
 
@@ -495,6 +540,10 @@ class ReviewerAgent:
         submit_tool = function_tool(_make_submit_review_tool(captured), strict_mode=False)
         tools: list = [submit_tool]
         max_turns = 4
+        # System prompt mentions of ``query_metric`` are conditional on the
+        # same flag that gates tool registration — see ``__init__`` for the
+        # rationale (live-run ``Tool query_metric not found`` regression).
+        instructions = self._instructions_base
         if reviewer_metric_queries:
             raw_metrics = profiling.raw_metrics if profiling is not None else None
             query_tool = function_tool(
@@ -503,9 +552,12 @@ class ReviewerAgent:
             )
             tools.append(query_tool)
             max_turns = 6
+            instructions = (
+                self._instructions_base + "\n\n" + self._instructions_metric_queries
+            )
         agent = Agent(
             name="Reviewer",
-            instructions=self._instructions,
+            instructions=instructions,
             model=self._model,
             tools=tools,
         )
@@ -537,6 +589,20 @@ class ReviewerAgent:
             if "output" in captured:
                 return _output_to_feedback(captured["output"])
             return _degraded("max_turns_exceeded")
+        except ModelBehaviorError as exc:
+            # Defense-in-depth: the SDK raises ``ModelBehaviorError`` when
+            # the LLM emits a tool call for a name that isn't registered
+            # (e.g. a future prompt-leak regression that mentions a tool
+            # the orchestrator did not wire up). Without this catch the
+            # exception unwinds ``Orchestrator.run()`` and aborts the
+            # whole optimization run; with it, this iteration degrades
+            # to rule-based feedback and the run continues. If a partial
+            # submission was captured before the bad tool call, prefer
+            # that — same precedence rule as ``MaxTurnsExceeded``.
+            if "output" in captured:
+                return _output_to_feedback(captured["output"])
+            reason = f"model_behavior_error:{type(exc).__name__}"
+            return _degraded(reason)
 
         if result is None:
             return _degraded("llm_retries_exhausted")

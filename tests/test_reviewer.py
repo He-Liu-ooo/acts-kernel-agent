@@ -716,7 +716,7 @@ def test_reviewer_has_model_false_when_sdk_absent():
     SDK availability."""
     with patch("src.agents.reviewer._SDK_AVAILABLE", False):
         agent = ReviewerAgent(model=MagicMock())
-    assert agent.has_model is False
+        assert agent.has_model is False
 
 
 # ── _make_submit_review_tool — defaulted Pydantic fields ──────────────────
@@ -924,7 +924,6 @@ async def test_review_flag_on_threads_raw_metrics_into_prompt_menu():
 
     profiling = ProfilingResult(
         analytical=AnalyticalMetrics(
-            arithmetic_intensity=1.0, ridge_point=10.0,
             achieved_tflops=5.0, achieved_bandwidth_gb_s=200.0,
             pct_peak_compute=0.4, pct_peak_bandwidth=0.5,
         ),
@@ -1043,7 +1042,6 @@ def _profiling_with(raw_metrics: dict[str, float] | None) -> "ProfilingResult":
 
     return ProfilingResult(
         analytical=AnalyticalMetrics(
-            arithmetic_intensity=1.0, ridge_point=10.0,
             achieved_tflops=5.0, achieved_bandwidth_gb_s=200.0,
             pct_peak_compute=0.4, pct_peak_bandwidth=0.5,
         ),
@@ -1136,7 +1134,6 @@ async def test_review_partial_ncu_degradation_still_exposes_raw_metrics():
 
     profiling = ProfilingResult(
         analytical=AnalyticalMetrics(
-            arithmetic_intensity=1.0, ridge_point=10.0,
             achieved_tflops=5.0, achieved_bandwidth_gb_s=200.0,
             pct_peak_compute=0.4, pct_peak_bandwidth=0.5,
         ),
@@ -1328,3 +1325,241 @@ def test_make_query_metric_tool_invalid_input_does_not_emit_event():
         tool(names="foo")  # bare string
 
     mock_emit.assert_not_called()
+
+
+# ── Prompt-leak guard: ``query_metric`` mention must mirror tool registration ──
+#
+# Regression for the live-run failure
+#   ``ModelBehaviorError: Tool query_metric not found in agent Reviewer``
+# The cause was that the static ``system.md`` documented a ``query_metric``
+# tool unconditionally; the LLM rationally tried to call it even when the
+# multi-turn flag was off and the tool was never registered. Symmetry between
+# prompt mention and tool registration is now invariant: flag-off => no
+# mention; flag-on => mention.
+
+
+def test_reviewer_prompt_omits_metric_menu_when_flag_off():
+    """Default path (``reviewer_metric_queries=False``): neither the user
+    prompt nor the system instructions mention ``query_metric`` or
+    ``Available raw metrics``. Mirrors the actual tool-registration gate
+    in ``review()`` — flag off, only ``submit_review`` is registered, so
+    nothing prompt-side may advertise the absent tool."""
+    # 1. SDK-absent path (model=None) — the system file is not loaded, but
+    #    user prompt assembly must still gate the menu.
+    agent_no_model = ReviewerAgent(model=None)
+    user_prompt_no_model = agent_no_model.build_user_prompt(
+        kernel_source="def k(): pass",
+        profiling_summary="",
+        sol_score=0.5,
+        headroom_pct=50.0,
+        bottleneck=BottleneckType.MEMORY_BOUND,
+        # Flag defaults to False — explicit here for documentation.
+        reviewer_metric_queries=False,
+    )
+    assert "query_metric" not in user_prompt_no_model
+    assert "Available raw metrics" not in user_prompt_no_model
+
+    # 2. SDK-present path (model is set) — the static system prompt is
+    #    loaded from disk in ``__init__``. With the flag off, ``review()``
+    #    threads ``_instructions_base`` (NOT the metric-queries addendum)
+    #    into the Agent. ``_instructions_base`` itself must be clean.
+    with patch("src.agents.reviewer._SDK_AVAILABLE", True):
+        agent_with_model = ReviewerAgent(model=MagicMock())
+    assert "query_metric" not in agent_with_model._instructions_base
+    assert "Available raw metrics" not in agent_with_model._instructions_base
+    # Back-compat: ``_instructions`` (legacy attr) defaults to the base —
+    # the same string used when the flag is off.
+    assert agent_with_model._instructions == agent_with_model._instructions_base
+
+
+def test_reviewer_prompt_includes_metric_menu_when_flag_on():
+    """Flag on (``reviewer_metric_queries=True``): both the user prompt
+    menu AND the system addendum mention ``query_metric``. Symmetric with
+    the tool registration in ``review()`` — flag on, both
+    ``submit_review`` and ``query_metric`` are registered, so prompt-side
+    mention is correct (and required for the LLM to use the tool)."""
+    agent = ReviewerAgent(model=None)
+    user_prompt = agent.build_user_prompt(
+        kernel_source="def k(): pass",
+        profiling_summary="",
+        sol_score=0.5,
+        headroom_pct=50.0,
+        bottleneck=BottleneckType.MEMORY_BOUND,
+        reviewer_metric_queries=True,
+        profiling=_profiling_with({"sm__a": 1.0, "sm__b": 2.0}),
+    )
+    assert "## Available raw metrics (queryable)" in user_prompt
+
+    # System-prompt side: the addendum file must exist and mention
+    # ``query_metric`` so the LLM knows the tool is callable. Loaded
+    # lazily via ``__init__`` only when SDK + model are present.
+    with patch("src.agents.reviewer._SDK_AVAILABLE", True):
+        agent_with_model = ReviewerAgent(model=MagicMock())
+    assert "query_metric" in agent_with_model._instructions_metric_queries
+
+
+@pytest.mark.asyncio
+async def test_review_threads_metric_queries_addendum_into_agent_instructions_when_flag_on():
+    """End-to-end: with the flag on, ``review()`` must construct the
+    Agent with instructions that DO mention ``query_metric`` (the
+    addendum is appended to the base). With the flag off, the Agent's
+    instructions must NOT mention it — symmetry guard against the
+    prompt-leak regression sneaking back in."""
+    capture_factory, fake_run = _simulate_review_submission(
+        outcome="improved",
+        bottleneck_classification="memory_bound",
+        branch_quality=BranchQuality.PROMISING,
+    )
+    agent_kwargs_seen: list[dict] = []
+
+    def recording_agent(**kwargs):
+        agent_kwargs_seen.append(kwargs)
+        return MagicMock()
+
+    with (
+        patch("src.agents.reviewer._SDK_AVAILABLE", True),
+        patch("src.agents.reviewer.Agent", side_effect=recording_agent),
+        patch("src.agents.reviewer.run_agent", new_callable=AsyncMock) as mock_run,
+        patch("src.agents.reviewer.make_run_config", return_value=None),
+        patch("src.agents.reviewer.function_tool", side_effect=lambda f, **kw: f),
+        patch("src.agents.reviewer._make_submit_review_tool", side_effect=capture_factory),
+    ):
+        mock_run.side_effect = fake_run
+        # Flag OFF — instructions must be clean.
+        await ReviewerAgent(model=MagicMock()).review(
+            kernel_source="def k(): pass",
+            profiling_summary="",
+            sol_score=0.5,
+            headroom_pct=50.0,
+            bottleneck=BottleneckType.MEMORY_BOUND,
+        )
+
+    assert len(agent_kwargs_seen) == 1
+    instructions_off = agent_kwargs_seen[0]["instructions"]
+    assert "query_metric" not in instructions_off
+    assert "Available raw metrics" not in instructions_off
+
+    # Flag ON — addendum must be appended, ``query_metric`` mentioned.
+    capture_factory, fake_run = _simulate_review_submission(
+        outcome="improved",
+        bottleneck_classification="memory_bound",
+        branch_quality=BranchQuality.PROMISING,
+    )
+    agent_kwargs_seen.clear()
+    with (
+        patch("src.agents.reviewer._SDK_AVAILABLE", True),
+        patch("src.agents.reviewer.Agent", side_effect=recording_agent),
+        patch("src.agents.reviewer.run_agent", new_callable=AsyncMock) as mock_run,
+        patch("src.agents.reviewer.make_run_config", return_value=None),
+        patch("src.agents.reviewer.function_tool", side_effect=lambda f, **kw: f),
+        patch("src.agents.reviewer._make_submit_review_tool", side_effect=capture_factory),
+    ):
+        mock_run.side_effect = fake_run
+        await ReviewerAgent(model=MagicMock()).review(
+            kernel_source="def k(): pass",
+            profiling_summary="",
+            sol_score=0.5,
+            headroom_pct=50.0,
+            bottleneck=BottleneckType.MEMORY_BOUND,
+            reviewer_metric_queries=True,
+            iter_idx=0,
+        )
+
+    assert len(agent_kwargs_seen) == 1
+    instructions_on = agent_kwargs_seen[0]["instructions"]
+    assert "query_metric" in instructions_on
+
+
+# ── Defensive ``ModelBehaviorError`` catch ─────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_review_handles_model_behavior_error_gracefully():
+    """Defense-in-depth: if the SDK raises ``ModelBehaviorError`` (e.g. a
+    future prompt-leak regression that mentions a tool the orchestrator
+    didn't register), ``review()`` must degrade to rule-based feedback
+    rather than letting the exception unwind ``Orchestrator.run()`` and
+    abort the whole optimization run. Mirrors the existing
+    ``MaxTurnsExceeded`` pattern."""
+    from src.agents.reviewer import ModelBehaviorError
+
+    with (
+        patch("src.agents.reviewer._SDK_AVAILABLE", True),
+        patch("src.agents.reviewer.Agent"),
+        patch("src.agents.reviewer.run_agent", new_callable=AsyncMock) as mock_run,
+        patch("src.agents.reviewer.make_run_config", return_value=None),
+        patch("src.agents.reviewer.function_tool", side_effect=lambda f, **kw: f),
+    ):
+        mock_run.side_effect = ModelBehaviorError(
+            "Tool query_metric not found in agent Reviewer"
+        )
+
+        agent = ReviewerAgent(model=MagicMock())
+        feedback = await agent.review(
+            kernel_source="def k(): pass",
+            profiling_summary="",
+            sol_score=0.5,
+            headroom_pct=50.0,
+            bottleneck=BottleneckType.MEMORY_BOUND,
+            prev_sol_score=0.45,
+        )
+
+    assert isinstance(feedback, ReviewerFeedback)
+    assert feedback.degraded is True
+    assert feedback.error_reason.startswith("model_behavior_error")
+    assert feedback.bottleneck_classification == "memory_bound"
+
+
+@pytest.mark.asyncio
+async def test_review_returns_partial_output_on_model_behavior_error_after_submission():
+    """If a valid submit_review landed before the SDK raised
+    ``ModelBehaviorError`` (e.g. the LLM submitted, then made a stray
+    call to an unregistered tool), prefer the captured submission —
+    same precedence rule as ``MaxTurnsExceeded``."""
+    from src.agents.reviewer import (
+        ModelBehaviorError,
+        ReviewerFeedbackOutput,
+        _make_submit_review_tool,
+    )
+
+    captured_holder: list[dict] = []
+
+    def _capture_factory(captured_dict: dict):
+        captured_holder.append(captured_dict)
+        return _make_submit_review_tool(captured_dict)
+
+    with (
+        patch("src.agents.reviewer._SDK_AVAILABLE", True),
+        patch("src.agents.reviewer.Agent"),
+        patch("src.agents.reviewer.run_agent", new_callable=AsyncMock) as mock_run,
+        patch("src.agents.reviewer.make_run_config", return_value=None),
+        patch("src.agents.reviewer.function_tool", side_effect=lambda f, **kw: f),
+        patch("src.agents.reviewer._make_submit_review_tool", side_effect=_capture_factory),
+    ):
+        async def _side_effect(*args, **kwargs):
+            assert captured_holder, "factory should have been called by review()"
+            captured_holder[0]["output"] = ReviewerFeedbackOutput(
+                outcome="improved",
+                metric_deltas={},
+                bottleneck_classification="memory_bound",
+                bottleneck_diagnosis="captured before stray call",
+                suggestions=[],
+                branch_quality=BranchQuality.PROMISING,
+                conditional_assessment="",
+            )
+            raise ModelBehaviorError("Tool query_metric not found in agent Reviewer")
+
+        mock_run.side_effect = _side_effect
+
+        agent = ReviewerAgent(model=MagicMock())
+        feedback = await agent.review(
+            kernel_source="src",
+            profiling_summary="",
+            sol_score=0.5,
+            headroom_pct=50.0,
+            bottleneck=BottleneckType.MEMORY_BOUND,
+        )
+
+    assert feedback.degraded is False
+    assert feedback.outcome == "improved"
+    assert "captured before stray call" in feedback.bottleneck_diagnosis

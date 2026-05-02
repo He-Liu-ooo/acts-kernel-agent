@@ -576,7 +576,7 @@ def test_planner_has_model_false_when_sdk_absent():
     that injects a model stub flows into the tool path and crashes."""
     with patch("src.agents.planner._SDK_AVAILABLE", False):
         agent = PlannerAgent(model=MagicMock())
-    assert agent.has_model is False
+        assert agent.has_model is False
 
 
 # ── _make_submit_plan_tool — defaulted Pydantic fields ────────────────────
