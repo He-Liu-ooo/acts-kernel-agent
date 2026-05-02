@@ -12,7 +12,7 @@ The user prompt is assembled programmatically by `PlannerAgent.build_user_prompt
 - Bottleneck: <memory_bound | compute_bound | balanced>
 
 ## Profiling summary
-<key metrics from the profiler — pct_peak_*, arithmetic_intensity, NCU signals>
+<key metrics from the profiler — pct_peak_*, arithmetic_intensity (MACs/byte, run-level invariant), NCU signals>
 
 ## Past experiences
 - <action_name> (tier <N>) [<param>=<val>, ...]: <success|failure>, speedup <X>x, bottleneck_before <label>

@@ -13,8 +13,8 @@ The user prompt is assembled programmatically by `ReviewerAgent.build_user_promp
 
 ## Profiling summary
 ### Analytical (roofline)
-- arithmetic_intensity: <float, 3 decimals> FLOP/byte
-- ridge_point: <float, 3 decimals> FLOP/byte
+- arithmetic_intensity: <float, 3 decimals> MACs/byte    # omitted when roofline unavailable
+- ridge_point: <float, 3 decimals> MACs/byte             # omitted when roofline unavailable
 - achieved: <TFLOPS, 2 decimals> TFLOPS / <GB/s, 2 decimals> GB/s
 - pct_peak: compute <pct, 1 decimal>% · bw <pct, 1 decimal>%
 

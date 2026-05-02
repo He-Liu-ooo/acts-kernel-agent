@@ -12,7 +12,10 @@ Two paths to T_SOL:
    running on custom (non-SOL-ExecBench) problems where flop_count and
    memory_bytes are known.
 
-Both paths produce a ``RooflineResult`` consumed by the scorer.
+Both paths produce a ``RooflineResult`` consumed by the scorer. See
+``RooflineResult`` for the unit policy on ``arithmetic_intensity`` and
+``ridge_point`` (both in MACs/byte regardless of source; the built-in
+path applies a FLOPs→MACs approximation, see ``compute_roofline``).
 """
 
 from __future__ import annotations
@@ -44,13 +47,41 @@ __all__ = [
 
 @dataclass
 class RooflineResult:
-    """Roofline analysis for a kernel on specific hardware."""
+    """Roofline analysis for a kernel on specific hardware.
+
+    Run-level invariants (a property of the kernel + workload + hardware,
+    not of any single iteration):
+
+    * ``arithmetic_intensity`` and ``ridge_point`` are both in **MACs/byte**
+      regardless of which path produced them. SOLAR's einsum analyzer
+      counts MACs natively (``total_macs / total_fused_bytes``); the
+      built-in ``compute_roofline`` fallback approximates MACs from
+      ``KernelSpec.flop_count`` via ``MACs ≈ FLOPs / 2`` (1 fused
+      multiply-add = 2 FLOPs).
+
+    * The FLOPs/2 approximation is **exact for MAC-dominated kernels**
+      (matmul, attention, conv) where every floating-point op is an FMA,
+      and an **over-estimate for non-MAC kernels** (rmsnorm, softmax,
+      reductions) where elementwise + reduction ops inflate
+      ``flop_count`` without contributing MACs. Consumers should treat
+      built-in-sourced AI as approximate when ``source == "builtin"``;
+      SOLAR-sourced AI (``source == "solar"``) is exact because its
+      analyzer excludes non-MAC ops cleanly.
+
+    * ``ridge_point`` source matters: SOLAR-sourced runs (``source ==
+      "solar"``) carry SOLAR's **precision-aware** ridge — picked from
+      the workload dtype's ``MAC_per_cycle`` table entry (bf16_tc,
+      fp16_tc, int8_tc, fp32_sm, ...). Built-in-sourced runs use a
+      ``peak_flops_fp32 / 2``-derived ridge as a fallback (see
+      ``compute_roofline``); that's correct for FP32 workloads and
+      approximate (over-estimates ridge) for tensor-core dtypes.
+    """
 
     t_sol_us: float  # Theoretical minimum runtime (microseconds)
-    arithmetic_intensity: float  # ops/byte
     bottleneck: BottleneckType
-    peak_achievable_tflops: float = 0.0
     source: str = "builtin"  # "solar" or "builtin"
+    arithmetic_intensity: float = 0.0  # MACs/byte — see class docstring
+    ridge_point: float = 0.0  # MACs/byte — see class docstring
 
 
 def derive_t_sol_from_solar(
@@ -80,11 +111,18 @@ def derive_t_sol_from_solar(
     if solar_result is None:
         return None
 
+    # SOLAR computes ``ridge_point`` using the workload's precision-aware
+    # ``MAC_per_cycle`` (e.g. ``bf16_tc`` for a bf16 workload), not a
+    # single FP32 peak. This is critical for tensor-core workloads where
+    # an FP32-derived ridge would be up to 4× too low and silently
+    # mis-classify them as compute-bound. See
+    # ``repo/benchmark/SOLAR/solar/perf/perf_model.py`` L232.
     return RooflineResult(
         t_sol_us=solar_result.t_sol_us,
-        arithmetic_intensity=solar_result.arithmetic_intensity,
         bottleneck=solar_result.bottleneck,
         source="solar",
+        arithmetic_intensity=solar_result.arithmetic_intensity,
+        ridge_point=solar_result.ridge_point,
     )
 
 
@@ -110,19 +148,38 @@ def compute_roofline(
         t_compute_us = (spec.flop_count / (peak_compute * 1e12)) * 1e6
         t_memory_us = (spec.memory_bytes / (peak_bw * 1e9)) * 1e6
         t_sol_us = max(t_compute_us, t_memory_us)
-        arithmetic_intensity = spec.flop_count / max(spec.memory_bytes, 1)
-        ridge_point = (peak_compute * 1e12) / (peak_bw * 1e9)
+        # ``RooflineResult.arithmetic_intensity`` is **MACs/byte** by
+        # contract (see class docstring). KernelSpec gives us FLOPs, not
+        # MACs, so we approximate: ``MACs ≈ FLOPs / 2`` (1 fused
+        # multiply-add = 2 FLOPs). Exact for MAC-dominated kernels
+        # (matmul, attention, conv); over-estimates AI for non-MAC
+        # kernels (rmsnorm, softmax, reductions) where elementwise +
+        # reduction ops inflate flop_count without contributing MACs.
+        # ``source="builtin"`` signals the approximation to consumers;
+        # the SOLAR path produces exact MACs/byte without this fudge.
+        # ``ridge_point`` is converted FLOPs→MACs the same way so the
+        # two compare dimensionally inside ``classify_bottleneck``.
+        arithmetic_intensity = (spec.flop_count / 2.0) / max(spec.memory_bytes, 1)
+        # Built-in fallback: no SOLAR available, so we can't pick a
+        # precision-aware ridge. FP32-derived ridge is correct for FP32
+        # workloads, approximate (over-estimates ridge) for tensor-core
+        # workloads — classifying them as compute-bound when they
+        # shouldn't be. SOLAR-sourced runs (the normal path) use the
+        # precision-aware ridge from ``solar_adapter.SolarResult``.
+        ridge_point = (peak_compute / 2.0) * 1e12 / (peak_bw * 1e9)
         bottleneck = classify_bottleneck(arithmetic_intensity, ridge_point)
     else:
         # No hardware specs — return synthetic values.
         t_sol_us = 10.0
         arithmetic_intensity = 0.0
+        ridge_point = 0.0
         bottleneck = BottleneckType.MEMORY_BOUND
 
     return RooflineResult(
         t_sol_us=t_sol_us,
-        arithmetic_intensity=arithmetic_intensity,
         bottleneck=bottleneck,
+        arithmetic_intensity=arithmetic_intensity,
+        ridge_point=ridge_point,
     )
 
 

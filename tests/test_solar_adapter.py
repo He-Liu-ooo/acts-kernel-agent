@@ -402,3 +402,106 @@ def test_derive_t_sol_soft_fails_on_bridge_value_error():
     ):
         result = derive_t_sol(definition, workload, spec)
     assert result is None
+
+
+# ── perf["arch"]["ridge_point"] propagation ────────────────────────────
+
+
+def test_derive_t_sol_populates_ridge_point_from_perf_arch():
+    """``SolarResult.ridge_point`` must come from
+    ``perf["arch"]["ridge_point"]`` — SOLAR's precision-aware value, which
+    uses the workload-dtype's ``MAC_per_cycle`` (e.g. ``bf16_tc``) rather
+    than a single FP32 peak. Without this, tensor-core workloads get an
+    FP32-derived ridge that's up to 4× too low and silently classify as
+    compute-bound."""
+    definition = _rmsnorm_definition()
+    workload = Workload.model_validate({
+        "uuid": "w1", "axes": {"batch_size": 7}, "inputs": {}
+    })
+    spec = HardwareSpec(name="RTX6000Ada")
+
+    # bf16 tensor-core ridge for RTX 6000 Ada is ~190 MACs/byte —
+    # distinct from the FP32-derived ~47.5 the old code path produced,
+    # so a wrong-source bug would be visible in the assertion.
+    fake_perf = {
+        "arch": {"name": "RTX6000Ada", "ridge_point": 189.8},
+        "fused": {
+            "runtime_ms": 0.5,
+            "bottleneck": "memory",
+            "arithmetic_intensity": 12.5,
+        },
+    }
+
+    # Stub each SOLAR stage so we never actually exercise the real
+    # pipeline. Stages 1–3 just need a truthy return; stage 4 returns
+    # the fake perf dict.
+    proc_stub = type("P", (), {
+        "process_model_file": lambda self, *a, **k: True,
+    })
+    conv_stub = type("C", (), {
+        "convert": lambda self, *a, **k: object(),
+    })
+    analyzer_stub = type("A", (), {
+        "analyze_graph": lambda self, *a, **k: object(),
+    })
+    perf_stub = type("M", (), {
+        "predict": lambda self, *a, **k: fake_perf,
+    })
+
+    # Patch ``Path.exists`` for the einsum_yaml lookup so stage 3's
+    # output path doesn't need to physically exist.
+    with (
+        patch("src.benchmark.solar_adapter._SOLAR_AVAILABLE", True),
+        patch("src.benchmark.solar_adapter.PyTorchProcessor", lambda *a, **k: proc_stub()),
+        patch("src.benchmark.solar_adapter.PyTorchToEinsum", lambda *a, **k: conv_stub()),
+        patch("src.benchmark.solar_adapter.EinsumGraphAnalyzer", lambda *a, **k: analyzer_stub()),
+        patch("src.benchmark.solar_adapter.EinsumGraphPerfModel", lambda *a, **k: perf_stub()),
+        patch("src.benchmark.solar_adapter.ProcessingConfig", lambda *a, **k: None),
+        patch.object(Path, "exists", lambda self: True),
+    ):
+        result = derive_t_sol(definition, workload, spec)
+
+    assert result is not None
+    assert result.ridge_point == pytest.approx(189.8)
+    # Sanity: arithmetic_intensity still flows through too (fixture
+    # value distinct from default 0.0).
+    assert result.arithmetic_intensity == pytest.approx(12.5)
+
+
+def test_derive_t_sol_ridge_point_defaults_to_zero_when_arch_missing():
+    """If SOLAR's ``perf`` dict somehow lacks ``arch.ridge_point`` (older
+    SOLAR build, partial dict), default cleanly to 0.0 rather than
+    raising — the caller's downstream classifier handles 0-ridge gracefully."""
+    definition = _rmsnorm_definition()
+    workload = Workload.model_validate({
+        "uuid": "w1", "axes": {"batch_size": 7}, "inputs": {}
+    })
+    spec = HardwareSpec(name="RTX6000Ada")
+
+    fake_perf = {
+        # No "arch" key at all
+        "fused": {
+            "runtime_ms": 0.5,
+            "bottleneck": "memory",
+            "arithmetic_intensity": 0.0,
+        },
+    }
+
+    proc_stub = type("P", (), {"process_model_file": lambda self, *a, **k: True})
+    conv_stub = type("C", (), {"convert": lambda self, *a, **k: object()})
+    analyzer_stub = type("A", (), {"analyze_graph": lambda self, *a, **k: object()})
+    perf_stub = type("M", (), {"predict": lambda self, *a, **k: fake_perf})
+
+    with (
+        patch("src.benchmark.solar_adapter._SOLAR_AVAILABLE", True),
+        patch("src.benchmark.solar_adapter.PyTorchProcessor", lambda *a, **k: proc_stub()),
+        patch("src.benchmark.solar_adapter.PyTorchToEinsum", lambda *a, **k: conv_stub()),
+        patch("src.benchmark.solar_adapter.EinsumGraphAnalyzer", lambda *a, **k: analyzer_stub()),
+        patch("src.benchmark.solar_adapter.EinsumGraphPerfModel", lambda *a, **k: perf_stub()),
+        patch("src.benchmark.solar_adapter.ProcessingConfig", lambda *a, **k: None),
+        patch.object(Path, "exists", lambda self: True),
+    ):
+        result = derive_t_sol(definition, workload, spec)
+
+    assert result is not None
+    assert result.ridge_point == 0.0

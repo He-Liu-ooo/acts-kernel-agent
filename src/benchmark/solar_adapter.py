@@ -54,11 +54,26 @@ except ModuleNotFoundError:
 
 @dataclass
 class SolarResult:
-    """T_SOL and bottleneck classification from SOLAR."""
+    """T_SOL and bottleneck classification from SOLAR.
+
+    ``arithmetic_intensity`` is in **MACs/byte** (SOLAR's native unit:
+    ``total_macs / total_fused_bytes`` from the einsum analyzer). This is
+    exact for MAC-dominated kernels (matmul, attention, conv) and reads
+    ``0.0`` for pure-elementwise / reduction kernels (rmsnorm, softmax)
+    where SOLAR's MAC counter excludes non-MAC ops cleanly.
+
+    ``ridge_point`` is **precision-aware**: SOLAR computes it from the
+    workload dtype's ``MAC_per_cycle`` (e.g. bf16 → ``MAC_per_cycle_bf16_tc``,
+    int8 → ``MAC_per_cycle_int8_tc``), not from a single FP32 peak. This
+    matters for tensor-core workloads where an FP32-derived ridge would
+    be up to 4× too low and silently mis-classify them as compute-bound.
+    Lifted directly from ``perf["arch"]["ridge_point"]``.
+    """
 
     t_sol_us: float
     bottleneck: BottleneckType
-    arithmetic_intensity: float = 0.0
+    arithmetic_intensity: float = 0.0  # MACs/byte — see class docstring
+    ridge_point: float = 0.0  # MACs/byte — precision-aware, see class docstring
     roofline_model: str = "fused"  # which SOLAR model was used
 
 
@@ -233,20 +248,12 @@ def _write_model_bridge_file(
 # Built-in SOLAR arch names that resolve internally without a path.
 _SOLAR_BUNDLED_ARCHES = {"H100_PCIe", "B200"}
 
-_ACTS_ARCH_DIR = Path(__file__).resolve().parent.parent.parent / "configs" / "arch"
-_ADA_YAML = _ACTS_ARCH_DIR / "RTX6000Ada.yaml"
-
-# ACTS-supplied arch YAMLs. When the hardware spec's name matches one of
-# these, SOLAR receives the absolute YAML path so its perf model loads
-# ACTS's hand-authored YAML directly. The placeholder alias covers the
-# zero-peak path (no GPU / broken torch / no YAML configured) — without
-# it, SOLAR's T_SOL would be computed against H100 while the in-process
-# roofline already mirrors Ada peaks, silently miscalibrating sol_score.
-_ACTS_ARCH_YAMLS = {
-    "RTX6000Ada": _ADA_YAML,
-    "NVIDIA RTX 6000 Ada Generation": _ADA_YAML,
-    "placeholder-RTX6000Ada": _ADA_YAML,
-}
+# Single source of truth lives in src/config.py — re-export so existing
+# imports (``from src.benchmark.solar_adapter import _ACTS_ARCH_YAMLS``)
+# keep working without duplicating the registry.
+from src.config import _ACTS_ARCH_DIR, _ACTS_ARCH_YAMLS  # noqa: E402  (re-export)
+from src.config import _ADA_YAML  # noqa: E402  (re-export)
+from src.config import _lookup_arch_yaml  # noqa: E402
 
 
 def _resolve_arch_config(hardware_spec: HardwareSpec, arch_yaml_path: Path | None) -> str:
@@ -259,8 +266,8 @@ def _resolve_arch_config(hardware_spec: HardwareSpec, arch_yaml_path: Path | Non
         return str(arch_yaml_path)
     if hardware_spec.name in _SOLAR_BUNDLED_ARCHES:
         return hardware_spec.name
-    yaml_path = _ACTS_ARCH_YAMLS.get(hardware_spec.name)
-    if yaml_path is not None and yaml_path.exists():
+    yaml_path = _lookup_arch_yaml(hardware_spec.name)
+    if yaml_path is not None:
         return str(yaml_path)
     logger.warning(
         "no arch YAML for hardware_spec.name=%r — falling back to SOLAR's "
@@ -369,11 +376,23 @@ def derive_t_sol(
 
     runtime_ms = float(section.get("runtime_ms", 0.0))
     bottleneck_str = str(section.get("bottleneck", "memory"))
+    # SOLAR's per-section ``arithmetic_intensity`` is MACs/byte
+    # (``total_macs / <section>_bytes``) — see solar/perf/perf_model.py.
+    # 0.0 is a valid value for non-MAC kernels (rmsnorm, softmax,
+    # reductions) where SOLAR's einsum analyzer reports no MAC ops.
     arithmetic_intensity = float(section.get("arithmetic_intensity", 0.0))
+    # SOLAR's ``perf["arch"]["ridge_point"]`` is the precision-aware ridge
+    # ``MAC_per_cycle / DRAM_byte_per_cycle`` where ``MAC_per_cycle`` is
+    # selected by the workload's dtype (fp32_sm, bf16_tc, fp16_tc, int8_tc,
+    # ...). Reading it here keeps us aligned with whatever precision SOLAR
+    # actually used for compute_cycles — see solar/perf/perf_model.py L232.
+    arch = perf.get("arch", {})
+    ridge_point = float(arch.get("ridge_point", 0.0))
 
     return SolarResult(
         t_sol_us=runtime_ms * 1000.0,  # ms → us
         bottleneck=_SOLAR_BOTTLENECK_TO_ENUM.get(bottleneck_str, BottleneckType.MEMORY_BOUND),
         arithmetic_intensity=arithmetic_intensity,
+        ridge_point=ridge_point,
         roofline_model=roofline_model,
     )
