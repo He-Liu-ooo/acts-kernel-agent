@@ -241,7 +241,8 @@ def test_profile_real_triton_kernel_end_to_end(
     assert result.degraded is False, f"NCU path degraded: {result.degraded_reason}"
     assert result.ncu is not None
     assert result.analytical is not None
-    assert result.analytical.arithmetic_intensity >= 0
+    # arithmetic_intensity is a run-level invariant on RooflineResult now
+    # (see src/eval/roofline.py), not a per-iter AnalyticalMetrics field.
     assert result.analytical.achieved_bandwidth_gb_s > 0
 
 

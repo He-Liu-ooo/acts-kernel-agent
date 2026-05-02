@@ -20,12 +20,14 @@ from src.eval.profiler import (
 )
 
 
-def _hw_peaks(hw: HardwareSpec) -> tuple[float, float, float]:
-    """Return (peak_tflops, peak_bw_gb_s, ridge_point) for a spec."""
-    peak_tflops = hw.peak_flops_fp32
-    peak_bw = hw.peak_memory_bandwidth_gb_s
-    ridge = (peak_tflops * 1e12) / (peak_bw * 1e9)
-    return peak_tflops, peak_bw, ridge
+def _hw_peaks(hw: HardwareSpec) -> tuple[float, float]:
+    """Return (peak_tflops, peak_bw_gb_s) for a spec.
+
+    Note: ridge_point is no longer a per-iter ``AnalyticalMetrics`` field;
+    it lives on ``RooflineResult`` (run-level invariant). Tests for
+    ridge_point math live in ``tests/test_roofline.py``.
+    """
+    return hw.peak_flops_fp32, hw.peak_memory_bandwidth_gb_s
 
 
 # ── structural ─────────────────────────────────────────────────────────────
@@ -41,6 +43,10 @@ def test_returns_analytical_metrics_dataclass():
     )
     assert isinstance(result, AnalyticalMetrics)
     assert not hasattr(result, "classification")
+    # AI / ridge_point are run-level invariants on RooflineResult — they
+    # must not leak back onto AnalyticalMetrics.
+    assert not hasattr(result, "arithmetic_intensity")
+    assert not hasattr(result, "ridge_point")
 
 
 def test_all_fields_populated_and_nonnegative():
@@ -51,8 +57,6 @@ def test_all_fields_populated_and_nonnegative():
         latency_s=1e-3,
         hardware_spec=hw,
     )
-    assert r.arithmetic_intensity >= 0
-    assert r.ridge_point > 0
     assert r.achieved_tflops >= 0
     assert r.achieved_bandwidth_gb_s >= 0
     assert r.pct_peak_compute >= 0
@@ -60,29 +64,6 @@ def test_all_fields_populated_and_nonnegative():
 
 
 # ── math ───────────────────────────────────────────────────────────────────
-
-
-def test_arithmetic_intensity_is_flops_over_bytes():
-    hw = _rtx6000_ada()
-    r = _compute_analytical(
-        flops=1_000_000,
-        nbytes=4_000_000,
-        latency_s=1e-3,
-        hardware_spec=hw,
-    )
-    assert r.arithmetic_intensity == pytest.approx(0.25)
-
-
-def test_ridge_point_matches_hardware():
-    hw = _rtx6000_ada()
-    _, _, expected_ridge = _hw_peaks(hw)
-    r = _compute_analytical(
-        flops=1,
-        nbytes=1,
-        latency_s=1e-3,
-        hardware_spec=hw,
-    )
-    assert r.ridge_point == pytest.approx(expected_ridge)
 
 
 def test_achieved_tflops_and_bandwidth():
@@ -100,7 +81,7 @@ def test_achieved_tflops_and_bandwidth():
 
 def test_pct_peak_fractions_in_zero_to_one_plus():
     hw = _rtx6000_ada()
-    peak_tflops, peak_bw, _ = _hw_peaks(hw)
+    peak_tflops, peak_bw = _hw_peaks(hw)
     # Sized so achieved ≈ 50% of peak bandwidth.
     nbytes = int(peak_bw * 1e9 * 0.5 * 1e-3)
     r = _compute_analytical(
@@ -152,8 +133,8 @@ def test_zeroed_hardware_peaks_raise():
 
 
 def test_zero_flops_is_ok():
-    """Pure memory ops (no arithmetic) are valid input. AI = 0 is fine."""
+    """Pure memory ops (no arithmetic) are valid input. achieved_tflops=0
+    is fine (and AI=0 lives on RooflineResult, not here)."""
     hw = _rtx6000_ada()
     r = _compute_analytical(flops=0, nbytes=1_000_000, latency_s=1e-3, hardware_spec=hw)
-    assert r.arithmetic_intensity == 0.0
     assert r.achieved_tflops == 0.0

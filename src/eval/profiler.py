@@ -43,6 +43,106 @@ _METRIC_SET_VERSION: str = "v2"
 _UNSET: Any = object()
 _NCU_BINARY_CACHE: Any = _UNSET
 
+# Once-per-process cache for NCU failures the OS makes permanent — most
+# notably ``NVreg_RestrictProfilingToAdminUsers=1`` on the host kernel
+# module, which makes every non-root NCU invocation fail with
+# ``ERR_NVGPUCTRPERM``. After the first observed permission failure,
+# subsequent ``_run_ncu`` calls return ``("", -1, True, <reason>)`` without
+# forking a subprocess. Reset only by ``_reset_ncu_permission_cache()``
+# (test hook); production callers should let the cache live the
+# orchestrator's lifetime.
+#
+# Held value is the diagnostic reason slug (str), e.g.
+# ``"ncu_skipped:permanently_unavailable:nvgpuctrperm"``. ``None`` means
+# "no permanent failure observed yet". A boolean flag would lose the
+# signature, so we stash the slug directly.
+_NCU_PERMANENTLY_UNAVAILABLE: str | None = None
+
+# Stderr signatures we consider "permanent for this process". Order
+# matters: more specific first so the resulting reason slug is the
+# highest-fidelity one. Pairs are ``(needle_lowercase, slug_suffix)``.
+# Matching is case-insensitive substring on stderr+stdout combined (NCU
+# sometimes writes the actionable error to stdout when --csv is set).
+_NCU_PERMANENT_SIGNATURES: tuple[tuple[str, str], ...] = (
+    ("err_nvgpuctrperm", "nvgpuctrperm"),
+    ("does not have permission to access the gpu performance counter", "counter_perm"),
+    ("the user does not have permission", "user_perm"),
+    ("nvidia-smi nvlink", "driver_init_failed"),
+)
+
+# Environment variable that suppresses NCU entirely — operator escape
+# hatch for hosts where NCU is known-broken. ``"1"`` / ``"true"`` /
+# ``"yes"`` (case-insensitive) all disable. Anything else, including
+# unset, leaves NCU enabled and the auto-detect path takes over.
+_NCU_DISABLE_ENV = "ACTS_DISABLE_NCU"
+
+
+def _reset_ncu_permission_cache() -> None:
+    """Test hook: clear the once-per-process permission-cache flag so the
+    next ``_run_ncu`` call hits the subprocess path again.
+
+    Production code never calls this — the whole point of the cache is
+    to avoid re-paying the subprocess fork cost for an OS-level
+    permission failure that won't change mid-run. Tests need to reset
+    between scenarios because the module is imported once."""
+    global _NCU_PERMANENTLY_UNAVAILABLE
+    _NCU_PERMANENTLY_UNAVAILABLE = None
+
+
+def _ncu_disabled_via_env() -> bool:
+    """Return True iff ``ACTS_DISABLE_NCU`` is set to a truthy value."""
+    raw = os.environ.get(_NCU_DISABLE_ENV, "")
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _classify_ncu_permanent_failure(stderr: str, stdout: str) -> str | None:
+    """Inspect NCU's combined stderr+stdout for a known permanent-failure
+    signature. Returns the slug suffix on match (e.g. ``"nvgpuctrperm"``),
+    or ``None`` when the failure looks transient / unknown.
+
+    Matching is case-insensitive substring; NCU phrasings have shifted
+    across releases (the ``ERR_NVGPUCTRPERM`` token is stable, but the
+    free-text suffix is not), so we anchor on tokens NVIDIA documents in
+    their counter-access KB article."""
+    haystack = (stderr + "\n" + stdout).lower()
+    for needle, slug in _NCU_PERMANENT_SIGNATURES:
+        if needle in haystack:
+            return slug
+    return None
+
+
+# Reason-slug suffixes are embedded into degraded tags read by humans in
+# the run log, so we keep them ASCII-safe and short. ``[^\w-]`` would
+# also strip the colons we use as field separators, which we want.
+_FINGERPRINT_SAFE_RE = re.compile(r"[^\w-]+")
+
+
+def _stderr_fingerprint(stderr: str, max_len: int = 60) -> str:
+    """Distill NCU's stderr into a short, log-safe slug for the degraded
+    reason tag. Picks the first non-empty line, slugifies non-word chars,
+    and truncates to ``max_len``.
+
+    Example: ``"==ERROR== ProfilerReply error: Not enough memory"``
+    becomes ``"ERROR_ProfilerReply_error_Not_enough_memory"``.
+
+    Returns ``""`` when stderr is empty / whitespace — caller falls back
+    to the bare ``ncu_nonzero_exit:<rc>`` tag."""
+    if not stderr:
+        return ""
+    first = next(
+        (ln.strip() for ln in stderr.splitlines() if ln.strip()),
+        "",
+    )
+    if not first:
+        return ""
+    # Strip NCU's ``==…==`` prefix decoration if present; the inner text
+    # is the load-bearing part.
+    first = first.replace("==", " ")
+    slug = _FINGERPRINT_SAFE_RE.sub("_", first).strip("_")
+    if not slug:
+        return ""
+    return slug[:max_len]
+
 # Required metrics must appear in the CSV (parse degrades otherwise);
 # optional metrics default to 0.0 when absent. Names are raw
 # (``--print-metric-name=name``) since ``label`` varies across NCU releases.
@@ -132,15 +232,17 @@ class ProfilerError(Exception):
 
 @dataclass(frozen=True)
 class AnalyticalMetrics:
-    """Zero-overhead roofline-derived metrics.
+    """Per-iteration dynamic measurements derived from measured latency.
 
-    Pure runtime measurements — classification lives at the run level
-    (``classify_run`` in ``src/eval/roofline.py``) since it's invariant
-    per ``(problem, representative_workload, hardware)``.
+    Pure runtime metrics. Classification + the run-level invariants
+    ``arithmetic_intensity`` and ``ridge_point`` live on
+    ``RooflineResult`` (see ``src/eval/roofline.py``) since they are
+    invariant per ``(problem, representative_workload, hardware)`` —
+    re-storing them on every per-iter ``AnalyticalMetrics`` was just
+    duplication. Consumers that need AI / ridge_point read them off
+    the run-level ``RooflineResult`` instead.
     """
 
-    arithmetic_intensity: float
-    ridge_point: float
     achieved_tflops: float
     achieved_bandwidth_gb_s: float
     pct_peak_compute: float
@@ -178,6 +280,24 @@ class ProfilingResult:
     def has_ncu(self) -> bool:
         return self.ncu is not None
 
+    @classmethod
+    def make_degraded(
+        cls, analytical: "AnalyticalMetrics", reason: str
+    ) -> "ProfilingResult":
+        """Construct a degraded ProfilingResult: no NCU data, empty raw
+        metrics, with the given reason explaining why.
+
+        Named ``make_degraded`` (not ``degraded``) to avoid clashing with
+        the ``degraded`` ``@property`` above — Python class attributes
+        share a single namespace.
+        """
+        return cls(
+            analytical=analytical,
+            ncu=None,
+            raw_metrics={},
+            degraded_reason=reason,
+        )
+
 
 def _compute_analytical(
     *,
@@ -186,7 +306,12 @@ def _compute_analytical(
     latency_s: float,
     hardware_spec: HardwareSpec,
 ) -> AnalyticalMetrics:
-    """Derive roofline runtime metrics from measured latency.
+    """Derive per-iteration achieved-throughput metrics from measured latency.
+
+    Returns achieved TFLOPS / bandwidth and their percent-of-peak ratios.
+    The kernel's arithmetic_intensity and the hardware's ridge_point are
+    run-level invariants and live on ``RooflineResult`` instead — this
+    function does not recompute them per iteration.
 
     Raises ``ProfilerError`` when inputs make analysis meaningless:
     non-positive latency / nbytes, or hardware with zero peak compute /
@@ -207,16 +332,12 @@ def _compute_analytical(
             "(load via SOLAR arch YAML or implement detect_hardware)"
         )
 
-    arithmetic_intensity = flops / nbytes
-    ridge_point = (peak_tflops * 1e12) / (peak_bw_gb_s * 1e9)
     achieved_tflops = flops / latency_s / 1e12
     achieved_bandwidth_gb_s = nbytes / latency_s / 1e9
     pct_peak_compute = achieved_tflops / peak_tflops
     pct_peak_bandwidth = achieved_bandwidth_gb_s / peak_bw_gb_s
 
     return AnalyticalMetrics(
-        arithmetic_intensity=arithmetic_intensity,
-        ridge_point=ridge_point,
         achieved_tflops=achieved_tflops,
         achieved_bandwidth_gb_s=achieved_bandwidth_gb_s,
         pct_peak_compute=pct_peak_compute,
@@ -440,6 +561,26 @@ def _run_ncu(
       and calls ``kernel_fn(*inputs, *outputs)``.
     * ``seed`` (int, optional): RNG seed for input generation; defaults to 0.
     """
+    # ``global`` must come before any read of the name in the same
+    # function — Python's compiler raises SyntaxError if we declare it
+    # later, even on a path the early-return below would skip.
+    global _NCU_PERMANENTLY_UNAVAILABLE
+
+    # Operator escape hatch: ``ACTS_DISABLE_NCU=1`` skips NCU entirely.
+    # Cheaper than the binary lookup and makes "I know NCU is broken on
+    # this host" explicit in the run logs (distinct from the auto-detect
+    # ``permanently_unavailable`` slug).
+    if _ncu_disabled_via_env():
+        return "", -1, True, "ncu_disabled_via_env"
+
+    # Once-per-process cache: if a previous call observed a permanent
+    # failure (host kernel NVreg_RestrictProfilingToAdminUsers=1, etc.),
+    # short-circuit before forking another doomed subprocess. The cached
+    # slug carries the original signature so operators can still tell
+    # "permission" from "driver init failed" downstream.
+    if _NCU_PERMANENTLY_UNAVAILABLE is not None:
+        return "", -1, True, _NCU_PERMANENTLY_UNAVAILABLE
+
     if _discover_ncu_binary() is None:
         return "", -1, True, "ncu_binary_not_found"
 
@@ -501,7 +642,30 @@ def _run_ncu(
         spec_json_path.unlink(missing_ok=True)
 
     if completed.returncode != 0:
-        return completed.stdout, completed.returncode, True, f"ncu_nonzero_exit:{completed.returncode}"
+        # Classify before reporting: permission / driver-init failures
+        # are permanent for this process and should flip the
+        # short-circuit cache so iteration N+1 doesn't pay the fork
+        # cost. Transient / unknown failures keep the legacy
+        # ``ncu_nonzero_exit:<rc>`` reason so operators can still see the
+        # exit code, but we surface a stderr fingerprint when one exists
+        # to make "permission issue vs host crash vs section name typo"
+        # distinguishable from the run log.
+        stderr = completed.stderr or ""
+        stdout = completed.stdout or ""
+        permanent_slug = _classify_ncu_permanent_failure(stderr, stdout)
+        if permanent_slug is not None:
+            reason = f"ncu_skipped:permanently_unavailable:{permanent_slug}"
+            _NCU_PERMANENTLY_UNAVAILABLE = reason
+            return stdout, completed.returncode, True, reason
+
+        fingerprint = _stderr_fingerprint(stderr)
+        if fingerprint:
+            return stdout, completed.returncode, True, (
+                f"ncu_nonzero_exit:{completed.returncode}:{fingerprint}"
+            )
+        return stdout, completed.returncode, True, (
+            f"ncu_nonzero_exit:{completed.returncode}"
+        )
 
     return completed.stdout, 0, False, None
 
@@ -601,11 +765,20 @@ def profile_kernel(
     2. If ``cache_dir`` is given and a cached NCUMetrics exists under the
        (source-hash, workload, mode, metric-set-version) key, rehydrate
        it and skip the subprocess.
-    3. Otherwise: discover ``ncu`` on PATH. Missing → degraded result
+    3. Operator escape hatch — ``ACTS_DISABLE_NCU=1`` short-circuits with
+       reason ``ncu_disabled_via_env``.
+    4. Process-wide skip — once a previous call observed an OS-level
+       permanent failure (host kernel restricted counters, etc.), every
+       subsequent call returns the cached
+       ``ncu_skipped:permanently_unavailable:<sig>`` reason without
+       forking a subprocess.
+    5. Otherwise: discover ``ncu`` on PATH. Missing → degraded result
        with no cache write; branch survives.
-    4. Run the NCU subprocess; driver-side failure → degraded, no cache.
-    5. Parse CSV; parser-side failure → degraded, no cache.
-    6. Both green → persist NCUMetrics, return full ProfilingResult.
+    6. Run the NCU subprocess; driver-side failure → degraded, no cache.
+       Permission-class failures flip the process-wide skip flag so step
+       4 catches the next call.
+    7. Parse CSV; parser-side failure → degraded, no cache.
+    8. Both green → persist NCUMetrics, return full ProfilingResult.
 
     NCU failures never raise. Analytical failures always raise.
     """
@@ -645,13 +818,19 @@ def profile_kernel(
     else:
         key = None
 
+    if _ncu_disabled_via_env():
+        return ProfilingResult.make_degraded(analytical, "ncu_disabled_via_env")
+
+    # Skip the (cheap but non-zero) compile + subprocess fork once we've
+    # observed an OS-level permanent failure — the host kernel won't
+    # un-restrict counters mid-run. The cached slug carries the original
+    # signature so the run log keeps "permission" / "driver init" / etc.
+    # distinguishable downstream.
+    if _NCU_PERMANENTLY_UNAVAILABLE is not None:
+        return ProfilingResult.make_degraded(analytical, _NCU_PERMANENTLY_UNAVAILABLE)
+
     if _discover_ncu_binary() is None:
-        return ProfilingResult(
-            analytical=analytical,
-            ncu=None,
-            raw_metrics={},
-            degraded_reason="ncu_binary_not_found",
-        )
+        return ProfilingResult.make_degraded(analytical, "ncu_binary_not_found")
 
     # Materialise the kernel on disk so the subprocess driver has a
     # stable import target. ``compile_kernel`` is source-hash-keyed, so
@@ -674,12 +853,7 @@ def profile_kernel(
         blob_roots=blob_roots,
     )
     if driver_degraded:
-        return ProfilingResult(
-            analytical=analytical,
-            ncu=None,
-            raw_metrics={},
-            degraded_reason=driver_reason,
-        )
+        return ProfilingResult.make_degraded(analytical, driver_reason)
 
     ncu, raw, parser_degraded, parser_reason = _parse_ncu_csv(stdout, kernel_name)
     if parser_degraded:

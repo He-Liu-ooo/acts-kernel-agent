@@ -71,6 +71,12 @@ def fake_ncu_path(tmp_path, monkeypatch):
     from src.eval import profiler as profiler_mod
 
     monkeypatch.setattr(profiler_mod, "_NCU_BINARY_CACHE", profiler_mod._UNSET, raising=False)
+    # The permission-cache flag is module-global and persists across
+    # tests; reset it per-test so a permission-failure scenario in one
+    # test doesn't poison the next test's clean run. Also clear the
+    # opt-out env var in case a previous test set it.
+    profiler_mod._reset_ncu_permission_cache()
+    monkeypatch.delenv(profiler_mod._NCU_DISABLE_ENV, raising=False)
     argv_log = tmp_path / "argv.log"
 
     def install(body: str) -> None:
@@ -135,6 +141,13 @@ def test_happy_path_returns_stdout_and_zero_exit(fake_ncu_path, sample_kernel, s
 
 
 def test_nonzero_exit_marks_degraded(fake_ncu_path, sample_kernel, sample_workload):
+    """Generic non-zero exit (no permission signature on stderr) keeps
+    the legacy ``ncu_nonzero_exit:<rc>`` prefix. When stderr is
+    non-empty, we additionally append a sanitized fingerprint (here:
+    the word ``boom``) so the run log distinguishes "permission" /
+    "OOM" / "section typo" without re-running the kernel — see the
+    ``test_transient_nonzero_exit_does_not_set_permission_cache`` test
+    below for the longer-form fingerprint case."""
     install, _ = fake_ncu_path
     install('echo "boom" 1>&2\nexit 3\n')
 
@@ -147,7 +160,12 @@ def test_nonzero_exit_marks_degraded(fake_ncu_path, sample_kernel, sample_worklo
     )
     assert rc == 3
     assert degraded is True
-    assert reason == "ncu_nonzero_exit:3"
+    # New shape: legacy prefix preserved, fingerprint appended after a
+    # second colon. Bare ``ncu_nonzero_exit:3`` is still emitted when
+    # stderr is empty (covered by
+    # ``test_nonzero_exit_with_empty_stderr_falls_back_to_bare_legacy_shape``).
+    assert reason.startswith("ncu_nonzero_exit:3")
+    assert "boom" in reason
 
 
 def test_timeout_marks_degraded(fake_ncu_path, sample_kernel, sample_workload):
@@ -876,3 +894,359 @@ def test_call_kernel_dps_requires_definition_and_workload():
             dps=True,
             device="cpu",
         )
+
+
+# ── permission-failure caching (host kernel NVreg_RestrictProfilingToAdminUsers=1) ─
+
+
+# Counter-shim helpers: count how many times the fake ncu shell actually
+# fires. Each invocation appends a line to ``count_path`` so the test can
+# assert on subprocess call count after a sequence of ``_run_ncu`` calls.
+def _install_counting_perm_failure(install, count_path: Path, signature: str) -> None:
+    """Fake ncu that records each invocation in ``count_path`` and exits
+    non-zero with the given permission-failure ``signature`` on stderr.
+    Tests use this to verify the permission cache flips after the first
+    call so subsequent calls do NOT re-invoke the subprocess."""
+    body = textwrap.dedent(
+        f"""\
+        echo "called" >> {count_path}
+        echo "{signature}" 1>&2
+        exit 1
+        """
+    )
+    install(body)
+
+
+def test_permission_failure_nvgpuctrperm_marks_skipped_and_caches(
+    fake_ncu_path, tmp_path, sample_kernel, sample_workload
+):
+    """First NCU call fails with the canonical ERR_NVGPUCTRPERM token;
+    the reason must report ``ncu_skipped:permanently_unavailable:nvgpuctrperm``
+    (NOT the generic ``ncu_nonzero_exit:1``) and the module-level cache
+    flag must flip so the next call short-circuits."""
+    from src.eval import profiler as profiler_mod
+
+    install, _ = fake_ncu_path
+    count_path = tmp_path / "ncu_calls.log"
+    _install_counting_perm_failure(
+        install, count_path, "==ERROR== ERR_NVGPUCTRPERM: counter access blocked"
+    )
+
+    stdout, rc, degraded, reason = _run_ncu(
+        sample_kernel,
+        sample_workload,
+        _identity_input_generator,
+        timeout_s=10.0,
+        mode="curated",
+    )
+
+    assert degraded is True
+    assert reason == "ncu_skipped:permanently_unavailable:nvgpuctrperm"
+    # The cache must hold the same slug so subsequent calls see it.
+    assert profiler_mod._NCU_PERMANENTLY_UNAVAILABLE == reason
+
+
+def test_permission_failure_counter_perm_phrase_marks_skipped(
+    fake_ncu_path, tmp_path, sample_kernel, sample_workload
+):
+    """Older / alternate NCU phrasing (no ERR_NVGPUCTRPERM token but the
+    free-text "does not have permission to access the GPU performance
+    counter" phrase) must also trigger the permanent-unavailable slug."""
+    install, _ = fake_ncu_path
+    count_path = tmp_path / "ncu_calls.log"
+    _install_counting_perm_failure(
+        install,
+        count_path,
+        "ERROR: The user does not have permission to access the GPU performance counter on the target device.",
+    )
+
+    _stdout, _rc, degraded, reason = _run_ncu(
+        sample_kernel,
+        sample_workload,
+        _identity_input_generator,
+        timeout_s=10.0,
+        mode="curated",
+    )
+
+    assert degraded is True
+    # First-match-wins: ``err_nvgpuctrperm`` is absent, so the
+    # ``counter_perm`` slug fires next.
+    assert reason == "ncu_skipped:permanently_unavailable:counter_perm"
+
+
+def test_permission_failure_short_circuits_subsequent_calls(
+    fake_ncu_path, tmp_path, sample_kernel, sample_workload
+):
+    """After the first permission failure flips the cache, subsequent
+    ``_run_ncu`` calls must NOT fork a subprocess. Verified by counting
+    the lines the fake ncu writes — only the first call should run."""
+    install, _ = fake_ncu_path
+    count_path = tmp_path / "ncu_calls.log"
+    _install_counting_perm_failure(
+        install, count_path, "==ERROR== ERR_NVGPUCTRPERM"
+    )
+
+    # Three back-to-back calls — only the first should actually exec ncu.
+    for _ in range(3):
+        _stdout, _rc, degraded, reason = _run_ncu(
+            sample_kernel,
+            sample_workload,
+            _identity_input_generator,
+            timeout_s=10.0,
+            mode="curated",
+        )
+        assert degraded is True
+        assert reason == "ncu_skipped:permanently_unavailable:nvgpuctrperm"
+
+    # The fake ncu writes a line per real invocation. Only the first
+    # call should have executed; the subsequent two short-circuited.
+    invocation_count = (
+        len(count_path.read_text().splitlines()) if count_path.exists() else 0
+    )
+    assert invocation_count == 1, (
+        f"expected exactly 1 subprocess invocation after cache flip; "
+        f"got {invocation_count}"
+    )
+
+
+def test_permission_cache_reset_hook_re_enables_subprocess(
+    fake_ncu_path, tmp_path, sample_kernel, sample_workload
+):
+    """``_reset_ncu_permission_cache()`` must clear the flag so a fresh
+    call hits the subprocess again. Lets test isolation work without
+    re-importing the module per test."""
+    from src.eval import profiler as profiler_mod
+
+    install, _ = fake_ncu_path
+    count_path = tmp_path / "ncu_calls.log"
+    _install_counting_perm_failure(
+        install, count_path, "==ERROR== ERR_NVGPUCTRPERM"
+    )
+
+    _run_ncu(
+        sample_kernel,
+        sample_workload,
+        _identity_input_generator,
+        timeout_s=10.0,
+        mode="curated",
+    )
+    assert profiler_mod._NCU_PERMANENTLY_UNAVAILABLE is not None
+
+    profiler_mod._reset_ncu_permission_cache()
+    assert profiler_mod._NCU_PERMANENTLY_UNAVAILABLE is None
+
+    _run_ncu(
+        sample_kernel,
+        sample_workload,
+        _identity_input_generator,
+        timeout_s=10.0,
+        mode="curated",
+    )
+
+    invocation_count = len(count_path.read_text().splitlines())
+    assert invocation_count == 2, (
+        f"expected 2 subprocess invocations across the reset; "
+        f"got {invocation_count}"
+    )
+
+
+# ── transient (non-permission) non-zero exit: keeps legacy behavior + adds fingerprint ─
+
+
+def test_transient_nonzero_exit_does_not_set_permission_cache(
+    fake_ncu_path, sample_kernel, sample_workload
+):
+    """A non-zero exit whose stderr lacks any permission signature must
+    keep the legacy ``ncu_nonzero_exit:<rc>`` reason shape (optionally
+    with a fingerprint suffix) and must NOT flip the permanent-skip
+    cache — transient failures should be retried next iteration."""
+    from src.eval import profiler as profiler_mod
+
+    install, _ = fake_ncu_path
+    install('echo "==ERROR== ProfilerReply error: Not enough memory" 1>&2\nexit 7\n')
+
+    _stdout, rc, degraded, reason = _run_ncu(
+        sample_kernel,
+        sample_workload,
+        _identity_input_generator,
+        timeout_s=10.0,
+        mode="curated",
+    )
+
+    assert rc == 7
+    assert degraded is True
+    # Non-permission failure: cache must remain unset so we retry on the
+    # next iteration.
+    assert profiler_mod._NCU_PERMANENTLY_UNAVAILABLE is None
+    # Legacy shape is preserved as the prefix; the fingerprint is
+    # appended after a colon.
+    assert reason.startswith("ncu_nonzero_exit:7")
+    # Fingerprint must surface a recognizable token from the stderr
+    # (sanitized for log-safety) so operators can distinguish "OOM" from
+    # "section name typo" without grepping the raw run.log.
+    assert "ProfilerReply" in reason or "Not_enough_memory" in reason
+
+
+def test_nonzero_exit_with_empty_stderr_falls_back_to_bare_legacy_shape(
+    fake_ncu_path, sample_kernel, sample_workload
+):
+    """When stderr is empty, the fingerprint helper returns ``""`` and the
+    reason collapses to the bare ``ncu_nonzero_exit:<rc>`` shape (the same
+    shape the original test_nonzero_exit_marks_degraded asserts on, so we
+    don't drift from existing callers)."""
+    install, _ = fake_ncu_path
+    install("exit 4\n")
+
+    _stdout, rc, degraded, reason = _run_ncu(
+        sample_kernel,
+        sample_workload,
+        _identity_input_generator,
+        timeout_s=10.0,
+        mode="curated",
+    )
+
+    assert rc == 4
+    assert degraded is True
+    # Exact match — no fingerprint suffix when stderr is empty.
+    assert reason == "ncu_nonzero_exit:4"
+
+
+# ── env-var opt-out ────────────────────────────────────────────────────────
+
+
+def test_acts_disable_ncu_env_var_skips_subprocess(
+    fake_ncu_path, tmp_path, sample_kernel, sample_workload, monkeypatch
+):
+    """``ACTS_DISABLE_NCU=1`` must short-circuit before the subprocess
+    fork. The fake ncu would record an invocation if it ran — assert it
+    didn't."""
+    from src.eval import profiler as profiler_mod
+
+    install, _ = fake_ncu_path
+    count_path = tmp_path / "ncu_calls.log"
+    _install_counting_perm_failure(
+        install, count_path, "this should never appear in the log"
+    )
+
+    monkeypatch.setenv(profiler_mod._NCU_DISABLE_ENV, "1")
+
+    _stdout, rc, degraded, reason = _run_ncu(
+        sample_kernel,
+        sample_workload,
+        _identity_input_generator,
+        timeout_s=10.0,
+        mode="curated",
+    )
+
+    assert degraded is True
+    assert reason == "ncu_disabled_via_env"
+    assert not count_path.exists() or count_path.read_text() == "", (
+        "ACTS_DISABLE_NCU=1 must skip the subprocess fork entirely"
+    )
+
+
+def test_acts_disable_ncu_env_var_truthy_variants(
+    fake_ncu_path, sample_kernel, sample_workload, monkeypatch
+):
+    """The env var accepts the standard truthy strings (1/true/yes/on,
+    case-insensitive). Anything else is treated as 'not set'."""
+    from src.eval import profiler as profiler_mod
+
+    install, _ = fake_ncu_path
+    install("exit 0\n")  # would succeed if reached
+
+    for truthy in ("1", "true", "TRUE", "yes", "Yes", "on"):
+        monkeypatch.setenv(profiler_mod._NCU_DISABLE_ENV, truthy)
+        _stdout, _rc, degraded, reason = _run_ncu(
+            sample_kernel,
+            sample_workload,
+            _identity_input_generator,
+            timeout_s=10.0,
+            mode="curated",
+        )
+        assert degraded is True, f"truthy='{truthy}' should disable NCU"
+        assert reason == "ncu_disabled_via_env"
+
+
+def test_acts_disable_ncu_env_var_falsy_does_not_skip(
+    fake_ncu_path, sample_kernel, sample_workload, monkeypatch
+):
+    """Empty / falsy values leave the auto-detect path active. We use
+    "0" — the env var is *opt-in*, not *opt-out-of-default*."""
+    from src.eval import profiler as profiler_mod
+
+    install, _ = fake_ncu_path
+    install("echo 'ok'\nexit 0\n")
+
+    monkeypatch.setenv(profiler_mod._NCU_DISABLE_ENV, "0")
+
+    stdout, rc, degraded, reason = _run_ncu(
+        sample_kernel,
+        sample_workload,
+        _identity_input_generator,
+        timeout_s=10.0,
+        mode="curated",
+    )
+
+    assert rc == 0
+    assert degraded is False
+    assert reason is None
+    assert "ok" in stdout
+
+
+# ── permanent-failure classifier unit tests ────────────────────────────────
+
+
+def test_classify_ncu_permanent_failure_recognizes_canonical_token():
+    from src.eval.profiler import _classify_ncu_permanent_failure
+
+    assert (
+        _classify_ncu_permanent_failure(
+            stderr="==ERROR== ERR_NVGPUCTRPERM: ...", stdout=""
+        )
+        == "nvgpuctrperm"
+    )
+
+
+def test_classify_ncu_permanent_failure_case_insensitive():
+    from src.eval.profiler import _classify_ncu_permanent_failure
+
+    assert (
+        _classify_ncu_permanent_failure(
+            stderr="err_nvgpuctrperm seen", stdout=""
+        )
+        == "nvgpuctrperm"
+    )
+
+
+def test_classify_ncu_permanent_failure_returns_none_for_transient():
+    from src.eval.profiler import _classify_ncu_permanent_failure
+
+    # Memory error and section-name typo are transient — operator can
+    # change the run config and retry; we should NOT flip the cache.
+    assert (
+        _classify_ncu_permanent_failure(
+            stderr="==ERROR== ProfilerReply error: Not enough memory", stdout=""
+        )
+        is None
+    )
+    assert (
+        _classify_ncu_permanent_failure(
+            stderr="==WARNING== Section 'Bogus' not found", stdout=""
+        )
+        is None
+    )
+
+
+def test_classify_ncu_permanent_failure_inspects_stdout_too():
+    """NCU sometimes writes the actionable error to stdout when --csv is
+    set (the CSV header is missing → the line operators see is the
+    error). Classifier must check both streams."""
+    from src.eval.profiler import _classify_ncu_permanent_failure
+
+    assert (
+        _classify_ncu_permanent_failure(
+            stderr="", stdout="ERR_NVGPUCTRPERM"
+        )
+        == "nvgpuctrperm"
+    )
