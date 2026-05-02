@@ -12,8 +12,36 @@ if TYPE_CHECKING:
 
     from src.config import HardwareSpec
     from src.eval.profiler import ProfilingResult
+    from src.eval.roofline import RooflineResult
     from src.eval.types import BottleneckType
     from src.search.orchestrator import SearchResult
+
+
+# Degraded-reason slug used when per-workload latency is missing /
+# non-positive / non-finite. Routes through the renderer's degraded
+# branch so analytical metrics are NOT fabricated from a mismatched
+# (latency, nbytes) pair.
+_DEGRADED_LATENCY_REASON = "per_workload_latency_missing"
+
+
+def _degraded_for_missing_latency() -> ProfilingResult:
+    """Build a ``ProfilingResult`` placeholder for a workload whose
+    per-workload latency is missing / invalid. The ``analytical`` field
+    is required by the dataclass; we zero it and rely on
+    ``degraded_reason`` to suppress the analytical line at render time.
+    Roofline data (AI / ridge / bottleneck) lives on a separate dict
+    and is still rendered for these workloads.
+    """
+    from src.eval.profiler import AnalyticalMetrics, ProfilingResult
+    return ProfilingResult.make_degraded(
+        AnalyticalMetrics(
+            achieved_tflops=0.0,
+            achieved_bandwidth_gb_s=0.0,
+            pct_peak_compute=0.0,
+            pct_peak_bandwidth=0.0,
+        ),
+        _DEGRADED_LATENCY_REASON,
+    )
 
 
 def _resolve_workload_roofline(
@@ -49,6 +77,12 @@ class OptimizationReport:
     ``winner_profiling_per_workload`` maps a workload UUID to the
     ``ProfilingResult`` captured by re-profiling the winning kernel on
     every selected workload.
+    ``winner_roofline_per_workload`` maps a workload UUID to its
+    ``RooflineResult`` (run-level invariants — ``arithmetic_intensity``
+    and ``ridge_point``, both in MACs/byte). Populated from the same
+    SOLAR call that fills ``winner_per_workload_bottlenecks`` so the
+    rendered report can surface AI / ridge_point alongside the
+    achieved-throughput numbers from the per-workload profile.
     """
 
     baseline_latency_us: float = 0.0
@@ -59,6 +93,7 @@ class OptimizationReport:
     bottleneck: BottleneckType | None = None
     winner_per_workload_bottlenecks: dict[str, BottleneckType] = field(default_factory=dict)
     winner_profiling_per_workload: dict[str, ProfilingResult] = field(default_factory=dict)
+    winner_roofline_per_workload: dict[str, RooflineResult] = field(default_factory=dict)
     remaining_headroom_pct: float = 0.0
     total_iterations: int = 0
     termination_reason: str = ""
@@ -127,16 +162,12 @@ def generate_report(
 
     per_workload_bottlenecks: dict[str, BottleneckType] = {}
     per_workload_profiling: dict[str, ProfilingResult] = {}
+    per_workload_roofline: dict[str, RooflineResult] = {}
     if workloads and hardware_spec is not None:
         do_reprofile = bool(input_generators)
         if do_reprofile:
             from src.eval.profiler import profile_kernel
 
-            aggregate_latency_s = (
-                best.score.candidate_latency_us / 1e6
-                if best.score is not None and best.score.candidate_latency_us > 0
-                else 1e-6
-            )
             per_workload_latency_us = best.per_workload_latency_us or {}
 
             if len(input_generators) != len(workloads):
@@ -163,16 +194,24 @@ def generate_report(
                 )
                 if solar is not None:
                     per_workload_bottlenecks[w.uuid] = solar.bottleneck
+                    # Capture the full RooflineResult so the renderer can
+                    # surface AI / ridge_point (run-level invariants in
+                    # MACs/byte) alongside the per-workload profile.
+                    per_workload_roofline[w.uuid] = solar
             if not do_reprofile:
                 continue
 
-            # Per-workload latency first (threaded from BenchmarkResult),
-            # falling back to the aggregate when the workload wasn't measured.
+            # Per-workload latency is required for analytical metrics. If
+            # missing / non-positive / non-finite, treat this workload as
+            # **degraded** rather than fabricating throughput numbers from
+            # the run-level aggregate latency (which belongs to a
+            # different workload's nbytes — see report.py history for the
+            # `bw 4839.4%` regression that motivated this).
             latency_us = per_workload_latency_us.get(w.uuid)
-            if latency_us is not None and latency_us > 0 and math.isfinite(latency_us):
-                latency_s = latency_us / 1e6
-            else:
-                latency_s = aggregate_latency_s
+            if latency_us is None or latency_us <= 0 or not math.isfinite(latency_us):
+                per_workload_profiling[w.uuid] = _degraded_for_missing_latency()
+                continue
+            latency_s = latency_us / 1e6
 
             # Default blob_roots to the problem dir when caller didn't
             # supply an override — same precedence as ``_load_problem``.
@@ -200,6 +239,7 @@ def generate_report(
             bottleneck=result.run_bottleneck,
             winner_per_workload_bottlenecks=per_workload_bottlenecks,
             winner_profiling_per_workload=per_workload_profiling,
+            winner_roofline_per_workload=per_workload_roofline,
             total_iterations=result.total_iterations,
             termination_reason=termination,
         )
@@ -212,6 +252,7 @@ def generate_report(
         bottleneck=result.run_bottleneck,
         winner_per_workload_bottlenecks=per_workload_bottlenecks,
         winner_profiling_per_workload=per_workload_profiling,
+        winner_roofline_per_workload=per_workload_roofline,
         remaining_headroom_pct=(1.0 - score.sol_score) * 100,
         total_iterations=result.total_iterations,
         termination_reason=termination,
@@ -254,7 +295,10 @@ def render_report(report: OptimizationReport) -> str:
         )
         lines.append(f"  Bottleneck (per workload): {per_workload}")
     if report.winner_profiling_per_workload:
-        lines.extend(_render_profiling_block(report.winner_profiling_per_workload))
+        lines.extend(_render_profiling_block(
+            report.winner_profiling_per_workload,
+            report.winner_roofline_per_workload,
+        ))
     if report.reward_hack_suspect:
         lines.append("  [AUDIT] reward_hack_suspect — candidate beats T_SOL (physics violation)")
     if report.calibration_warning:
@@ -264,11 +308,27 @@ def render_report(report: OptimizationReport) -> str:
 
 def _render_profiling_block(
     per_workload: dict[str, ProfilingResult],
+    per_workload_roofline: dict[str, RooflineResult] | None = None,
 ) -> list[str]:
     """Format the per-workload analytical + NCU block for the rendered
     report. Suppresses the NCU section when every entry is degraded
     with ``ncu_binary_not_found`` (common on CI without the ncu binary)
-    so the operator doesn't see a wall of DEGRADED notices."""
+    so the operator doesn't see a wall of DEGRADED notices.
+
+    AI / ridge_point are read from ``per_workload_roofline`` (run-level
+    invariants in MACs/byte) and rendered alongside the achieved-
+    throughput numbers from ``per_workload``. When no roofline is
+    available for a given workload UUID, the AI / ridge prefix is
+    omitted from that line.
+
+    Per-workload entries flagged with ``degraded_reason ==
+    _DEGRADED_LATENCY_REASON`` skip the analytical throughput line
+    entirely (TFLOPS / GB/s / pct_peak require a valid latency to be
+    meaningful) and render a ``[DEGRADED: ...]`` marker beneath the
+    roofline summary. Operators still see the workload + its roofline
+    classification, but no fabricated throughput numbers.
+    """
+    per_workload_roofline = per_workload_roofline or {}
     all_ncu_missing = all(
         p.ncu is None and p.degraded_reason == "ncu_binary_not_found"
         for p in per_workload.values()
@@ -277,23 +337,71 @@ def _render_profiling_block(
     lines: list[str] = ["  Winner profile (per workload):"]
     for uuid, p in per_workload.items():
         a = p.analytical
-        lines.append(
-            f"    [{uuid}] "
-            f"AI {a.arithmetic_intensity:.2f}, ridge {a.ridge_point:.2f}, "
-            f"{a.achieved_tflops:.2f} TFLOPS / {a.achieved_bandwidth_gb_s:.2f} GB/s "
-            f"(pct_peak: compute {a.pct_peak_compute * 100:.1f}% · "
-            f"bw {a.pct_peak_bandwidth * 100:.1f}%)"
-        )
+        rr = per_workload_roofline.get(uuid)
+        latency_missing = p.degraded_reason == _DEGRADED_LATENCY_REASON
+
+        if latency_missing:
+            # Per-workload latency was missing / invalid upstream — render
+            # roofline summary (independent of latency) but suppress the
+            # analytical throughput line. Fabricating TFLOPS / GB/s from a
+            # mismatched (latency, nbytes) pair was the root cause of the
+            # `bw 4839.4%` regression on workload 841b0afa.
+            if rr is not None:
+                lines.append(
+                    f"    [{uuid}] "
+                    f"AI {rr.arithmetic_intensity:.2f}, "
+                    f"ridge {rr.ridge_point:.2f}, "
+                    f"bottleneck={rr.bottleneck.value}"
+                )
+            else:
+                lines.append(f"    [{uuid}]")
+            lines.append(
+                "      [DEGRADED: missing per-workload latency — "
+                "analytical metrics suppressed]"
+            )
+        else:
+            # Happy path: render the analytical throughput line. Roofline
+            # prefix (AI / ridge) keeps the same shape it had before this
+            # rendering split — bottleneck is rendered run-level
+            # elsewhere, not inlined here.
+            roofline_prefix = (
+                f"AI {rr.arithmetic_intensity:.2f}, ridge {rr.ridge_point:.2f}, "
+                if rr is not None
+                else ""
+            )
+            lines.append(
+                f"    [{uuid}] "
+                f"{roofline_prefix}"
+                f"{a.achieved_tflops:.2f} TFLOPS / {a.achieved_bandwidth_gb_s:.2f} GB/s "
+                f"(pct_peak: compute {a.pct_peak_compute * 100:.1f}% · "
+                f"bw {a.pct_peak_bandwidth * 100:.1f}%)"
+            )
         if all_ncu_missing:
             continue
         if p.ncu is not None:
             n = p.ncu
+            # Stall values come from NCU's
+            # ``smsp__average_warp_latency_issue_stalled_<reason>.pct``
+            # metric. Despite the ``.pct`` suffix and NCU's ``%`` unit
+            # tag, the value is **not** a bounded percentage — it's the
+            # average warp-cycles-stalled per warp instruction issued,
+            # multiplied by 100. For deeply-stalled kernels values in
+            # the thousands or tens-of-thousands are normal (the
+            # golden fixture's ``imc_miss`` is 57,700; a real GPU run
+            # of rmsnorm produced 534,386 for ``long_scoreboard``).
+            # Rendering with a trailing ``%`` would mislead the
+            # operator into treating these as fractions of total
+            # stalls; show them as unitless ``cyc/inst×100`` instead.
+            # The relative ranking (dominant vs runner-up) is still
+            # the actionable signal.
             lines.append(
                 f"      NCU: occ {n.sm_occupancy_pct:.1f}% · "
                 f"L2 {n.l2_hit_rate_pct:.1f}% · "
                 f"TC {n.tensor_core_util_pct:.1f}% · "
-                f"top stalls {n.warp_stall_dominant} ({n.warp_stall_dominant_pct:.1f}%), "
-                f"{n.warp_stall_runner_up} ({n.warp_stall_runner_up_pct:.1f}%)"
+                f"top stalls {n.warp_stall_dominant} "
+                f"({n.warp_stall_dominant_pct:.1f} cyc/inst×100), "
+                f"{n.warp_stall_runner_up} "
+                f"({n.warp_stall_runner_up_pct:.1f} cyc/inst×100)"
             )
         elif p.degraded:
             lines.append(

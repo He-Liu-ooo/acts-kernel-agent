@@ -47,8 +47,6 @@ def _make_kernel(name: str = "root") -> Kernel:
 
 def _make_analytical() -> AnalyticalMetrics:
     return AnalyticalMetrics(
-        arithmetic_intensity=10.0,
-        ridge_point=20.0,
         achieved_tflops=1.0,
         achieved_bandwidth_gb_s=100.0,
         pct_peak_compute=0.1,
@@ -119,7 +117,6 @@ def harness():
     baseline = _make_kernel("root")
     roofline = RooflineResult(
         t_sol_us=50.0,
-        arithmetic_intensity=1.0,
         bottleneck=BottleneckType.MEMORY_BOUND,
     )
 
@@ -402,6 +399,11 @@ class TestReportWinnerReprofile:
             speedup=1.67,
         )
         child.profiling = _make_profile()
+        # Populate per-workload latencies so the re-profile loop has a
+        # measured latency to pair with each workload's nbytes — the
+        # renderer no longer fabricates a fallback from the aggregate
+        # (see report.py for the latency-missing degraded-sentinel path).
+        child.per_workload_latency_us = {"wl0": 60.0, "wl1": 60.0, "wl2": 60.0}
         search_result = SearchResult(
             best_node=child,
             total_iterations=1,
@@ -637,13 +639,21 @@ class TestReportUsesPerWorkloadLatency:
         latencies = [call.kwargs["latency_s"] for call in profile_fake.call_args_list]
         assert latencies == [40.0 / 1e6, 60.0 / 1e6, 100.0 / 1e6]
 
-    def test_reprofile_falls_back_to_aggregate_when_no_per_workload_dict(self, harness):
+    def test_reprofile_marks_degraded_when_no_per_workload_dict(self, harness):
         """Legacy checkpoint (or placeholder path): no per_workload_latency_us
-        on the node. The re-profile loop must fall back to the aggregate so
-        old trees still render."""
+        on the node. The re-profile loop must NOT call ``profile_kernel`` for
+        these workloads — falling back to the aggregate latency would pair
+        the wrong workload's nbytes with the wrong latency and produce
+        garbage analytical metrics (the historical `bw 4839.4%` regression
+        on workload 841b0afa). Each workload gets a degraded sentinel
+        instead, which the renderer surfaces with a [DEGRADED:...] marker.
+        """
         from sol_execbench.core.data import Workload
         from src.eval.scorer import ScoreResult
-        from src.pipeline.report import generate_report
+        from src.pipeline.report import (
+            _DEGRADED_LATENCY_REASON,
+            generate_report,
+        )
         from src.search.orchestrator import SearchResult, TerminationReason
         from src.search.tree import SearchTree
 
@@ -674,17 +684,23 @@ class TestReportUsesPerWorkloadLatency:
 
         profile_fake = MagicMock(return_value=_make_profile())
         with patch("src.eval.profiler.profile_kernel", profile_fake):
-            generate_report(
+            report = generate_report(
                 search_result,
                 workloads=workloads,
                 input_generators=gens,
                 hardware_spec=harness.config.hardware,
             )
 
-        assert profile_fake.call_count == 2
-        latencies = [call.kwargs["latency_s"] for call in profile_fake.call_args_list]
-        # Both calls fall back to the aggregate candidate_latency_us (60us).
-        assert latencies == [60.0 / 1e6, 60.0 / 1e6]
+        # No measured per-workload latency → no profile call. The
+        # renderer would otherwise pair aggregate latency with each
+        # workload's nbytes and lie about achieved bandwidth.
+        assert profile_fake.call_count == 0
+        # Each workload still appears in the per-workload dict, marked
+        # degraded so the renderer can show the roofline summary
+        # without fabricating analytical metrics.
+        assert set(report.winner_profiling_per_workload.keys()) == {"wl0", "wl1"}
+        for p in report.winner_profiling_per_workload.values():
+            assert p.degraded_reason == _DEGRADED_LATENCY_REASON
 
     def test_reprofile_forwards_problem_definition_path_when_problem_given(
         self, harness, tmp_path

@@ -275,3 +275,234 @@ class TestRenderReport:
         ))
         assert "reward" not in text.lower()
         assert "calibration" not in text.lower()
+
+
+class TestRenderProfilingBlock:
+    """Phase C ``Winner profile (per workload)`` rendering.
+
+    Regression tests for the rendered units in the per-workload profile
+    block. Two surfaces are easy to mis-render:
+
+    * ``pct_peak_compute`` / ``pct_peak_bandwidth`` are stored as
+      fractions in ``[0, 1]`` and the formatter multiplies by 100. The
+      formatter must not double-multiply, and must not silently emit
+      values way outside ``[0, ~150]`` (we allow some headroom for
+      L2-cache-amplified bandwidth on tiny working sets).
+    * NCU's stall metric ``smsp__average_warp_latency_issue_stalled_*.pct``
+      is **not** a bounded percentage despite the name. Values in the
+      thousands are normal. The formatter must not append ``%`` to it
+      (which would lie to the operator) — the unit suffix lives in the
+      format string explicitly.
+    """
+
+    def _make_profiling(
+        self,
+        *,
+        achieved_tflops: float = 50.0,
+        achieved_bandwidth_gb_s: float = 800.0,
+        pct_peak_compute: float = 0.6,
+        pct_peak_bandwidth: float = 0.85,
+        sm_occupancy_pct: float = 70.0,
+        l2_hit_rate_pct: float = 50.0,
+        tensor_core_util_pct: float = 0.0,
+        dominant_pct: float = 5343.86,
+        runner_up_pct: float = 2929.48,
+    ):
+        from src.eval.profiler import (
+            AnalyticalMetrics,
+            NCUMetrics,
+            ProfilingResult,
+        )
+        return ProfilingResult(
+            analytical=AnalyticalMetrics(
+                achieved_tflops=achieved_tflops,
+                achieved_bandwidth_gb_s=achieved_bandwidth_gb_s,
+                pct_peak_compute=pct_peak_compute,
+                pct_peak_bandwidth=pct_peak_bandwidth,
+            ),
+            ncu=NCUMetrics(
+                sm_occupancy_pct=sm_occupancy_pct,
+                l2_hit_rate_pct=l2_hit_rate_pct,
+                tensor_core_util_pct=tensor_core_util_pct,
+                warp_stall_dominant="long_scoreboard",
+                warp_stall_dominant_pct=dominant_pct,
+                warp_stall_runner_up="short_scoreboard",
+                warp_stall_runner_up_pct=runner_up_pct,
+            ),
+        )
+
+    def test_stalls_render_without_percent_sign(self):
+        """The NCU stall metric is unbounded (not a [0, 100] percentage).
+        Appending ``%`` would mislead the operator into reading
+        ``5343.86 cyc/inst×100`` as ``5343%`` of total stalls."""
+        text = render_report(OptimizationReport(
+            termination_reason="budget",
+            total_iterations=1,
+            winner_profiling_per_workload={
+                "wl-uuid": self._make_profiling(
+                    dominant_pct=534386.0,
+                    runner_up_pct=292948.1,
+                ),
+            },
+        ))
+        # The rendered stall pair must NOT carry a trailing ``%``
+        # character — it would imply the value is bounded.
+        assert "534386.0%" not in text
+        assert "292948.1%" not in text
+        # The unit suffix must make the metric's nature explicit.
+        assert "cyc/inst×100" in text
+        # Stall reasons themselves must still be rendered for the
+        # operator's bottleneck-attribution use case.
+        assert "long_scoreboard" in text
+        assert "short_scoreboard" in text
+
+    def _make_degraded_for_missing_latency(self):
+        """Sentinel ProfilingResult mirroring what generate_report
+        produces for a workload whose per-workload latency is missing.
+        Constructed via the renderer's own helper so the test cannot
+        drift from the production marker / shape."""
+        from src.pipeline.report import _degraded_for_missing_latency
+        return _degraded_for_missing_latency()
+
+    def _make_roofline(
+        self,
+        *,
+        ai: float = 1.5,
+        ridge: float = 32.0,
+        bottleneck=None,
+    ):
+        from src.eval.roofline import RooflineResult
+        from src.eval.types import BottleneckType
+        return RooflineResult(
+            t_sol_us=1.0,
+            bottleneck=bottleneck or BottleneckType.MEMORY_BOUND,
+            source="solar",
+            arithmetic_intensity=ai,
+            ridge_point=ridge,
+        )
+
+    def test_render_profiling_block_degrades_when_per_workload_latency_missing(self):
+        """When generate_report can't pair a workload with its measured
+        latency, it inserts the latency-missing sentinel. The renderer
+        must surface a DEGRADED marker, keep the roofline summary
+        visible, and emit no fabricated TFLOPS / GB/s / pct_peak line.
+        """
+        text = render_report(OptimizationReport(
+            termination_reason="budget",
+            total_iterations=1,
+            winner_profiling_per_workload={
+                "wl-uuid-missing": self._make_degraded_for_missing_latency(),
+            },
+            winner_roofline_per_workload={
+                "wl-uuid-missing": self._make_roofline(ai=2.5, ridge=64.0),
+            },
+        ))
+        assert "[DEGRADED:" in text
+        assert "missing per-workload latency" in text
+        # The fabricated-throughput line is the bug we are fixing — it
+        # must not be present for a degraded workload.
+        assert "TFLOPS" not in text
+        assert "GB/s" not in text
+        assert "pct_peak" not in text
+        # Roofline data is independent of latency and must still render.
+        assert "AI 2.50" in text
+        assert "ridge 64.00" in text
+        assert "memory_bound" in text
+
+    def test_render_profiling_block_degrades_on_non_finite_latency(self):
+        """Variant: non-finite per-workload latency goes through the
+        same degraded path as missing. This test exercises the rendered
+        output once the sentinel is in place — the upstream gating in
+        ``generate_report`` is what produces the sentinel for `inf` /
+        `nan`, and is exercised separately via the generate_report
+        path; here we lock the renderer behavior."""
+        text = render_report(OptimizationReport(
+            termination_reason="budget",
+            total_iterations=1,
+            winner_profiling_per_workload={
+                "wl-uuid-inf": self._make_degraded_for_missing_latency(),
+            },
+            winner_roofline_per_workload={
+                "wl-uuid-inf": self._make_roofline(),
+            },
+        ))
+        assert "[DEGRADED:" in text
+        assert "TFLOPS" not in text
+
+    def test_render_profiling_block_degrades_on_zero_latency(self):
+        """Same renderer behavior for the zero-latency case — caller
+        feeds the sentinel and the renderer suppresses analytical
+        output."""
+        text = render_report(OptimizationReport(
+            termination_reason="budget",
+            total_iterations=1,
+            winner_profiling_per_workload={
+                "wl-uuid-zero": self._make_degraded_for_missing_latency(),
+            },
+            winner_roofline_per_workload={
+                "wl-uuid-zero": self._make_roofline(),
+            },
+        ))
+        assert "[DEGRADED:" in text
+        assert "TFLOPS" not in text
+
+    def test_render_profiling_block_happy_path_unchanged(self):
+        """Sanity: the analytical TFLOPS / GB/s / pct_peak line still
+        renders for a workload with valid analytical metrics. Guards
+        against the degraded branch accidentally swallowing all entries.
+        """
+        text = render_report(OptimizationReport(
+            termination_reason="budget",
+            total_iterations=1,
+            winner_profiling_per_workload={
+                "wl-uuid-ok": self._make_profiling(
+                    achieved_tflops=12.5,
+                    achieved_bandwidth_gb_s=400.0,
+                    pct_peak_compute=0.5,
+                    pct_peak_bandwidth=0.4,
+                ),
+            },
+        ))
+        assert "12.50 TFLOPS" in text
+        assert "400.00 GB/s" in text
+        assert "pct_peak" in text
+        assert "[DEGRADED:" not in text
+
+    def test_pct_peak_compute_and_bw_are_in_sane_range(self):
+        """pct_peak fields are fractions in [0, 1] in the analytical
+        contract; the formatter multiplies by 100 once. With sane
+        analytical inputs the rendered values must stay in a plausible
+        range — drifting outside [0, 150] indicates a double-multiply
+        regression (e.g., the formatter being changed to read a value
+        already in [0, 100])."""
+        text = render_report(OptimizationReport(
+            termination_reason="budget",
+            total_iterations=1,
+            winner_profiling_per_workload={
+                "wl-uuid": self._make_profiling(
+                    pct_peak_compute=0.637,
+                    pct_peak_bandwidth=0.85,
+                ),
+            },
+        ))
+        # Spot-check the rendered values — 63.7% and 85.0% are the
+        # expected single-multiply outputs.
+        assert "63.7%" in text
+        assert "85.0%" in text
+        # Defensive: the rendered text must not contain a four-digit
+        # pct_peak (which is the smoking gun for either a measurement
+        # bug upstream OR a double-multiply in the formatter).
+        import re
+        for match in re.finditer(r"(\d+(?:\.\d+)?)%", text):
+            value = float(match.group(1))
+            # Allow occupancy / L2 / headroom up to 100; allow a small
+            # cushion above for L2-amplified bandwidth on tiny working
+            # sets (well-known measurement effect — DRAM traffic <
+            # nbytes when L2 hits dominate).
+            assert value <= 200.0, (
+                f"Rendered percentage {match.group(0)!r} exceeds 200%; "
+                "either the formatter double-multiplied a fraction or "
+                "the upstream measurement is corrupt (latency / nbytes "
+                "mismatch — see report.py:184 fallback to "
+                "aggregate_latency_s)."
+            )
