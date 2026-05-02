@@ -20,17 +20,15 @@ import sol_execbench  # noqa: F401 — load-bearing side effects (_ELAPSED_TIME_
 import asyncio
 import logging
 import os
+import signal
+import subprocess
 from dataclasses import replace
+from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from sol_execbench.core.bench.clock_lock import (
-    lock_clocks,
-    probe_clock_lock_available,
-    unlock_clocks,
-    verify_clocks,
-)
-from sol_execbench.core.bench.config.device_config import get_clock_preset
+from sol_execbench.core.bench.clock_lock import probe_clock_lock_available
+from sol_execbench.core.bench.config.device_config import ClockPreset, get_clock_preset
 
 from src.config import HardwareSpec
 
@@ -53,6 +51,222 @@ DEFAULT_MODEL_CONFIG_PATH = Path("configs/models/deepseek.json")
 # idempotent so a second call (atexit + finally) is harmless.
 _clock_lock_state: dict[str, object] = {"locked": False, "device_name": ""}
 
+# ACTS uses cuda:0 by default. SOL's ``lock_clocks`` runs nvidia-smi
+# without ``-i <idx>``, which applies to *all* GPUs on the host — on
+# multi-GPU dev boxes that pins clocks on devices ACTS isn't using. We
+# scope every nvidia-smi invocation to GPU 0 here. Future: read from
+# CUDA_VISIBLE_DEVICES.
+_GPU_INDEX = "0"
+
+
+def _nvidia_smi(
+    *args: str, capture_output: bool = True,
+) -> subprocess.CompletedProcess[str] | None:
+    """Run ``sudo -n nvidia-smi <args> -i _GPU_INDEX``, capturing output.
+
+    Returns the ``CompletedProcess`` on success (return code 0) or
+    ``None`` on any failure (``CalledProcessError``, ``FileNotFoundError``,
+    subprocess raised). Centralizes the GPU-0 scoping suffix and the
+    failure-mode swallowing so individual call sites stay short.
+    """
+    cmd = ["sudo", "-n", "nvidia-smi", *args, "-i", _GPU_INDEX]
+    try:
+        return subprocess.run(
+            cmd, check=True, capture_output=capture_output, text=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+
+
+class ClockLockReason(StrEnum):
+    """Closed-vocabulary reasons emitted by ``clock_lock_unavailable``.
+
+    Exception-derived reasons stay free-form (e.g. ``f"verify_raised:{exc}"``);
+    ``_emit_clock_unavailable`` accepts either form.
+    """
+
+    OK = "ok"
+    PROBE_RETURNED_FALSE = "probe_returned_false"
+    NO_PRESET = "no_preset"
+    LOCK_FAILED = "lock_failed"
+    VERIFY_FAILED = "verify_failed"
+    UNKNOWN = "unknown"
+
+
+def _emit_clock_unavailable(device: str, reason: ClockLockReason | str) -> None:
+    """Centralizes the ``clock_lock_unavailable`` event emit shape.
+
+    Accepts either a closed-vocabulary ``ClockLockReason`` or a free-form
+    string (for exception-derived reasons like ``"verify_raised:..."`` or
+    ``"lock_raised:<exc>"``).
+    """
+    from src.runtime.events import emit
+
+    emit("clock_lock_unavailable", device=device, reason=str(reason))
+
+
+def _rollback_partial_lock(device_name: str, reason: ClockLockReason | str) -> None:
+    """Roll back a partially-acquired GPU clock lock and emit the
+    unavailability event.
+
+    Used on the verify-failure paths (verify returned False, or verify
+    raised) so the rollback shape doesn't diverge.
+    """
+    try:
+        _unlock_gpu0_clocks()
+    except Exception as exc:
+        logger.warning(
+            "Rollback _unlock_gpu0_clocks failed for %s: %s. Manual "
+            "recovery: python -m src.pipeline.optimize --reset-clocks",
+            device_name, exc,
+        )
+    _emit_clock_unavailable(device_name, reason)
+
+# ACTS-side clock preset table — consulted before SOL's. Lets ACTS lock
+# clocks on cards SOL doesn't ship presets for (workstation + Pro cards
+# like Ada). Substring match against device_name; first hit wins.
+#
+# Value choice for RTX 6000 Ada: 2505 MHz GPU (the design-boost target
+# from the datasheet) and 10001 MHz memory (the only supported memory
+# clock per nvidia-smi -q -d SUPPORTED_CLOCKS on this card). 2505 also
+# matches configs/arch/RTX6000Ada.yaml's freq_GHz=2.505 so SOLAR T_SOL
+# stays calibrated against the locked clock.
+#
+# This is *more aggressive* than SOL's philosophy (SOL pins A100 at
+# 1065 / boost 1410 ≈ 75% of boost, prioritizing thermal stability over
+# perf). For workstation cards on a single-tenant dev box without
+# sustained 100%-utilization workloads, design-boost is reasonable.
+# Future entries that target multi-tenant or sustained-load envs may
+# want SOL-style conservative values.
+_ACTS_CLOCK_PRESETS: dict[str, ClockPreset] = {
+    "RTX 6000 Ada": ClockPreset(gpu_clk_mhz=2505, dram_clk_mhz=10001),
+}
+
+
+def _resolve_clock_preset(device_name: str) -> ClockPreset | None:
+    """ACTS-first preset lookup with SOL fallback.
+
+    Checks ACTS's table first (covers workstation + Pro cards SOL omits).
+    If no match, defers to SOL's ``get_clock_preset`` (datacenter-focused:
+    B200 / H100 / A100). Returns None if neither has a preset, in which
+    case ``_try_acquire_clock_lock`` emits clock_lock_unavailable with
+    reason="no_preset" and the run continues with unlocked clocks.
+
+    Substring match against device_name to mirror SOL's contract.
+    """
+    for key, preset in _ACTS_CLOCK_PRESETS.items():
+        if key in device_name:
+            return preset
+    return get_clock_preset(device_name)
+
+
+def _lock_gpu0_clocks(gpu_mhz: int, dram_mhz: int) -> bool:
+    """Lock GPU + DRAM clocks on GPU 0 only.
+
+    Returns True on success, False on any failure (preserving the
+    return contract of SOL's ``lock_clocks``). Logs warnings via the
+    module logger. If the DRAM lock fails after the GPU lock landed,
+    rolls back the GPU lock so we don't leave a partial-lock state.
+    """
+    if _nvidia_smi("-lgc", f"{gpu_mhz},{gpu_mhz}") is None:
+        logger.warning("Failed to lock GPU clocks on GPU %s", _GPU_INDEX)
+        return False
+    if _nvidia_smi("-lmc", f"{dram_mhz},{dram_mhz}") is None:
+        logger.warning("Failed to lock DRAM clocks on GPU %s", _GPU_INDEX)
+        # Roll back the GPU-clock lock so we don't leave a partial-lock state.
+        _nvidia_smi("-rgc")
+        return False
+    return True
+
+
+def _verify_gpu0_locked(
+    expected_gpu_mhz: int, expected_dram_mhz: int, tolerance_mhz: int = 50,
+) -> bool:
+    """Verify GPU 0's clocks landed at the locked values.
+
+    SOL's ``verify_clocks`` is unfit for this host for two reasons:
+
+    (H1) ``-lgc`` sets the GPU's *application* clock — the frequency the
+    card runs at *while busy*. When idle, RTX 6000 Ada drops to ~210 MHz
+    regardless of the lock; reading ``clocks.current.graphics`` right
+    after the lock subprocess returns therefore sees the idle clock and
+    reports drift, even though the lock is in force.
+
+    (H2) SOL's ``verify_clocks`` queries every GPU on the host (no
+    ``-i <idx>``) and requires *all* of them to be within tolerance. On
+    multi-GPU dev boxes that fails the moment any other GPU is busy or
+    locked elsewhere — even though ACTS only ever locks GPU 0.
+
+    The fix here is symmetric with ``_lock_gpu0_clocks``: (1) wake GPU 0
+    with a single small kernel launch so the current clock reflects the
+    locked target, then (2) query nvidia-smi *for GPU 0 only* and compare
+    with a tolerance. Returns False on any subprocess / parse failure;
+    callers in ``_try_acquire_clock_lock`` treat False as drift and roll
+    back the partial lock.
+
+    Wake-up is a tiny FP32 add on a 32-element tensor + a synchronize —
+    well under 1ms of GPU work, less than the lock subprocess overhead.
+    Failure to import torch or run the wake op is non-fatal: we still
+    issue the nvidia-smi query (it'll most likely report idle clocks and
+    return False, which is the correct conservative outcome).
+    """
+    try:
+        import torch
+        x = torch.zeros(32, device=f"cuda:{_GPU_INDEX}")
+        x = x + 1.0
+        torch.cuda.synchronize(int(_GPU_INDEX))
+    except Exception as exc:
+        # Wake-up is best-effort: if torch/cuda glitched, the verify
+        # below will read idle clocks and (correctly) return False, so
+        # the caller rolls back the partial lock — degraded mode, not a
+        # phantom locked-state.
+        logger.warning("GPU %s wake-op for verify failed: %s", _GPU_INDEX, exc)
+
+    result = _nvidia_smi(
+        "--query-gpu=clocks.current.graphics,clocks.current.memory",
+        "--format=csv,noheader,nounits",
+    )
+    if result is None:
+        logger.warning("nvidia-smi clock query failed for GPU %s", _GPU_INDEX)
+        return False
+
+    line = result.stdout.strip().splitlines()[0] if result.stdout.strip() else ""
+    parts = line.split(",")
+    if len(parts) < 2:
+        logger.warning("Unexpected nvidia-smi output for GPU %s: %r", _GPU_INDEX, line)
+        return False
+    try:
+        actual_gpu = int(parts[0].strip())
+        actual_dram = int(parts[1].strip())
+    except ValueError:
+        logger.warning("Could not parse nvidia-smi output for GPU %s: %r", _GPU_INDEX, line)
+        return False
+
+    if abs(actual_gpu - expected_gpu_mhz) > tolerance_mhz:
+        logger.warning(
+            "GPU %s graphics-clock mismatch — expected %d MHz, got %d MHz",
+            _GPU_INDEX, expected_gpu_mhz, actual_gpu,
+        )
+        return False
+    if abs(actual_dram - expected_dram_mhz) > tolerance_mhz:
+        logger.warning(
+            "GPU %s memory-clock mismatch — expected %d MHz, got %d MHz",
+            _GPU_INDEX, expected_dram_mhz, actual_dram,
+        )
+        return False
+    return True
+
+
+def _unlock_gpu0_clocks() -> None:
+    """Unlock GPU + DRAM clocks on GPU 0 only.
+
+    Idempotent at the nvidia-smi level — calling -rgc / -rmc on an
+    already-unlocked GPU is harmless. Used both by the normal cleanup
+    path and by the ``--reset-clocks`` operator escape hatch.
+    """
+    _nvidia_smi("-rgc")
+    _nvidia_smi("-rmc")
+
 
 def _unlock_clocks_safe() -> None:
     """Idempotent unlock for atexit + finally — swallows all exceptions.
@@ -64,14 +278,34 @@ def _unlock_clocks_safe() -> None:
     if not _clock_lock_state["locked"]:
         return
     try:
-        unlock_clocks()
+        _unlock_gpu0_clocks()
     except Exception as exc:
         logger.error(
-            "Failed to unlock GPU clocks for %s: %s. Manual recovery: nvidia-smi -rgc",
+            "Failed to unlock GPU clocks for %s: %s. Manual recovery: "
+            "python -m src.pipeline.optimize --reset-clocks "
+            "(or: sudo nvidia-smi -rgc -i 0 && sudo nvidia-smi -rmc -i 0)",
             _clock_lock_state["device_name"], exc,
         )
     finally:
         _clock_lock_state["locked"] = False
+
+
+def _signal_unlock_handler(signum: int, frame) -> None:  # noqa: ARG001 — frame required by signal protocol
+    """Best-effort unlock on SIGTERM / SIGHUP, then propagate the signal.
+
+    ``atexit`` does NOT fire on uncaught signals (SIGTERM from
+    ``kill <pid>`` / systemd, SIGHUP from SSH session drop), so we'd
+    otherwise leak a clock lock. After unlocking we restore the default
+    disposition for *signum* and re-raise it via ``os.kill`` rather than
+    calling ``sys.exit`` — that preserves the conventional signal-class
+    exit code (128 + signum) for shells / process supervisors.
+
+    Not registered for SIGINT: KeyboardInterrupt → ``atexit`` already
+    cleans up Ctrl-C cleanly, and a custom handler would interfere.
+    """
+    _unlock_clocks_safe()
+    signal.signal(signum, signal.SIG_DFL)
+    os.kill(os.getpid(), signum)
 
 
 class UnknownBenchmarkFormat(RuntimeError):
@@ -90,14 +324,14 @@ class UnknownBenchmarkFormat(RuntimeError):
 # run produces representative roofline math.
 _PLACEHOLDER_HARDWARE_SPEC = HardwareSpec(
     name="placeholder-RTX6000Ada",
-    freq_GHz=2.5,
-    SRAM_capacity=98_304 * 1024,
-    SRAM_byte_per_cycle=4000.0,
-    DRAM_capacity=48 * 1024**3,
-    DRAM_byte_per_cycle=384.0,
-    MAC_per_cycle_fp32_sm=12_800.0,
-    MAC_per_cycle_fp16_tc=512_000.0,
-    MAC_per_cycle_bf16_tc=512_000.0,
+    freq_GHz=2.505,
+    SRAM_capacity=100_663_296,        # 96 MiB L2
+    SRAM_byte_per_cycle=2200.0,       # ~5.5 TB/s @ 2.505 GHz
+    DRAM_capacity=51_539_607_552,     # 48 GiB GDDR6 ECC
+    DRAM_byte_per_cycle=383.0,        # 960 GB/s / 2.505 GHz
+    MAC_per_cycle_fp32_sm=18_185.0,   # 91.1 TFLOPS
+    MAC_per_cycle_fp16_tc=72_695.0,   # 364.2 TFLOPS dense
+    MAC_per_cycle_bf16_tc=72_695.0,   # 364.2 TFLOPS dense
 )
 
 
@@ -278,6 +512,7 @@ async def _load_sol_problem(
     reconstruct the (unpicklable) input generator.
     """
     from src.benchmark.baseline_generator import generate_triton_baseline
+    from src.benchmark.solar_adapter import is_solar_available
     from src.benchmark.workload_selector import select_workloads
     # ``load`` is re-exported as a function from
     # ``src/benchmarks/sol_execbench/__init__.py``; bind it directly so
@@ -285,6 +520,27 @@ async def _load_sol_problem(
     from src.benchmarks.sol_execbench import load as sol_load
     from src.eval.inputs import build_input_generator, build_reference_fn
     from src.eval.roofline import derive_t_sol_from_solar
+
+    # Fail-fast: SOL-ExecBench problems leave ``KernelSpec.flop_count`` /
+    # ``memory_bytes`` at zero — the per-workload roofline math is
+    # populated later via ``compute_roofline_inputs(definition, workload)``.
+    # That means the orchestrator's built-in ``compute_roofline(spec, hw)``
+    # fallback (which fires when ``derive_t_sol_from_solar`` returns
+    # ``None``) silently produces ``t_sol_us=0.0``, corrupting every SOL
+    # score with no visible diagnostic. Rather than papering over a
+    # broken installation at score time, refuse to load the problem so
+    # the operator sees the actionable install hint immediately.
+    if not is_solar_available():
+        raise RuntimeError(
+            "SOLAR is required for SOL-ExecBench problems but is not "
+            "importable. T_SOL would silently fall back to 0.0 (zero "
+            "flop_count / memory_bytes on SOL kernel specs), corrupting "
+            "every score. Install SOLAR + torchview into the run venv:\n"
+            "    VIRTUAL_ENV=/tmp/acts_run_venv uv pip install torchview\n"
+            "    VIRTUAL_ENV=/tmp/acts_run_venv uv pip install \\\n"
+            "        -e /path/to/SOLAR --no-deps\n"
+            "See configs/venvs/3.12.md for the canonical recipe."
+        )
 
     definition, all_workloads = sol_load(problem_dir)
     definition_path = problem_dir / "definition.json"
@@ -468,7 +724,24 @@ def main(argv: list[str] | None = None) -> None:
             "value (``--trace-dir=``) to disable capture entirely."
         ),
     )
+    parser.add_argument(
+        "--reset-clocks",
+        action="store_true",
+        help=(
+            "Operator escape hatch for SIGKILL / segfault recovery: reset "
+            "GPU 0 application clocks and exit immediately. Does not run "
+            "the optimization pipeline."
+        ),
+    )
     args = parser.parse_args(argv)
+
+    # Reset-clocks short-circuit: skip the entire pipeline (no RunContext,
+    # no model load, no optimize call) and just clear any sticky lock that
+    # a prior crashed run left behind.
+    if args.reset_clocks:
+        _unlock_gpu0_clocks()
+        print(f"GPU {_GPU_INDEX} clocks reset.")
+        return
 
     # Trace-dir tri-state mapped onto RunContext: ``--trace-dir=`` is
     # the kill switch; any other value (or its absence) is handed to
@@ -488,6 +761,12 @@ def main(argv: list[str] | None = None) -> None:
     # ``probe + lock`` happens after ``run_start`` so the event log opens
     # with the canonical run boundary.
     atexit.register(_unlock_clocks_safe)
+    # ``atexit`` does NOT fire on SIGTERM (kill <pid>, systemd) or SIGHUP
+    # (SSH session drop) — install best-effort signal handlers so those
+    # paths also unlock before the process dies. SIGINT is intentionally
+    # not handled: KeyboardInterrupt → atexit already covers Ctrl-C.
+    signal.signal(signal.SIGTERM, _signal_unlock_handler)
+    signal.signal(signal.SIGHUP, _signal_unlock_handler)
 
     model_configured = _is_model_configured()
     emit(
@@ -544,8 +823,6 @@ def _try_acquire_clock_lock() -> None:
     ``clock_lock_unavailable`` event and continue. Never raises — clock
     locking is a stability optimization, not a correctness gate.
     """
-    from src.runtime.events import emit
-
     try:
         import torch
     except Exception:
@@ -558,44 +835,85 @@ def _try_acquire_clock_lock() -> None:
         return
     _clock_lock_state["device_name"] = device_name
 
-    if not probe_clock_lock_available():
-        logger.warning(
-            "Clock-lock unavailable (no sudo or unsupported GPU); "
-            "expect timing variance"
+    # SOL's ``probe_clock_lock_available()`` currently returns a bare ``bool``
+    # (see SOL-ExecBench's ``core/bench/clock_lock.py``), but its docstring
+    # hints a ``(bool, str)`` tuple variant may land upstream. Handle both
+    # shapes defensively so a future SOL bump doesn't silently break here,
+    # and synthesize a ``reason`` string when the bare-bool form gives us
+    # nothing — the event log needs *why* the probe failed.
+    probe_result = probe_clock_lock_available()
+    if isinstance(probe_result, tuple):
+        ok = bool(probe_result[0])
+        reason: ClockLockReason | str = (
+            str(probe_result[1]) if len(probe_result) > 1 else ClockLockReason.UNKNOWN
         )
-        emit("clock_lock_unavailable", device=device_name)
+    else:
+        ok = bool(probe_result)
+        reason = ClockLockReason.OK if ok else ClockLockReason.PROBE_RETURNED_FALSE
+    if not ok:
+        logger.warning(
+            "Clock-lock unavailable (%s); expect timing variance", reason,
+        )
+        _emit_clock_unavailable(device_name, reason)
+        return
+
+    preset = _resolve_clock_preset(device_name)
+    if preset is None:
+        logger.warning(
+            "No clock preset for %s — skipping clock lock", device_name,
+        )
+        _emit_clock_unavailable(device_name, ClockLockReason.NO_PRESET)
         return
 
     try:
-        locked = lock_clocks(device_name)
+        locked = _lock_gpu0_clocks(preset.gpu_clk_mhz, preset.dram_clk_mhz)
     except Exception as exc:  # never let a clock-lock hiccup kill the run
-        logger.warning("lock_clocks failed for %s: %s", device_name, exc)
-        emit("clock_lock_unavailable", device=device_name, reason=str(exc)[:120])
+        logger.warning("_lock_gpu0_clocks failed for %s: %s", device_name, exc)
+        _emit_clock_unavailable(device_name, str(exc)[:120])
         return
     if not locked:
         logger.warning(
-            "lock_clocks returned False for %s — preset missing or partial unlock",
+            "_lock_gpu0_clocks returned False for %s — partial lock rolled back",
             device_name,
         )
-        emit("clock_lock_unavailable", device=device_name, reason="lock_failed")
+        _emit_clock_unavailable(device_name, ClockLockReason.LOCK_FAILED)
         return
 
-    # Verify the actual clocks landed where we asked. ``lock_clocks``
-    # already calls ``verify_clocks`` internally and returns False on
-    # mismatch, so this is a belt-and-braces second pass for visibility.
-    preset = get_clock_preset(device_name)
-    if preset is not None:
-        try:
-            verified = verify_clocks(preset.gpu_clk_mhz, preset.dram_clk_mhz)
-            if not verified:
-                logger.warning(
-                    "verify_clocks reported drift on %s after lock", device_name,
-                )
-        except Exception as exc:
-            logger.warning("verify_clocks raised: %s", exc)
+    # Verify the actual clocks landed where we asked. We use
+    # ``_verify_gpu0_locked`` (ACTS-side wrapper) instead of SOL's
+    # ``verify_clocks`` because the latter (a) reads the *current*
+    # graphics clock — which on an idle GPU drops to ~210 MHz regardless
+    # of the lock, producing false-negatives — and (b) queries every GPU
+    # on the host without ``-i <idx>``, so multi-GPU dev boxes fail the
+    # check whenever any other GPU is busy or pinned elsewhere. Our
+    # wrapper wakes GPU 0 with a tiny kernel launch, then queries
+    # nvidia-smi scoped to GPU 0, mirroring the GPU-0-only lock above.
+    # Verification failure (drift detected or exception) is treated as
+    # lock-acquisition failure: roll back the partial pin so we don't
+    # leave the GPU clamped to a wrong/drifting frequency, emit
+    # ``clock_lock_unavailable`` with a meaningful ``reason``, and return
+    # *before* flipping ``_clock_lock_state`` — downstream plateau/scoring
+    # logic must see unlocked clocks (the correct degraded-mode signal),
+    # not a phantom locked-state.
+    try:
+        verified = _verify_gpu0_locked(preset.gpu_clk_mhz, preset.dram_clk_mhz)
+    except Exception as exc:
+        logger.warning(
+            "verify_clocks raised on %s — rolling back partial lock: %s",
+            device_name, exc,
+        )
+        _rollback_partial_lock(device_name, f"verify_raised:{str(exc)[:120]}")
+        return
+    if not verified:
+        logger.warning(
+            "verify_clocks reported drift on %s — rolling back partial lock",
+            device_name,
+        )
+        _rollback_partial_lock(device_name, ClockLockReason.VERIFY_FAILED)
+        return
 
     _clock_lock_state["locked"] = True
-    logger.info("GPU clocks locked for %s", device_name)
+    logger.info("GPU clocks locked for %s (GPU %s)", device_name, _GPU_INDEX)
 
 
 if __name__ == "__main__":

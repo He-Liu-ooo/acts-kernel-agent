@@ -68,6 +68,7 @@ async def test_load_problem_returns_reference_fn_and_all_generators():
             "src.pipeline.optimize._definition_to_kernel_spec", return_value=spec,
         ),
         patch("src.benchmark.workload_selector.select_workloads", return_value=workloads),
+        patch("src.benchmark.solar_adapter.is_solar_available", return_value=True),
         patch("src.eval.roofline.derive_t_sol_from_solar", return_value=None),
         patch(
             "src.benchmark.baseline_generator.generate_triton_baseline",
@@ -134,6 +135,7 @@ async def test_load_problem_forwards_arch_config_path_to_solar():
             "src.pipeline.optimize._definition_to_kernel_spec", return_value=spec,
         ),
         patch("src.benchmark.workload_selector.select_workloads", return_value=workloads),
+        patch("src.benchmark.solar_adapter.is_solar_available", return_value=True),
         patch("src.eval.roofline.derive_t_sol_from_solar", side_effect=_capture),
         patch(
             "src.benchmark.baseline_generator.generate_triton_baseline",
@@ -183,6 +185,7 @@ async def test_load_problem_passes_none_when_arch_config_path_empty():
             "src.pipeline.optimize._definition_to_kernel_spec", return_value=spec,
         ),
         patch("src.benchmark.workload_selector.select_workloads", return_value=workloads),
+        patch("src.benchmark.solar_adapter.is_solar_available", return_value=True),
         patch("src.eval.roofline.derive_t_sol_from_solar", side_effect=_capture),
         patch(
             "src.benchmark.baseline_generator.generate_triton_baseline",
@@ -199,6 +202,93 @@ async def test_load_problem_passes_none_when_arch_config_path_empty():
         )
 
     assert captured["arch_yaml_path"] is None
+
+
+@pytest.mark.asyncio
+async def test_load_sol_problem_fails_fast_when_solar_unavailable():
+    """SOL-ExecBench problems leave ``KernelSpec.flop_count`` /
+    ``memory_bytes`` at zero — the orchestrator's built-in
+    ``compute_roofline`` fallback (which fires when SOLAR returns
+    ``None``) silently produces ``t_sol_us=0.0``, corrupting every
+    score with no visible diagnostic. The adapter must refuse to load
+    the problem so the operator sees the actionable install hint
+    immediately, not at score-emit time.
+
+    Regression for the 2026-04-30 live-run bug where every
+    ``score_computed`` event reported ``t_sol_source="builtin"`` and
+    ``t_sol_us=0.0`` because SOLAR was missing from the run venv."""
+    config = ACTSConfig(benchmark_adapter="sol_execbench")
+
+    with patch(
+        "src.benchmark.solar_adapter.is_solar_available", return_value=False
+    ):
+        with pytest.raises(RuntimeError, match=r"SOLAR is required"):
+            await _load_problem(Path("/fake"), config, MagicMock())
+
+
+@pytest.mark.asyncio
+async def test_load_sol_problem_threads_solar_source_into_roofline():
+    """Regression: when SOLAR succeeds, the ``RooflineResult`` returned
+    to the orchestrator must carry ``source="solar"`` so the per-iter
+    ``score_computed`` event reports the correct provenance.
+
+    Together with the fail-fast test above, this pins the two halves of
+    the live-run bug: (1) SOLAR-absent must not silently land on
+    ``builtin`` + ``t_sol_us=0.0``; (2) SOLAR-present must thread
+    ``source="solar"`` end-to-end."""
+    from sol_execbench.core.data import Definition, Workload
+
+    from src.eval.roofline import BottleneckType, RooflineResult
+
+    definition = Definition.model_validate({
+        "name": "p",
+        "axes": {"N": {"type": "var"}},
+        "inputs": {"x": {"shape": ["N"], "dtype": "float32"}},
+        "outputs": {"y": {"shape": ["N"], "dtype": "float32"}},
+        "reference": "def run(x): return x\n",
+    })
+    workloads = [
+        Workload.model_validate({"uuid": "w1", "axes": {"N": 8}, "inputs": {}})
+    ]
+    spec = _spec()
+    baseline = Kernel(spec=spec, source_code="src")
+
+    solar_roofline = RooflineResult(
+        t_sol_us=12.5,
+        bottleneck=BottleneckType.MEMORY_BOUND,
+        source="solar",
+    )
+
+    config = ACTSConfig(benchmark_adapter="sol_execbench")
+
+    with (
+        patch(
+            "src.benchmarks.sol_execbench.load",
+            return_value=(definition, workloads),
+        ),
+        patch(
+            "src.pipeline.optimize._definition_to_kernel_spec", return_value=spec,
+        ),
+        patch("src.benchmark.workload_selector.select_workloads", return_value=workloads),
+        patch("src.benchmark.solar_adapter.is_solar_available", return_value=True),
+        patch(
+            "src.eval.roofline.derive_t_sol_from_solar",
+            return_value=solar_roofline,
+        ),
+        patch(
+            "src.benchmark.baseline_generator.generate_triton_baseline",
+            new_callable=AsyncMock,
+            return_value=baseline,
+        ),
+        patch("src.eval.inputs.build_reference_fn", return_value=lambda x: x),
+        patch("src.eval.inputs.build_input_generator", return_value=lambda s: ()),
+    ):
+        result = await _load_problem(Path("/fake"), config, MagicMock())
+
+    _baseline, _definition, _workloads, roofline, *_rest = result
+    assert roofline is solar_roofline
+    assert roofline.source == "solar"
+    assert roofline.t_sol_us == 12.5
 
 
 @pytest.mark.asyncio
@@ -867,13 +957,13 @@ def test_main_emits_clock_lock_unavailable_when_probe_fails(tmp_path, monkeypatc
         patch.object(opt_mod, "optimize", side_effect=fake_optimize),
         patch("src.agents.llm_backend._SDK_AVAILABLE", False),
         patch.object(opt_mod, "probe_clock_lock_available", return_value=False),
-        patch.object(opt_mod, "lock_clocks") as mock_lock,
+        patch.object(opt_mod, "_lock_gpu0_clocks") as mock_lock,
         patch("src.pipeline.report.generate_report", return_value=MagicMock()),
         patch("src.pipeline.report.render_report", return_value=""),
     ):
         opt_mod.main(["placeholder", "--run-dir", str(tmp_path / "runs")])
 
-    # lock_clocks must NOT be called when the probe fails.
+    # _lock_gpu0_clocks must NOT be called when the probe fails.
     mock_lock.assert_not_called()
     rd = next((tmp_path / "runs").glob("run_*"))
     lines = [
@@ -885,11 +975,176 @@ def test_main_emits_clock_lock_unavailable_when_probe_fails(tmp_path, monkeypatc
     assert "clock_lock_unavailable" in kinds, kinds
 
 
+def test_clock_lock_unavailable_event_includes_reason_when_probe_returns_bare_false():
+    """Regression: SOL's ``probe_clock_lock_available()`` returns a bare
+    ``bool`` today, not a ``(bool, str)`` tuple. When it returns ``False``,
+    the ``clock_lock_unavailable`` event must still carry a synthesized
+    ``reason`` field so post-run analysis sees *why* clock locking was
+    skipped — earlier code dropped the reason and emitted only ``device``.
+    """
+    from src.pipeline import optimize as opt_mod
+
+    fake_torch = MagicMock()
+    fake_torch.cuda.is_available.return_value = True
+    fake_torch.cuda.device_count.return_value = 1
+    fake_torch.cuda.get_device_name.return_value = "FakeGPU"
+
+    with (
+        patch.dict("sys.modules", {"torch": fake_torch}),
+        patch.object(opt_mod, "probe_clock_lock_available", return_value=False),
+        patch("src.runtime.events.emit") as mock_emit,
+    ):
+        opt_mod._try_acquire_clock_lock()
+
+    # Find the clock_lock_unavailable emit call.
+    matching = [
+        c for c in mock_emit.call_args_list
+        if c.args and c.args[0] == "clock_lock_unavailable"
+    ]
+    assert len(matching) == 1, mock_emit.call_args_list
+    kwargs = matching[0].kwargs
+    assert kwargs.get("device") == "FakeGPU"
+    assert kwargs.get("reason") == "probe_returned_false", kwargs
+
+
+def test_clock_lock_unavailable_event_handles_tuple_probe_return():
+    """Defensive: if a future SOL release lands a ``(bool, str)`` tuple
+    return shape for ``probe_clock_lock_available()`` (its docstring hints
+    at this), ACTS must unpack it and forward the SOL-supplied reason
+    string into the event payload — not crash on tuple-vs-bool unpacking
+    and not synthesize a generic placeholder."""
+    from src.pipeline import optimize as opt_mod
+
+    fake_torch = MagicMock()
+    fake_torch.cuda.is_available.return_value = True
+    fake_torch.cuda.device_count.return_value = 1
+    fake_torch.cuda.get_device_name.return_value = "FakeGPU"
+
+    with (
+        patch.dict("sys.modules", {"torch": fake_torch}),
+        patch.object(
+            opt_mod,
+            "probe_clock_lock_available",
+            return_value=(False, "custom reason"),
+        ),
+        patch("src.runtime.events.emit") as mock_emit,
+    ):
+        opt_mod._try_acquire_clock_lock()
+
+    matching = [
+        c for c in mock_emit.call_args_list
+        if c.args and c.args[0] == "clock_lock_unavailable"
+    ]
+    assert len(matching) == 1, mock_emit.call_args_list
+    assert matching[0].kwargs.get("reason") == "custom reason"
+
+
+def test_try_acquire_clock_lock_rolls_back_on_verify_false():
+    """Regression: when ``_lock_gpu0_clocks`` succeeds but ``verify_clocks``
+    reports drift (``False``), the lock attempt must be treated as a
+    *failure* — roll back the partial pin via ``_unlock_gpu0_clocks``,
+    emit ``clock_lock_unavailable`` with ``reason='verify_failed'``, and
+    leave ``_clock_lock_state['locked']`` as ``False``. The earlier
+    behavior swallowed the drift warning and still flipped
+    ``locked=True``, which let plateau/scoring logic proceed as if
+    clocks were pinned even though verification proved otherwise.
+    """
+    from src.pipeline import optimize as opt_mod
+
+    # Reset module-global state so prior tests don't leak in.
+    opt_mod._clock_lock_state["locked"] = False
+    opt_mod._clock_lock_state["device_name"] = ""
+
+    fake_torch = MagicMock()
+    fake_torch.cuda.is_available.return_value = True
+    fake_torch.cuda.device_count.return_value = 1
+    fake_torch.cuda.get_device_name.return_value = "FakeGPU"
+    fake_preset = MagicMock(gpu_clk_mhz=2505, dram_clk_mhz=10001)
+
+    with (
+        patch.dict("sys.modules", {"torch": fake_torch}),
+        patch.object(opt_mod, "probe_clock_lock_available", return_value=True),
+        patch.object(opt_mod, "get_clock_preset", return_value=fake_preset),
+        patch.object(opt_mod, "_lock_gpu0_clocks", return_value=True),
+        patch.object(opt_mod, "_verify_gpu0_locked", return_value=False),
+        patch.object(opt_mod, "_unlock_gpu0_clocks") as mock_unlock,
+        patch("src.runtime.events.emit") as mock_emit,
+    ):
+        opt_mod._try_acquire_clock_lock()
+
+    # Rollback fired exactly once.
+    assert mock_unlock.call_count == 1
+    # Event emitted with the verify_failed reason.
+    matching = [
+        c for c in mock_emit.call_args_list
+        if c.args and c.args[0] == "clock_lock_unavailable"
+    ]
+    assert len(matching) == 1, mock_emit.call_args_list
+    kwargs = matching[0].kwargs
+    assert kwargs.get("device") == "FakeGPU"
+    assert kwargs.get("reason") == "verify_failed", kwargs
+    # locked-state must remain False.
+    assert opt_mod._clock_lock_state["locked"] is False
+
+
+def test_try_acquire_clock_lock_rolls_back_on_verify_exception():
+    """Regression: when ``verify_clocks`` *raises*, ACTS must treat that
+    the same as drift — roll back the partial pin, emit
+    ``clock_lock_unavailable`` with a ``reason`` that starts with
+    ``verify_raised:`` and carries a snippet of the exception message,
+    and leave ``_clock_lock_state['locked']`` False. The earlier
+    behavior logged a warning and then unconditionally flipped
+    ``locked=True``, hiding a real driver-level disagreement from
+    downstream consumers.
+    """
+    from src.pipeline import optimize as opt_mod
+
+    # Reset module-global state so prior tests don't leak in.
+    opt_mod._clock_lock_state["locked"] = False
+    opt_mod._clock_lock_state["device_name"] = ""
+
+    fake_torch = MagicMock()
+    fake_torch.cuda.is_available.return_value = True
+    fake_torch.cuda.device_count.return_value = 1
+    fake_torch.cuda.get_device_name.return_value = "FakeGPU"
+    fake_preset = MagicMock(gpu_clk_mhz=2505, dram_clk_mhz=10001)
+
+    with (
+        patch.dict("sys.modules", {"torch": fake_torch}),
+        patch.object(opt_mod, "probe_clock_lock_available", return_value=True),
+        patch.object(opt_mod, "get_clock_preset", return_value=fake_preset),
+        patch.object(opt_mod, "_lock_gpu0_clocks", return_value=True),
+        patch.object(
+            opt_mod, "_verify_gpu0_locked",
+            side_effect=RuntimeError("driver disagrees"),
+        ),
+        patch.object(opt_mod, "_unlock_gpu0_clocks") as mock_unlock,
+        patch("src.runtime.events.emit") as mock_emit,
+    ):
+        opt_mod._try_acquire_clock_lock()
+
+    # Rollback fired exactly once.
+    assert mock_unlock.call_count == 1
+    # Event emitted with a verify_raised:* reason that carries exception text.
+    matching = [
+        c for c in mock_emit.call_args_list
+        if c.args and c.args[0] == "clock_lock_unavailable"
+    ]
+    assert len(matching) == 1, mock_emit.call_args_list
+    kwargs = matching[0].kwargs
+    assert kwargs.get("device") == "FakeGPU"
+    reason = kwargs.get("reason", "")
+    assert reason.startswith("verify_raised:"), reason
+    assert "driver disagrees" in reason, reason
+    # locked-state must remain False.
+    assert opt_mod._clock_lock_state["locked"] is False
+
+
 def test_main_unlocks_clocks_on_normal_exit(tmp_path, monkeypatch):
-    """On normal exit, ``main()`` must call ``unlock_clocks`` exactly once
-    via the ``finally`` path. The atexit registration is a safety net for
-    abnormal exits; the explicit call ensures unlock happens before the
-    interpreter teardown."""
+    """On normal exit, ``main()`` must call ``_unlock_gpu0_clocks`` at
+    least once via the ``finally`` path. The atexit registration is a
+    safety net for abnormal exits; the explicit call ensures unlock
+    happens before the interpreter teardown."""
     from src.pipeline import optimize as opt_mod
 
     monkeypatch.chdir(tmp_path)
@@ -897,13 +1152,16 @@ def test_main_unlocks_clocks_on_normal_exit(tmp_path, monkeypatch):
     async def fake_optimize(problem_path, config=None):
         return MagicMock(), MagicMock()
 
+    fake_preset = MagicMock(gpu_clk_mhz=2505, dram_clk_mhz=10001)
+
     with (
         patch.object(opt_mod, "optimize", side_effect=fake_optimize),
         patch("src.agents.llm_backend._SDK_AVAILABLE", False),
         patch.object(opt_mod, "probe_clock_lock_available", return_value=True),
-        patch.object(opt_mod, "lock_clocks", return_value=True),
-        patch.object(opt_mod, "verify_clocks", return_value=True),
-        patch.object(opt_mod, "unlock_clocks") as mock_unlock,
+        patch.object(opt_mod, "get_clock_preset", return_value=fake_preset),
+        patch.object(opt_mod, "_lock_gpu0_clocks", return_value=True),
+        patch.object(opt_mod, "_verify_gpu0_locked", return_value=True),
+        patch.object(opt_mod, "_unlock_gpu0_clocks") as mock_unlock,
         patch("src.pipeline.report.generate_report", return_value=MagicMock()),
         patch("src.pipeline.report.render_report", return_value=""),
     ):
@@ -924,13 +1182,16 @@ def test_main_unlocks_clocks_when_optimize_raises(tmp_path, monkeypatch):
     async def raising_optimize(problem_path, config=None):
         raise RuntimeError("boom")
 
+    fake_preset = MagicMock(gpu_clk_mhz=2505, dram_clk_mhz=10001)
+
     with (
         patch.object(opt_mod, "optimize", side_effect=raising_optimize),
         patch("src.agents.llm_backend._SDK_AVAILABLE", False),
         patch.object(opt_mod, "probe_clock_lock_available", return_value=True),
-        patch.object(opt_mod, "lock_clocks", return_value=True),
-        patch.object(opt_mod, "verify_clocks", return_value=True),
-        patch.object(opt_mod, "unlock_clocks") as mock_unlock,
+        patch.object(opt_mod, "get_clock_preset", return_value=fake_preset),
+        patch.object(opt_mod, "_lock_gpu0_clocks", return_value=True),
+        patch.object(opt_mod, "_verify_gpu0_locked", return_value=True),
+        patch.object(opt_mod, "_unlock_gpu0_clocks") as mock_unlock,
     ):
         with pytest.raises(RuntimeError, match="boom"):
             opt_mod.main(["placeholder", "--run-dir", str(tmp_path / "runs")])
@@ -940,16 +1201,276 @@ def test_main_unlocks_clocks_when_optimize_raises(tmp_path, monkeypatch):
 
 def test_unlock_clocks_safe_is_idempotent():
     """``_unlock_clocks_safe`` swallows exceptions and clears the flag so
-    a second call is a no-op even if unlock_clocks raises on the first."""
+    a second call is a no-op even if the underlying unlock raises on the
+    first call."""
     from src.pipeline import optimize as opt_mod
 
     opt_mod._clock_lock_state["locked"] = True
     opt_mod._clock_lock_state["device_name"] = "TestGPU"
-    with patch.object(opt_mod, "unlock_clocks", side_effect=RuntimeError("nope")):
+    with patch.object(
+        opt_mod, "_unlock_gpu0_clocks", side_effect=RuntimeError("nope"),
+    ):
         # First call: unlock raises but we swallow it; flag is cleared.
         opt_mod._unlock_clocks_safe()
     assert opt_mod._clock_lock_state["locked"] is False
     # Second call: flag cleared, no-op.
-    with patch.object(opt_mod, "unlock_clocks") as mock_unlock:
+    with patch.object(opt_mod, "_unlock_gpu0_clocks") as mock_unlock:
         opt_mod._unlock_clocks_safe()
         mock_unlock.assert_not_called()
+
+
+# ── GPU-0-scoped clock lock helpers ────────────────────────────────────
+
+
+def test_lock_gpu0_clocks_issues_two_scoped_subprocess_calls():
+    """``_lock_gpu0_clocks`` must invoke ``nvidia-smi`` twice — once for
+    -lgc (graphics clock) and once for -lmc (memory clock) — and both
+    invocations must carry ``-i 0`` so the lock applies to GPU 0 only,
+    not to every GPU on the host."""
+    from src.pipeline import optimize as opt_mod
+
+    with patch.object(opt_mod, "subprocess") as mock_sp:
+        # Default MagicMock return is a successful CompletedProcess-like.
+        mock_sp.CalledProcessError = __import__("subprocess").CalledProcessError
+        ok = opt_mod._lock_gpu0_clocks(2505, 10001)
+
+    assert ok is True
+    assert mock_sp.run.call_count == 2
+    first_args = mock_sp.run.call_args_list[0].args[0]
+    second_args = mock_sp.run.call_args_list[1].args[0]
+    assert first_args == [
+        "sudo", "-n", "nvidia-smi", "-lgc", "2505,2505", "-i", "0",
+    ]
+    assert second_args == [
+        "sudo", "-n", "nvidia-smi", "-lmc", "10001,10001", "-i", "0",
+    ]
+
+
+def test_unlock_gpu0_clocks_issues_two_scoped_subprocess_calls():
+    """``_unlock_gpu0_clocks`` must invoke ``nvidia-smi`` twice — once for
+    -rgc and once for -rmc — both scoped to ``-i 0`` so we never reset
+    application clocks on GPUs ACTS isn't using."""
+    from src.pipeline import optimize as opt_mod
+
+    with patch.object(opt_mod, "subprocess") as mock_sp:
+        opt_mod._unlock_gpu0_clocks()
+
+    assert mock_sp.run.call_count == 2
+    first_args = mock_sp.run.call_args_list[0].args[0]
+    second_args = mock_sp.run.call_args_list[1].args[0]
+    assert first_args == ["sudo", "-n", "nvidia-smi", "-rgc", "-i", "0"]
+    assert second_args == ["sudo", "-n", "nvidia-smi", "-rmc", "-i", "0"]
+
+
+def test_lock_gpu0_clocks_rolls_back_on_dram_failure():
+    """If the DRAM lock (``-lmc``) fails after the GPU clock lock
+    (``-lgc``) succeeded, ``_lock_gpu0_clocks`` must (a) return False
+    and (b) issue a ``-rgc -i 0`` call to roll the GPU lock back —
+    otherwise we'd leave a half-locked GPU."""
+    import subprocess as real_subprocess
+
+    from src.pipeline import optimize as opt_mod
+
+    def run_side_effect(cmd, **_kwargs):
+        # First call: -lgc succeeds. Second: -lmc fails. Third: -rgc rollback.
+        if "-lmc" in cmd:
+            raise real_subprocess.CalledProcessError(
+                returncode=1, cmd=cmd, stderr=b"locked",
+            )
+        return MagicMock()  # CompletedProcess stand-in
+
+    with patch.object(opt_mod, "subprocess") as mock_sp:
+        mock_sp.CalledProcessError = real_subprocess.CalledProcessError
+        mock_sp.run.side_effect = run_side_effect
+        ok = opt_mod._lock_gpu0_clocks(2505, 10001)
+
+    assert ok is False
+    # Three calls: lgc (ok), lmc (raise), rgc rollback.
+    assert mock_sp.run.call_count == 3
+    rollback_cmd = mock_sp.run.call_args_list[2].args[0]
+    assert rollback_cmd == ["sudo", "-n", "nvidia-smi", "-rgc", "-i", "0"]
+
+
+# ── ACTS-side verify wrapper ──────────────────────────────────────────
+
+
+def test_verify_gpu0_locked_returns_true_when_clocks_match():
+    """``_verify_gpu0_locked`` must return True when nvidia-smi reports
+    current graphics + memory clocks within tolerance of the expected
+    values. The wake-op (a tiny torch kernel launch) is mocked away —
+    we're testing the parse + compare logic, not torch."""
+    from src.pipeline import optimize as opt_mod
+
+    fake_torch = MagicMock()
+    fake_completed = MagicMock()
+    fake_completed.stdout = "2505, 10001\n"
+
+    with (
+        patch.dict("sys.modules", {"torch": fake_torch}),
+        patch.object(opt_mod.subprocess, "run", return_value=fake_completed) as mock_run,
+    ):
+        ok = opt_mod._verify_gpu0_locked(2505, 10001)
+
+    assert ok is True
+    # The nvidia-smi query must be scoped to GPU 0 (mirroring the
+    # GPU-0-only lock) — that's the H2 fix.
+    cmd = mock_run.call_args.args[0]
+    assert "-i" in cmd and cmd[cmd.index("-i") + 1] == "0", cmd
+    assert "nvidia-smi" in cmd
+    assert "--query-gpu=clocks.current.graphics,clocks.current.memory" in cmd
+
+
+def test_verify_gpu0_locked_returns_false_when_clocks_drift_beyond_tolerance():
+    """When nvidia-smi reports a current clock outside the 50-MHz
+    tolerance band, ``_verify_gpu0_locked`` must return False so the
+    caller rolls back the partial lock. This is the H1 false-negative
+    case we used to silently accept (idle GPU at 210 MHz vs locked
+    target 2505 MHz)."""
+    from src.pipeline import optimize as opt_mod
+
+    fake_torch = MagicMock()
+    fake_completed = MagicMock()
+    # Idle clock: 210 MHz graphics, target was 2505 — well outside tolerance.
+    fake_completed.stdout = "210, 10001\n"
+
+    with (
+        patch.dict("sys.modules", {"torch": fake_torch}),
+        patch.object(opt_mod.subprocess, "run", return_value=fake_completed),
+    ):
+        ok = opt_mod._verify_gpu0_locked(2505, 10001)
+
+    assert ok is False
+
+
+def test_verify_gpu0_locked_returns_false_on_subprocess_error():
+    """If nvidia-smi fails (CalledProcessError, FileNotFoundError),
+    ``_verify_gpu0_locked`` must return False rather than raising —
+    callers treat False as drift and roll back the partial lock, which
+    is the correct conservative outcome when we can't read the clocks."""
+    import subprocess as real_subprocess
+
+    from src.pipeline import optimize as opt_mod
+
+    fake_torch = MagicMock()
+
+    with (
+        patch.dict("sys.modules", {"torch": fake_torch}),
+        patch.object(
+            opt_mod.subprocess, "run",
+            side_effect=real_subprocess.CalledProcessError(returncode=1, cmd="x"),
+        ),
+    ):
+        ok = opt_mod._verify_gpu0_locked(2505, 10001)
+
+    assert ok is False
+
+
+def test_signal_unlock_handler_unlocks_then_propagates():
+    """The SIGTERM/SIGHUP handler must (1) call ``_unlock_clocks_safe``,
+    (2) restore the default disposition for the signal, and (3) re-raise
+    the signal via ``os.kill`` so the process dies with the conventional
+    signal-class exit code (128 + signum) rather than via ``sys.exit``."""
+    import signal as real_signal
+
+    from src.pipeline import optimize as opt_mod
+
+    with (
+        patch.object(opt_mod, "_unlock_clocks_safe") as mock_unlock,
+        patch.object(opt_mod.signal, "signal") as mock_sig,
+        patch.object(opt_mod.os, "kill") as mock_kill,
+        patch.object(opt_mod.os, "getpid", return_value=12345),
+    ):
+        opt_mod._signal_unlock_handler(real_signal.SIGTERM, None)
+
+    mock_unlock.assert_called_once()
+    # Default disposition must be restored for the specific signal.
+    mock_sig.assert_called_once_with(real_signal.SIGTERM, real_signal.SIG_DFL)
+    # Re-raise via os.kill against this pid.
+    mock_kill.assert_called_once_with(12345, real_signal.SIGTERM)
+
+
+# ── ACTS-first clock preset resolution ────────────────────────────────
+
+
+def test_resolve_clock_preset_acts_table_hits_for_rtx_6000_ada():
+    """ACTS's table covers workstation + Pro cards SOL omits. RTX 6000
+    Ada must resolve to the design-boost values (2505 / 10001) so
+    clock-lock activates on the dev host instead of falling through to
+    ``no_preset``."""
+    from sol_execbench.core.bench.config.device_config import ClockPreset
+
+    from src.pipeline.optimize import _resolve_clock_preset
+
+    result = _resolve_clock_preset("NVIDIA RTX 6000 Ada Generation")
+    assert result == ClockPreset(gpu_clk_mhz=2505, dram_clk_mhz=10001)
+
+
+def test_resolve_clock_preset_falls_through_to_sol_for_h100():
+    """When the ACTS table misses, SOL's ``get_clock_preset`` is
+    consulted. H100 is in SOL's table → returns the SOL preset
+    (gpu_clk_mhz=1410); we don't assert the exact dram value to keep
+    the test loosely coupled to SOL's internal numbers."""
+    from src.pipeline.optimize import _resolve_clock_preset
+
+    result = _resolve_clock_preset("NVIDIA H100 PCIe")
+    assert result is not None
+    assert result.gpu_clk_mhz == 1410
+
+
+def test_resolve_clock_preset_returns_none_for_unknown_device():
+    """Both ACTS and SOL tables miss → None propagates so the caller
+    emits ``clock_lock_unavailable`` with ``reason='no_preset'`` and
+    continues with unlocked clocks."""
+    from src.pipeline.optimize import _resolve_clock_preset
+
+    assert _resolve_clock_preset("Made-Up GPU Model") is None
+
+
+def test_resolve_clock_preset_acts_table_takes_precedence():
+    """Defensive: ACTS-first ordering means a colliding key in ACTS's
+    table shadows SOL's value. No current entry collides, but the
+    contract is worth pinning so future overrides behave predictably."""
+    from sol_execbench.core.bench.config.device_config import ClockPreset
+
+    from src.pipeline import optimize as opt_mod
+
+    fake_table = {
+        "NVIDIA H100": ClockPreset(gpu_clk_mhz=9999, dram_clk_mhz=8888),
+    }
+    with patch.object(opt_mod, "_ACTS_CLOCK_PRESETS", fake_table):
+        result = opt_mod._resolve_clock_preset("NVIDIA H100 PCIe")
+
+    assert result is not None
+    assert result.gpu_clk_mhz == 9999, (
+        "ACTS table entry must shadow SOL's H100 preset (1410)"
+    )
+
+
+def test_main_reset_clocks_short_circuits_pipeline(tmp_path, monkeypatch, capsys):
+    """``--reset-clocks`` is the operator escape hatch for the SIGKILL /
+    segfault case: it must reset GPU 0 clocks and exit immediately,
+    without creating a RunContext, loading a model, or invoking
+    ``asyncio.run(optimize(...))``."""
+    from src.pipeline import optimize as opt_mod
+
+    monkeypatch.chdir(tmp_path)
+
+    with (
+        patch.object(opt_mod, "subprocess") as mock_sp,
+        patch("src.runtime.run_context.RunContext.create") as mock_rc_create,
+        patch.object(opt_mod.asyncio, "run") as mock_async_run,
+    ):
+        opt_mod.main(["--reset-clocks"])
+
+    # Two subprocess calls: -rgc + -rmc, both scoped to GPU 0.
+    assert mock_sp.run.call_count == 2
+    rgc_cmd = mock_sp.run.call_args_list[0].args[0]
+    rmc_cmd = mock_sp.run.call_args_list[1].args[0]
+    assert rgc_cmd == ["sudo", "-n", "nvidia-smi", "-rgc", "-i", "0"]
+    assert rmc_cmd == ["sudo", "-n", "nvidia-smi", "-rmc", "-i", "0"]
+    # No pipeline side effects.
+    mock_rc_create.assert_not_called()
+    mock_async_run.assert_not_called()
+    # Confirmation line on stdout.
+    captured = capsys.readouterr()
+    assert "GPU 0 clocks reset." in captured.out
