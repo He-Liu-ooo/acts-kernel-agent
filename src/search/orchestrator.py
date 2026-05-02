@@ -375,6 +375,13 @@ class Orchestrator:
             per_workload_latency_us=_per_workload_us(baseline_bench),
         )
 
+        # Children get per_workload_latency_us from their bench at L784;
+        # root needs the same so Phase C re-profile can use it when no
+        # child beats baseline (root becomes ``best_node``). Without this,
+        # report.py degrades every winner workload as
+        # ``per_workload_latency_missing``.
+        root.per_workload_latency_us = baseline_bench.per_workload_latency_us
+
         if roofline is None:
             roofline = compute_roofline(baseline.spec, self._config.hardware)
 

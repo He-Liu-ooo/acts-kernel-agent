@@ -576,11 +576,10 @@ class TestPerWorkloadLatencyPersistedOnNode:
         children = [n for n in result.tree._nodes.values() if n.parent_id is not None]
         assert len(children) == 1
         assert children[0].per_workload_latency_us == {"wl0": 55.0, "wl1": 80.0}
-        # Root never benchmarked a child via the iteration loop — its field
-        # stays ``None`` (baseline bench is a separate call; we don't
-        # persist it on the root to match the existing profiling=None
-        # convention for the root).
-        assert result.tree.get_node(0).per_workload_latency_us is None
+        # Root carries the baseline benchmark's per-workload dict so Phase C
+        # re-profile can use it when baseline is the winner (no child beat
+        # baseline).
+        assert result.tree.get_node(0).per_workload_latency_us == {"wl0": 100.0, "wl1": 110.0}
 
 
 class TestReportUsesPerWorkloadLatency:
@@ -638,6 +637,73 @@ class TestReportUsesPerWorkloadLatency:
         assert profile_fake.call_count == 3
         latencies = [call.kwargs["latency_s"] for call in profile_fake.call_args_list]
         assert latencies == [40.0 / 1e6, 60.0 / 1e6, 100.0 / 1e6]
+
+    @pytest.mark.asyncio
+    async def test_reprofile_uses_root_per_workload_latency_when_baseline_wins(
+        self, harness
+    ):
+        # Plateau termination → no child beat baseline → ``best_node()``
+        # returns the root. The orchestrator must persist the baseline's
+        # per-workload dict on the root so Phase C re-profile can use it;
+        # without that, every winner workload renders as
+        # ``[DEGRADED: per_workload_latency_missing]``.
+        from sol_execbench.core.data import Workload
+        from src.pipeline.report import (
+            _DEGRADED_LATENCY_REASON,
+            generate_report,
+        )
+        from src.search.orchestrator import Orchestrator
+
+        workloads = [
+            Workload.model_validate({"uuid": "wl0", "axes": {}, "inputs": {}}),
+            Workload.model_validate({"uuid": "wl1", "axes": {}, "inputs": {}}),
+        ]
+        baseline_bench = BenchmarkResult(
+            median_latency_us=100.0,
+            timed_runs=1,
+            per_workload_latency_us={"wl0": 100.0, "wl1": 110.0},
+        )
+        # Child slower than baseline → no improvement → best_node stays root.
+        child_bench = BenchmarkResult(
+            median_latency_us=200.0,
+            timed_runs=1,
+            per_workload_latency_us={"wl0": 200.0, "wl1": 210.0},
+        )
+        input_generators = [lambda seed: (), lambda seed: ()]
+
+        profile_fake = MagicMock(return_value=_make_profile())
+        with (
+            patch(
+                "src.eval.benchmark.benchmark_kernel",
+                side_effect=[baseline_bench, child_bench],
+            ),
+            patch("src.eval.profiler.profile_kernel", profile_fake),
+        ):
+            orch = Orchestrator(
+                harness.config, harness.planner, harness.coder,
+                harness.reviewer, harness.retriever,
+            )
+            search_result = await orch.run(
+                harness.baseline,
+                workloads=workloads,
+                roofline=harness.roofline,
+                input_generators=input_generators,
+            )
+
+            # Sanity: root really is the winner (no child beat it).
+            assert search_result.best_node.id == 0
+
+            report = generate_report(
+                search_result,
+                workloads=workloads,
+                input_generators=input_generators,
+                hardware_spec=harness.config.hardware,
+            )
+
+        # Each workload was actually re-profiled, not degraded-skipped.
+        assert set(report.winner_profiling_per_workload.keys()) == {"wl0", "wl1"}
+        for p in report.winner_profiling_per_workload.values():
+            assert p.degraded_reason != _DEGRADED_LATENCY_REASON
 
     def test_reprofile_marks_degraded_when_no_per_workload_dict(self, harness):
         """Legacy checkpoint (or placeholder path): no per_workload_latency_us
