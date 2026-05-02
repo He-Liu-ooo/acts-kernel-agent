@@ -4,10 +4,27 @@ from __future__ import annotations
 
 import configparser
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+
+# ── ACTS-supplied arch YAML registry (single source of truth) ─────────
+#
+# Maps a hardware name (as either the YAML stem or the runtime-detected
+# ``torch.cuda.get_device_properties().name``) to the YAML file that
+# describes its peak throughput tables. ``solar_adapter._resolve_arch_config``
+# re-exports this — do not duplicate the mapping. New GPUs: drop a YAML
+# under ``configs/arch/`` and register every detected-name spelling here.
+_ACTS_ARCH_DIR = Path(__file__).resolve().parent.parent / "configs" / "arch"
+_ADA_YAML = _ACTS_ARCH_DIR / "RTX6000Ada.yaml"
+
+_ACTS_ARCH_YAMLS: dict[str, Path] = {
+    "RTX6000Ada": _ADA_YAML,
+    "NVIDIA RTX 6000 Ada Generation": _ADA_YAML,
+    "placeholder-RTX6000Ada": _ADA_YAML,
+}
 
 
 @dataclass(frozen=True)
@@ -50,17 +67,17 @@ class HardwareSpec:
     @property
     def peak_flops_fp32(self) -> float:
         """Peak FP32 throughput in TFLOPS (CUDA cores)."""
-        return self.MAC_per_cycle_fp32_sm * self.freq_GHz * 2 / 1e6
+        return self.MAC_per_cycle_fp32_sm * self.freq_GHz * 2 / 1e3
 
     @property
     def peak_flops_bf16(self) -> float:
         """Peak BF16 throughput in TFLOPS (Tensor Cores)."""
-        return self.MAC_per_cycle_bf16_tc * self.freq_GHz * 2 / 1e6
+        return self.MAC_per_cycle_bf16_tc * self.freq_GHz * 2 / 1e3
 
     @property
     def peak_flops_fp16(self) -> float:
         """Peak FP16 throughput in TFLOPS (Tensor Cores)."""
-        return self.MAC_per_cycle_fp16_tc * self.freq_GHz * 2 / 1e6
+        return self.MAC_per_cycle_fp16_tc * self.freq_GHz * 2 / 1e3
 
 
 def load_hardware_spec(path: Path) -> HardwareSpec:
@@ -199,17 +216,42 @@ def load_config(path: Path) -> ACTSConfig:
     return ACTSConfig(**kwargs)
 
 
+def _lookup_arch_yaml(detected_name: str) -> Path | None:
+    """Return the configs/arch YAML registered for *detected_name*, or None.
+
+    The lookup is exact-match against ``_ACTS_ARCH_YAMLS`` — every spelling
+    of a hardware name (the YAML stem and each ``torch.cuda`` reports) must
+    be registered explicitly. Returns ``None`` when no YAML is registered
+    or when the registered file is missing on disk.
+    """
+    yaml_path = _ACTS_ARCH_YAMLS.get(detected_name)
+    if yaml_path is None or not yaml_path.exists():
+        return None
+    return yaml_path
+
+
 def detect_hardware() -> HardwareSpec:
     """Detect GPU hardware via ``torch.cuda`` and return a HardwareSpec.
 
-    **Best-effort, partial spec.** Populates only the runtime-knowable
-    fields (``name``, ``freq_GHz``, ``SRAM_capacity``, ``DRAM_capacity``).
-    Per-precision throughput tables (``MAC_per_cycle_*``) and bandwidth
-    coefficients (``DRAM_byte_per_cycle``, ``SRAM_byte_per_cycle``) stay
-    at zero — those depend on architecture details ``torch.cuda`` cannot
-    infer (boost-clock vs base-clock, tensor-core configurations, memory
-    subsystem peak vs effective). For real ``T_SOL`` / roofline math,
-    callers must load a SOLAR arch YAML via ``load_hardware_spec()``.
+    **Two-stage detection.** First populate the runtime-knowable fields
+    (``name``, ``freq_GHz``, ``SRAM_capacity``, ``DRAM_capacity``) from
+    ``torch.cuda.get_device_properties``. Then, if the detected name is
+    registered in ``_ACTS_ARCH_YAMLS`` and the YAML exists, merge the
+    YAML's per-precision throughput tables (``MAC_per_cycle_*``) and
+    bandwidth coefficients (``DRAM_byte_per_cycle``, ``SRAM_byte_per_cycle``)
+    onto the detected fields. The runtime fields (name/freq/capacities)
+    win on conflict — those are ground truth from the live device — but
+    any zero-valued runtime field gets back-filled by the YAML.
+
+    The merge means a populated arch YAML for the running GPU produces a
+    fully-populated ``HardwareSpec`` here, so callers don't need a separate
+    ``arch_config_path`` round-trip and the placeholder-substitution path
+    in ``pipeline/optimize.py`` doesn't kick in (which would otherwise
+    swap in ``placeholder-RTX6000Ada`` and skip SOLAR's roofline).
+
+    ``validate_hardware_spec`` runs against (YAML, detected) and any
+    mismatch is logged at WARNING — never raised — so a stale YAML
+    catches operator attention without breaking the load path.
 
     Returns a fully-zeroed ``HardwareSpec`` (matches the no-config
     placeholder) when:
@@ -238,11 +280,41 @@ def detect_hardware() -> HardwareSpec:
     except Exception:
         return HardwareSpec()
 
-    return HardwareSpec(
+    detected = HardwareSpec(
         name=props.name,
         freq_GHz=props.clock_rate / 1_000_000,  # kHz → GHz
         SRAM_capacity=props.L2_cache_size,
         DRAM_capacity=props.total_memory,
+    )
+
+    yaml_path = _lookup_arch_yaml(detected.name)
+    if yaml_path is None:
+        # Unregistered GPU — caller falls through to the placeholder path
+        # downstream. Don't log here: many test paths exercise zero-peak
+        # detection deliberately.
+        return detected
+
+    try:
+        yaml_spec = load_hardware_spec(yaml_path)
+    except Exception as exc:
+        logger.warning(
+            "detect_hardware: arch YAML %s for %r failed to load (%s) — "
+            "returning runtime-only spec; placeholder substitution will engage",
+            yaml_path, detected.name, exc,
+        )
+        return detected
+
+    for msg in validate_hardware_spec(yaml_spec, detected):
+        logger.warning("detect_hardware: %s (yaml=%s)", msg, yaml_path)
+
+    # Merge: runtime ground-truth wins for name/freq/capacities; YAML fills
+    # in throughput tables + per-cycle bandwidths that torch.cuda can't see.
+    return replace(
+        yaml_spec,
+        name=detected.name or yaml_spec.name,
+        freq_GHz=detected.freq_GHz or yaml_spec.freq_GHz,
+        SRAM_capacity=detected.SRAM_capacity or yaml_spec.SRAM_capacity,
+        DRAM_capacity=detected.DRAM_capacity or yaml_spec.DRAM_capacity,
     )
 
 

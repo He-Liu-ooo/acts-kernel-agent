@@ -146,7 +146,7 @@ Bridges SOL `Definition` + `Workload` directly to the pair of callables `verify_
 
 Per-iteration diagnostic signals for the Reviewer. Two pieces:
 
-- **Analytical (required)** — `_compute_analytical()` derives `AnalyticalMetrics` from `(flops, nbytes, latency_s, HardwareSpec)`: arithmetic intensity, ridge point, achieved TFLOPS + GB/s, pct-of-peak compute + bandwidth. Fails closed with `ProfilerError` on zero-latency, non-positive `nbytes`, negative `flops`, or zero-peak hardware (the orchestrator marks the branch DEAD_END).
+- **Analytical (required)** — `_compute_analytical()` derives `AnalyticalMetrics` from `(flops, nbytes, latency_s, HardwareSpec)`, narrowed to per-iter dynamics only: `achieved_tflops`, `achieved_bandwidth_gb_s`, `pct_peak_compute`, `pct_peak_bandwidth`. Fails closed with `ProfilerError` on zero-latency, non-positive `nbytes`, negative `flops`, or zero-peak hardware (the orchestrator marks the branch DEAD_END). Run-level invariants `arithmetic_intensity` and `ridge_point` (both in MACs/byte) live on `RooflineResult` (`src/eval/roofline.py`); the Reviewer prompt builder reads AI / ridge from `RooflineResult` and achieved_* / pct_peak_* from `AnalyticalMetrics`.
 - **NCU (best-effort)** — subprocess `ncu --csv --print-metric-name=name --section ...` via a dedicated driver (`_profiler_driver.py`). Extracts curated signals: SM occupancy, L2 hit rate, tensor-core utilization, and the top-2 warp-stall classes with percentages. Failures degrade the result (`ncu=None, degraded=True, degraded_reason=<slug>`) but keep the branch alive — the analytical block still drives the Reviewer's profiling summary.
 
 Returns `ProfilingResult(analytical, ncu, raw_metrics, degraded_reason)`. Bottleneck classification is **not** on `ProfilingResult` — it lives at the run level (see `classify_run` in `roofline.py`) because it's invariant per `(problem, representative workload, hardware)`.
@@ -197,13 +197,17 @@ Subprocess invocation uses `sys.executable` (not bare `"python"`) so the child i
 
 | Reason slug | Cause | Behavior |
 |---|---|---|
+| `ncu_disabled_via_env` | Operator escape hatch via `ACTS_DISABLE_NCU=1` (truthy: `1` / `true` / `yes` / `on`, case-insensitive) | Degraded, short-circuits before subprocess fork |
+| `ncu_skipped:permanently_unavailable:<sig>` | Process-wide cache flip on permanent-failure signatures (`ERR_NVGPUCTRPERM`, driver-init class, counter-permission class) | Degraded, short-circuits subsequent calls (no re-fork) |
 | `ncu_binary_not_found` | `ncu` not on `$PATH` | Degraded, no cache write |
 | `ncu_timeout` | Subprocess exceeded `timeout_s` (default 60s) | Degraded, no cache write |
-| `ncu_nonzero_exit:<rc>` | Subprocess returned non-zero | Degraded, no cache write |
+| `ncu_nonzero_exit:<rc>` / `ncu_nonzero_exit:<rc>:<sanitized_stderr_first_line>` | Subprocess returned non-zero. When stderr is non-empty, the slug carries a fingerprint suffix (sanitized = slugified, capped 60 chars); empty stderr keeps the bare `ncu_nonzero_exit:<rc>` form | Degraded, no cache write |
 | `csv_parse:<kind>` | Parser couldn't find header / columns | Degraded, no cache write |
 | `no_matching_kernel` | `--kernel-name regex:` matched no row in the NCU CSV | Degraded |
 | `missing_metric:<name>` | Required curated metric absent from CSV | Degraded |
 | `stalls_incomplete` | Fewer than 2 stall metrics parsed | Degraded |
+
+**Once-per-process permission cache.** When the first NCU invocation returns a permanent-failure signature (admin-only counters, driver-init failure), the module-level `_NCU_PERMANENTLY_UNAVAILABLE` flag in `src/eval/profiler.py` flips and every subsequent call short-circuits with `ncu_skipped:permanently_unavailable:<sig>` instead of re-forking `ncu`. This avoids paying the subprocess + driver-init cost on every iteration once we know counters are admin-only on this host. Operators can pre-empt the probe entirely by setting `ACTS_DISABLE_NCU=1`, which yields the `ncu_disabled_via_env` slug before any subprocess work.
 
 Analytical failures raise `ProfilerError` and kill the branch. NCU failures never raise.
 
@@ -246,10 +250,19 @@ Drives SOLAR via its published Python API (no subprocess) in four stages:
 
 1. Explicit `arch_yaml_path` (forwarded from `config.arch_config_path`)
 2. SOLAR-bundled name (`H100_PCIe`, `B200`) — passed through as-is
-3. ACTS-supplied YAML lookup in `_ACTS_ARCH_YAMLS` (currently: `RTX6000Ada`, `NVIDIA RTX 6000 Ada Generation`, `placeholder-RTX6000Ada` — all → `configs/arch/RTX6000Ada.yaml`)
+3. ACTS-supplied YAML lookup via `_lookup_arch_yaml(detected_name)` — the `_ACTS_ARCH_YAMLS` registry and lookup helper now live in `src/config.py` as the single source of truth, consulted by both `solar_adapter._resolve_arch_config` and `config.detect_hardware()` (currently: `RTX6000Ada`, `NVIDIA RTX 6000 Ada Generation`, `placeholder-RTX6000Ada` — all → `configs/arch/RTX6000Ada.yaml`)
 4. Fallback: `H100_PCIe` with a `WARNING` log
 
 `SolarResult.bottleneck` is a `BottleneckType` enum (consistent with `RooflineResult.bottleneck`), not a raw SOLAR string.
+
+### Unit policy and precision-aware ridge
+
+Both `RooflineResult.arithmetic_intensity` and `RooflineResult.ridge_point` are in **MACs/byte**, regardless of `source`. The two paths fill them with different fidelity:
+
+- **SOLAR-source** (the normal path): AI is exact — SOLAR's einsum analyzer counts MACs precisely; for kernels with no MACs (e.g. rmsnorm) AI = 0. Ridge_point is **precision-aware**, sourced from `perf["arch"]["ridge_point"]` which SOLAR computes as `mac_per_cycle / dram_byte_per_cycle` using the workload's actual dtype (e.g. `MAC_per_cycle_bf16_tc` for a bf16 workload, **not** `MAC_per_cycle_fp32_sm`). For RTX 6000 Ada, fp32 ridge ≈ 47.5 MACs/byte vs. bf16 ridge ≈ 190 MACs/byte (~4× difference) — same hardware, different ridge per dtype.
+- **Built-in source** (fallback for non-SOL problems with explicit `KernelSpec.flop_count` / `memory_bytes`): AI is approximate via `MACs ≈ FLOPs / 2` — exact only for FMA-dominated kernels, over-estimates for elementwise / reduction-heavy kernels. Ridge_point uses FP32 peak (no precision metadata in the built-in path), so tensor-core workloads on the built-in path get an FP32-derived ridge that may misclassify them as compute-bound.
+
+`RooflineResult` fields: `t_sol_us`, `bottleneck`, `source`, `arithmetic_intensity`, `ridge_point`. The previously documented `peak_achievable_tflops` field has been **removed** (was an unused stub). Bottleneck classification is still `MEMORY_BOUND` / `COMPUTE_BOUND` / `BALANCED`.
 
 ### Classification helpers
 

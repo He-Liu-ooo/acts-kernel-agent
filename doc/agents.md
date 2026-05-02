@@ -111,12 +111,19 @@ The deterministic orchestrator controls all flow. Agents are stateless — calle
 - `llm_retries_exhausted` — `run_agent` returned `None` after all transient retries.
 - `max_turns_exceeded` — SDK raised `MaxTurnsExceeded` and no valid submission was captured before the budget ran out.
 - `missing_submit_review` — the SDK loop ended cleanly (within `max_turns`) but the LLM never invoked `submit_review`.
+- `model_behavior_error:<ExcType>` — the OpenAI Agents SDK's `ModelBehaviorError` was raised inside `Runner.run` (typically because the LLM emitted a tool call for a tool that isn't registered, e.g., a stale prompt mention of `query_metric` after a prompt-template change). The defensive catch in `ReviewerAgent.review()` degrades to rule-based fallback with this tag instead of letting the exception unwind `Orchestrator.run()` and crash the entire optimization. The `<ExcType>` part is the exception class name (currently `ModelBehaviorError`).
 
-The orchestrator logs a warning for any non-empty `error_reason`, distinguishing all three from the expected "no-LLM" configuration (where `error_reason` stays empty).
+The orchestrator logs a warning for any non-empty `error_reason`, distinguishing all four from the expected "no-LLM" configuration (where `error_reason` stays empty).
 
 **Branch quality values**: `promising`, `blocked_potential`, `plateau`, `dead_end`.
 
 **Specialization hook**: `prompt_dir` is a constructor parameter, so a future Compute-Reviewer / Memory-Reviewer split can swap in specialized system prompts without subclassing.
+
+**System prompt assembly (split + conditional)**: The Reviewer's system prompt is split into two files in `src/prompts/reviewer/`:
+- `system.md` — the always-on base instructions (read into `ReviewerAgent._instructions_base` at agent construction). Contains zero mentions of `query_metric` or the metric menu.
+- `system_metric_queries.md` — the addendum describing the multi-turn `query_metric` tool, its expected arguments, the operating procedure, and the metric-menu format. Read into `ReviewerAgent._instructions_metric_queries` at construction (always loaded, even when the flag is off — small cost).
+
+Conditional assembly happens inside `ReviewerAgent.review()`: when `ACTSConfig.reviewer_metric_queries=True`, the addendum is appended to `_instructions_base` and passed as the agent's system prompt; when `False` (default), only `_instructions_base` is used. This mirrors exactly the gate that controls `query_metric` tool registration — preventing the prompt-leak regression where the LLM tried to call `query_metric` even when the tool wasn't registered (which crashed the orchestrator with `agents.exceptions.ModelBehaviorError`). A back-compat alias `_instructions = _instructions_base` is kept so callers/tests reading the old field name still work.
 
 **Model choice**: Can be cheaper model (analysis is easier than planning).
 

@@ -66,9 +66,11 @@ Frozen dataclass using the SOLAR arch YAML schema. Load from YAML via `load_hard
 |----------|---------|------|
 | `peak_memory_bandwidth_gb_s` | `DRAM_byte_per_cycle * freq_GHz` | GB/s |
 | `peak_sram_bandwidth_gb_s` | `SRAM_byte_per_cycle * freq_GHz` | GB/s |
-| `peak_flops_fp32` | `MAC_per_cycle_fp32_sm * freq_GHz * 2 / 1e6` | TFLOPS |
-| `peak_flops_bf16` | `MAC_per_cycle_bf16_tc * freq_GHz * 2 / 1e6` | TFLOPS |
-| `peak_flops_fp16` | `MAC_per_cycle_fp16_tc * freq_GHz * 2 / 1e6` | TFLOPS |
+| `peak_flops_fp32` | `MAC_per_cycle_fp32_sm * freq_GHz * 2 / 1e3` | TFLOPS |
+| `peak_flops_bf16` | `MAC_per_cycle_bf16_tc * freq_GHz * 2 / 1e3` | TFLOPS |
+| `peak_flops_fp16` | `MAC_per_cycle_fp16_tc * freq_GHz * 2 / 1e3` | TFLOPS |
+
+Dimensional analysis for the FLOPS rows: `MAC/cycle * GHz * 2` → `1e9 MACs/sec * 2 ops/MAC` → ops/sec; divide by `1e12` for TFLOPS, i.e. `* 1e9 * 2 / 1e12 = * 2 / 1e3`. The previous `/1e6` divisor returned PFLOPS while claiming TFLOPS — a 1000× overstatement.
 
 ## ACTSConfig
 
@@ -77,7 +79,7 @@ Mutable dataclass. All parameters for a single optimization run.
 **Search parameters** — control tree search in `search/orchestrator.py`:
 - `beam_width` (3): max active frontier nodes after beam pruning.
 - `beam_diversity` (True): enable the diversity-aware rescue pass (B2) in `beam_prune`. Disable for ablation or pure-exploitation runs.
-- `reviewer_metric_queries` (False): If True, Reviewer can fetch additional NCU metrics via the `query_metric` tool (multi-turn agent loop, `max_turns=6`). Default off; the default submit-only path is the verified default.
+- `reviewer_metric_queries` (False): If True, Reviewer can fetch additional NCU metrics via the `query_metric` tool (multi-turn agent loop, `max_turns=6`). Default off; the default submit-only path is the verified default. When True, `ReviewerAgent` also appends the `system_metric_queries.md` addendum to its system prompt; when False, the base `system.md` is used alone (mirrors tool-registration to prevent prompt-leak regressions).
 - `max_depth` (20): max tree depth (longest root-to-leaf path).
 - `epsilon_start` (0.3): initial exploration rate for epsilon-greedy selection.
 - `epsilon_end` (0.05): final exploration rate after decay.
@@ -106,13 +108,18 @@ Mutable dataclass. All parameters for a single optimization run.
 
 - `load_config(path) -> ACTSConfig`: Parse `.cfg` file, fall back to defaults. Loads arch YAML if `[hardware] arch_config_path` is set; after load, calls `validate_hardware_spec()` against `detect_hardware()` and logs a `WARNING` per mismatch.
 - `load_hardware_spec(path) -> HardwareSpec`: Parse a SOLAR arch config YAML into a `HardwareSpec`.
-- `detect_hardware() -> HardwareSpec`: Query CUDA runtime via `torch.cuda.get_device_properties(0)`. Populates runtime-knowable fields:
-  - `name` — GPU model string (e.g. "NVIDIA RTX 6000 Ada Generation")
-  - `freq_GHz` — boost clock from `clock_rate / 1_000_000` (kHz → GHz)
-  - `SRAM_capacity` — `L2_cache_size`
-  - `DRAM_capacity` — `total_memory`
+- `detect_hardware() -> HardwareSpec`: Query CUDA runtime via `torch.cuda.get_device_properties(0)`, then auto-load the registered arch YAML for the detected device (if any) and merge. Steps:
+  1. Probe runtime-knowable fields:
+     - `name` — GPU model string (e.g. "NVIDIA RTX 6000 Ada Generation")
+     - `freq_GHz` — boost clock from `clock_rate / 1_000_000` (kHz → GHz)
+     - `SRAM_capacity` — `L2_cache_size`
+     - `DRAM_capacity` — `total_memory`
+  2. Look up the device name in `_ACTS_ARCH_YAMLS` via `_lookup_arch_yaml(detected.name)`.
+  3. If a YAML is registered AND on disk, load it via `load_hardware_spec` and merge with the runtime spec via `dataclasses.replace`. **Runtime ground-truth wins** for `name` / `freq_GHz` / `SRAM_capacity` / `DRAM_capacity`; the YAML supplies `MAC_per_cycle_*` + `*_byte_per_cycle` + tier ratios.
+  4. Run `validate_hardware_spec(yaml_spec, runtime_spec)` and log `WARNING` on any mismatch (DRAM/SRAM/freq, 10% tolerance) — never raises.
+  5. If the device name isn't registered, OR the YAML load raises, OR torch isn't available / no CUDA, return the runtime-only spec with throughput tables and bandwidth coefficients zeroed (the previous behavior). The placeholder substitution path in `pipeline/optimize.py` covers this fallback for SOL-ExecBench live runs.
 
-  Per-precision throughput tables (`MAC_per_cycle_*`) and bandwidth coefficients (`DRAM_byte_per_cycle`, `SRAM_byte_per_cycle`) stay zero — those require a SOLAR arch YAML. Returns a fully-zeroed `HardwareSpec` on any failure: torch import error (catches `Exception`, covering broken-driver `OSError`/`RuntimeError`), `torch.cuda.is_available()` False, no CUDA devices, or device-property probe raises.
+  Returns a fully-zeroed `HardwareSpec` on torch import error (catches `Exception`, covering broken-driver `OSError`/`RuntimeError`), `torch.cuda.is_available()` False, no CUDA devices, or device-property probe raises.
 
 ### `validate_hardware_spec(spec, detected) -> list[str]`
 
@@ -128,3 +135,15 @@ Call sites:
 2. `pipeline/optimize.py::optimize()` — before substituting `_PLACEHOLDER_HARDWARE_SPEC` for zero-peak specs.
 
 Both call sites **warn (don't raise)** — sometimes you legitimately model GPU X while running on GPU Y for ablation.
+
+### Arch YAML registry
+
+`_ACTS_ARCH_YAMLS: dict[str, Path]` in `src/config.py` maps detected GPU device names to canonical arch YAML paths. Currently registered:
+
+- `RTX6000Ada` → `configs/arch/RTX6000Ada.yaml`
+- `NVIDIA RTX 6000 Ada Generation` → `configs/arch/RTX6000Ada.yaml`
+- `placeholder-RTX6000Ada` → `configs/arch/RTX6000Ada.yaml`
+
+Lookup goes through `_lookup_arch_yaml(detected_name) -> Path | None`, which returns the registered path if the YAML exists on disk, else `None`. The registry is consulted by both `detect_hardware()` (auto-load on runtime detection) and `solar_adapter._resolve_arch_config` (explicit SOLAR adapter path) — single source of truth; `solar_adapter` re-exports the symbol for back-compat.
+
+To add a new GPU: drop a YAML in `configs/arch/<Name>.yaml` matching SOLAR's arch schema (per-precision `MAC_per_cycle` table + `DRAM_byte_per_cycle` + `SRAM_byte_per_cycle` + `freq_GHz` + capacities), then add the device-name substring to `_ACTS_ARCH_YAMLS`.

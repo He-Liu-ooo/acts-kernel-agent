@@ -7,12 +7,13 @@ End-to-end optimization entry points.
 CLI:
 
 ```
-python -m src.pipeline.optimize [problem_path] [--run-dir DIR] [--trace-dir DIR]
+python -m src.pipeline.optimize [problem_path] [--run-dir DIR] [--trace-dir DIR] [--reset-clocks]
 ```
 
 - `problem_path` (positional, optional) — SOL-ExecBench problem directory (contains `definition.json` + `workload.jsonl`), or the literal string `placeholder` for the built-in matmul demo. Default `"placeholder"` preserves the no-LLM smoke path.
 - `--run-dir DIR` (optional) — parent directory for per-invocation run artifacts. Defaults to `./runs`. Each invocation creates `<run-dir>/run_<YYYYMMDDTHHMMSS_ffffffZ>/` (see "Run artifacts" below).
 - `--trace-dir DIR` (optional) — directory for per-run JSONL trace files capturing every LLM input/output, tool call, and span via `src.agents.trace_processor.JSONLTraceProcessor`. Default is `None`: when omitted, SDK traces land under `<run-dir>/traces/` inside the per-invocation run directory. Passing `--trace-dir <path>` relocates the traces to `<path>`. Passing `--trace-dir=` (empty string) is a kill switch — no capture.
+- `--reset-clocks` — operator escape hatch. Resets GPU 0 clocks (`-rgc -i 0` + `-rmc -i 0`) and exits without running any pipeline phase. Use after a SIGKILL / segfault left clocks locked from a prior run; the in-process atexit + signal handler chain (SIGTERM / SIGHUP) covers the normal exit cases.
 
 ### Phase A: Load Problem
 
@@ -27,6 +28,7 @@ python -m src.pipeline.optimize [problem_path] [--run-dir DIR] [--trace-dir DIR]
 
 **SOL mode** (`_load_sol_problem`, dispatched from `_load_problem`):
 
+0. **Fail-fast SOLAR guard**: if `is_solar_available()` returns False (the `solar` Python package not installed in the run venv), `_load_sol_problem` raises `RuntimeError` with the canonical install hint: `uv pip install -e <SOLAR_PATH> --no-deps` + `uv pip install torchview`. SOLAR is REQUIRED for SOL-ExecBench problems — the previous silent fallback to `compute_roofline()` produced `t_sol_us=0.0` on SOL specs (their `flop_count` / `memory_bytes` are zero by construction), corrupting every score.
 1. `src.benchmarks.sol_execbench.load(path)` parses the SOL definition + workloads into the pydantic `Definition` + `list[Workload]` pair.
 2. `_definition_to_kernel_spec(definition, definition_path)` (in `pipeline/optimize.py`) derives the `KernelSpec` (name, kernel_type, `definition_path`, `pytorch_reference`); `flop_count` / `memory_bytes` stay 0 because SOLAR / `compute_roofline_inputs` derive them from workload axes, not the static definition.
 3. `derive_t_sol_from_solar()` produces the roofline result; `spec.t_sol_us` is populated when SOLAR returns data.
@@ -37,6 +39,18 @@ python -m src.pipeline.optimize [problem_path] [--run-dir DIR] [--trace-dir DIR]
 **Model load** (`_load_model_if_configured`): reads `$ACTS_MODEL_CONFIG` or falls back to `configs/models/deepseek.json`. Gated on SOL mode — placeholder mode intentionally runs with `model=None` so the CLI stays executable without credentials. Without an SDK install or without a model config on disk, returns `None` and every agent stays in no-op mode.
 
 **Placeholder mode** (`_load_placeholder`): loads `make_matmul_kernel(1024, 1024, 1024)` directly; no oracle, no workloads, no roofline. Exercises the scaffold end-to-end only.
+
+### Clock-lock lifecycle
+
+GPU clocks are locked at run start so per-iter latency isn't poisoned by DVFS-driven frequency drift. The lock targets GPU 0 only (the GPU ACTS uses); GPUs 1+ on a multi-GPU host are untouched.
+
+- **Probe** — `probe_clock_lock_available()` (from SOL) checks whether passwordless `sudo nvidia-smi` is configured. The call site does defensive both-shape handling for the bare-`bool` return (today) vs a future tuple-`(bool, str)` return.
+- **Preset lookup** — `_resolve_clock_preset(device_name)` consults the ACTS-side `_ACTS_CLOCK_PRESETS` table first (currently `RTX 6000 Ada → ClockPreset(2505, 10001)`) and falls back to SOL's `get_clock_preset` for known datacenter cards.
+- **Lock** — `_lock_gpu0_clocks(gpu_mhz, dram_mhz)` runs `nvidia-smi -lgc <m>,<m> -i 0` and `-lmc <m>,<m> -i 0`. GPU 0 only.
+- **Verify** — `_verify_gpu0_locked(gpu_mhz, dram_mhz)` first wakes GPU 0 with a tiny torch op (the lock sets the *application* clock, which only manifests when the GPU has work; querying current clock on an idle GPU returns 210 MHz, not the locked target). Then queries `nvidia-smi -i 0` and compares with 50 MHz tolerance.
+- **Lifecycle** — lock attempted at run start (after `run_start` event); state stored in `_clock_lock_state` (locked + device_name); cleanup goes through three paths: (a) explicit `finally` in `main()`, (b) `atexit.register(_unlock_clocks_safe)`, (c) signal handlers `_signal_unlock_handler` for `SIGTERM` + `SIGHUP`. Operator escape hatch via `--reset-clocks` covers the SIGKILL / segfault case.
+- **Verify-failure semantics** — `_verify_gpu0_locked` returning False or raising triggers `_rollback_partial_lock(device, reason)`, which calls `_unlock_gpu0_clocks` and emits `clock_lock_unavailable` with `reason="verify_failed"` or `reason="verify_raised:<exc>"`. Lock state stays False.
+- **Event surface** — `clock_lock_unavailable` reasons go through a `ClockLockReason` `StrEnum` (`OK` / `PROBE_RETURNED_FALSE` / `NO_PRESET` / `LOCK_FAILED` / `VERIFY_FAILED` / `UNKNOWN`); exception-derived reasons are free-form strings (`verify_raised:<exc>`).
 
 ### Phase B: Search Loop
 
@@ -100,6 +114,14 @@ Multi-line CLI summary. Skips the scoring block when `baseline_latency_us == 0` 
 
 When `winner_profiling_per_workload` is populated, a "Winner profile (per workload)" block follows, with one analytical line per workload plus optional NCU lines. If every per-workload profile is degraded with `ncu_binary_not_found` (common on machines without the NCU CLI), the NCU block is suppressed to keep the output tidy.
 
+#### Per-workload latency degraded rendering
+
+- **Source of per-workload latency** — `child.per_workload_latency_us[uuid]` is populated by the orchestrator from `BenchmarkResult.per_workload_latency_us` after the per-iter benchmark.
+- **Degraded path** — when a workload's UUID is missing from the dict (or its value is non-finite), `_render_profiling_block` in `src/pipeline/report.py` constructs a sentinel via `_degraded_for_missing_latency` (factory in the same file) — sets a `ProfilingResult` with empty `raw_metrics`, no `ncu`, and `degraded_reason = _DEGRADED_LATENCY_REASON = "per_workload_latency_missing"`.
+- **Render** — the workload's analytical line is replaced with `[DEGRADED: missing per-workload latency — analytical metrics suppressed]`. The roofline summary (`AI`, `ridge`, `bottleneck`) still renders since those don't depend on latency.
+- **Why** — the previous silent fallback to `aggregate_latency_s` (the run-level candidate latency) paired one workload's `nbytes` with another workload's `latency_s`, producing impossible apparent bandwidths (e.g., `bw 4839.4%`). The degraded path fails closed instead.
+- **Known issue (2026-05-02)** — `child.per_workload_latency_us` is currently missing UUIDs for all workloads on the live run (`runs/run_20260502T060558_692431Z`). Three suspects: (a) per-workload bench failure → `inf` sentinel; (b) per-workload UUID never reaching the dict from a partial-failure path in `eval/benchmark.py`; (c) stale checkpoint. Investigation pending — see PROCESS.md "Active phase" queue item 1.
+
 ## Running the Pipeline
 
 **Placeholder mode** — the default CLI (`python -m src.pipeline.optimize`, no positional arg) runs the matmul starter without GPU, LLM, or SOL-ExecBench. `main()` wraps its body in a `RunContext` (from `src/runtime/run_context.py`) that owns run-dir creation, logging config, and trace-processor wiring (replaced the removed `_enable_traces_if_possible` helper). It resolves `args.problem_path == "placeholder"`, runs `optimize("placeholder")`, and prints `render_report(generate_report(result))`. No model is loaded — every agent stays in no-op mode, the baseline comes from `make_matmul_kernel`, and with no workloads `benchmark_kernel` returns its 100us sentinel so the report emits a scoring block with baseline == best (speedup 1.00x). This only exercises the scaffold end-to-end; it is not a meaningful search result.
@@ -136,7 +158,7 @@ Phase B runs real CUDA-event benchmarking (`eval/benchmark.py`) end-to-end. `eva
 
 Before substituting, `optimize()` calls `validate_hardware_spec(_PLACEHOLDER_HARDWARE_SPEC, config.hardware)` and logs `WARNING` per mismatch (see `doc/config.md` for the validator's field-by-field comparison rules). This catches the silent miscalibration where a real GPU (e.g. H100) gets the Ada-shaped placeholder substituted on top of it because its peaks were left at zero.
 
-The stand-in `_PLACEHOLDER_HARDWARE_SPEC` mirrors the Tier 1/2 test-fixture values for the RTX 6000 Ada (`freq_GHz=2.5`, DRAM 48 GiB / `DRAM_byte_per_cycle=384`, SRAM 96 MiB, `MAC_per_cycle_fp32_sm=12_800`, `MAC_per_cycle_fp16_tc=MAC_per_cycle_bf16_tc=512_000`) so the placeholder run produces representative roofline math. The spec's `name="placeholder-RTX6000Ada"` is also the SOLAR adapter's alias key in `_ACTS_ARCH_YAMLS`, so SOLAR loads `configs/arch/RTX6000Ada.yaml` for this name instead of silently falling back to `H100_PCIe`. The result: the analytical roofline (built from these fixture peaks) and the SOLAR roofline (built from the YAML) stay aligned on the placeholder path. Real runs should load a SOLAR arch YAML for their target GPU.
+The stand-in `_PLACEHOLDER_HARDWARE_SPEC` mirrors `configs/arch/RTX6000Ada.yaml` so SOLAR (YAML-driven) and the placeholder fallback agree on bottleneck classification. Aligned values: `freq_GHz=2.505`, `MAC_per_cycle_fp32_sm=18_185.0`, `MAC_per_cycle_fp16_tc=72_695.0`, `MAC_per_cycle_bf16_tc=72_695.0`, `DRAM_byte_per_cycle=383.0`, `SRAM_byte_per_cycle=2200.0`, `SRAM_capacity=100_663_296` (96 MiB L2), `DRAM_capacity=51_539_607_552` (48 GiB GDDR6 ECC). The alignment was briefly drifted today (placeholder was unsynced when the YAML was edited from sparse → dense values) and is restored in this same patch. The spec's `name="placeholder-RTX6000Ada"` is also the SOLAR adapter's alias key in `_ACTS_ARCH_YAMLS`, so SOLAR loads `configs/arch/RTX6000Ada.yaml` for this name instead of silently falling back to `H100_PCIe`. The result: the analytical roofline (built from these fixture peaks) and the SOLAR roofline (built from the YAML) stay aligned on the placeholder path. Real runs should load a SOLAR arch YAML for their target GPU.
 
 ### Phase A → B threading
 

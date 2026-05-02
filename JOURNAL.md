@@ -546,7 +546,7 @@ Post-task Distillation     — tree → memory entries + KB entries
 
 - `load_hardware_spec(path)` reads a SOLAR YAML into a `HardwareSpec`
 - SOLAR's Python API and ACTS's built-in roofline both consume the same data
-- Derived properties (`peak_flops_fp32`, `peak_memory_bandwidth_gb_s`) are computed from the raw per-cycle fields + frequency, matching the formulas in SOLAR's comments (e.g., `MAC_per_cycle_bf16_tc * freq_GHz * 2` = PFLOPS)
+- Derived properties (`peak_flops_fp32`, `peak_memory_bandwidth_gb_s`) are computed from the raw per-cycle fields + frequency, matching the formulas in SOLAR's comments (e.g., `MAC_per_cycle_bf16_tc * freq_GHz * 2` = PFLOPS) _(superseded 2026-05-02: this formula reading was the source of an off-by-1000 unit bug; see `peak_flops_*` properties in `src/config.py` — actual divisor is `1e3` for TFLOPS, not the implicit `1e6` that PFLOPS framing suggested)_
 
 The alternative — a GPU-metadata-oriented schema (SM count, compute capability, peak TFLOPS) — would require translating to/from SOLAR's schema at the boundary, and the "peak TFLOPS" values would need to know which precision to report for. SOLAR's schema is more precise: it distinguishes FP32 SM cores from BF16 Tensor Cores from FP8 Tensor Cores.
 

@@ -47,14 +47,38 @@ def test_derived_peak_bandwidth():
 
 def test_derived_peak_flops_fp32():
     spec = load_hardware_spec(_write_yaml(_H100_YAML))
-    # MAC_per_cycle_fp32_sm * freq_GHz * 2 / 1e6 = 25500 * 2 * 2 / 1e6 = 0.102 TFLOPS
-    assert abs(spec.peak_flops_fp32 - 0.102) < 0.001
+    # MAC_per_cycle_fp32_sm * freq_GHz * 2 / 1e3 = 25500 * 2 * 2 / 1e3 = 102.0 TFLOPS
+    assert abs(spec.peak_flops_fp32 - 102.0) < 0.1
 
 
 def test_derived_peak_flops_bf16():
     spec = load_hardware_spec(_write_yaml(_H100_YAML))
-    # MAC_per_cycle_bf16_tc * freq_GHz * 2 / 1e6 = 378000 * 2 * 2 / 1e6 = 1.512 TFLOPS
-    assert abs(spec.peak_flops_bf16 - 1.512) < 0.001
+    # MAC_per_cycle_bf16_tc * freq_GHz * 2 / 1e3 = 378000 * 2 * 2 / 1e3 = 1512.0 TFLOPS
+    assert abs(spec.peak_flops_bf16 - 1512.0) < 0.1
+
+
+def test_peak_flops_unit_is_tflops_not_pflops():
+    """Regression: ``peak_flops_*`` must return TFLOPS, not PFLOPS.
+
+    The formula is ops/sec / 1e12 = MAC_per_cycle * freq_GHz * 1e9 * 2 / 1e12
+    = MAC_per_cycle * freq_GHz * 2 / 1e3. A previous version divided by 1e6
+    (PFLOPS) — downstream consumers in eval/profiler.py and eval/roofline.py
+    treat the value as TFLOPS, so the off-by-1000x silently broke roofline /
+    bottleneck classification on hosts that loaded a real arch YAML.
+
+    Hand-constructed spec keeps this torch-free."""
+    spec = HardwareSpec(
+        MAC_per_cycle_fp32_sm=10000,
+        MAC_per_cycle_bf16_tc=20000,
+        MAC_per_cycle_fp16_tc=30000,
+        freq_GHz=2.0,
+    )
+    # 10000 * 2.0 * 2 / 1e3 = 40.0 TFLOPS
+    assert spec.peak_flops_fp32 == pytest.approx(40.0)
+    # 20000 * 2.0 * 2 / 1e3 = 80.0 TFLOPS
+    assert spec.peak_flops_bf16 == pytest.approx(80.0)
+    # 30000 * 2.0 * 2 / 1e3 = 120.0 TFLOPS
+    assert spec.peak_flops_fp16 == pytest.approx(120.0)
 
 
 def test_missing_nvfp4_defaults_to_zero():
@@ -115,11 +139,15 @@ def test_detect_hardware_zero_devices_returns_zeroed_spec():
 
 
 def test_detect_hardware_with_gpu_populates_runtime_fields():
-    """With a real GPU, populate name / freq_GHz / SRAM_capacity /
-    DRAM_capacity from torch.cuda.get_device_properties. Per-precision
-    throughput tables stay at zero — those need a SOLAR arch YAML."""
+    """With a GPU whose name is NOT registered in ``_ACTS_ARCH_YAMLS``,
+    populate only name / freq_GHz / SRAM_capacity / DRAM_capacity from
+    torch.cuda.get_device_properties. Per-precision throughput tables
+    stay at zero — those need a registered SOLAR arch YAML.
+
+    (For the merged-with-YAML path, see
+    ``test_detect_hardware_merges_yaml_when_name_matches_known_stem``.)"""
     props = SimpleNamespace(
-        name="NVIDIA RTX 6000 Ada Generation",
+        name="NVIDIA Unregistered Test GPU",
         clock_rate=2_505_000,        # kHz → 2.505 GHz
         L2_cache_size=100_663_296,
         total_memory=50_876_841_984,
@@ -128,11 +156,11 @@ def test_detect_hardware_with_gpu_populates_runtime_fields():
     with patch.dict(sys.modules, {"torch": fake}):
         spec = detect_hardware()
 
-    assert spec.name == "NVIDIA RTX 6000 Ada Generation"
+    assert spec.name == "NVIDIA Unregistered Test GPU"
     assert abs(spec.freq_GHz - 2.505) < 1e-6
     assert spec.SRAM_capacity == 100_663_296
     assert spec.DRAM_capacity == 50_876_841_984
-    # Per-precision tables intentionally left at zero.
+    # Per-precision tables intentionally left at zero (no YAML merged).
     assert spec.MAC_per_cycle_fp32_sm == 0.0
     assert spec.MAC_per_cycle_bf16_tc == 0.0
     assert spec.DRAM_byte_per_cycle == 0.0
@@ -344,3 +372,138 @@ freq_GHz: 2.505
 
     assert config.hardware.name == "RTX6000Ada"  # YAML still wins
     assert any("DRAM capacity mismatch" in rec.message for rec in caplog.records)
+
+
+# ── detect_hardware() auto-merge of configs/arch/<name>.yaml ──────────
+
+
+def test_detect_hardware_merges_yaml_when_name_matches_known_stem():
+    """When the detected GPU name is registered in ``_ACTS_ARCH_YAMLS``
+    and the YAML exists, ``detect_hardware`` returns a fully-populated
+    HardwareSpec — runtime ground-truth for name/freq/capacities, YAML
+    for the per-precision throughput tables. This is the bug fix: prior
+    to the merge, callers got ``MAC_per_cycle_bf16_tc=0`` and
+    ``DRAM_byte_per_cycle=0``, which routed pipeline/optimize.py through
+    the placeholder substitution and skipped SOLAR's roofline."""
+    props = SimpleNamespace(
+        name="NVIDIA RTX 6000 Ada Generation",
+        clock_rate=2_505_000,        # kHz → 2.505 GHz
+        L2_cache_size=100_663_296,
+        total_memory=51_539_607_552,
+    )
+    fake = _fake_torch(cuda_available=True, props=props)
+    with patch.dict(sys.modules, {"torch": fake}):
+        spec = detect_hardware()
+
+    # Runtime fields preserved (the GPU is ground-truth for these).
+    assert spec.name == "NVIDIA RTX 6000 Ada Generation"
+    assert abs(spec.freq_GHz - 2.505) < 1e-6
+    assert spec.SRAM_capacity == 100_663_296
+    assert spec.DRAM_capacity == 51_539_607_552
+    # YAML-supplied throughput tables non-zero — SOLAR roofline + sol_score
+    # math now have real numbers to work with.
+    assert spec.MAC_per_cycle_bf16_tc > 0
+    assert spec.MAC_per_cycle_fp32_sm > 0
+    assert spec.DRAM_byte_per_cycle > 0
+    assert spec.SRAM_byte_per_cycle > 0
+    # Derived peaks must therefore be non-zero too.
+    assert spec.peak_flops_bf16 > 0
+    assert spec.peak_memory_bandwidth_gb_s > 0
+
+
+def test_detect_hardware_unknown_name_returns_zero_peaks():
+    """When the detected GPU isn't registered in ``_ACTS_ARCH_YAMLS``,
+    behavior is unchanged from the pre-fix code: runtime fields populated,
+    throughput tables zero. The orchestrator's placeholder-substitution
+    path then engages downstream — the existing fallback contract."""
+    props = SimpleNamespace(
+        name="NVIDIA RTX 9999 Made Up GPU",
+        clock_rate=1_500_000,
+        L2_cache_size=50_000_000,
+        total_memory=24 * 1024**3,
+    )
+    fake = _fake_torch(cuda_available=True, props=props)
+    with patch.dict(sys.modules, {"torch": fake}):
+        spec = detect_hardware()
+
+    assert spec.name == "NVIDIA RTX 9999 Made Up GPU"
+    assert spec.SRAM_capacity == 50_000_000
+    assert spec.MAC_per_cycle_bf16_tc == 0.0
+    assert spec.DRAM_byte_per_cycle == 0.0
+    assert spec.peak_flops_bf16 == 0.0
+
+
+def test_detect_hardware_yaml_mismatch_logs_warning_does_not_raise(caplog):
+    """If the YAML registered for the detected name disagrees with the
+    runtime fields by >10% (stale YAML / wrong registry entry), log a
+    WARNING per mismatched field but still return the merged spec. The
+    operator sees the silent miscalibration without the load path
+    breaking on a partial-mismatch."""
+    # Simulate: detected name matches the Ada YAML registry entry, but
+    # the device reports H100 capacities (~80 GiB DRAM, ~50 MiB L2).
+    # validate_hardware_spec should flag DRAM + SRAM mismatches.
+    props = SimpleNamespace(
+        name="NVIDIA RTX 6000 Ada Generation",
+        clock_rate=2_505_000,
+        L2_cache_size=52_428_800,           # ~50 MiB (H100, not Ada's 96 MiB)
+        total_memory=85_899_345_920,        # ~80 GiB (H100, not Ada's 48 GiB)
+    )
+    fake = _fake_torch(cuda_available=True, props=props)
+    with (
+        patch.dict(sys.modules, {"torch": fake}),
+        caplog.at_level("WARNING", logger="src.config"),
+    ):
+        spec = detect_hardware()
+
+    assert any("DRAM capacity mismatch" in rec.message for rec in caplog.records)
+    # Spec still returned (warning, not raise) and runtime ground-truth
+    # for the mismatched fields wins.
+    assert spec.DRAM_capacity == 85_899_345_920
+    assert spec.SRAM_capacity == 52_428_800
+    # YAML-supplied throughput tables still merge in.
+    assert spec.MAC_per_cycle_bf16_tc > 0
+
+
+def test_detect_hardware_no_gpu_path_unchanged_after_merge():
+    """No-GPU regression: with CUDA unavailable, detect_hardware still
+    returns a fully-zeroed spec — the YAML merge logic must not engage
+    when there's no detected name to look up."""
+    fake = _fake_torch(cuda_available=False)
+    with patch.dict(sys.modules, {"torch": fake}):
+        spec = detect_hardware()
+    assert spec == HardwareSpec()
+    assert spec.MAC_per_cycle_bf16_tc == 0.0
+
+
+def test_detect_hardware_yaml_load_failure_falls_back_to_runtime_only(
+    tmp_path, monkeypatch, caplog,
+):
+    """If the registered YAML exists but ``yaml.safe_load`` chokes on it
+    (corrupted file, encoding mismatch), don't crash — log a warning and
+    return the runtime-only HardwareSpec so the placeholder path can
+    still engage downstream."""
+    from src import config as cfg_module
+
+    bogus_yaml = tmp_path / "bogus.yaml"
+    bogus_yaml.write_text("name: 'X\nthis_is: not_yaml: at_all\n")
+
+    monkeypatch.setitem(
+        cfg_module._ACTS_ARCH_YAMLS, "NVIDIA Test Bogus", bogus_yaml,
+    )
+
+    props = SimpleNamespace(
+        name="NVIDIA Test Bogus",
+        clock_rate=2_000_000,
+        L2_cache_size=50_000_000,
+        total_memory=24 * 1024**3,
+    )
+    fake = _fake_torch(cuda_available=True, props=props)
+    with (
+        patch.dict(sys.modules, {"torch": fake}),
+        caplog.at_level("WARNING", logger="src.config"),
+    ):
+        spec = detect_hardware()
+
+    assert spec.name == "NVIDIA Test Bogus"
+    assert spec.MAC_per_cycle_bf16_tc == 0.0
+    assert any("failed to load" in rec.message for rec in caplog.records)
