@@ -1250,3 +1250,219 @@ def test_classify_ncu_permanent_failure_inspects_stdout_too():
         )
         == "nvgpuctrperm"
     )
+
+
+# ── ncu-rep capture (search-tree-recording feature) ────────────────────────
+
+
+def test_profiling_result_has_ncu_rep_path_field():
+    """ProfilingResult exposes ncu_rep_path; default None."""
+    from src.eval.profiler import AnalyticalMetrics, ProfilingResult
+    a = AnalyticalMetrics(
+        achieved_tflops=0.0, achieved_bandwidth_gb_s=0.0,
+        pct_peak_compute=0.0, pct_peak_bandwidth=0.0,
+    )
+    pr = ProfilingResult(analytical=a)
+    assert pr.ncu_rep_path is None
+
+
+def test_ncu_argv_includes_output_flag(tmp_path):
+    """_build_ncu_argv includes -o <path>.ncu-rep when out_path is set."""
+    from src.eval.profiler import _build_ncu_argv
+    from src.kernels.kernel import Kernel, KernelSpec, KernelType
+    spec = KernelSpec(name="t", kernel_type=KernelType.ELEMENTWISE,
+                      flop_count=0, memory_bytes=0, input_shapes=[],
+                      pytorch_reference="", t_sol_us=1.0)
+    kernel = Kernel(spec=spec, source_code="")
+    spec_json = tmp_path / "spec.json"
+    spec_json.write_text("{}")
+    out_path = tmp_path / "report.ncu-rep"
+    argv = _build_ncu_argv(kernel, spec_json, mode="full",
+                           kernel_name="kernel_fn", out_path=out_path)
+    # ncu's flag is -o <basename> (no .ncu-rep suffix; ncu adds it)
+    assert "-o" in argv
+    out_idx = argv.index("-o")
+    assert out_idx + 1 < len(argv)
+    # Either basename or full path is acceptable; the key is the flag's there.
+    assert str(out_path).rstrip(".ncu-rep") in argv[out_idx + 1] or \
+           str(out_path) in argv[out_idx + 1]
+
+
+def test_ncu_rep_path_set_when_cache_dir_is_none(tmp_path, monkeypatch):
+    """The .ncu-rep file is written and exposed via ProfilingResult.ncu_rep_path
+    even when no cache_dir is supplied — the orchestrator uses this code path.
+
+    Mirrors the fake-ncu pattern in tests/test_profiler_cache.py: the script
+    emits a canned CSV the parser can consume and ALSO touches a sentinel
+    file at the ``-o`` argument so the post-run ``ncu_rep_out.exists()``
+    check sees a real file. The shell script parses ``-o <basename>`` from
+    its argv (NCU strips the ``.ncu-rep`` suffix before passing the path to
+    ``-o``; the script appends it back).
+    """
+    from src.eval import profiler as profiler_mod
+    from src.eval.profiler import (
+        ProfilingResult,
+        profile_kernel,
+    )
+    from conftest import rtx6000_ada_hardware
+
+    # Reset NCU-discovery + permission caches so this test sees the fake
+    # ncu on its monkeypatched PATH (the same dance test_profiler_cache.py
+    # does in its autouse reset).
+    monkeypatch.setattr(
+        profiler_mod, "_NCU_BINARY_CACHE", profiler_mod._UNSET, raising=False
+    )
+    profiler_mod._reset_ncu_permission_cache()
+    monkeypatch.delenv(profiler_mod._NCU_DISABLE_ENV, raising=False)
+
+    # Canned CSV: parser-valid for the curated path. Mirrors the
+    # _canned_csv() helper in test_profiler_cache.py — kept inline here to
+    # avoid cross-file fixture import.
+    header = '"ID","Kernel Name","Metric Name","Metric Unit","Metric Value"\n'
+
+    def row(metric: str, value: str) -> str:
+        return f'"0","elementwise_add_kernel","{metric}","%","{value}"\n'
+
+    rows = [
+        row("sm__warps_active.avg.pct_of_peak_sustained_active", "55.0"),
+        row("lts__t_sector_hit_rate.pct", "72.5"),
+        row(
+            "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active",
+            "0",
+        ),
+    ]
+    stall_values = {
+        "barrier": "0",
+        "branch_resolving": "5",
+        "dispatch_stall": "10",
+        "drain": "15",
+        "imc_miss": "20",
+        "lg_throttle": "25",
+        "long_scoreboard": "80",
+        "math_pipe_throttle": "35",
+        "membar": "40",
+        "mio_throttle": "45",
+        "misc": "50",
+        "no_instruction": "55",
+        "not_selected": "60",
+        "selected": "65",
+        "short_scoreboard": "70",
+        "sleeping": "1",
+        "tex_throttle": "2",
+        "wait": "3",
+    }
+    for reason, val in stall_values.items():
+        rows.append(
+            row(f"smsp__average_warp_latency_issue_stalled_{reason}.pct", val)
+        )
+    banner = (
+        "==PROF== Connected to process 1 (/usr/bin/python3.10)\n"
+        "ok\n"
+        "==PROF== Disconnected from process 1\n"
+    )
+    csv = banner + header + "".join(rows)
+
+    # Shell body: parse ``-o <basename>`` out of argv, ``touch
+    # <basename>.ncu-rep`` (matching what real NCU writes), then dump the
+    # CSV stream the parser expects.
+    body = (
+        "#!/usr/bin/env bash\n"
+        "out_basename=\"\"\n"
+        "while [[ $# -gt 0 ]]; do\n"
+        "  if [[ \"$1\" == \"-o\" ]]; then\n"
+        "    out_basename=\"$2\"\n"
+        "    shift 2\n"
+        "    continue\n"
+        "  fi\n"
+        "  shift\n"
+        "done\n"
+        "if [[ -n \"$out_basename\" ]]; then\n"
+        "  : > \"$out_basename.ncu-rep\"\n"
+        "fi\n"
+        'cat <<"NCUEOF"\n'
+        + csv
+        + "NCUEOF\n"
+    )
+    script = tmp_path / "ncu"
+    script.write_text(body)
+    script.chmod(
+        script.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
+    )
+    monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ.get('PATH', '')}")
+
+    kernel = Kernel(
+        spec=KernelSpec(
+            name="my_elementwise",
+            kernel_type=KernelType.ELEMENTWISE,
+            entrypoint="elementwise_add_kernel",
+        ),
+        source_code=(
+            "# kernel source — tier 1 stub; compile_kernel needs the "
+            "entrypoint to resolve\n"
+            "def elementwise_add_kernel(*args, **kwargs):\n"
+            "    return None\n"
+        ),
+    )
+    workload = {"uuid": "workload-0", "axes": {"N": 1024}, "inputs": {}}
+
+    result = profile_kernel(
+        kernel,
+        workload,
+        _identity_input_generator,
+        hardware_spec=rtx6000_ada_hardware(),
+        flops=1_000_000,
+        nbytes=4_000_000,
+        latency_s=1e-3,
+        mode="curated",
+        timeout_s=10.0,
+        cache_dir=None,
+    )
+
+    assert isinstance(result, ProfilingResult)
+    assert result.degraded is False, (
+        f"profile_kernel went degraded with cache_dir=None: {result.degraded_reason}"
+    )
+    assert result.ncu_rep_path is not None, (
+        "ncu_rep_path must be populated even when cache_dir is None — "
+        "the orchestrator runs without a cache_dir and tree_dump needs the path"
+    )
+    assert result.ncu_rep_path.exists(), (
+        f"ncu_rep_path points at {result.ncu_rep_path} but no file is on disk"
+    )
+
+
+def test_ncu_argv_includes_force_flag_when_out_path_set(tmp_path):
+    """`_build_ncu_argv` includes -f (force-overwrite) along with -o so
+    NCU doesn't fail on a stale .ncu-rep file in the persistent
+    user-scoped tmpdir."""
+    from src.eval.profiler import _build_ncu_argv
+    from src.kernels.kernel import Kernel, KernelSpec, KernelType
+    spec = KernelSpec(name="t", kernel_type=KernelType.ELEMENTWISE,
+                      flop_count=0, memory_bytes=0, input_shapes=[],
+                      pytorch_reference="", t_sol_us=1.0)
+    kernel = Kernel(spec=spec, source_code="")
+    spec_json = tmp_path / "spec.json"
+    spec_json.write_text("{}")
+    out_path = tmp_path / "report.ncu-rep"
+    argv = _build_ncu_argv(kernel, spec_json, mode="full",
+                           kernel_name="kernel_fn", out_path=out_path)
+    assert "-f" in argv
+    # The order matters minimally (NCU accepts -f anywhere), but -f and
+    # -o should both be present.
+    assert "-o" in argv
+
+
+def test_ncu_argv_omits_force_flag_when_out_path_none(tmp_path):
+    """When no -o is requested, no -f either — keeps argv minimal."""
+    from src.eval.profiler import _build_ncu_argv
+    from src.kernels.kernel import Kernel, KernelSpec, KernelType
+    spec = KernelSpec(name="t", kernel_type=KernelType.ELEMENTWISE,
+                      flop_count=0, memory_bytes=0, input_shapes=[],
+                      pytorch_reference="", t_sol_us=1.0)
+    kernel = Kernel(spec=spec, source_code="")
+    spec_json = tmp_path / "spec.json"
+    spec_json.write_text("{}")
+    argv = _build_ncu_argv(kernel, spec_json, mode="full",
+                           kernel_name="kernel_fn", out_path=None)
+    assert "-f" not in argv
+    assert "-o" not in argv

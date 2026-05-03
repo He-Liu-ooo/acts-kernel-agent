@@ -271,6 +271,12 @@ class ProfilingResult:
     ncu: NCUMetrics | None = None
     raw_metrics: dict[str, float] = field(default_factory=dict)
     degraded_reason: str | None = None
+    # Path to the binary NCU report (.ncu-rep) when ncu produced one.
+    # ``None`` on degraded runs (binary not found, permission denied, etc.)
+    # and on cache hits where the report wasn't preserved. Excluded from
+    # checkpoint round-trip — callers re-run the profiler if the path is
+    # stale.
+    ncu_rep_path: Path | None = None
 
     @property
     def degraded(self) -> bool:
@@ -457,12 +463,18 @@ def _build_ncu_argv(
     *,
     mode: str,
     kernel_name: str | None = None,
+    out_path: Path | None = None,
 ) -> list[str]:
     """Build the ``ncu`` command line.
 
     ``kernel_name`` is the GPU symbol (extracted from ``@triton.jit def``)
     NCU filters on. Falls back to ``kernel.spec.entrypoint`` when no
     Triton kernel is found in the source.
+
+    ``out_path`` is the desired ``.ncu-rep`` report path. When set, the
+    argv is extended with ``-o <out_path-without-suffix>`` (NCU appends
+    the ``.ncu-rep`` suffix itself); when ``None``, no ``-o`` flag is
+    emitted and NCU only writes the CSV stream to stdout.
     """
     regex_name = kernel_name or kernel.spec.entrypoint
     argv: list[str] = [
@@ -480,6 +492,15 @@ def _build_ncu_argv(
         "--kernel-name",
         f"regex:{regex_name}",
     ]
+
+    if out_path is not None:
+        # NCU appends ``.ncu-rep`` to whatever ``-o`` value we pass; strip
+        # the suffix here so we don't end up with ``foo.ncu-rep.ncu-rep``.
+        # ``-f`` (force-overwrite) is required because ``_ncu_tmpdir()`` is
+        # user-scoped and persistent across runs; without it, repeat profiles
+        # of the same (source, workload, mode, kernel) cache key fail when
+        # NCU refuses to overwrite the existing .ncu-rep from a prior run.
+        argv += ["-f", "-o", str(out_path.with_suffix(""))]
 
     if mode == "full":
         # Debug escape hatch — captures everything NCU knows; the curated
@@ -517,6 +538,7 @@ def _run_ncu(
     kernel_name: str | None = None,
     problem_definition_path: Path | None = None,
     blob_roots: list[Path] | None = None,
+    ncu_rep_out: Path | None = None,
 ) -> tuple[str, int, bool, str | None]:
     """Invoke ``ncu`` as a subprocess around ``_profiler_driver``.
 
@@ -546,6 +568,12 @@ def _run_ncu(
     the driver rehydrates back to ``list[Path]``. ``None`` omits the
     field — the driver defaults to ``None`` so non-safetensors workloads
     and older cached specs keep working unchanged.
+
+    ``ncu_rep_out`` is the desired ``.ncu-rep`` report path. When set, it
+    is forwarded to ``_build_ncu_argv`` as the ``-o`` target so NCU emits
+    a binary report alongside the CSV stream. The caller is responsible
+    for checking ``ncu_rep_out.exists()`` after success and stashing it
+    on the resulting ``ProfilingResult.ncu_rep_path``.
 
     Spec JSON contract (consumed by ``_profiler_driver``):
 
@@ -619,7 +647,13 @@ def _run_ncu(
         json.dump(spec_payload, f)
         spec_json_path = Path(f.name)
 
-    argv = _build_ncu_argv(kernel, spec_json_path, mode=mode, kernel_name=kernel_name)
+    argv = _build_ncu_argv(
+        kernel,
+        spec_json_path,
+        mode=mode,
+        kernel_name=kernel_name,
+        out_path=ncu_rep_out,
+    )
 
     try:
         completed = subprocess.run(
@@ -804,19 +838,37 @@ def profile_kernel(
         or kernel.spec.entrypoint
     )
 
+    # ``key`` is computed unconditionally — the JSON cache only consults
+    # it when ``cache_dir`` is set, but the ``.ncu-rep`` filename uses it
+    # in both cases (cache_dir present → next to JSON entry; cache_dir
+    # absent → in the per-process NCU temp dir). Pure function, no I/O.
+    key = _cache_key(kernel.source_code, workload, mode, kernel_name)
+
+    # Derive the ``-o`` target for ``ncu`` so each (source, workload, mode,
+    # kernel_name) tuple gets its own ``.ncu-rep``. When ``cache_dir`` is
+    # set the report lands next to the JSON cache entry (dedup-friendly,
+    # survives across processes); otherwise it lands in the per-process
+    # NCU TMPDIR so the file is still on disk and readable by
+    # ``tree_dump.dump_node`` — the orchestrator runs without a cache_dir
+    # and would otherwise lose the binary report entirely.
+    ncu_rep_out: Path = (cache_dir or Path(_ncu_tmpdir())) / f"{key}.ncu-rep"
     if cache_dir is not None:
-        key = _cache_key(kernel.source_code, workload, mode, kernel_name)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
+    if cache_dir is not None:
         cached = _load_ncu_cache(cache_dir, key)
         if cached is not None:
             # Cache stores only the NCU piece — ``raw_metrics`` is
-            # populated only on the freshly-parsed path.
+            # populated only on the freshly-parsed path. ``ncu_rep_path``
+            # surfaces the previously-written ``.ncu-rep`` when it's still
+            # on disk; if a sibling run pruned it, fall back to ``None``
+            # (callers treat that as "no report to copy").
             return ProfilingResult(
                 analytical=analytical,
                 ncu=cached,
                 raw_metrics={},
+                ncu_rep_path=ncu_rep_out if ncu_rep_out.exists() else None,
             )
-    else:
-        key = None
 
     if _ncu_disabled_via_env():
         return ProfilingResult.make_degraded(analytical, "ncu_disabled_via_env")
@@ -851,6 +903,7 @@ def profile_kernel(
         kernel_name=kernel_name,
         problem_definition_path=problem_definition_path,
         blob_roots=blob_roots,
+        ncu_rep_out=ncu_rep_out,
     )
     if driver_degraded:
         return ProfilingResult.make_degraded(analytical, driver_reason)
@@ -864,11 +917,19 @@ def profile_kernel(
             degraded_reason=parser_reason,
         )
 
-    if cache_dir is not None and key is not None:
+    if cache_dir is not None:
         _save_ncu_cache(cache_dir, key, ncu, raw)
+
+    # Only surface the report path when ncu actually wrote it — the
+    # subprocess could exit zero with the CSV stream intact but no
+    # ``.ncu-rep`` on disk if the OS killed the writer between flush and
+    # rename. Callers (orchestrator tree-dump) treat ``None`` as "no
+    # report to copy".
+    final_rep_path = ncu_rep_out if ncu_rep_out.exists() else None
 
     return ProfilingResult(
         analytical=analytical,
         ncu=ncu,
         raw_metrics=raw,
+        ncu_rep_path=final_rep_path,
     )
