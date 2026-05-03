@@ -685,6 +685,7 @@ def main(argv: list[str] | None = None) -> None:
     from datetime import datetime, timezone
 
     from src.pipeline.report import render_report
+    from src.runtime import tree_dump
     from src.runtime.events import emit
     from src.runtime.run_context import RunContext
 
@@ -805,6 +806,11 @@ def main(argv: list[str] | None = None) -> None:
                 (datetime.now(timezone.utc) - ctx.started_at).total_seconds(), 3
             ),
         )
+        # End-of-run tree dump: writes <run_dir>/tree/{index.json,
+        # tree.txt, tree.dot, tree.mmd}. Must run before ``ctx.close()``
+        # so the ``tree_dump.bind(...)`` is still live. Never raises
+        # (tree_dump.finalize_tree swallows OSError); no-op when unbound.
+        tree_dump.finalize_tree(result.tree)
         print(render_report(report))
         if ctx.trace_processor is not None and hasattr(ctx.trace_processor, "path"):
             print(f"\nLLM trace: {ctx.trace_processor.path}")

@@ -7,6 +7,7 @@ The Coder's compile/correctness tools handle self-correction internally.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import math
 from dataclasses import dataclass
@@ -14,6 +15,7 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
+from src.runtime import tree_dump
 from src.runtime.events import (
     DEAD_BENCH_FAILURE,
     DEAD_CUDA_ERROR,
@@ -185,6 +187,26 @@ def _emit_dead_end(iter_no: int, reason: str, *, detail: str | None = None) -> N
     emit("iter_end", iter=iter_no, outcome=ITER_DEAD_END)
 
 
+try:
+    from agents import trace as _agents_trace
+except ModuleNotFoundError:
+    _agents_trace = None  # SDK not installed (Tier-1 test venv); _iter_trace degrades.
+
+
+def _iter_trace(iter_no: int, agent_name: str):
+    """Return a context manager that wraps an agent invocation in an
+    SDK ``trace`` tagged with the iteration index + agent name. Falls
+    back to ``contextlib.nullcontext`` when the SDK isn't installed
+    (Tier-1 test venv) so orchestration code stays harness-agnostic.
+    """
+    if _agents_trace is None:
+        return contextlib.nullcontext()
+    return _agents_trace(
+        workflow_name="acts_iter",
+        metadata={"iter": iter_no, "agent": agent_name},
+    )
+
+
 def detect_plateau(
     score_history: list[float],
     window: int,
@@ -266,6 +288,18 @@ class Orchestrator:
             self._tree,
             self._config.beam_width,
             enable_diversity=self._config.beam_diversity,
+        )
+        # Persist the dead-end node to <run_dir>/tree/node_<id>/ with the
+        # kill reason in meta.json. Centralized here (rather than at each
+        # of the six call sites) so the dump can't drift out of sync with
+        # _kill_branch's other side-effects. No profiling on the dead-end
+        # path → ncu_rep_src is None.
+        tree_dump.dump_node(
+            child,
+            iter_no=iter_no,
+            ncu_rep_src=None,
+            failure_reason=reason,
+            failure_detail=detail,
         )
         _emit_dead_end(iter_no, reason, detail=detail)
 
@@ -485,15 +519,16 @@ class Orchestrator:
             # Coder skip-iter pattern below — a single agent hiccup cannot
             # kill a multi-iteration run.
             try:
-                plan = await self._planner.plan(
-                    kernel_source=parent.kernel.source_code,
-                    profiling_summary=parent_profiling_summary,
-                    past_experiences=experiences,
-                    available_actions=[],
-                    tree_context=tree.render_path(parent.id),
-                    reviewer_feedback=None,
-                    bottleneck=run_bottleneck,
-                )
+                with _iter_trace(iter_no, "planner"):
+                    plan = await self._planner.plan(
+                        kernel_source=parent.kernel.source_code,
+                        profiling_summary=parent_profiling_summary,
+                        past_experiences=experiences,
+                        available_actions=[],
+                        tree_context=tree.render_path(parent.id),
+                        reviewer_feedback=None,
+                        bottleneck=run_bottleneck,
+                    )
             except PlanningError as exc:
                 logger.warning(
                     "Iteration %d: Planner failed (%s) — skipping iteration",
@@ -527,13 +562,14 @@ class Orchestrator:
             # run survives one Coder hiccup the way it survives one
             # branch's benchmark crash.
             try:
-                coder_output = await self._coder.implement(
-                    kernel_source=parent.kernel.source_code,
-                    plan=plan,
-                    kernel_spec=baseline.spec,
-                    reference_fn=reference_fn,
-                    input_generators=input_generators,
-                )
+                with _iter_trace(iter_no, "coder"):
+                    coder_output = await self._coder.implement(
+                        kernel_source=parent.kernel.source_code,
+                        plan=plan,
+                        kernel_spec=baseline.spec,
+                        reference_fn=reference_fn,
+                        input_generators=input_generators,
+                    )
             except ImplementationError as exc:
                 logger.warning(
                     "Iteration %d: Coder failed (%s) — skipping iteration",
@@ -559,7 +595,7 @@ class Orchestrator:
                 triton_kernel_name=coder_output.triton_kernel_name,
                 dps=getattr(coder_output, "dps", False),
             )
-            child = tree.add_child(parent.id, child_kernel, plan.technique)
+            child = tree.add_child(parent.id, child_kernel, plan.technique, iter_no=iter_no)
             # Successful child generation clears the parent's counter so
             # one transient blip earlier in the run doesn't permanently
             # quarantine an otherwise-productive node.
@@ -872,19 +908,20 @@ class Orchestrator:
                 child.branch_quality = BranchQuality.PROMISING
             else:
                 prev_sol = parent.score.sol_score if parent.score is not None else None
-                feedback = await self._reviewer.review(
-                    kernel_source=new_source,
-                    profiling_summary=_NO_PROFILE_SUMMARY,  # superseded by profiling=
-                    sol_score=child.score.sol_score,
-                    headroom_pct=(1.0 - child.score.sol_score) * 100,
-                    bottleneck=run_bottleneck,
-                    tree_context=tree.render_path(child.id),
-                    prev_sol_score=prev_sol,
-                    profiling=profiling,
-                    roofline=roofline,
-                    reviewer_metric_queries=self._config.reviewer_metric_queries,
-                    iter_idx=iter_no,
-                )
+                with _iter_trace(iter_no, "reviewer"):
+                    feedback = await self._reviewer.review(
+                        kernel_source=new_source,
+                        profiling_summary=_NO_PROFILE_SUMMARY,  # superseded by profiling=
+                        sol_score=child.score.sol_score,
+                        headroom_pct=(1.0 - child.score.sol_score) * 100,
+                        bottleneck=run_bottleneck,
+                        tree_context=tree.render_path(child.id),
+                        prev_sol_score=prev_sol,
+                        profiling=profiling,
+                        roofline=roofline,
+                        reviewer_metric_queries=self._config.reviewer_metric_queries,
+                        iter_idx=iter_no,
+                    )
                 if feedback.degraded:
                     logger.warning(
                         "Reviewer degraded at iteration %d (reason=%s) — branch_quality is rule-based.",
@@ -900,8 +937,25 @@ class Orchestrator:
                     degraded=feedback.degraded,
                 )
 
-            # Beam prune
+            # Beam prune. Runs BEFORE ``tree_dump.dump_node`` below so that
+            # the streamed ``meta.json`` reflects the post-prune
+            # ``branch_quality`` (an evicted child gets DEAD_END here).
+            # Pre-fix: dump_node ran first → meta.json said ``promising``
+            # while the final ``index.json`` (built post-prune) said
+            # ``dead_end`` for the same node.
             beam_prune(tree, self._config.beam_width, enable_diversity=self._config.beam_diversity)
+
+            # Persist the committed node to <run_dir>/tree/node_<id>/.
+            # Only fires on the ITER_ADVANCED path (post-score, post-reviewer,
+            # post-prune); dead-end + skipped iterations dump from inside
+            # ``_kill_branch`` instead. ``ncu_rep_src`` is the binary NCU
+            # report path when the profiler captured one, else None.
+            ncu_rep_src = (
+                profiling.ncu_rep_path
+                if profiling is not None and profiling.ncu is not None
+                else None
+            )
+            tree_dump.dump_node(child, iter_no=iter_no, ncu_rep_src=ncu_rep_src)
 
             # Single end-of-iter best scan — reused for target / plateau checks.
             best = tree.best_node()

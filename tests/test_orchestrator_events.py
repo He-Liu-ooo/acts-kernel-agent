@@ -398,3 +398,242 @@ async def test_dead_end_iteration_event_sequence(tmp_path, harness):
     assert dead_idx < end_idx
     assert records[end_idx]["outcome"] == "dead_end"
     assert "reason" in records[dead_idx]
+
+
+@pytest.mark.asyncio
+async def test_runner_run_wrapped_in_trace_with_iter_metadata(harness, monkeypatch):
+    """Each agent invocation in the iteration body is wrapped in
+    ``with _iter_trace(iter_no, agent_name)``. We spy on the helper to
+    confirm planner / coder / reviewer are all wrapped on iter 1."""
+    from src.search import orchestrator as orch
+
+    calls: list[dict] = []
+    real = orch._iter_trace
+
+    def spy(iter_no, agent_name):
+        calls.append({"iter": iter_no, "agent": agent_name})
+        return real(iter_no, agent_name)
+
+    monkeypatch.setattr(orch, "_iter_trace", spy)
+    await _run_orch(harness)
+    assert {"iter": 1, "agent": "planner"} in calls
+    assert {"iter": 1, "agent": "coder"} in calls
+    assert {"iter": 1, "agent": "reviewer"} in calls
+
+
+@pytest.mark.asyncio
+async def test_committed_node_carries_iter_no(tmp_path, harness):
+    """The child committed on iter N has node.iter_no == N. The happy
+    path commits one child off the root on iter 1, so node 1 must carry
+    iter_no=1 (root remains at the default -1)."""
+    result = await _run_orch(harness)
+    child = result.tree.get_node(1)
+    assert child.iter_no == 1
+    # Root is added before the loop body; its iter_no stays at the default.
+    assert result.tree.get_node(0).iter_no == -1
+
+
+@pytest.mark.asyncio
+async def test_dump_node_called_on_committed_node(harness, monkeypatch):
+    """On the ITER_ADVANCED path, ``tree_dump.dump_node`` is invoked for
+    the committed child with the right iter_no. ``ncu_rep_src`` is None
+    here because the test profile has no ``.ncu-rep`` artifact."""
+    from src.runtime import tree_dump
+
+    calls: list[dict] = []
+
+    def spy(node, *, iter_no, ncu_rep_src):
+        calls.append({"id": node.id, "iter_no": iter_no, "ncu_rep_src": ncu_rep_src})
+
+    monkeypatch.setattr(tree_dump, "dump_node", spy)
+    await _run_orch(harness)
+    assert len(calls) == 1
+    assert calls[0]["id"] == 1
+    assert calls[0]["iter_no"] == 1
+    assert calls[0]["ncu_rep_src"] is None
+
+
+@pytest.mark.asyncio
+async def test_dump_node_called_on_dead_end_with_failure_reason(harness, monkeypatch):
+    """Dead-end iterations now DO call ``tree_dump.dump_node`` so operators
+    inspecting "why did node N die" find a meta.json with the kill reason.
+
+    The original Task-13 invariant (dead-ends do NOT dump) flipped when
+    Codex caught that ``finalize_tree`` indexes the dead-end node in
+    ``index.json`` while the per-node directory was missing — same node,
+    two truths. Dead-end dumps now carry ``failure_reason`` /
+    ``failure_detail`` from the kill path; on the partial-bench path the
+    reason is ``DEAD_BENCH_FAILURE`` and the detail describes the
+    workload errors.
+    """
+    from src.runtime import tree_dump
+    from src.search.orchestrator import DEAD_BENCH_FAILURE, Orchestrator
+
+    captured: list[dict] = []
+
+    def spy(node, *, iter_no, ncu_rep_src,
+            failure_reason=None, failure_detail=None):
+        captured.append({
+            "id": node.id, "iter_no": iter_no,
+            "ncu_rep_src": ncu_rep_src,
+            "failure_reason": failure_reason,
+            "failure_detail": failure_detail,
+        })
+
+    monkeypatch.setattr(tree_dump, "dump_node", spy)
+
+    partial_bench = BenchmarkResult(
+        median_latency_us=100.0,
+        timed_runs=1,
+        per_workload_latency_us={"wl-0": 100.0, "wl-1": float("inf")},
+        workload_errors={"wl-1": "launch failed"},
+    )
+    call_seq = [harness.bench, partial_bench]
+
+    def next_bench(*_args, **_kwargs):
+        return call_seq.pop(0) if call_seq else partial_bench
+
+    with (
+        patch("src.eval.benchmark.benchmark_kernel", side_effect=next_bench),
+        patch("src.eval.profiler.profile_kernel", MagicMock(return_value=_make_profile())),
+    ):
+        orch = Orchestrator(
+            harness.config, harness.planner, harness.coder,
+            harness.reviewer, harness.retriever,
+        )
+        await orch.run(harness.baseline, workloads=None, roofline=harness.roofline)
+
+    # Exactly one dump_node call captured the dead-end node and carried
+    # the kill reason from _kill_branch through to dump_node.
+    assert len(captured) == 1, captured
+    rec = captured[0]
+    assert rec["id"] == 1
+    assert rec["iter_no"] == 1
+    # No profiling on the dead-end path → ncu_rep_src is None.
+    assert rec["ncu_rep_src"] is None
+    # failure_reason came from the kill site.
+    assert rec["failure_reason"] == DEAD_BENCH_FAILURE
+    # detail is non-None (the orchestrator built a workload-errors string).
+    assert rec["failure_detail"] is not None
+    assert "wl-1" in rec["failure_detail"]
+
+
+@pytest.mark.asyncio
+async def test_dump_node_called_after_beam_prune(harness, monkeypatch):
+    """``dump_node`` runs after ``beam_prune`` so meta.json reflects the
+    post-prune ``branch_quality``. Pre-fix: dump_node ran first and the
+    streamed meta.json said ``promising`` while the final index.json
+    (post-prune) said ``dead_end``. Same node, two truths.
+
+    Test pattern: replace ``beam_prune`` with a stub that marks every
+    just-committed (non-root) node DEAD_END, then assert dump_node saw
+    DEAD_END (not the pre-prune PROMISING that the reviewer assigned).
+    """
+    from src.runtime import tree_dump
+
+    captured: list[dict] = []
+
+    def spy(node, *, iter_no, ncu_rep_src,
+            failure_reason=None, failure_detail=None):
+        captured.append({
+            "id": node.id,
+            "branch_quality": node.branch_quality,
+        })
+
+    monkeypatch.setattr(tree_dump, "dump_node", spy)
+
+    def evicting_prune(tree, beam_width, **kwargs):
+        # Mark every just-committed (non-root) node DEAD_END.
+        for n in list(tree._nodes.values()):
+            if n.id != 0:
+                n.branch_quality = BranchQuality.DEAD_END
+        return []
+
+    # Patch ``beam_prune`` at its source module. The orchestrator
+    # imports it lazily inside ``run()`` via ``from src.search.beam
+    # import beam_prune``, so by the time the loop body calls it, the
+    # name resolves to the source-module attribute (which we replace).
+    # Same applies to the ``_kill_branch`` helper's local re-import.
+    from src.search import beam as beam_mod
+    monkeypatch.setattr(beam_mod, "beam_prune", evicting_prune)
+
+    await _run_orch(harness)
+
+    # Exactly one advance-path dump for the committed child, and it
+    # observed the post-prune DEAD_END branch_quality (not the
+    # PROMISING the reviewer assigned).
+    assert len(captured) == 1, captured
+    assert captured[0]["id"] == 1
+    assert captured[0]["branch_quality"] == BranchQuality.DEAD_END
+
+
+@pytest.mark.asyncio
+async def test_dump_node_receives_real_ncu_rep_src_on_advance(harness, monkeypatch):
+    """The orchestrator's profile_kernel call now produces a real
+    ``ncu_rep_path``, and dump_node receives it (not None) on the advance
+    path. Regression guard against a future change that drops the
+    ``ncu_rep_src`` derivation at line ~929."""
+    from pathlib import Path
+
+    from src.runtime import tree_dump
+
+    captured: list[dict] = []
+
+    def spy(node, *, iter_no, ncu_rep_src,
+            failure_reason=None, failure_detail=None):
+        captured.append({"ncu_rep_src": ncu_rep_src})
+
+    monkeypatch.setattr(tree_dump, "dump_node", spy)
+
+    # Build a profile with a populated ncu_rep_path. The profile is
+    # what the orchestrator threads through to ncu_rep_src derivation.
+    profile_with_rep = ProfilingResult(
+        analytical=AnalyticalMetrics(
+            achieved_tflops=1.0,
+            achieved_bandwidth_gb_s=100.0,
+            pct_peak_compute=0.1,
+            pct_peak_bandwidth=0.5,
+        ),
+        ncu=NCUMetrics(
+            sm_occupancy_pct=72.5,
+            l2_hit_rate_pct=45.0,
+            tensor_core_util_pct=0.0,
+            warp_stall_dominant="long_scoreboard",
+            warp_stall_dominant_pct=33.0,
+            warp_stall_runner_up="wait",
+            warp_stall_runner_up_pct=18.0,
+        ),
+        raw_metrics={},
+        degraded_reason=None,
+        ncu_rep_path=Path("/tmp/fake_rep.ncu-rep"),
+    )
+
+    await _run_orch(
+        harness,
+        profile_fake=MagicMock(return_value=profile_with_rep),
+    )
+
+    # The advance-path dump_node call received the populated
+    # ncu_rep_path (not None).
+    assert len(captured) == 1, captured
+    assert captured[0]["ncu_rep_src"] is not None
+    assert isinstance(captured[0]["ncu_rep_src"], Path)
+    assert captured[0]["ncu_rep_src"] == Path("/tmp/fake_rep.ncu-rep")
+
+
+@pytest.mark.asyncio
+async def test_dump_node_not_called_on_skipped(harness, monkeypatch):
+    """Skipped iterations (Coder failure → no tree mutation) must NOT
+    call ``tree_dump.dump_node`` — there's no committed node to dump."""
+    from src.agents.coder import ImplementationError
+    from src.runtime import tree_dump
+
+    calls: list = []
+    monkeypatch.setattr(
+        tree_dump, "dump_node",
+        lambda *a, **k: calls.append((a, k)),
+    )
+
+    harness.coder.implement = AsyncMock(side_effect=ImplementationError("budget exhausted"))
+    await _run_orch(harness)
+    assert calls == []

@@ -20,6 +20,22 @@ from src.kernels.kernel import Kernel, KernelSpec, KernelType
 from src.pipeline.optimize import _load_problem, optimize
 
 
+@pytest.fixture(autouse=True)
+def _stub_tree_dump_finalize(monkeypatch):
+    """Default-stub ``tree_dump.finalize_tree`` so tests that drive
+    ``main()`` with a ``MagicMock`` ``SearchResult`` (i.e., ``result.tree``
+    is not a real ``SearchTree``) don't trip the JSON encoder when the
+    Task 14 ``finalize_tree(result.tree)`` call lands on disk.
+
+    Tests that *want* to assert on ``finalize_tree`` (Task 14's own
+    success/exception tests) call ``monkeypatch.setattr`` themselves;
+    that override beats this fixture's stub on the same attribute.
+    """
+    from src.runtime import tree_dump
+
+    monkeypatch.setattr(tree_dump, "finalize_tree", lambda tree: None)
+
+
 def _spec() -> KernelSpec:
     return KernelSpec(
         name="t",
@@ -1474,3 +1490,69 @@ def test_main_reset_clocks_short_circuits_pipeline(tmp_path, monkeypatch, capsys
     # Confirmation line on stdout.
     captured = capsys.readouterr()
     assert "GPU 0 clocks reset." in captured.out
+
+
+# ── tree_dump.finalize_tree wiring (Task 14) ──────────────────────────
+
+
+def test_main_calls_finalize_tree_on_success(tmp_path, monkeypatch):
+    """After ``optimize()`` returns, ``main()`` must call
+    ``tree_dump.finalize_tree(result.tree)`` so end-of-run tree files
+    (index.json + the three visualizations) land on disk before the
+    RunContext closes and unbinds tree_dump."""
+    from src.pipeline import optimize as opt_mod
+    from src.runtime import tree_dump
+
+    monkeypatch.chdir(tmp_path)
+
+    fake_tree = MagicMock(name="search_tree")
+    fake_result = MagicMock()
+    fake_result.tree = fake_tree
+    # SearchResult's run_end emit reads a few attrs — keep them MagicMock-safe.
+    fake_result.best_node = None
+    fake_result.total_iterations = 0
+    fake_result.termination_reason = MagicMock()
+    fake_result.termination_reason.value = "budget"
+
+    async def fake_optimize(problem_path, config=None):
+        return fake_result, MagicMock()
+
+    calls: list = []
+    monkeypatch.setattr(tree_dump, "finalize_tree", lambda tree: calls.append(tree))
+
+    with (
+        patch.object(opt_mod, "optimize", side_effect=fake_optimize),
+        patch("src.agents.llm_backend._SDK_AVAILABLE", False),
+        patch("src.pipeline.report.generate_report", return_value=MagicMock()),
+        patch("src.pipeline.report.render_report", return_value=""),
+    ):
+        opt_mod.main(["placeholder", "--run-dir", str(tmp_path / "runs")])
+
+    assert len(calls) == 1
+    assert calls[0] is fake_tree
+
+
+def test_main_does_not_call_finalize_tree_on_exception(tmp_path, monkeypatch):
+    """If ``optimize()`` raises before producing a SearchResult, there's
+    no tree to finalize — ``finalize_tree`` must not be called. (Partial-
+    tree finalize requires a separate "capture in-progress tree" mechanism
+    that's out of scope for Task 14.)"""
+    from src.pipeline import optimize as opt_mod
+    from src.runtime import tree_dump
+
+    monkeypatch.chdir(tmp_path)
+
+    async def raising_optimize(problem_path, config=None):
+        raise RuntimeError("test crash")
+
+    calls: list = []
+    monkeypatch.setattr(tree_dump, "finalize_tree", lambda tree: calls.append(tree))
+
+    with (
+        patch.object(opt_mod, "optimize", side_effect=raising_optimize),
+        patch("src.agents.llm_backend._SDK_AVAILABLE", False),
+    ):
+        with pytest.raises(RuntimeError, match="test crash"):
+            opt_mod.main(["placeholder", "--run-dir", str(tmp_path / "runs")])
+
+    assert calls == []
