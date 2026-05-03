@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import IO
 
-from src.runtime import events
+from src.runtime import events, tree_dump
 from src.runtime.timefmt import filename_ts
 
 logger = logging.getLogger(__name__)
@@ -93,6 +93,7 @@ class RunContext:
                 traces_dir.mkdir(parents=True, exist_ok=False)
             events_fh = events_path.open("w", buffering=1)
             events.bind(events_fh)
+            tree_dump.bind(run_dir / "tree")
             log_path.touch()
             fmt = logging.Formatter(_LOG_FORMAT)
             file_handler = logging.FileHandler(log_path)
@@ -177,6 +178,7 @@ class RunContext:
         of a path that's already handling an exception.
         """
         events.unbind()
+        tree_dump.unbind()
         if events_fh is not None:
             try:
                 events_fh.close()
@@ -196,6 +198,7 @@ class RunContext:
             return
         self._closed = True
         events.unbind()
+        tree_dump.unbind()
         if self._events_fh is not None:
             try:
                 self._events_fh.close()

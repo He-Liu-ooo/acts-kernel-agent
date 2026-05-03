@@ -45,6 +45,9 @@ class TreeNode:
     # ``QUARANTINE_THRESHOLD`` so a deterministically-failing parent
     # doesn't burn the whole search budget by being re-selected forever.
     consecutive_agent_failures: int = 0
+    # Iteration index (1-based) that produced this node. ``-1`` for the
+    # root and for legacy checkpoints predating the field.
+    iter_no: int = -1
 
 
 # A parent that has caused this many consecutive Planner/Coder failures
@@ -72,6 +75,8 @@ class SearchTree:
         parent_id: int,
         kernel: Kernel,
         action_applied: str,
+        *,
+        iter_no: int = -1,
     ) -> TreeNode:
         """Add a child node resulting from an optimization action."""
         parent = self._nodes[parent_id]
@@ -81,6 +86,7 @@ class SearchTree:
             parent_id=parent_id,
             action_applied=action_applied,
             depth=parent.depth + 1,
+            iter_no=iter_no,
         )
         parent.children_ids.append(node.id)
         self._nodes[node.id] = node
@@ -90,6 +96,17 @@ class SearchTree:
     def get_node(self, node_id: int) -> TreeNode:
         """Retrieve a node by ID."""
         return self._nodes[node_id]
+
+    def nodes(self):
+        """Iterate over every node in the tree (insertion order)."""
+        return self._nodes.values()
+
+    def has_node(self, node_id: int) -> bool:
+        """Return True iff a node with this ID exists."""
+        return node_id in self._nodes
+
+    def __len__(self) -> int:
+        return len(self._nodes)
 
     def frontier(self) -> list[TreeNode]:
         """Return all expandable frontier nodes — neither marked dead_end
@@ -224,6 +241,7 @@ def _serialize_node(node: TreeNode) -> dict:
         "profiling": _serialize_profiling(node.profiling),
         "per_workload_latency_us": _serialize_per_workload_latency(node.per_workload_latency_us),
         "consecutive_agent_failures": node.consecutive_agent_failures,
+        "iter_no": node.iter_no,
     }
 
 
@@ -368,6 +386,9 @@ def _deserialize_node(data: dict) -> TreeNode:
         # ``.get(..., 0)`` keeps pre-quarantine checkpoints loadable —
         # legacy nodes default to "no failures recorded yet."
         consecutive_agent_failures=data.get("consecutive_agent_failures", 0),
+        # ``.get(..., -1)`` keeps pre-iter_no checkpoints loadable —
+        # legacy nodes default to the same sentinel as the root.
+        iter_no=data.get("iter_no", -1),
     )
 
 

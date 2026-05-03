@@ -138,3 +138,45 @@ def test_create_twice_in_same_second_does_not_collide(tmp_path):
     finally:
         ctx_a.close()
         ctx_b.close()
+
+
+def test_tree_dump_bound_on_create(tmp_path):
+    from src.runtime import tree_dump
+    from src.runtime.run_context import RunContext
+    ctx = RunContext.create(root=tmp_path)
+    try:
+        assert tree_dump.is_bound()
+        assert (ctx.run_dir / "tree").is_dir()
+    finally:
+        ctx.close()
+
+
+def test_tree_dump_unbound_on_close(tmp_path):
+    from src.runtime import tree_dump
+    from src.runtime.run_context import RunContext
+    ctx = RunContext.create(root=tmp_path)
+    ctx.close()
+    assert not tree_dump.is_bound()
+
+
+def test_tree_dump_unbound_on_partial_setup_failure(tmp_path, monkeypatch):
+    """Mid-setup OSError must trigger _cleanup_partial_setup which unbinds
+    tree_dump. (Reuses the FileHandler-patch idiom from the existing
+    test_create_mid_setup_osError_falls_back_to_null_context — patching
+    builtins.open does not intercept Path.open in CPython 3.12.)"""
+    import src.runtime.run_context as rc_mod
+    from src.runtime import tree_dump
+    from src.runtime.run_context import RunContext
+
+    def exploding_file_handler(*args, **kwargs):
+        raise OSError("simulated quota exhaustion")
+
+    monkeypatch.setattr(rc_mod.logging, "FileHandler", exploding_file_handler)
+
+    ctx = RunContext.create(root=tmp_path)
+    try:
+        # Setup failed → null context; tree_dump must not be left bound.
+        assert ctx.run_dir is None
+        assert not tree_dump.is_bound()
+    finally:
+        ctx.close()
