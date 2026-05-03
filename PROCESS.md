@@ -45,6 +45,17 @@
 - **src/runtime/{__init__,timefmt,events,run_context}.py** — `RunContext.create(root, *, trace_dir=None, capture_traces=True)` owns per-invocation lifecycle: creates `./runs/run_<UTC>/` with microsecond-precision filename (parallel-safe), configures stdlib `FileHandler` + `StreamHandler`, silences `httpx`/`openai`/`agents` to WARNING, binds `events.jsonl`, wires SDK trace processor under `<run-dir>/traces/`. `close()` idempotent; `atexit` + `finally` for crashed-run flush. `_NullRunContext` keeps `emit()` in logger-only mode on setup OSError. `events.emit(kind, *, iter, **fields)` with `never-raise` discipline; 20 `CORE_EVENT_KINDS`. `finite_or_none()` sanitizes `inf`/`nan` for RFC-8259-valid JSON. See `doc/runtime.md`.
 - **agents/trace_processor.py** — imports `filename_ts` from `src/runtime/timefmt.py` (deprecation-clean).
 
+### Search-Tree Recording (landed 2026-05-02)
+- **src/runtime/tree_dump.py** — new module, mirrors `events.py` bind/unbind/never-raise pattern. Exposes `bind(tree_root) / unbind() / is_bound() / dump_node(node, *, iter_no, ncu_rep_src, failure_reason=None, failure_detail=None) / finalize_tree(tree)`.
+- **`RunContext.create / close`** — bind/unbind tree_dump alongside events; `_cleanup_partial_setup` includes tree_dump unbind.
+- **src/search/tree.py** — `TreeNode.iter_no: int = -1` field; public `nodes()`, `has_node(node_id)`, `__len__` on `SearchTree`.
+- **src/search/orchestrator.py** — three changes: `_iter_trace(iter_no, agent_name)` wraps each agent's `Runner.run()` in SDK `trace(workflow_name="acts_iter", metadata={...})` (Tier-1 fallback to `nullcontext`); `_kill_branch` calls `tree_dump.dump_node` after `branch_quality = DEAD_END` with `failure_reason`/`failure_detail` so dead-end nodes get persisted dirs; advance-path `dump_node` runs **after** `beam_prune` so streamed `meta.json.branch_quality` reflects post-prune state.
+- **src/eval/profiler.py** — `.ncu-rep` capture decoupled from JSON cache (`(cache_dir or _ncu_tmpdir())`); `-f` force-overwrite flag in NCU argv to avoid stale-report collisions in persistent user-scoped tmpdir; `ProfilingResult.ncu_rep_path` populated whenever NCU produced a file.
+- **src/pipeline/optimize.py** — `tree_dump.finalize_tree(result.tree)` runs after `optimize()` returns (before `ctx.close()` so bind is still live); writes end-of-run `index.json` + `tree.{txt,dot,mmd}` and rewrites each per-node `meta.json`'s `branch_quality` from final tree state.
+- Per-node files: `<run_dir>/tree/node_<id>/{kernel.py, ncu.json, ncu.ncu-rep, meta.json}`. End-of-run files: `<run_dir>/tree/{index.json, tree.txt, tree.dot, tree.mmd}`. Trace cross-reference: `jq 'select(.metadata.iter == N and .metadata.agent == "<role>")' traces/*.jsonl`.
+- 5 Codex review findings landed during the feature (3 adversarial + 2 non-adversarial): `.ncu-rep` orchestrator wiring, post-prune dump ordering, dead-end node persistence, beam-evicted-node meta rewrite at finalize, NCU `-f` flag.
+- Tests: `tests/test_tree_dump.py` (new), `tests/test_search_tree.py` (new), plus extensions to `test_run_context.py`, `test_orchestrator_events.py`, `test_pipeline_optimize.py`, `test_profiler_subprocess.py`. Final state at this commit: 649 passed / 0 failed across non-GPU suite.
+
 ### SOL Integration (mega-PR PR2, landed 2026-04-28/29)
 Adopted SOL primitives in-process; cu12.8-compatible, benchmark-agnostic.
 - **Tier 1 schema** — `Definition` / `Workload` / `Solution` / `Trace` + all input/solution/trace variants.
@@ -62,19 +73,15 @@ Tier 2 (`do_bench` timing) and Tier 8 (subprocess) deferred — see Future.
 - V1 completion cleared 2026-04-27 (action library guidance + real `detect_hardware()` + SOLAR adapter).
 - Multi-turn Reviewer (Variant A) shipped 2026-04-27.
 - NCU enabled on host (`NVreg_RestrictProfilingToAdminUsers=0` + reboot, real metrics flowing).
-- Live GPU run #3 (2026-05-02, `runs/run_20260502T060558_692431Z`) cleared 5 of 6 verification points; one regression surfaced — see Next Up §1.
+- Live GPU run #3 (2026-05-02, `runs/run_20260502T060558_692431Z`) cleared 5 of 6 verification points; the per-workload-latency regression that surfaced has since landed as part of the search-tree-recording work (per-workload latencies populated on every committed node + emitted in `bench_done`).
 
 ## Next Up
 
 ### Active queue (in order)
 
-1. **Per-workload latency missing → universal degraded rendering bug** *(NEW — surfaced 2026-05-02 live run #3)*. Every winner workload renders `[DEGRADED: per_workload_latency_missing]` because `child.per_workload_latency_us` is missing every UUID. The new degraded path is correct (suppresses wrong-bandwidth garbage); the upstream cause is the bug. Suspects: (a) per-workload bench failure → `math.inf`; (b) UUID never reaches `bench.per_workload_latency_us` due to partial-failure path in `eval/benchmark.py:201`; (c) stale checkpoint without the dict. All 3 workloads degraded → structural (b) likelier than transient (a). **Start**: grep `bench_done` events in `runs/run_20260502T060558_692431Z/events.jsonl`. See auto-memory `per_workload_latency_missing_bug.md`.
+1. **Backward-kernel SOLAR support**. Forward-shaped plan (zero structural change to SOL `Definition`): identify backward problems by spec-name suffix (`*_backward`); bridge gains `get_loss_fn` / `get_target` synthesis; `derive_t_sol` branches on suffix to select `BackwardProcessor`. Touches correctness + inputs + baseline generator + adapter — own brainstorming round. *Trigger to start*: first backward problem in SOL-ExecBench (likely attention-backward or layernorm-backward).
 
-2. **Logger / event-stream enrichment**. Today's `run.log` + `events.jsonl` carry headline signals; follow-up investigations want richer payloads. Concrete asks (refine in design): per-workload latency in `bench_done` (so §1's bug class is debuggable from events alone); `nvidia_smi_call` / `clock_lock_acquired` / `clock_lock_released` events; `solar_pipeline_stage` events per SOLAR stage; `ncu_metrics` event with parsed metric dict + `degraded_reason`. Design discussion required — load-bearing vs nice-to-have, schema-versioning contract, scannable-yet-informative tradeoff.
-
-3. **Backward-kernel SOLAR support**. Forward-shaped plan (zero structural change to SOL `Definition`): identify backward problems by spec-name suffix (`*_backward`); bridge gains `get_loss_fn` / `get_target` synthesis; `derive_t_sol` branches on suffix to select `BackwardProcessor`. Touches correctness + inputs + baseline generator + adapter — own brainstorming round. *Trigger to start*: first backward problem in SOL-ExecBench (likely attention-backward or layernorm-backward).
-
-4. **`eval/anti_cheat.py` orchestration policy layer**. Process-level primitives shipped via Tier 4; remaining is the policy layer — route `reward_hack_suspect` / `calibration_warning` from `scorer.py` to a handler (mark branch dead vs warn-only vs human-review queue). Design discussion required.
+2. **`eval/anti_cheat.py` orchestration policy layer**. Process-level primitives shipped via Tier 4; remaining is the policy layer — route `reward_hack_suspect` / `calibration_warning` from `scorer.py` to a handler (mark branch dead vs warn-only vs human-review queue). Design discussion required.
 
 ### Backlog (post-V1)
 
@@ -99,6 +106,8 @@ Tier 2 (`do_bench` timing) and Tier 8 (subprocess) deferred — see Future.
 ### Trigger-gated tech-debt
 
 Items surfaced by review passes; each has a **trigger** — the signal to act. Re-read the trigger before reaching for one of these.
+
+- **Event-catalog enrichment — clock-lock / SOLAR-stage / NCU-metrics events**. Per-workload latency in `bench_done` already landed; the remaining sub-asks are deferred: `nvidia_smi_call` / `clock_lock_acquired` / `clock_lock_released` events around the clock-lock lifecycle; `solar_pipeline_stage` events per SOLAR pipeline stage (PyTorchProcessor → PyTorchToEinsum → EinsumGraphAnalyzer → EinsumGraphPerfModel); `ncu_metrics` event with parsed metric dict + `degraded_reason` (raw NCU dict is now persisted to `tree/node_<id>/ncu.json`, so the event is purely about scannable headline signal). *Trigger*: next live run where clock-lock or SOLAR-stage state is needed for postmortem from `events.jsonl` alone.
 
 - **SOL Tier 2 — `do_bench` timing + per-iter memory pool (PR 3)** *(deferred 2026-04-29)*. Replace `_TorchCudaTimer` in `eval/benchmark.py` with `sol_execbench.core.bench.timing.{time_runnable, do_bench, clone_args}`; wire `ShiftingMemoryPoolAllocator` into `do_bench`'s `setup` callback. Existing timer adequate for live runs (cleared 2026-04-26). Cost of deferring: ~1–5% ACTS-vs-SOL score gap (statistical estimator divergence); `ShiftingMemoryPoolAllocator` defends against result-cache exploits irrelevant for honest LLM kernels (no cross-iter memoization, L2 thrasher invalidates L2). 12 tests in `tests/test_benchmark.py` will need rewrite (Protocol → callable seam). *Trigger* (any): publish ACTS-vs-SOL head-to-head; anti-cheat catches result-cache exploit the L2 thrasher missed; a kernel's runtime is far enough outside fixed warmup/rep counts to skew the median; SOL upgrades `do_bench` with a feature we want.
 

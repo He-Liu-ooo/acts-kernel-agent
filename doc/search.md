@@ -4,7 +4,7 @@ Tree search with beam pruning. 3 LLM agents coordinated by a deterministic orche
 
 ## SearchTree — `tree.py`
 
-Manages tree state: nodes, frontier, and expansion.
+Manages tree state: nodes, frontier, and expansion. The persisted form of the search tree lives under `<run_dir>/tree/` — see [`runtime.md`](runtime.md) for the layout and visualization formats.
 
 ### TreeNode
 
@@ -19,12 +19,16 @@ Manages tree state: nodes, frontier, and expansion.
 | `action_applied` | str | Technique name that produced this node |
 | `depth` | int | Distance from root |
 | `consecutive_agent_failures` | `int` | Count of consecutive Planner/Coder failures on this parent. Reset to 0 after a successful `add_child`. Drives quarantine via `frontier()`. |
+| `iter_no` | `int` | Iteration index (1-based) that produced this node. Default `-1` for the root and for legacy checkpoints predating the field. Threaded in via `add_child`'s keyword-only argument so the on-disk per-node directory under `<run_dir>/tree/node_<id>/` can record which iteration committed it. |
 
 ### Methods
 
 - `add_root(kernel) -> TreeNode`: Add baseline as root.
-- `add_child(parent_id, kernel, action) -> TreeNode`: Add optimization result.
+- `add_child(parent_id, kernel, action_applied, *, iter_no=-1) -> TreeNode`: Add optimization result. `iter_no` is the iteration index that produced this child; defaults to `-1` (root / legacy checkpoint sentinel).
 - `get_node(id) -> TreeNode`: Lookup.
+- `nodes() -> Iterable[TreeNode]`: Iterate over every node in the tree, in insertion order. Used by the on-disk tree dumper to walk the full set when building `<run_dir>/tree/index.json`.
+- `has_node(node_id) -> bool`: Membership test — True iff a node with this ID exists.
+- `__len__() -> int`: Total node count (root + every committed child, including DEAD_END / quarantined nodes).
 - `frontier() -> list[TreeNode]`: All non-dead_end nodes whose `consecutive_agent_failures < QUARANTINE_THRESHOLD` (module constant, default 2). Quarantining repeat-failing parents prevents `select_next` from burning the search budget on a deterministically-failing node by re-picking it forever.
 - `best_node() -> TreeNode`: Highest SOL score. Quarantined nodes are intentionally still considered here — quarantine blocks future expansion (a `frontier()` concern), not winner-as-final-answer; the node's already-measured score is still valid as the run's best.
 - `path_to_node(id) -> list[TreeNode]`: Ordered path from root to given node. Raises `KeyError` for unknown IDs.
@@ -114,7 +118,7 @@ async def run(
 8. **Profile** child on representative workload — skip when `repr_workload_latency_s` is None; `ProfilerError` → mark `DEAD_END`, `beam_prune`, next iteration; `(flops, nbytes) == (0, 0)` (no formula for op_type) → keep branch alive but skip profile
 9. Commit `child.profiling`, `child.score` (via `compute_sol_score`), `child.per_workload_latency_us` to the tree node. The emitted `score_computed` event carries `t_sol_source` (`"solar"` or `"builtin"`) so audit can distinguish SOLAR-grounded scores from `compute_roofline()` fallback-grounded ones.
 10. **Reviewer**: eval results + `run_bottleneck` + live `ProfilingResult` + `tree_context=render_path(child.id)` → `ReviewerFeedback` + `branch_quality`. When profiling was skipped, defaults `branch_quality` to `PROMISING` (keeps the branch alive so `beam_prune` treats it normally)
-11. `beam_prune(tree, beam_width, enable_diversity=config.beam_diversity)`
+11. `beam_prune(tree, beam_width, enable_diversity=config.beam_diversity)` — then `tree_dump.dump_node(child, iter_no=iter_no, ncu_rep_src=...)` writes `<run_dir>/tree/node_<id>/{kernel.py, ncu.json, ncu.ncu-rep, meta.json}` so the on-disk `meta.json` reflects the post-prune `branch_quality` (an evicted child correctly serializes as `dead_end`).
 12. Termination checks: `sol_target` (child.score ≥ threshold), `plateau` (via `detect_plateau` on `best_scores`), else decay epsilon and continue
 13. Budget exhausted after `max_depth` iterations → `BUDGET`
 
@@ -130,7 +134,7 @@ Three independent detector channels feed the same DEAD_END routing pipeline, wit
 
 **CUDA sticky-state recovery.** A subset of `RuntimeError` messages (substring match against `_CUDA_STICKY_PATTERNS = ("illegal memory access", "device-side assert", "unspecified launch failure", "misaligned address", "out of memory", "cublas", "cudnn")`) trigger a single `torch.cuda.synchronize()` retry. A loose `"cuda" in msg` check is intentionally **not** used — strings like "operation not implemented for CUDA" are real bugs and must propagate. Non-matching `RuntimeError`s re-raise. After the sync, the branch is killed via `_kill_branch(..., reason=DEAD_CUDA_ERROR)` (infra failure, no agent-failure bump). A run-level `consecutive_cuda_errors` counter is incremented when the sync itself fails; on the third consecutive failure the orchestrator raises `CUDAContextPoisoned` to abort the whole run rather than burn iterations producing meaningless results from a poisoned device. The counter resets to zero after any successful bench or successful sync.
 
-**`_kill_branch(child, parent, iter_no, *, reason, detail, bumps_agent_failures)` helper.** Consolidates the six DEAD_END exit sites (channel A reward-hack, channel B reward-hack-confirmed, CUDA sticky-state, partial bench failure, repr-workload-latency-unavailable, profiler error). Each call: marks `child.branch_quality = DEAD_END`, optionally bumps `parent.consecutive_agent_failures` (True only for agent-output failures — Coder/Planner produced a buggy/cheating kernel; False for infra failures where the agent isn't accountable), runs `beam_prune`, and emits the `branch_dead_end{reason, detail}` + `iter_end{outcome=dead_end}` pair. The trailing `epsilon = max(epsilon_end, epsilon - decay)` decay still lives at each call site because `epsilon` and `decay` are local to `run()`'s frame.
+**`_kill_branch(child, parent, iter_no, *, reason, detail, bumps_agent_failures)` helper.** Consolidates the six DEAD_END exit sites (channel A reward-hack, channel B reward-hack-confirmed, CUDA sticky-state, partial bench failure, repr-workload-latency-unavailable, profiler error). Each call: marks `child.branch_quality = DEAD_END`, optionally bumps `parent.consecutive_agent_failures` (True only for agent-output failures — Coder/Planner produced a buggy/cheating kernel; False for infra failures where the agent isn't accountable), runs `beam_prune`, calls `tree_dump.dump_node(child, iter_no=iter_no, ncu_rep_src=None, failure_reason=reason, failure_detail=detail)` so the dead-end node still gets a per-node directory under `<run_dir>/tree/node_<id>/` carrying the kill reason, and emits the `branch_dead_end{reason, detail}` + `iter_end{outcome=dead_end}` pair. The trailing `epsilon = max(epsilon_end, epsilon - decay)` decay still lives at each call site because `epsilon` and `decay` are local to `run()`'s frame.
 
 **`DEAD_*` reason constants** (defined in `runtime/events.py`, frozen in `DEAD_REASONS`):
 

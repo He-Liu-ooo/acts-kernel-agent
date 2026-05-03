@@ -1,8 +1,8 @@
 # Runtime — `src/runtime/`
 
-Per-run observability substrate: one run directory, three sinks, structured events.
+Per-run observability substrate: one run directory, three streaming sinks plus a per-node search-tree dump, structured events.
 
-Every ACTS run produces exactly one `runs/run_<UTC>/` directory holding a human-readable log, a structured JSONL event stream, and SDK trace records. The runtime module owns setup, file handles, and teardown for all three.
+Every ACTS run produces exactly one `runs/run_<UTC>/` directory holding a human-readable log, a structured JSONL event stream, SDK trace records, and a per-node dump of the search tree. The runtime module owns setup, file handles, and teardown for all four.
 
 ## Run directory layout
 
@@ -13,8 +13,9 @@ Every ACTS run produces exactly one `runs/run_<UTC>/` directory holding a human-
 | `run.log` | Human-readable stdlib log (DEBUG to file, INFO to stderr). | `tail -f` during a run; post-mortem text search. |
 | `events.jsonl` | Structured ACTS-narrative events, one JSON object per line, RFC-8259 valid. | Tooling via `jq`; scoring / progress dashboards. |
 | `traces/acts_trace_<UTC>.jsonl` | SDK-level records per LLM call and per tool call, written by `JSONLTraceProcessor`. | Ground-truth replay of agent conversations. |
+| `tree/` | Per-committed-node `node_<id>/{kernel.py, ncu.json, ncu.ncu-rep, meta.json}` (streamed per-iter) + end-of-run `index.json` / `tree.{txt,dot,mmd}` (visualizations). Written by `tree_dump`. | Postmortem inspection of every kernel + score + status the search produced; cross-referenced into `traces/*.jsonl` via the SDK `workflow_name="acts_iter"` metadata. |
 
-The three sinks are independent: `events.jsonl` records the orchestrator's narrative (what the search did); `traces/*.jsonl` records what the SDK actually dispatched. Cross-referencing both is how you verify claims that the narrative cannot make on its own — see the truthfulness note on `coder_submitted` below.
+The four artifact families are independent: `events.jsonl` records the orchestrator's narrative (what the search did); `traces/*.jsonl` records what the SDK actually dispatched; `tree/` records every committed node's full state. Cross-referencing them is how you verify claims that any single stream cannot make on its own — see the truthfulness note on `coder_submitted` below, and the `tree/` section's trace cross-reference recipe.
 
 ## `timefmt.py`
 
@@ -137,12 +138,72 @@ Calling `emit()` after `close()` no-ops on the JSONL side (sink unbound) and sti
 |---|---|---|
 | `emit()` write fails (disk full, closed FD) | silent for that event | yes |
 | Unknown `kind` passed to `emit()` | `run.log` WARNING line; record still written | yes |
+| `tree_dump.dump_node` / `finalize_tree` write fails (disk full, closed FD, hardlink-cross-device error) | `run.log` WARNING line, that node / those summary files missing from `tree/` | yes |
 | `mkdir runs/run_<UTC>/` denied | stderr WARNING, null-paths `RunContext`, `emit()` degrades to logger-only | yes |
 | SDK not installed | stderr WARNING, no `traces/*.jsonl`, everything else works | yes |
 | Crash mid-run (uncaught exception) | `atexit` flushes `events.jsonl` + closes `run.log` | n/a |
 | SIGKILL | line-buffered writes preserve the last complete line; partial last line may be lost | n/a |
 
 Every path here is "continue, not abort" by design — the logger observes the run, it does not gate it.
+
+## Tree dump (`<run_dir>/tree/`)
+
+Every committed node is streamed to disk under `tree/node_<id>/` as the
+search progresses; end-of-run files are written by
+`tree_dump.finalize_tree`.
+
+| Path | Content |
+|------|---------|
+| `tree/node_<id>/kernel.py` | Triton source verbatim. |
+| `tree/node_<id>/ncu.json`  | NCU `raw_metrics` dict. Absent on degraded runs. |
+| `tree/node_<id>/ncu.ncu-rep` | Binary NCU report. Open in Nsight Compute. Absent on degraded runs. |
+| `tree/node_<id>/meta.json` | Structural + scoring + status fields. |
+| `tree/index.json` | All-nodes summary + edges. |
+| `tree/tree.txt`   | ASCII visualization. |
+| `tree/tree.dot`   | Graphviz source — render: `dot -Tpng tree.dot > tree.png`. |
+| `tree/tree.mmd`   | Mermaid source — preview in GitHub / VS Code. |
+
+Module surface mirrors `events.py`: `bind(tree_root)` / `unbind()` /
+`is_bound()` manage the single bound root, `dump_node(node, *, iter_no,
+ncu_rep_src, failure_reason=None, failure_detail=None)` streams one
+committed node, `finalize_tree(tree)` writes the four top-level files.
+Both write paths are no-ops when unbound and swallow `OSError` (logged
+at `WARNING`) so a tree-dump hiccup cannot kill a running search.
+`RunContext.create` calls `bind(run_dir / "tree")` after
+`events.bind(...)`; `RunContext.close` calls `unbind()`.
+
+`failure_reason` / `failure_detail` are populated by `_kill_branch` for
+dead-end branches and surface as a top-level `failure: {reason, detail}`
+object in the node's `meta.json`.
+
+`finalize_tree` also rewrites each per-node `meta.json`'s
+`branch_quality` from the final tree state — beam-evicted nodes whose
+status was mutated after their streamed dump get their on-disk record
+reconciled with `index.json`. The rewrite preserves every other key
+(including `failure`) and skips nodes that never streamed a `meta.json`
+(e.g., the root).
+
+### Trace cross-reference
+
+Per-iteration LLM-call detail lives in `traces/acts_trace_<ts>.jsonl`,
+keyed by SDK trace metadata. The orchestrator wraps each agent
+invocation in `with trace(workflow_name="acts_iter", metadata={"iter":
+N, "agent": "planner|coder|reviewer"})`. To pull the planner / coder /
+reviewer records for node 5 (committed on iter 3):
+
+```bash
+jq 'select(.metadata.iter == 3 and .metadata.agent == "reviewer")' \
+  <run_dir>/traces/*.jsonl
+```
+
+`meta.json.trace_workflow` always equals `"acts_iter"` so the filter
+recipe is documented in the file itself.
+
+### `★ best` convention
+
+ASCII / DOT / Mermaid all mark the run's best-scoring node with `★`.
+`index.json` sets `is_best=true` on that node and `best_node_id` at the
+top level.
 
 ## Live-watch one-liners
 

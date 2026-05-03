@@ -60,6 +60,22 @@ Some optimizations require passing through a performance valley (e.g., restructu
 
 **Decision**: keep expansion serial until a real benchmark shows LLM latency is the dominant cost. At that point, design the change as a coordinated restructure — frontier snapshots + batched memory flush + per-worker checkpoint slots — rather than dropping `asyncio.gather` into the hot path. Recorded with its trigger in `PROCESS.md` → Deferred Improvements → "Parallel beam expansion via asyncio.gather".
 
+### Search-tree recording — per-node dump under <run_dir>/tree/ (2026-05-02)
+
+**Per-node directory, streamed per-iter**: each node gets `tree/node_<id>/{kernel.py, ncu.json, ncu.ncu-rep, meta.json}` over one inlined JSON blob. **Why**: postmortem is `cat node_5/kernel.py` and per-file diffs, not jq on a megabyte blob. Streaming after each `beam_prune` (not end-of-run) preserves partial state when a multi-minute live run crashes mid-search.
+
+**Bind/unbind module-level state**: mirrors `events.py`. **Why**: Orchestrator stays unaware of `run_dir`; no parameter-threading through the search loop. RunContext owns lifecycle.
+
+**Trace cross-reference via metadata, not duplication**: per-node `meta.json` carries only `trace_workflow="acts_iter"` + `iter_no`; Planner/Reviewer prose stays in `traces/*.jsonl`. **Why**: traces are the single source of truth for LLM-call detail — duplicating prose would drift.
+
+**Post-prune dump + `finalize_tree` rewrite**: streamed dump runs after `beam_prune` so `branch_quality` reflects post-prune state; `finalize_tree` rewrites every `meta.json` from final tree state at end-of-run. **Why**: streamed-only would silently disagree with `index.json` once the beam fills and evicts already-dumped nodes.
+
+**`failure_reason` / `failure_detail` on `dump_node`** (Codex adversarial round): `_kill_branch` now calls `dump_node` with the kill reason in `meta.json.failure`. **Why**: "why did node 5 die" postmortem needs the DEAD_END node's directory, not just an index entry.
+
+**`.ncu-rep` decoupled from `cache_dir`**: capture path is `(cache_dir or _ncu_tmpdir())`; NCU `-f` handles persistent-tmpdir collisions. **Why**: orchestrator path doesn't pass `cache_dir`, so tying `.ncu-rep` to it would silently drop the report on every real run.
+
+**Non-goals**: not a checkpoint primitive (`SearchTree.save/load` left for future resume); no live rendering; `.ncu-rep` captured but no analysis tooling on top of it.
+
 ---
 
 ## Agents
