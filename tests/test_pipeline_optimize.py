@@ -230,9 +230,9 @@ async def test_load_sol_problem_fails_fast_when_solar_unavailable():
     the problem so the operator sees the actionable install hint
     immediately, not at score-emit time.
 
-    Regression for the 2026-04-30 live-run bug where every
-    ``score_computed`` event reported ``t_sol_source="builtin"`` and
-    ``t_sol_us=0.0`` because SOLAR was missing from the run venv."""
+    Regression for the live-run bug where every ``score_computed``
+    event reported ``t_sol_source="builtin"`` and ``t_sol_us=0.0``
+    because SOLAR was missing from the run venv."""
     config = ACTSConfig(benchmark_adapter="sol_execbench")
 
     with patch(
@@ -1312,47 +1312,47 @@ def test_lock_gpu0_clocks_rolls_back_on_dram_failure():
 
 def test_verify_gpu0_locked_returns_true_when_clocks_match():
     """``_verify_gpu0_locked`` must return True when nvidia-smi reports
-    current graphics + memory clocks within tolerance of the expected
-    values. The wake-op (a tiny torch kernel launch) is mocked away —
-    we're testing the parse + compare logic, not torch."""
+    ``clocks.applications.{graphics,memory}`` within tolerance of the
+    expected lock targets. ``applications.*`` is what ``-lgc`` / ``-lmc``
+    write — it reflects the lock target whether the GPU is busy or idle,
+    so no wake-op is needed."""
     from src.pipeline import optimize as opt_mod
 
-    fake_torch = MagicMock()
     fake_completed = MagicMock()
     fake_completed.stdout = "2505, 10001\n"
 
-    with (
-        patch.dict("sys.modules", {"torch": fake_torch}),
-        patch.object(opt_mod.subprocess, "run", return_value=fake_completed) as mock_run,
-    ):
+    with patch.object(
+        opt_mod.subprocess, "run", return_value=fake_completed,
+    ) as mock_run:
         ok = opt_mod._verify_gpu0_locked(2505, 10001)
 
     assert ok is True
     # The nvidia-smi query must be scoped to GPU 0 (mirroring the
-    # GPU-0-only lock) — that's the H2 fix.
+    # GPU-0-only lock).
     cmd = mock_run.call_args.args[0]
     assert "-i" in cmd and cmd[cmd.index("-i") + 1] == "0", cmd
     assert "nvidia-smi" in cmd
-    assert "--query-gpu=clocks.current.graphics,clocks.current.memory" in cmd
+    # The query field name is the contract — pin it at the test level so
+    # an accidental revert to ``clocks.current.*`` (the idle-drift trap)
+    # fails the regression here.
+    assert (
+        "--query-gpu=clocks.applications.graphics,clocks.applications.memory"
+        in cmd
+    )
 
 
 def test_verify_gpu0_locked_returns_false_when_clocks_drift_beyond_tolerance():
-    """When nvidia-smi reports a current clock outside the 50-MHz
-    tolerance band, ``_verify_gpu0_locked`` must return False so the
-    caller rolls back the partial lock. This is the H1 false-negative
-    case we used to silently accept (idle GPU at 210 MHz vs locked
-    target 2505 MHz)."""
+    """When nvidia-smi reports an applications clock outside the 50-MHz
+    tolerance band (e.g. driver pinned the lock to a different value, or
+    another process repinned), ``_verify_gpu0_locked`` returns False so
+    the caller rolls back the partial lock."""
     from src.pipeline import optimize as opt_mod
 
-    fake_torch = MagicMock()
     fake_completed = MagicMock()
-    # Idle clock: 210 MHz graphics, target was 2505 — well outside tolerance.
+    # Applications clock far from the 2505 MHz target — outside tolerance.
     fake_completed.stdout = "210, 10001\n"
 
-    with (
-        patch.dict("sys.modules", {"torch": fake_torch}),
-        patch.object(opt_mod.subprocess, "run", return_value=fake_completed),
-    ):
+    with patch.object(opt_mod.subprocess, "run", return_value=fake_completed):
         ok = opt_mod._verify_gpu0_locked(2505, 10001)
 
     assert ok is False
@@ -1367,18 +1367,52 @@ def test_verify_gpu0_locked_returns_false_on_subprocess_error():
 
     from src.pipeline import optimize as opt_mod
 
-    fake_torch = MagicMock()
-
-    with (
-        patch.dict("sys.modules", {"torch": fake_torch}),
-        patch.object(
-            opt_mod.subprocess, "run",
-            side_effect=real_subprocess.CalledProcessError(returncode=1, cmd="x"),
-        ),
+    with patch.object(
+        opt_mod.subprocess, "run",
+        side_effect=real_subprocess.CalledProcessError(returncode=1, cmd="x"),
     ):
         ok = opt_mod._verify_gpu0_locked(2505, 10001)
 
     assert ok is False
+
+
+def test_verify_gpu0_locked_does_not_invoke_torch():
+    """The wake-op is dead code now that we read ``clocks.applications.*``
+    (which reflects the lock target whether the GPU is busy or idle).
+    ``_verify_gpu0_locked`` must not import or touch torch — verifying
+    this prevents an accidental revert to the wake-op pattern (which
+    re-introduces a startup-latency cost and an exception surface for
+    no benefit)."""
+    import sys
+
+    from src.pipeline import optimize as opt_mod
+
+    fake_completed = MagicMock()
+    fake_completed.stdout = "2505, 10001\n"
+
+    # Booby-trap ``torch`` so any attribute access raises. If verify
+    # still tries to import + use torch (the old wake-op path), the
+    # AssertionError surfaces as a test failure.
+    class _BoobyTrap:
+        def __getattr__(self, name: str) -> object:
+            raise AssertionError(
+                f"verify must not touch torch (accessed torch.{name})",
+            )
+
+    saved = sys.modules.get("torch")
+    sys.modules["torch"] = _BoobyTrap()
+    try:
+        with patch.object(
+            opt_mod.subprocess, "run", return_value=fake_completed,
+        ):
+            ok = opt_mod._verify_gpu0_locked(2505, 10001)
+    finally:
+        if saved is None:
+            sys.modules.pop("torch", None)
+        else:
+            sys.modules["torch"] = saved
+
+    assert ok is True
 
 
 def test_signal_unlock_handler_unlocks_then_propagates():

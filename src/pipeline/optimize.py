@@ -182,48 +182,15 @@ def _lock_gpu0_clocks(gpu_mhz: int, dram_mhz: int) -> bool:
 def _verify_gpu0_locked(
     expected_gpu_mhz: int, expected_dram_mhz: int, tolerance_mhz: int = 50,
 ) -> bool:
-    """Verify GPU 0's clocks landed at the locked values.
+    """Verify GPU 0 is locked at the requested clock targets.
 
-    SOL's ``verify_clocks`` is unfit for this host for two reasons:
-
-    (H1) ``-lgc`` sets the GPU's *application* clock — the frequency the
-    card runs at *while busy*. When idle, RTX 6000 Ada drops to ~210 MHz
-    regardless of the lock; reading ``clocks.current.graphics`` right
-    after the lock subprocess returns therefore sees the idle clock and
-    reports drift, even though the lock is in force.
-
-    (H2) SOL's ``verify_clocks`` queries every GPU on the host (no
-    ``-i <idx>``) and requires *all* of them to be within tolerance. On
-    multi-GPU dev boxes that fails the moment any other GPU is busy or
-    locked elsewhere — even though ACTS only ever locks GPU 0.
-
-    The fix here is symmetric with ``_lock_gpu0_clocks``: (1) wake GPU 0
-    with a single small kernel launch so the current clock reflects the
-    locked target, then (2) query nvidia-smi *for GPU 0 only* and compare
-    with a tolerance. Returns False on any subprocess / parse failure;
-    callers in ``_try_acquire_clock_lock`` treat False as drift and roll
-    back the partial lock.
-
-    Wake-up is a tiny FP32 add on a 32-element tensor + a synchronize —
-    well under 1ms of GPU work, less than the lock subprocess overhead.
-    Failure to import torch or run the wake op is non-fatal: we still
-    issue the nvidia-smi query (it'll most likely report idle clocks and
-    return False, which is the correct conservative outcome).
+    Reads ``clocks.applications.{graphics,memory}`` (the field
+    ``-lgc``/``-lmc`` write — reflects the lock target whether the GPU
+    is busy or idle), scoped to GPU 0. Returns False on any subprocess
+    or parse failure so the caller rolls back the partial lock.
     """
-    try:
-        import torch
-        x = torch.zeros(32, device=f"cuda:{_GPU_INDEX}")
-        x = x + 1.0
-        torch.cuda.synchronize(int(_GPU_INDEX))
-    except Exception as exc:
-        # Wake-up is best-effort: if torch/cuda glitched, the verify
-        # below will read idle clocks and (correctly) return False, so
-        # the caller rolls back the partial lock — degraded mode, not a
-        # phantom locked-state.
-        logger.warning("GPU %s wake-op for verify failed: %s", _GPU_INDEX, exc)
-
     result = _nvidia_smi(
-        "--query-gpu=clocks.current.graphics,clocks.current.memory",
+        "--query-gpu=clocks.applications.graphics,clocks.applications.memory",
         "--format=csv,noheader,nounits",
     )
     if result is None:
@@ -536,8 +503,8 @@ async def _load_sol_problem(
             "importable. T_SOL would silently fall back to 0.0 (zero "
             "flop_count / memory_bytes on SOL kernel specs), corrupting "
             "every score. Install SOLAR + torchview into the run venv:\n"
-            "    VIRTUAL_ENV=/tmp/acts_run_venv uv pip install torchview\n"
-            "    VIRTUAL_ENV=/tmp/acts_run_venv uv pip install \\\n"
+            "    VIRTUAL_ENV=~/.venvs/acts_run_venv uv pip install torchview\n"
+            "    VIRTUAL_ENV=~/.venvs/acts_run_venv uv pip install \\\n"
             "        -e /path/to/SOLAR --no-deps\n"
             "See configs/venvs/3.12.md for the canonical recipe."
         )
@@ -885,15 +852,6 @@ def _try_acquire_clock_lock() -> None:
         _emit_clock_unavailable(device_name, ClockLockReason.LOCK_FAILED)
         return
 
-    # Verify the actual clocks landed where we asked. We use
-    # ``_verify_gpu0_locked`` (ACTS-side wrapper) instead of SOL's
-    # ``verify_clocks`` because the latter (a) reads the *current*
-    # graphics clock — which on an idle GPU drops to ~210 MHz regardless
-    # of the lock, producing false-negatives — and (b) queries every GPU
-    # on the host without ``-i <idx>``, so multi-GPU dev boxes fail the
-    # check whenever any other GPU is busy or pinned elsewhere. Our
-    # wrapper wakes GPU 0 with a tiny kernel launch, then queries
-    # nvidia-smi scoped to GPU 0, mirroring the GPU-0-only lock above.
     # Verification failure (drift detected or exception) is treated as
     # lock-acquisition failure: roll back the partial pin so we don't
     # leave the GPU clamped to a wrong/drifting frequency, emit
