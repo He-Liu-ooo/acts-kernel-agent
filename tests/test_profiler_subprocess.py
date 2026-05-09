@@ -6,7 +6,7 @@ by ``tests/test_profiler_csv.py`` — the driver must pass stdout through
 to the parser without interpreting it.
 
 Tier 1: GPU-free. A ``fake_ncu`` shell script on ``$PATH`` stands in for
-the real ``ncu`` binary. Runs in ``/tmp/acts_test_venv``.
+the real ``ncu`` binary. Runs in ``~/.venvs/acts_test_venv``.
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ from pathlib import Path
 
 import pytest
 
+from _profiler_helpers import force_ncu_discovery, two_phase_fake_ncu_body
 from src.eval.profiler import _run_ncu
 from src.kernels.kernel import Kernel, KernelSpec, KernelType
 
@@ -208,6 +209,10 @@ def test_garbage_stdout_passes_through(fake_ncu_path, sample_kernel, sample_work
 def test_binary_missing_marks_degraded(tmp_path, monkeypatch, sample_kernel, sample_workload):
     """No ``ncu`` on ``$PATH`` → driver returns degraded without raising
     FileNotFoundError."""
+    # Force discovery to miss both PATH and the cuda-12.8 fallback so the
+    # driver hits the "neither PATH nor host install" degradation path.
+    force_ncu_discovery(monkeypatch, fallback_present=False)
+
     # Point PATH at an empty dir so `ncu` cannot resolve.
     empty = tmp_path / "empty"
     empty.mkdir()
@@ -222,6 +227,36 @@ def test_binary_missing_marks_degraded(tmp_path, monkeypatch, sample_kernel, sam
     )
     assert degraded is True
     assert reason == "ncu_binary_not_found"
+
+
+# ── ncu binary discovery ───────────────────────────────────────────────────
+
+
+def test_discover_ncu_binary_falls_back_to_cuda_12_8_when_path_misses(
+    tmp_path, monkeypatch
+):
+    """When ``shutil.which('ncu')`` returns None (PATH doesn't include
+    cuda's bin), discovery falls back to the hardcoded
+    ``/usr/local/cuda-12.8/bin/ncu`` if that file exists. Regression
+    guard for the ``ncu_binary_not_found`` live-run failure after a
+    clean rebuild of ``~/.venvs/acts_run_venv``."""
+    from src.eval import profiler as profiler_mod
+
+    force_ncu_discovery(monkeypatch, fallback_present=True)
+
+    assert profiler_mod._discover_ncu_binary() == profiler_mod._NCU_FALLBACK_PATH
+
+
+def test_discover_ncu_binary_returns_none_when_neither_path_nor_fallback_exists(
+    tmp_path, monkeypatch
+):
+    """Both ``shutil.which`` miss AND fallback path missing → discovery
+    returns None so callers degrade with ``ncu_binary_not_found``."""
+    from src.eval import profiler as profiler_mod
+
+    force_ncu_discovery(monkeypatch, fallback_present=False)
+
+    assert profiler_mod._discover_ncu_binary() is None
 
 
 # ── argv wiring ────────────────────────────────────────────────────────────
@@ -1362,27 +1397,7 @@ def test_ncu_rep_path_set_when_cache_dir_is_none(tmp_path, monkeypatch):
     )
     csv = banner + header + "".join(rows)
 
-    # Shell body: parse ``-o <basename>`` out of argv, ``touch
-    # <basename>.ncu-rep`` (matching what real NCU writes), then dump the
-    # CSV stream the parser expects.
-    body = (
-        "#!/usr/bin/env bash\n"
-        "out_basename=\"\"\n"
-        "while [[ $# -gt 0 ]]; do\n"
-        "  if [[ \"$1\" == \"-o\" ]]; then\n"
-        "    out_basename=\"$2\"\n"
-        "    shift 2\n"
-        "    continue\n"
-        "  fi\n"
-        "  shift\n"
-        "done\n"
-        "if [[ -n \"$out_basename\" ]]; then\n"
-        "  : > \"$out_basename.ncu-rep\"\n"
-        "fi\n"
-        'cat <<"NCUEOF"\n'
-        + csv
-        + "NCUEOF\n"
-    )
+    body = two_phase_fake_ncu_body(csv)
     script = tmp_path / "ncu"
     script.write_text(body)
     script.chmod(
@@ -1466,3 +1481,370 @@ def test_ncu_argv_omits_force_flag_when_out_path_none(tmp_path):
                            kernel_name="kernel_fn", out_path=None)
     assert "-f" not in argv
     assert "-o" not in argv
+
+
+# ── --import CSV extraction (2026-05-08 NCU 2025.x two-subprocess fix) ─────
+
+
+def test_ncu_argv_omits_log_file_when_out_path_set(tmp_path):
+    """``_build_ncu_argv`` must NOT emit ``--log-file`` — that flag was
+    explored (Option A) and rejected after empirical verification: when
+    ``-o`` is set, NCU's stdout is banners-only and ``--log-file`` only
+    redirects what would have been printed. The fix is the two-subprocess
+    path (``_extract_ncu_csv`` post-profile), not a flag tweak."""
+    from src.eval.profiler import _build_ncu_argv
+    from src.kernels.kernel import Kernel, KernelSpec, KernelType
+    spec = KernelSpec(name="t", kernel_type=KernelType.ELEMENTWISE,
+                      flop_count=0, memory_bytes=0, input_shapes=[],
+                      pytorch_reference="", t_sol_us=1.0)
+    kernel = Kernel(spec=spec, source_code="")
+    spec_json = tmp_path / "spec.json"
+    spec_json.write_text("{}")
+    out_path = tmp_path / "report.ncu-rep"
+
+    argv = _build_ncu_argv(kernel, spec_json, mode="full",
+                           kernel_name="kernel_fn", out_path=out_path)
+
+    assert "--log-file" not in argv
+    # ``-o`` and ``-f`` still belong to the capture argv.
+    assert "-o" in argv
+    assert "-f" in argv
+
+
+def test_extract_ncu_csv_argv_uses_import_csv_page_details(tmp_path, monkeypatch):
+    """``_extract_ncu_csv`` invokes ncu with ``--import <rep> --csv --page
+    details`` — the only flag combo that re-emits the parser-expected
+    columns from a binary report. Mock ncu echoes its argv to a log file
+    so the test can assert on the exact command line."""
+    import os
+    import stat
+    from src.eval import profiler as profiler_mod
+    from src.eval.profiler import _extract_ncu_csv
+
+    monkeypatch.setattr(
+        profiler_mod, "_NCU_BINARY_CACHE", profiler_mod._UNSET, raising=False
+    )
+
+    argv_log = tmp_path / "argv.log"
+    body = (
+        "#!/usr/bin/env bash\n"
+        f"printf '%s\\n' \"$@\" > {argv_log}\n"
+        "echo 'ID,Kernel Name,Metric Name,Metric Unit,Metric Value'\n"
+    )
+    script = tmp_path / "ncu"
+    script.write_text(body)
+    script.chmod(script.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ.get('PATH', '')}")
+
+    rep_path = tmp_path / "report.ncu-rep"
+    rep_path.write_text("ncu-rep-marker")
+
+    stdout, rc, degraded, reason = _extract_ncu_csv(rep_path)
+    assert rc == 0
+    assert degraded is False
+    assert reason is None
+    assert "Kernel Name" in stdout
+
+    args = argv_log.read_text().splitlines()
+    assert "--import" in args
+    assert str(rep_path) in args
+    assert "--csv" in args
+    assert "--page" in args
+    page_idx = args.index("--page")
+    assert args[page_idx + 1] == "details"
+
+
+def test_extract_ncu_csv_nonzero_returns_ncu_import_failed(tmp_path, monkeypatch):
+    """``_extract_ncu_csv`` returns the distinct ``ncu_import_failed:<rc>``
+    slug on non-zero exit so the upstream classifier can tell "the binary
+    is there but post-processing failed" from "no header in CSV"."""
+    import os
+    import stat
+    from src.eval import profiler as profiler_mod
+    from src.eval.profiler import _extract_ncu_csv
+
+    monkeypatch.setattr(
+        profiler_mod, "_NCU_BINARY_CACHE", profiler_mod._UNSET, raising=False
+    )
+
+    body = (
+        "#!/usr/bin/env bash\n"
+        "echo 'ncu: error: import failed' >&2\n"
+        "exit 7\n"
+    )
+    script = tmp_path / "ncu"
+    script.write_text(body)
+    script.chmod(script.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ.get('PATH', '')}")
+
+    rep_path = tmp_path / "report.ncu-rep"
+    rep_path.write_text("ncu-rep-marker")
+
+    _stdout, rc, degraded, reason = _extract_ncu_csv(rep_path)
+    assert rc == 7
+    assert degraded is True
+    assert reason == "ncu_import_failed:7"
+
+
+def test_profile_kernel_extracts_csv_via_import_with_ncu_2025(
+    tmp_path, monkeypatch
+):
+    """Regression guard for commit 166d697.
+
+    Real NCU 2025.x suppresses CSV from stdout when ``-o`` is set —
+    stdout is just ``==PROF==`` banners and the binary report is on
+    disk. Before the two-subprocess fix, ``_parse_ncu_csv`` saw zero
+    rows on stdout and degraded with ``csv_parse:no_header``. This test
+    mocks NCU honoring the real contract: ``-o`` (capture mode) writes a
+    marker rep + emits banners-only stdout; ``--import <rep>`` (extract
+    mode) emits CSV. The fix must run the extract subprocess after the
+    profile subprocess, hand its stdout to the parser, and produce a
+    non-degraded ProfilingResult.
+    """
+    from src.eval import profiler as profiler_mod
+    from src.eval.profiler import ProfilingResult, profile_kernel
+    from conftest import rtx6000_ada_hardware
+
+    monkeypatch.setattr(
+        profiler_mod, "_NCU_BINARY_CACHE", profiler_mod._UNSET, raising=False
+    )
+    profiler_mod._reset_ncu_permission_cache()
+    monkeypatch.delenv(profiler_mod._NCU_DISABLE_ENV, raising=False)
+
+    header = '"ID","Kernel Name","Metric Name","Metric Unit","Metric Value"\n'
+
+    def row(metric: str, value: str) -> str:
+        return f'"0","elementwise_add_kernel","{metric}","%","{value}"\n'
+
+    rows = [
+        row("sm__warps_active.avg.pct_of_peak_sustained_active", "55.0"),
+        row("lts__t_sector_hit_rate.pct", "72.5"),
+        row("sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active", "0"),
+    ]
+    stall_values = {
+        "barrier": "0", "branch_resolving": "5", "dispatch_stall": "10",
+        "drain": "15", "imc_miss": "20", "lg_throttle": "25",
+        "long_scoreboard": "80", "math_pipe_throttle": "35", "membar": "40",
+        "mio_throttle": "45", "misc": "50", "no_instruction": "55",
+        "not_selected": "60", "selected": "65", "short_scoreboard": "70",
+        "sleeping": "1", "tex_throttle": "2", "wait": "3",
+    }
+    for reason, val in stall_values.items():
+        rows.append(
+            row(f"smsp__average_warp_latency_issue_stalled_{reason}.pct", val)
+        )
+    csv_text = header + "".join(rows)
+
+    body = two_phase_fake_ncu_body(csv_text)
+    script = tmp_path / "ncu"
+    script.write_text(body)
+    script.chmod(script.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ.get('PATH', '')}")
+
+    kernel = Kernel(
+        spec=KernelSpec(
+            name="my_elementwise",
+            kernel_type=KernelType.ELEMENTWISE,
+            entrypoint="elementwise_add_kernel",
+        ),
+        source_code=(
+            "def elementwise_add_kernel(*args, **kwargs):\n"
+            "    return None\n"
+        ),
+    )
+    workload = {"uuid": "workload-0", "axes": {"N": 1024}, "inputs": {}}
+
+    result = profile_kernel(
+        kernel,
+        workload,
+        _identity_input_generator,
+        hardware_spec=rtx6000_ada_hardware(),
+        flops=1_000_000,
+        nbytes=4_000_000,
+        latency_s=1e-3,
+        mode="curated",
+        timeout_s=10.0,
+        cache_dir=None,
+    )
+
+    assert isinstance(result, ProfilingResult)
+    assert result.degraded is False, (
+        f"profile_kernel degraded with reason={result.degraded_reason!r} — "
+        "expected the post-profile ``ncu --import`` extract to recover "
+        "the parser. Without the two-subprocess fix, this would be "
+        "'csv_parse:no_header' (banners-only stdout from the capture call)."
+    )
+    assert result.ncu is not None
+    assert result.ncu.sm_occupancy_pct == pytest.approx(55.0)
+    assert result.ncu.warp_stall_dominant == "long_scoreboard"
+
+
+def test_parser_would_fail_without_import_extract_call():
+    """Regression-guard for design point #8: explicit assertion that the
+    parser fails with ``csv_parse:no_header`` if ``_run_ncu`` ever returns
+    the profile subprocess's banner-only stdout (i.e. a future cleanup
+    that drops the post-profile ``ncu --import`` extract call would
+    re-trigger the bug). Pure parser test — no subprocess. Cheap defense
+    against ``_extract_ncu_csv`` being pruned on a future "is this second
+    call redundant?" pass."""
+    from src.eval.profiler import _parse_ncu_csv
+
+    # Exactly what NCU 2025.1.1.0 writes to stdout when ``-o`` is set:
+    # four ``==PROF==`` banners and nothing else. The two-subprocess fix
+    # exists because this stdout has no CSV anywhere — only ``ncu --import
+    # <rep> --csv`` re-emits parseable rows.
+    banners_only_stdout = (
+        "==PROF== Connected to process 1\n"
+        "==PROF== Profiling kernel\n"
+        "==PROF== Disconnected from process 1\n"
+        "==PROF== Report saved\n"
+    )
+
+    ncu, raw, degraded, reason = _parse_ncu_csv(
+        banners_only_stdout, "elementwise_add_kernel"
+    )
+
+    assert ncu is None
+    assert raw == {}
+    assert degraded is True
+    # This exact slug is what surfaced (newly loud, thanks to
+    # _log_degradation) on the 2026-05-08 live run. If the post-profile
+    # ``ncu --import`` extract call is ever pruned, _run_ncu would feed
+    # this banners-only stdout to the parser and we'd be back here.
+    assert reason == "csv_parse:no_header"
+
+
+# ── fallback-binary threaded into the capture subprocess ──────────────────
+#
+# Regression guards for the Codex adversarial review (2026-05-08): the
+# initial ``_discover_ncu_binary`` fallback was effectively dead code in
+# the clean-venv scenario it was designed to fix because ``_build_ncu_argv``
+# still hardcoded argv[0] to bare ``"ncu"``. ``_run_ncu`` must substitute
+# the discovered absolute path before ``subprocess.run`` so a PATH-clean +
+# fallback-present host actually reaches NCU. JOURNAL 2026-05-08 amendment.
+
+
+def test_run_ncu_uses_discovered_binary_when_path_misses(
+    monkeypatch, sample_kernel, sample_workload
+):
+    """PATH-clean + fallback-present: ``_run_ncu`` must invoke
+    ``subprocess.run`` with the discovered absolute path (not bare
+    ``"ncu"``). Without the fix, ``subprocess.run(["ncu", ...])`` raises
+    FileNotFoundError on a clean venv and every profile degrades as
+    ``ncu_binary_not_found`` even though ``_discover_ncu_binary`` returned
+    a usable path."""
+    import subprocess
+    from src.eval import profiler as profiler_mod
+
+    profiler_mod._reset_ncu_permission_cache()
+    monkeypatch.delenv(profiler_mod._NCU_DISABLE_ENV, raising=False)
+    # Force discovery to take the cuda-12.8 fallback path (simulates clean
+    # ~/.venvs/acts_run_venv before the activate-script PATH patch).
+    force_ncu_discovery(monkeypatch, fallback_present=True)
+
+    captured: dict[str, object] = {}
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = list(argv)
+        # Return a healthy CompletedProcess so ``_run_ncu`` follows the
+        # success path. ``ncu_rep_out`` is None in this test so the second
+        # subprocess (``--import``) is not invoked.
+        return subprocess.CompletedProcess(
+            args=argv, returncode=0, stdout="", stderr=""
+        )
+
+    monkeypatch.setattr(profiler_mod.subprocess, "run", fake_run)
+
+    _run_ncu(
+        sample_kernel,
+        sample_workload,
+        _identity_input_generator,
+        timeout_s=10.0,
+        mode="curated",
+    )
+
+    assert "argv" in captured, "subprocess.run was never called"
+    argv = captured["argv"]
+    assert argv[0] == profiler_mod._NCU_FALLBACK_PATH, (
+        f"_run_ncu invoked subprocess with argv[0]={argv[0]!r}; "
+        f"expected the discovered absolute path "
+        f"{profiler_mod._NCU_FALLBACK_PATH!r}. Bare 'ncu' would raise "
+        "FileNotFoundError on a PATH-clean host and defeat the fallback."
+    )
+
+
+def test_extract_ncu_csv_uses_discovered_binary_when_path_misses(
+    tmp_path, monkeypatch
+):
+    """Companion guard: ``_extract_ncu_csv`` already substitutes
+    ``_discover_ncu_binary()`` for argv[0] (see profiler.py:506-516). Pin
+    that behavior so a future refactor doesn't regress it back to bare
+    ``"ncu"`` and re-create the same dead-fallback bug on the import call."""
+    import subprocess
+    from src.eval import profiler as profiler_mod
+    from src.eval.profiler import _extract_ncu_csv
+
+    force_ncu_discovery(monkeypatch, fallback_present=True)
+
+    captured: dict[str, object] = {}
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = list(argv)
+        return subprocess.CompletedProcess(
+            args=argv, returncode=0, stdout="", stderr=""
+        )
+
+    monkeypatch.setattr(profiler_mod.subprocess, "run", fake_run)
+
+    rep_path = tmp_path / "report.ncu-rep"
+    rep_path.write_text("ncu-rep-marker")
+
+    _extract_ncu_csv(rep_path)
+
+    assert "argv" in captured
+    argv = captured["argv"]
+    assert argv[0] == profiler_mod._NCU_FALLBACK_PATH
+
+
+def test_extract_ncu_csv_propagates_tmpdir_env(tmp_path, monkeypatch):
+    """``_extract_ncu_csv`` must pass the same user-scoped ``TMPDIR``
+    env that ``_run_ncu`` constructs, otherwise the import subprocess
+    inherits the process default ``/tmp`` and can hit the
+    ``nsight-compute-lock`` ownership/permission failure on shared hosts
+    after capture succeeds."""
+    import subprocess
+    from src.eval import profiler as profiler_mod
+    from src.eval.profiler import _extract_ncu_csv, _ncu_tmpdir
+
+    monkeypatch.setattr(
+        profiler_mod, "_NCU_BINARY_CACHE", profiler_mod._UNSET, raising=False
+    )
+
+    captured: dict[str, object] = {}
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = list(argv)
+        captured["env"] = kwargs.get("env")
+        return subprocess.CompletedProcess(
+            args=argv, returncode=0, stdout="", stderr=""
+        )
+
+    monkeypatch.setattr(profiler_mod.subprocess, "run", fake_run)
+
+    rep_path = tmp_path / "report.ncu-rep"
+    rep_path.write_text("ncu-rep-marker")
+
+    _extract_ncu_csv(rep_path)
+
+    assert "env" in captured, "subprocess.run was never called"
+    env = captured["env"]
+    assert env is not None, (
+        "_extract_ncu_csv invoked subprocess.run without env=; the import "
+        "call inherits process /tmp and can hit nsight-compute-lock ownership "
+        "failures on shared hosts. Mirror _run_ncu's env construction."
+    )
+    assert env.get("TMPDIR") == _ncu_tmpdir(), (
+        f"TMPDIR mismatch: expected {_ncu_tmpdir()!r}, got {env.get('TMPDIR')!r}. "
+        "Must match _run_ncu's TMPDIR exactly so capture and import see the "
+        "same user-scoped tempdir."
+    )

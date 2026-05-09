@@ -13,6 +13,7 @@ import getpass
 import hashlib
 import io
 import json
+import logging
 import os
 import re
 import shutil
@@ -25,6 +26,10 @@ from typing import TYPE_CHECKING, Any, Callable
 
 from src.config import HardwareSpec
 from src.kernels.compiler import compile_kernel
+
+# WARNING per degraded ``ProfilingResult`` so silent NCU degradations
+# are greppable in ``run.log``.
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from src.kernels.kernel import Kernel
@@ -42,6 +47,14 @@ _METRIC_SET_VERSION: str = "v2"
 # ``_UNSET`` sentinel distinguishes "not yet probed" from "probed → missing".
 _UNSET: Any = object()
 _NCU_BINARY_CACHE: Any = _UNSET
+
+# Hardcoded fallback for ``_discover_ncu_binary`` when ``shutil.which("ncu")``
+# misses — typically a freshly-built ``~/.venvs/acts_run_venv`` whose
+# ``activate`` script doesn't prepend cuda's bin to ``PATH``. Matches the
+# host-cuda invariant in ``configs/venvs/3.12.md`` (driver 570.x + CUDA
+# 12.8). When the host cuda version bumps, update this path AND the
+# corresponding step in that recipe in lockstep.
+_NCU_FALLBACK_PATH: str = "/usr/local/cuda-12.8/bin/ncu"
 
 # Once-per-process cache for NCU failures the OS makes permanent — most
 # notably ``NVreg_RestrictProfilingToAdminUsers=1`` on the host kernel
@@ -291,12 +304,14 @@ class ProfilingResult:
         cls, analytical: "AnalyticalMetrics", reason: str
     ) -> "ProfilingResult":
         """Construct a degraded ProfilingResult: no NCU data, empty raw
-        metrics, with the given reason explaining why.
+        metrics, with the given reason explaining why. Logs the reason at
+        WARNING so the slug is greppable in ``run.log``.
 
         Named ``make_degraded`` (not ``degraded``) to avoid clashing with
         the ``degraded`` ``@property`` above — Python class attributes
         share a single namespace.
         """
+        logger.warning("ncu degraded: %s", reason)
         return cls(
             analytical=analytical,
             ncu=None,
@@ -457,6 +472,75 @@ def _ncu_tmpdir() -> str:
     return str(path)
 
 
+def _ncu_env() -> dict[str, str]:
+    """TMPDIR override shared by capture and import subprocesses
+    (workaround for shared-``/tmp`` lock-ownership)."""
+    env = os.environ.copy()
+    env["TMPDIR"] = _ncu_tmpdir()
+    return env
+
+
+def _extract_ncu_csv(rep_path: Path, *, timeout_s: float = 30.0) -> tuple[str, int, bool, str | None]:
+    """Run ``ncu --import <rep_path> --csv --page details`` and return its
+    stdout as a CSV stream.
+
+    NCU 2025.x suppresses the CSV stream from stdout whenever ``-o`` is
+    set on the profile call (the binary report is written, but stdout
+    only carries ``==PROF==`` banners; there is no ``--csv-file`` flag and
+    ``--log-file`` only redirects what would have been printed). The
+    fix is a second subprocess that re-extracts the CSV from the binary
+    after the profile runs — no GPU work, just binary→CSV serialization.
+
+    Returns ``(stdout, returncode, degraded, reason)`` mirroring
+    ``_run_ncu``'s shape:
+      * ``("", -1, True, "ncu_binary_not_found")`` if ncu vanished from
+        PATH between the profile call and this one.
+      * ``("", -1, True, "ncu_import_failed:timeout")`` on timeout.
+      * ``(stdout, rc, True, "ncu_import_failed:<rc>")`` on non-zero exit.
+      * ``(stdout, 0, False, None)`` on success — caller hands stdout
+        straight to ``_parse_ncu_csv``.
+    """
+    binary = _discover_ncu_binary()
+    if binary is None:
+        return "", -1, True, "ncu_binary_not_found"
+    # ``--print-metric-name=name`` is required on the import call too —
+    # without it, section data renders metrics under their human-readable
+    # *labels* (``Achieved Occupancy``, ``Warp Cycles Per Issued
+    # Instruction``) rather than raw dotted names. The flag on the
+    # capture call only governs the suppressed-stdout stream; section
+    # rendering is re-decided at import time.
+    argv = [
+        binary,
+        "--import",
+        str(rep_path),
+        "--csv",
+        "--page",
+        "details",
+        "--print-metric-name=name",
+    ]
+    try:
+        completed = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+            env=_ncu_env(),
+            check=False,
+        )
+    except FileNotFoundError:
+        return "", -1, True, "ncu_binary_not_found"
+    except subprocess.TimeoutExpired:
+        return "", -1, True, "ncu_import_failed:timeout"
+    if completed.returncode != 0:
+        return (
+            completed.stdout or "",
+            completed.returncode,
+            True,
+            f"ncu_import_failed:{completed.returncode}",
+        )
+    return completed.stdout or "", 0, False, None
+
+
 def _build_ncu_argv(
     kernel: "Kernel",
     spec_json_path: Path,
@@ -500,6 +584,13 @@ def _build_ncu_argv(
         # user-scoped and persistent across runs; without it, repeat profiles
         # of the same (source, workload, mode, kernel) cache key fail when
         # NCU refuses to overwrite the existing .ncu-rep from a prior run.
+        #
+        # NCU 2025.x routing quirk: when ``-o`` is set, NCU suppresses the
+        # CSV stream from stdout entirely — there's no flag combination
+        # that delivers both binary ``.ncu-rep`` and CSV stdout in one
+        # invocation. ``_run_ncu`` runs a second subprocess
+        # (``ncu --import <rep> --csv --page details``) post-profile to
+        # re-extract the CSV from the binary.
         argv += ["-f", "-o", str(out_path.with_suffix(""))]
 
     if mode == "full":
@@ -609,7 +700,8 @@ def _run_ncu(
     if _NCU_PERMANENTLY_UNAVAILABLE is not None:
         return "", -1, True, _NCU_PERMANENTLY_UNAVAILABLE
 
-    if _discover_ncu_binary() is None:
+    binary = _discover_ncu_binary()
+    if binary is None:
         return "", -1, True, "ncu_binary_not_found"
 
     spec_payload: dict[str, Any] = {
@@ -638,8 +730,7 @@ def _run_ncu(
     # rebuilds it from the serialized problem.
     _ = input_generator
 
-    env = os.environ.copy()
-    env["TMPDIR"] = _ncu_tmpdir()
+    env = _ncu_env()
 
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".json", delete=False, dir=env["TMPDIR"]
@@ -654,6 +745,13 @@ def _run_ncu(
         kernel_name=kernel_name,
         out_path=ncu_rep_out,
     )
+    # Substitute the discovered absolute path for the bare ``"ncu"``
+    # ``_build_ncu_argv`` puts at argv[0]. On a clean venv where
+    # ``shutil.which("ncu")`` misses but ``_NCU_FALLBACK_PATH`` resolves,
+    # leaving argv[0] as bare ``"ncu"`` would make ``subprocess.run`` raise
+    # ``FileNotFoundError`` and degrade as ``ncu_binary_not_found`` even
+    # though discovery succeeded. Mirrors ``_extract_ncu_csv``'s pattern.
+    argv[0] = binary
 
     try:
         completed = subprocess.run(
@@ -701,16 +799,33 @@ def _run_ncu(
             f"ncu_nonzero_exit:{completed.returncode}"
         )
 
+    # When ``-o`` is set, NCU 2025.x suppresses the CSV stream from
+    # stdout — ``completed.stdout`` is just ``==PROF==`` banners and the
+    # parser would degrade with ``csv_parse:no_header``. Run a second
+    # subprocess (``ncu --import <rep> --csv --page details``) to
+    # re-extract the CSV from the binary report. No GPU work — just a
+    # binary→CSV serialization pass.
+    if ncu_rep_out is not None:
+        return _extract_ncu_csv(ncu_rep_out, timeout_s=timeout_s)
+
     return completed.stdout, 0, False, None
 
 
 def _discover_ncu_binary() -> str | None:
     """Return the absolute path of ``ncu`` on ``$PATH``, or ``None`` if
     missing. Result is cached at module level so long-lived orchestrators
-    pay ``shutil.which`` only once per process."""
+    pay ``shutil.which`` only once per process.
+
+    Falls back to ``_NCU_FALLBACK_PATH`` (host cuda-12.8 install) when
+    ``shutil.which`` returns None — survives venvs whose activate script
+    doesn't prepend cuda's bin to PATH (clean rebuilds from
+    ``configs/venvs/3.12.md``)."""
     global _NCU_BINARY_CACHE
     if _NCU_BINARY_CACHE is _UNSET:
-        _NCU_BINARY_CACHE = shutil.which("ncu")
+        found = shutil.which("ncu")
+        if found is None and Path(_NCU_FALLBACK_PATH).is_file():
+            found = _NCU_FALLBACK_PATH
+        _NCU_BINARY_CACHE = found
     return _NCU_BINARY_CACHE
 
 
@@ -906,15 +1021,23 @@ def profile_kernel(
         ncu_rep_out=ncu_rep_out,
     )
     if driver_degraded:
-        return ProfilingResult.make_degraded(analytical, driver_reason)
+        return ProfilingResult.make_degraded(
+            analytical, driver_reason or "ncu_unknown_driver_failure"
+        )
 
     ncu, raw, parser_degraded, parser_reason = _parse_ncu_csv(stdout, kernel_name)
     if parser_degraded:
+        # Parser path constructs ProfilingResult directly because
+        # ``raw_metrics=raw`` may be non-empty (escape hatch for prompt
+        # engineers); ``make_degraded`` zeroes raw, so it can't be reused.
+        # Log here to keep parity with every other degraded return.
+        reason = parser_reason or "ncu_unknown_parser_failure"
+        logger.warning("ncu degraded: %s", reason)
         return ProfilingResult(
             analytical=analytical,
             ncu=None,
             raw_metrics=raw,
-            degraded_reason=parser_reason,
+            degraded_reason=reason,
         )
 
     if cache_dir is not None:

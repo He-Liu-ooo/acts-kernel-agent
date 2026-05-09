@@ -25,6 +25,7 @@ from pathlib import Path
 
 import pytest
 
+from _profiler_helpers import force_ncu_discovery, two_phase_fake_ncu_body
 from conftest import rtx6000_ada_hardware as _rtx6000_ada
 from src.config import HardwareSpec
 from src.eval import profiler as profiler_mod
@@ -140,16 +141,12 @@ def fake_ncu(tmp_path, monkeypatch):
     script = tmp_path / "ncu"
 
     csv = _canned_csv()
-    # Escape for embedding in a shell heredoc: nothing special needed
-    # since the heredoc delimiter is quoted (``<<"EOF"`` → no expansion).
-    body = (
-        "#!/usr/bin/env bash\n"
-        f"n=$(cat {counter})\n"
-        f"echo $((n+1)) > {counter}\n"
-        'cat <<"NCUEOF"\n'
-        + csv
-        + "NCUEOF\n"
-    )
+    # See ``two_phase_fake_ncu_body`` for the mock contract: counter
+    # increments on capture (``-o``) and legacy invocations only —
+    # extract (``--import``) calls are excluded so cache-hit tests can
+    # assert on full-profile-run count without conflating the
+    # post-profile extract subprocess.
+    body = two_phase_fake_ncu_body(csv, counter_path=counter)
     script.write_text(body)
     script.chmod(script.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
@@ -566,12 +563,17 @@ def test_profiler_error_on_bad_latency_with_populated_cache(
 def test_ncu_binary_missing_returns_degraded_no_cache_write(
     tmp_path, sample_kernel, sample_workload, monkeypatch
 ):
-    """Empty ``$PATH`` → ``_discover_ncu_binary`` returns None → profile
-    returns a degraded ``ProfilingResult`` without raising and without
-    writing any cache entry. The analytical side still populated."""
+    """Empty ``$PATH`` AND fallback path missing → ``_discover_ncu_binary``
+    returns None → profile returns a degraded ``ProfilingResult`` without
+    raising and without writing any cache entry. The analytical side still
+    populated."""
     empty = tmp_path / "empty"
     empty.mkdir()
     monkeypatch.setenv("PATH", str(empty))
+    # Force discovery to miss both PATH and the cuda-12.8 fallback — on a
+    # host where the fallback exists, ``_run_ncu`` would resolve via it and
+    # degrade with a different reason.
+    force_ncu_discovery(monkeypatch, fallback_present=False)
 
     cache_dir = tmp_path / "cache"
     result = _call_profile(sample_kernel, sample_workload, cache_dir=cache_dir)

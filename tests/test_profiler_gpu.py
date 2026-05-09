@@ -1,7 +1,7 @@
 """Tier 2 real-GPU tests for ``src.eval.profiler``.
 
 Gated by ``@pytest.mark.gpu`` at module scope — skipped by the default
-``/tmp/acts_test_venv`` Tier 1 run. These tests exercise the full
+``~/.venvs/acts_test_venv`` Tier 1 run. These tests exercise the full
 analytical + NCU pipeline against the live ``ncu`` binary and a real
 Triton kernel on the RTX 6000 Ada.
 
