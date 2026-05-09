@@ -821,7 +821,7 @@ async def test_submit_tool_registered_with_strict_mode_false():
 async def test_review_flag_on_registers_both_tools_with_strict_mode_false():
     """When reviewer_metric_queries=True, both submit_review AND query_metric
     must be registered, both with strict_mode=False. Same SDK strict-schema
-    trap as the planner submit-tool dict params (JOURNAL 2026-04-26)."""
+    trap as the planner submit-tool dict params."""
     capture_factory, fake_run = _simulate_review_submission(
         outcome="improved",
         bottleneck_classification="memory_bound",

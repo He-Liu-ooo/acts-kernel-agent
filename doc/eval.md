@@ -193,6 +193,19 @@ GPU-symbol resolution priority (T4): (1) `Kernel.triton_kernel_name` declared by
 
 Subprocess invocation uses `sys.executable` (not bare `"python"`) so the child inherits the venv with torch/triton installed. `TMPDIR` is redirected to a user-scoped `/tmp/<user>_ncu` so `nsight-compute-lock` files owned by other users on shared hosts can't block the run.
 
+### Two-subprocess architecture (capture + extract)
+
+NCU 2025.x suppresses the CSV stream from stdout whenever `-o` is set on the profile call — the binary report is written but stdout carries only `==PROF==` banners; no flag combination delivers both binary `.ncu-rep` and CSV in a single invocation (`--log-file` only redirects what would have been printed). The driver therefore runs two subprocesses:
+
+- **Profile call** — existing argv built by `_build_ncu_argv` (with `-f -o <rep_path-without-suffix>`) produces the binary `.ncu-rep` and a banner-only stdout that is discarded.
+- **Extract call** — `_extract_ncu_csv` runs `ncu --import <rep_path> --csv --page details --print-metric-name=name`, which extracts the CSV from the binary report (no GPU work, just binary→CSV serialization). Its stdout is handed to `_parse_ncu_csv` with the unchanged signature.
+
+The extract subprocess inherits the same `TMPDIR` env as the capture subprocess (post-Codex-review amendment, via the shared `_ncu_env()` helper) so the user-scoped tmpdir workaround for shared `/tmp` lock-ownership applies symmetrically across both calls.
+
+`ProfilingResult.ncu_rep_path` is populated whenever NCU produced a `.ncu-rep` (success path); the orchestrator's `tree_dump.dump_node` reads it to copy the binary report into the run artefact tree. Cache-hit returns surface the path when the previously-written report is still on disk and `None` otherwise; degraded returns always carry `None`.
+
+See JOURNAL 2026-05-08 entry "NCU `.ncu-rep` capture + CSV extraction — two-subprocess architecture" for the full rationale (rejected single-call alternatives, cost analysis).
+
 ### Failure taxonomy
 
 | Reason slug | Cause | Behavior |
@@ -202,10 +215,14 @@ Subprocess invocation uses `sys.executable` (not bare `"python"`) so the child i
 | `ncu_binary_not_found` | `ncu` not on `$PATH` | Degraded, no cache write |
 | `ncu_timeout` | Subprocess exceeded `timeout_s` (default 60s) | Degraded, no cache write |
 | `ncu_nonzero_exit:<rc>` / `ncu_nonzero_exit:<rc>:<sanitized_stderr_first_line>` | Subprocess returned non-zero. When stderr is non-empty, the slug carries a fingerprint suffix (sanitized = slugified, capped 60 chars); empty stderr keeps the bare `ncu_nonzero_exit:<rc>` form | Degraded, no cache write |
+| `ncu_import_failed:timeout` | The second subprocess (`ncu --import <rep_path> --csv --page details`) exceeded its timeout. Distinct from `ncu_timeout` (capture call) and from `csv_parse:no_header` (parser couldn't find a header in extract-call stdout) — `ncu_import_failed:*` means "binary `.ncu-rep` was captured but post-processing it via `ncu --import` failed." | Degraded, no cache write |
+| `ncu_import_failed:<rc>` | The `ncu --import` subprocess returned non-zero exit code `<rc>`. Same distinction from `ncu_nonzero_exit` (capture call) and `csv_parse:*` (parser-side) as above | Degraded, no cache write |
 | `csv_parse:<kind>` | Parser couldn't find header / columns | Degraded, no cache write |
 | `no_matching_kernel` | `--kernel-name regex:` matched no row in the NCU CSV | Degraded |
 | `missing_metric:<name>` | Required curated metric absent from CSV | Degraded |
 | `stalls_incomplete` | Fewer than 2 stall metrics parsed | Degraded |
+
+Every degraded `ProfilingResult` is announced at WARNING level via `logger = logging.getLogger("src.eval.profiler")` so silent failures are greppable from `run.log` alone. The factory `ProfilingResult.make_degraded(analytical, reason)` emits `ncu degraded: <slug>` and is called from each degraded return path in `profile_kernel`; the parser-degraded branch (which preserves `raw_metrics` and so cannot use the factory) emits the same `ncu degraded: <slug>` line inline. This was the regression-guard added 2026-05-08.
 
 **Once-per-process permission cache.** When the first NCU invocation returns a permanent-failure signature (admin-only counters, driver-init failure), the module-level `_NCU_PERMANENTLY_UNAVAILABLE` flag in `src/eval/profiler.py` flips and every subsequent call short-circuits with `ncu_skipped:permanently_unavailable:<sig>` instead of re-forking `ncu`. This avoids paying the subprocess + driver-init cost on every iteration once we know counters are admin-only on this host. Operators can pre-empt the probe entirely by setting `ACTS_DISABLE_NCU=1`, which yields the `ncu_disabled_via_env` slug before any subprocess work.
 

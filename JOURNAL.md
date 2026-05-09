@@ -76,6 +76,8 @@ Some optimizations require passing through a performance valley (e.g., restructu
 
 **Non-goals**: not a checkpoint primitive (`SearchTree.save/load` left for future resume); no live rendering; `.ncu-rep` captured but no analysis tooling on top of it.
 
+**Amendment 2026-05-08 — `finalize_tree` refreshes late-bound node fields.** The 2026-05-08 root-dump fix (item #1: call `dump_node(root, …)` after baseline `per_workload_latency_us` assignment) wrote `node_0/meta.json` *before* `root.score` was computed, leaving `score: null` in the persisted artifact even though `index.json` and the in-memory tree had the scored baseline. `finalize_tree` already rewrote `branch_quality` post-prune; extending it to also refresh `score`, `per_workload_latency_us`, and (post a second Codex review) `children_ids` for already-dumped nodes addresses this regression class structurally — any future late-bound node field gets the same treatment without needing every dump-call site to be moved or duplicated. Codex adversarial review caught the original `score` instance; a follow-up `/codex:review` caught `children_ids` (root dumps with `children_ids: []` and the field stayed null even after iters added children). The refresh-finalize approach was preferred over moving the root dump call (which would only fix the known fields, not the class). New regression tests assert `node_0/meta.json["score"]` and `["children_ids"]` match the in-memory root after `finalize_tree` runs. Lesson: when extending the refresh-field list, enumerate **all** dump-time-captured fields that can be late-bound, not just the ones the latest review surfaced.
+
 ---
 
 ## Agents
@@ -379,7 +381,7 @@ Rationale: top-1 tells the Reviewer which tier to target (stall-memory-throttle 
 **Real-GPU tests required when a GPU is available (process decision, 2026-04-20)**. Fake-`ncu` subprocess tests (shell script on `$PATH`) cover every failure path in the driver cheaply, but they cannot catch (a) NCU metric-name drift between CUDA versions, (b) whether curated sections are available on the target GPU architecture, (c) whether `--kernel-name regex:<entrypoint>` actually matches Triton's mangled kernel names, or (d) whether the subprocess driver imports and launches correctly. On a GPU-equipped dev machine, a "manual smoke script not in CI" is a dodge — if the machine can run the test, the test is required.
 
 **Done gate for `eval/profiler.py`**:
-1. Tier 1 (GPU-free, fake-`ncu`, 5 test files) passes in `/tmp/acts_test_venv`.
+1. Tier 1 (GPU-free, fake-`ncu`, 5 test files) passes in `~/.venvs/acts_test_venv`.
 2. Tier 2 (`tests/test_profiler_gpu.py`, `@pytest.mark.gpu`, real `ncu` on the RTX 6000 Ada / CUDA 12.8 host) passes locally.
 3. Codex + user review clean.
 
@@ -473,9 +475,95 @@ The shapes:
 - SOL upstream relaxes `requires-python` back to `>=3.10` (unlikely — they're on the modern-Python track). Then the dual-venv split (`/tmp/acts_test_venv` for unit tests, `/tmp/acts_run_venv` for live runs) collapses back to a single 3.10 venv.
 - A SOL feature ACTS wants pulls in cuda-tile / cutlass-dsl / cudnn-frontend for real. Then either the cu13 stack arrives on Ubuntu 22.04+ (host bump) or ACTS stays scoped to the cu128-compatible SOL surface.
 
----
+### NCU `.ncu-rep` capture + CSV extraction — two-subprocess architecture (2026-05-08)
 
-## Optimization Memory
+**Rationale.** Commit 166d697 added `-f -o <ncu-rep-path>` to NCU's argv to capture binary `.ncu-rep` files alongside the JSON cache. On NCU 2025.1.1.0 (the host), passing `-o` *suppresses* the CSV stream from stdout — it's not redirected, it's not delivered anywhere, it just stops. Stdout reduces to four `==PROF==` banner lines. `_parse_ncu_csv` strips banners, finds zero CSV rows, emits `csv_parse:no_header`. The 2026-05-03 live run silently degraded (no stalls reported, no clear signal why); the 2026-05-08 live run showed the same shape, but loud — the diagnostic emission added in profiler.py earlier today made `csv_parse:no_header` greppable from `run.log`. NCU's CLI provides no flag combination that delivers both binary `.ncu-rep` and CSV stdout from a single invocation: `--csv` + `-o` ≠ both outputs, `--log-file` redirects the (banner-only) stdout to a file rather than peeling CSV off, and there's no `--csv-file` flag. Verified by direct repro: `-o` alone → 3 banners + binary; `-o + --log-file <path>` → 3 banners in `<path>` + binary (no CSV anywhere); `ncu --import <rep> --csv` → full CSV with the parser-expected `Kernel Name` / `Metric Name` / `Metric Value` columns.
+
+**What changed.** `_run_ncu` now performs two subprocess calls per profile:
+
+1. **Profile** — existing argv with `-f -o <rep_path>`; produces the binary `.ncu-rep` and a banner-only stdout that we discard. The capture path from 166d697 stays unchanged.
+2. **Extract** — `ncu --import <rep_path> --csv --page details`; stdout is a CSV with the columns `_parse_ncu_csv` already understands. Feed that into the existing parser.
+
+`_parse_ncu_csv` signature unchanged. Mock NCU shell scripts in `tests/test_profiler_subprocess.py` and `tests/test_profiler_cache.py` now honor `--import <rep>` mode (when `--import` is in argv, emit the cached CSV; otherwise capture mode emits banners + writes a marker rep file).
+
+**Settled design choices.**
+
+- **Two subprocess calls, sequential.** Per-profile cost is one extra `ncu` fork (~hundreds of ms; no GPU work in the import call — just binary→CSV serialization). At ~3 profiles per iter × ~30 iters per run, the tax is ~20–45s on a 5–15 min run, <5% wallclock. Bearable, especially since the binary report itself is irrecoverable once thrown away.
+- **`.ncu-rep` capture stays.** Useful for: `ncu-ui` postmortem (source-level attribution, all sections, raw counters), the deferred Reviewer Variant B feature (`reprofile(sections, metrics)` — re-extract sections via `ncu --import` without re-running the GPU profile), audit-trail completeness for the search-tree-recording feature.
+- **`ncu --import` runs in the same `_run_ncu` call site.** Encapsulated as `_extract_ncu_csv(rep_path) -> str`, a pure shell-out helper. Failure mode if extract subprocess fails: distinct degradation slug `ncu_import_failed:<rc>` (separate from `csv_parse:no_header` which is parser-side; this one is "the binary is there but post-processing the binary failed").
+- **Mock fixture: modify both existing mocks** (`tests/test_profiler_subprocess.py` + `tests/test_profiler_cache.py`) to honor `--import <rep>` mode rather than adding parallel fixtures. One source of truth for "what real NCU does."
+- **Regression-guard test**: assert the parser would fail with `csv_parse:no_header` if the `--import` extract step were skipped. Pins the failure mode against a future "is this second call redundant?" cleanup.
+- **No NCU-version probe**: two-subprocess path runs unconditionally. Single-host dev box; pre-2025 NCU isn't a target. Keeps the code one-branch.
+
+**Why not Option A (`--log-file <path>` alongside `-o`).** The earlier entry that proposed this was wrong. Empirically, NCU 2025.x's `--log-file` redirects whatever stdout *would have been* — and when `-o` is set, that's just banners. The flag has no awareness of "CSV stream that didn't get printed because of `-o`." Verified directly: `ncu --csv -f -o caseB --log-file caseB.log <kernel>` produces a 651KB `.ncu-rep` plus a 3-line `caseB.log` containing `==PROF== Connected`, `==PROF== Disconnected`, `==PROF== Report: <rep>`. No CSV. The diagnosing subagent's earlier conclusion was inferred from `--log-file`'s help text ("Send all tool output to the specified file") rather than tested with `-o` and `--log-file` set together. The Option-A working-tree implementation passed unit tests because the mock honored the *desired* contract; against real NCU, all 6 GPU profiler tests failed with `csv_parse:no_header`. Cost of the wrong path: one JOURNAL amendment + one re-implementation pass. Lesson recorded in `feedback_repro_flag_combinations.md` (auto-memory).
+
+**Why not Option C (drop `-o`, single subprocess, no `.ncu-rep`).** Loses the search-tree-recording feature's `tree/node_<id>/ncu.ncu-rep` capture entirely (the very motivation for 166d697) and forecloses the deferred Reviewer Variant B. Saves the second subprocess (~5% wallclock) but trades irrecoverable artifact loss for it. Considered briefly; rejected.
+
+**Why not Option D (NCU Python/SDK API: read binary in-process).** Would deliver single-subprocess + both outputs, but adds a CUDA-toolkit-version-coupled Python dependency (`ncu-report` module ships with the toolkit and its API surface is not stable across major versions). Brittle for a long-lived dev tool. Considered; rejected.
+
+**Trigger for revisit.**
+
+- NCU 2026.x changes the `-o`-suppresses-stdout behavior or adds a `--csv-file` flag. Watch `ncu --help` on toolkit upgrades.
+- The `_extract_ncu_csv` cost shows up in real run profiling — at that point the cu-toolkit Python SDK option (D) becomes worth its dependency cost.
+- Reviewer Variant B lands. The `ncu --import` invocation logic ends up in two places (profile path + reprofile path); consolidate into a shared `_run_import_csv(rep_path, sections, metrics)` helper.
+
+**Amendment 2026-05-08 (post-Codex review) — `_extract_ncu_csv` propagates the same `TMPDIR` env as `_run_ncu`.** The original two-subprocess implementation passed `env=...` to the capture subprocess (carrying the user-scoped `TMPDIR` workaround for the `nsight-compute-lock` ownership issue that hits on shared `/tmp`), but the new `_extract_ncu_csv` subprocess inherited the process default `/tmp`. On hosts that need the workaround, capture would succeed but import could fail after — undoing the gain. Symmetric fix: thread the same `TMPDIR` env into `_extract_ncu_csv`'s `subprocess.run`. Lesson: when adding a sibling subprocess to an established pattern, audit the existing call's `env`/`cwd`/`stdin` parameters and replicate; default-inherit is not safe for ones with operational workarounds.
+
+### NCU binary discovery — `_discover_ncu_binary()` fallback for venvs that don't add cuda to PATH (2026-05-08)
+
+**Rationale.** `_discover_ncu_binary()` (`src/eval/profiler.py:801`) currently relies on `shutil.which("ncu")` only. The 2026-05-08 venv relocation rebuilt `~/.venvs/acts_run_venv` from `configs/venvs/3.12.md`'s canonical recipe, which does not include a step to prepend `/usr/local/cuda-12.8/bin` to the venv's activate-script PATH. The OLD `/tmp/acts_gpu_venv` had this patched manually (per the now-superseded `reference_test_venv.md` auto-memory). When the new venv was built clean from the recipe, the PATH adjustment was lost; the live optimize run on 2026-05-08 then failed with `ncu_binary_not_found` × 6 (one per profile attempt). The GPU pytest sweep happened to pass because pytest's collection / fixture wiring inherits a different PATH than the orchestrator's subprocess invocations, but that's an implementation accident; depending on it is brittle.
+
+Either way, the operator-side activate-script patching is brittle as a primary fix: any clean rebuild from the canonical recipe loses NCU discoverability silently. The load-bearing fix needs to be code-side so the system survives ad-hoc venv rebuilds.
+
+**What changed.** Two-pronged:
+
+- **Code**: `_discover_ncu_binary()` falls back to `/usr/local/cuda-12.8/bin/ncu` when `shutil.which("ncu")` returns None. Hardcoded path matches the host driver / cuda toolkit version per `configs/venvs/3.12.md`'s host invariant ("Host: Ubuntu 20.04, NVIDIA RTX 6000 Ada, driver 570.172.08, CUDA 12.8").
+- **Recipe**: `configs/venvs/3.12.md` gets a "Step 7: prepend `/usr/local/cuda-12.8/bin` to activate" subsection so the operator surface is also clean — venvs built from the recipe now have ncu on PATH from activation alone, no fallback exercised.
+
+**Settled design choices** (2026-05-08 inline question-list discussion):
+
+- **Hardcoded fallback path, not version-glob**. The host has 4 cuda installs (11.0, 11.8, 12.4, 12.8); a glob would need version-sort logic and could pick a cuda the current driver doesn't support. Hardcoding to 12.8 is tighter coupling to the host config but more correct. If the host cuda gets bumped, the recipe needs updating anyway, so adding the path string to the same hardcoded set is a one-edit lockstep.
+- **Both code-fallback AND activate-script patch**. Code is load-bearing (survives ad-hoc rebuilds, the failure mode today's session already hit twice); recipe is operator-facing (clean signal about what setup needs).
+- **No env-var override** (e.g., `ACTS_NCU_BINARY=/path`). Considered; rejected — adds API surface without solving a real ergonomic; if the operator wants a non-default ncu, prepending PATH or symlinking `ncu` is the conventional Linux move and works without code support.
+
+**Trigger for revisit.**
+
+- Host cuda version bumps from 12.8. Both `_discover_ncu_binary()`'s fallback and the recipe's activate-step need updating in lockstep.
+- ACTS deploys to a host without `/usr/local/cuda-*/bin/ncu` (e.g., Conda-managed CUDA, a containerized runtime, a Mac dev box). At that point the hardcoded fallback becomes wrong; switch to the version-glob path or env-var-driven discovery.
+- Persistent ncu version mismatches between what activate-PATH resolves and what the fallback resolves (e.g., user's PATH points at cuda-12.4 but fallback finds cuda-12.8). Surface a startup warning if the two disagree.
+
+**Amendment 2026-05-08 — thread the discovered binary into `_run_ncu`'s subprocess invocation.** The initial fix added the fallback to `_discover_ncu_binary()` but `_build_ncu_argv` still hardcoded argv[0] to the bare string `"ncu"` — so when PATH lacked ncu, `subprocess.run` would still raise `FileNotFoundError` and degrade as `ncu_binary_not_found`, even though the fallback discovery had succeeded. The fallback was effectively dead code in the exact clean-venv scenario it was designed to fix; today's live run only worked because the activate-script PATH patch made `shutil.which("ncu")` succeed, so the fallback path was never exercised. The unit test that "verified" the fallback only checked `_discover_ncu_binary()`'s return value, not whether `_run_ncu` actually launched the right binary.
+
+`_run_ncu` now substitutes `_discover_ncu_binary()` for argv[0] before `subprocess.run`. Mirrors the pattern `_extract_ncu_csv` already uses for the `ncu --import` invocation (which is why that one worked). New regression test: PATH-clean (`shutil.which("ncu")` returns None) + fallback-present scenario, asserts `_run_ncu` succeeds end-to-end (not just `_discover_ncu_binary` returning a path). Codex adversarial review caught it.
+
+### Clock-lock verify — query `clocks.applications.*` instead of `clocks.current.*` (2026-05-08)
+
+**Rationale.** `_verify_gpu0_locked` (`src/pipeline/optimize.py:182-257`) was reading `clocks.current.{graphics,memory}` — the GPU's *live* clock frequency at the instant of query. On RTX 6000 Ada the GPU drops back to idle (graphics ~210 MHz, DRAM ~810 MHz) within microseconds of any kernel completing; the wake-op (32-element `torch.zeros + 1.0`) does fire the clocks up to lock target, but the next `sudo nvidia-smi` subprocess takes tens of ms to cold-start and loses the race against idle drop. Live optimize run on 2026-05-08 hit `WARNING GPU 0 graphics-clock mismatch — expected 2505 MHz, got 210 MHz` and rolled back the partial lock with `verify_failed`. The lock itself was in force throughout — `clocks.applications.*` consistently reported 2505/10001 (the lock target). ACTS was reading the wrong field for its lock-correctness predicate.
+
+The 2026-05-07 first diagnosis attributed `verify_failed` to `nvidia-persistenced.service` being disabled. That hypothesis was wrong; persistence-mode is now enabled on all 4 GPUs (verified by `nvidia-smi --query-gpu=persistence_mode --format=csv` and `systemctl is-active nvidia-persistenced`). Persistence keeps the *applications* clock pinned (which we read after this fix), so it's load-bearing for the lock target itself, but it doesn't keep the GPU busy — `current.*` would still show idle drift even with persistence on. The persistence fix and this query-field fix are both required, in series.
+
+**What changed.**
+
+- `_verify_gpu0_locked`'s query-csv argument switches from `--query-gpu=clocks.current.graphics,clocks.current.memory` to `--query-gpu=clocks.applications.graphics,clocks.applications.memory`.
+- The 32-element wake-op `torch.zeros(32, device='cuda:0') + 1.0` becomes dead code — `applications.*` reflects the lock target whether the GPU is busy or idle. Wake-op removed; `_verify_gpu0_locked` is purely a query-and-compare now.
+- Tolerance unchanged (50 MHz). Field name unchanged in the warning message ("graphics-clock mismatch", "memory-clock mismatch") because the user-facing semantics are still "this clock didn't lock to the target."
+- GPU-0-only scoping unchanged. All `nvidia-smi` calls in `src/pipeline/optimize.py` already route through `_nvidia_smi()` which always appends `-i 0`; audit confirmed no leaks. The fix is field-only, not scope-related.
+
+**Settled design choices** (2026-05-08 inline question-list discussion):
+
+- **`clocks.applications.*` over `clocks.current.*`**. The `applications` field is exactly what `nvidia-smi -lgc <gpu>,<gpu>` and `-lmc <dram>,<dram>` write — it's the lock target nvidia-smi pins, and persists at that value as long as the lock holds, whether the GPU is busy or idle. `current` is the live frequency, which depends on idle/busy state and is therefore load-state-coupled. The lock-correctness predicate we actually want is "did the lock subprocess pin the clock target?", not "is the GPU running at lock target *right this microsecond*?". The field name documents the answer.
+- **Drop the wake-op entirely**, don't keep it as a defense-in-depth. It was load-bearing for the wrong reason (forcing `current.*` up); with `applications.*` it does nothing useful and adds startup latency, an exception surface (CUDA init can fail in degraded states), and a sequencing constraint (kernel must launch *before* verify reads). Dead code; remove.
+- **Don't add a redundancy check** ("warn if `applications` and `current` disagree by more than X"). Considered briefly; rejected — `current` differs from `applications` *by design* whenever the GPU is idle, so the check would either fire constantly (false positives) or need a deferred-check window after compute that re-introduces the wake-op race we just eliminated.
+- **Tolerance stays 50 MHz**. `applications.*` is set exactly by the lock subprocess; observed drift from target should be 0 in healthy state. The 50 MHz tolerance handles any future driver-side rounding (none observed today on RTX 6000 Ada). No change needed.
+
+**Why not Option 2 (retry-on-current).** Keeps the strict "live frequency" check via 3× retry with sleep + repeated wake-op. Adds 100–500ms to startup; still races on heavily loaded hosts; the strict check it preserves isn't actually the lock-correctness predicate (idle drift is the GPU working as designed, not a lock failure). Option 1 fixes the regression with a smaller diff and a more correct semantic.
+
+**Why not Option 3 (settle-delay).** Sleep before verify. Doesn't address the race — once any wake kernel completes, the GPU drops idle regardless of how long we slept beforehand. Insufficient alone; would need to combine with the busy-loop wake from Option 2 to actually close the race.
+
+**Trigger for revisit.**
+
+- Hardware-level lock failures (thermal override, driver bug pinning `applications.*` to target while the silicon ignores it). Today's check would miss these. If real-world runs show suspiciously bad-and-stable latencies, layer Option 2 on top: verify `applications.*` matches lock target *and* `current.*` is within ±200 MHz of target during a measured profiling kernel (which is a very different observation point than the post-lock instant).
+- Multi-process GPU contention. With `clocks.applications.*` we read what *we* pinned; if another process pins different applications clocks, we'd read theirs not ours. ACTS is single-tenant on this host today; revisit if multi-tenant.
 
 ### Summary-only, contrastive injection
 

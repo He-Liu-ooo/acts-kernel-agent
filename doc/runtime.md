@@ -176,12 +176,19 @@ at `WARNING`) so a tree-dump hiccup cannot kill a running search.
 dead-end branches and surface as a top-level `failure: {reason, detail}`
 object in the node's `meta.json`.
 
-`finalize_tree` also rewrites each per-node `meta.json`'s
-`branch_quality` from the final tree state — beam-evicted nodes whose
-status was mutated after their streamed dump get their on-disk record
-reconciled with `index.json`. The rewrite preserves every other key
-(including `failure`) and skips nodes that never streamed a `meta.json`
-(e.g., the root).
+`finalize_tree` also rewrites each per-node `meta.json`'s late-bound
+fields — `branch_quality`, `score`, `per_workload_latency_us`, and
+`children_ids` — from the final tree state, so any node whose state
+mutated after its streamed dump reflects the truth on disk. The root's
+`meta.json` is streamed at baseline-completion (orchestrator
+`dump_node(root, ...)` after the baseline benchmark), so the rewrite
+applies to it just as much as to children. Canonical reconciliation
+cases: beam-evicted nodes whose `branch_quality` mutated post-dump,
+nodes whose benchmark or score landed after the initial dump (late
+`score` / `per_workload_latency_us`), and parents that gained
+`children_ids` as later iters attached. The rewrite preserves every
+other key (including `failure`) and skips nodes that never streamed a
+`meta.json` (e.g., a node added before a crash aborted `_kill_branch`).
 
 ### Trace cross-reference
 
