@@ -12,7 +12,7 @@ import logging
 import shutil
 from dataclasses import asdict
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from src.search.tree import TreeNode
@@ -101,6 +101,26 @@ def _branch_quality_str(node: "TreeNode") -> str | None:
     )
 
 
+def _late_bound_fields(node: "TreeNode") -> dict[str, Any]:
+    """Single source of truth for the four meta.json fields that mutate
+    after the streamed dump (beam eviction, post-dump scoring, late-attached
+    children). Both the initial ``_build_meta`` write and the
+    ``finalize_tree`` rewrite read from here so the on-disk shape stays
+    consistent if a future late-bound field joins."""
+    from src.search.tree import _serialize_per_workload_latency, _serialize_score
+
+    return {
+        "branch_quality": _branch_quality_str(node),
+        "score": _serialize_score(node.score),
+        # Spec §4.4 contract: empty dict (not null) on unmeasured nodes —
+        # the shared serializer returns None, so coerce.
+        "per_workload_latency_us": _serialize_per_workload_latency(
+            node.per_workload_latency_us
+        ) or {},
+        "children_ids": list(node.children_ids),
+    }
+
+
 def _build_meta(node: "TreeNode", *, iter_no: int,
                 failure_reason: str | None = None,
                 failure_detail: str | None = None) -> dict:
@@ -110,29 +130,21 @@ def _build_meta(node: "TreeNode", *, iter_no: int,
     a top-level ``failure`` object is appended to the result. When
     both are None (the dominant advance-path case), the key is absent.
     """
-    from src.search.tree import _serialize_per_workload_latency, _serialize_score
-
     analytical = (
         asdict(node.profiling.analytical)
         if node.profiling is not None
         else None
     )
-    # Spec §4.4 contract: empty dict (not null) on unmeasured nodes —
-    # the shared serializer returns None, so coerce.
-    pwl = _serialize_per_workload_latency(node.per_workload_latency_us) or {}
     result: dict = {
         "id": node.id,
         "parent_id": node.parent_id,
-        "children_ids": list(node.children_ids),
         "depth": node.depth,
         "iter_no": iter_no,
         "action_applied": node.action_applied,
-        "branch_quality": _branch_quality_str(node),
-        "score": _serialize_score(node.score),
         "analytical": analytical,
-        "per_workload_latency_us": pwl,
         "consecutive_agent_failures": node.consecutive_agent_failures,
         "trace_workflow": "acts_iter",
+        **_late_bound_fields(node),
     }
     if failure_reason is not None or failure_detail is not None:
         result["failure"] = {"reason": failure_reason, "detail": failure_detail}
@@ -164,11 +176,13 @@ def _node_summary(node: "TreeNode", *, is_best: bool) -> dict:
 def finalize_tree(tree) -> None:
     """End-of-run write: tree/{index.json, tree.txt, tree.dot, tree.mmd}.
 
-    Also rewrites each per-node meta.json's ``branch_quality`` field from
-    the final tree state, so beam-evicted nodes (whose status was mutated
-    after their streamed dump) reflect the post-prune truth on disk. The
-    rewrite preserves every other key (including ``failure``) and skips
-    nodes that never streamed a meta.json (e.g., root).
+    Also rewrites each per-node meta.json's late-bound fields
+    (``branch_quality``, ``score``, ``per_workload_latency_us``,
+    ``children_ids``) from the final tree state, so nodes whose state
+    mutated after their streamed dump (beam eviction, root dumped
+    pre-scoring, or root dumped before iters attached children) reflect
+    the truth on disk. The rewrite preserves every other key (including
+    ``failure``) and skips nodes that never streamed a meta.json.
 
     No-op when unbound. Never raises."""
     if _root is None:
@@ -186,10 +200,10 @@ def finalize_tree(tree) -> None:
             except (json.JSONDecodeError, OSError):
                 # Corrupted or unreadable. Skip — never raise.
                 continue
-            bq_value = _branch_quality_str(node)
-            if existing.get("branch_quality") == bq_value:
+            fresh = _late_bound_fields(node)
+            if all(existing.get(k) == v for k, v in fresh.items()):
                 continue  # no rewrite needed
-            existing["branch_quality"] = bq_value
+            existing.update(fresh)
             try:
                 meta_path.write_text(json.dumps(existing, indent=2))
             except OSError as exc:

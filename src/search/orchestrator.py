@@ -416,6 +416,14 @@ class Orchestrator:
         # ``per_workload_latency_missing``.
         root.per_workload_latency_us = baseline_bench.per_workload_latency_us
 
+        # Persist the baseline root to <run_dir>/tree/node_0/. Mirrors the
+        # child-side dump_node call (advance path) and the dead-end dump
+        # in _kill_branch — without this, finalize_tree would index the
+        # root in tree/index.json while the per-node dir was missing on
+        # disk (same half-truth motivating the dead-end dump fix). No
+        # profiling for the baseline → ncu_rep_src=None.
+        tree_dump.dump_node(root, iter_no=root.iter_no, ncu_rep_src=None)
+
         if roofline is None:
             roofline = compute_roofline(baseline.spec, self._config.hardware)
 

@@ -437,6 +437,80 @@ def test_finalize_tree_preserves_failure_key_on_rewrite(tmp_path):
         tree_dump.unbind()
 
 
+def test_finalize_tree_refreshes_late_bound_score_and_pwl(tmp_path):
+    """A node dumped before its score and per_workload_latency_us were
+    assigned (the orchestrator's root-baseline path) gets those fields
+    refreshed from the in-memory tree at finalize_tree time. Mirrors the
+    branch_quality refresh pattern; addresses the late-binding regression
+    class structurally."""
+    import json
+    from src.eval.scorer import ScoreResult
+    from src.runtime import tree_dump
+    tree_dump.bind(tmp_path / "tree")
+    try:
+        tree = _make_tree_two_levels()
+        # Stream-dump node 1 *before* score / pwl are bound, mirroring the
+        # orchestrator's "dump root, then score" sequence.
+        node1 = tree.get_node(1)
+        node1.score = None
+        node1.per_workload_latency_us = None
+        tree_dump.dump_node(node1, iter_no=node1.iter_no, ncu_rep_src=None)
+        meta1_pre = json.loads((tmp_path / "tree" / "node_1" / "meta.json").read_text())
+        assert meta1_pre["score"] is None
+        assert meta1_pre["per_workload_latency_us"] == {}
+        # Now assign the late-bound fields and finalize.
+        node1.score = ScoreResult(
+            sol_score=0.42, baseline_latency_us=100.0,
+            candidate_latency_us=50.0, t_sol_us=21.0, speedup=2.0,
+            reward_hack_suspect=False, calibration_warning=False,
+        )
+        node1.per_workload_latency_us = {"wkl-a": 50.0, "wkl-b": 60.0}
+        tree_dump.finalize_tree(tree)
+        meta1_post = json.loads((tmp_path / "tree" / "node_1" / "meta.json").read_text())
+        assert meta1_post["score"]["sol_score"] == 0.42
+        assert meta1_post["score"]["speedup"] == 2.0
+        assert meta1_post["per_workload_latency_us"] == {
+            "wkl-a": 50.0, "wkl-b": 60.0,
+        }
+    finally:
+        tree_dump.unbind()
+
+
+def test_finalize_tree_refreshes_late_bound_children_ids(tmp_path):
+    """A node dumped before its children were attached (the orchestrator's
+    early root-dump path) gets ``children_ids`` refreshed from the in-memory
+    tree at finalize_tree time. Same late-binding regression class as
+    score / per_workload_latency_us; ensures node_0/meta.json agrees with
+    index.json after iters add children."""
+    import json
+    from src.runtime import tree_dump
+    tree_dump.bind(tmp_path / "tree")
+    try:
+        # Build a single-node tree and dump the root *before* any children
+        # exist, mirroring orchestrator's "dump root, then iterate" sequence.
+        from src.search.tree import SearchTree
+        tree = SearchTree()
+        n0 = _make_node(node_id=0, parent_id=None, iter_no=0,
+                        action="", with_score=False, with_profiling=False)
+        tree._nodes[0] = n0
+        tree._next_id = 1
+        tree_dump.dump_node(n0, iter_no=n0.iter_no, ncu_rep_src=None)
+        meta0_pre = json.loads((tmp_path / "tree" / "node_0" / "meta.json").read_text())
+        assert meta0_pre["children_ids"] == []
+        # Now attach two children (mirrors add_child) and finalize.
+        n1 = _make_node(node_id=1, parent_id=0, iter_no=1, action="tiling")
+        n2 = _make_node(node_id=2, parent_id=0, iter_no=2, action="vectorize")
+        tree._nodes[1] = n1
+        tree._nodes[2] = n2
+        n0.children_ids.extend([1, 2])
+        tree._next_id = 3
+        tree_dump.finalize_tree(tree)
+        meta0_post = json.loads((tmp_path / "tree" / "node_0" / "meta.json").read_text())
+        assert meta0_post["children_ids"] == [1, 2]
+    finally:
+        tree_dump.unbind()
+
+
 def test_finalize_tree_skips_nodes_with_no_meta_json(tmp_path):
     """Nodes whose meta.json was never streamed (e.g., root) are
     silently skipped by the rewrite loop. No exception, no spurious file."""

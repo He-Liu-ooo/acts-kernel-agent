@@ -447,10 +447,13 @@ async def test_dump_node_called_on_committed_node(harness, monkeypatch):
 
     monkeypatch.setattr(tree_dump, "dump_node", spy)
     await _run_orch(harness)
-    assert len(calls) == 1
-    assert calls[0]["id"] == 1
-    assert calls[0]["iter_no"] == 1
-    assert calls[0]["ncu_rep_src"] is None
+    # Filter to non-root: the orchestrator also dumps the baseline root
+    # (id=0, iter_no=-1); this test asserts on the child-side advance call.
+    child_calls = [c for c in calls if c["id"] != 0]
+    assert len(child_calls) == 1
+    assert child_calls[0]["id"] == 1
+    assert child_calls[0]["iter_no"] == 1
+    assert child_calls[0]["ncu_rep_src"] is None
 
 
 @pytest.mark.asyncio
@@ -503,10 +506,13 @@ async def test_dump_node_called_on_dead_end_with_failure_reason(harness, monkeyp
         )
         await orch.run(harness.baseline, workloads=None, roofline=harness.roofline)
 
+    # Filter to non-root: the orchestrator also dumps the baseline root
+    # (id=0); this test asserts on the dead-end child dump.
+    child_recs = [c for c in captured if c["id"] != 0]
     # Exactly one dump_node call captured the dead-end node and carried
     # the kill reason from _kill_branch through to dump_node.
-    assert len(captured) == 1, captured
-    rec = captured[0]
+    assert len(child_recs) == 1, child_recs
+    rec = child_recs[0]
     assert rec["id"] == 1
     assert rec["iter_no"] == 1
     # No profiling on the dead-end path → ncu_rep_src is None.
@@ -559,12 +565,14 @@ async def test_dump_node_called_after_beam_prune(harness, monkeypatch):
 
     await _run_orch(harness)
 
-    # Exactly one advance-path dump for the committed child, and it
-    # observed the post-prune DEAD_END branch_quality (not the
-    # PROMISING the reviewer assigned).
-    assert len(captured) == 1, captured
-    assert captured[0]["id"] == 1
-    assert captured[0]["branch_quality"] == BranchQuality.DEAD_END
+    # Filter to non-root: the orchestrator also dumps the baseline root
+    # (id=0) before the search loop. Exactly one advance-path dump for
+    # the committed child, and it observed the post-prune DEAD_END
+    # branch_quality (not the PROMISING the reviewer assigned).
+    child_recs = [c for c in captured if c["id"] != 0]
+    assert len(child_recs) == 1, child_recs
+    assert child_recs[0]["id"] == 1
+    assert child_recs[0]["branch_quality"] == BranchQuality.DEAD_END
 
 
 @pytest.mark.asyncio
@@ -581,6 +589,10 @@ async def test_dump_node_receives_real_ncu_rep_src_on_advance(harness, monkeypat
 
     def spy(node, *, iter_no, ncu_rep_src,
             failure_reason=None, failure_detail=None):
+        # Skip the baseline root dump (id=0); this test verifies the
+        # advance-path child dump receives the populated ncu_rep_path.
+        if node.id == 0:
+            return
         captured.append({"ncu_rep_src": ncu_rep_src})
 
     monkeypatch.setattr(tree_dump, "dump_node", spy)
@@ -624,16 +636,52 @@ async def test_dump_node_receives_real_ncu_rep_src_on_advance(harness, monkeypat
 @pytest.mark.asyncio
 async def test_dump_node_not_called_on_skipped(harness, monkeypatch):
     """Skipped iterations (Coder failure → no tree mutation) must NOT
-    call ``tree_dump.dump_node`` — there's no committed node to dump."""
+    call ``tree_dump.dump_node`` — there's no committed node to dump.
+
+    The baseline root (id=0) dump fires before the loop body and is
+    unrelated to the skipped-iteration invariant; filter it out.
+    """
     from src.agents.coder import ImplementationError
     from src.runtime import tree_dump
 
     calls: list = []
-    monkeypatch.setattr(
-        tree_dump, "dump_node",
-        lambda *a, **k: calls.append((a, k)),
-    )
+
+    def spy(node, *args, **kwargs):
+        calls.append(node.id)
+
+    monkeypatch.setattr(tree_dump, "dump_node", spy)
 
     harness.coder.implement = AsyncMock(side_effect=ImplementationError("budget exhausted"))
     await _run_orch(harness)
-    assert calls == []
+    # Only the baseline root dump should have fired — no per-iter dump on
+    # the skipped path.
+    assert [c for c in calls if c != 0] == []
+
+
+@pytest.mark.asyncio
+async def test_dump_node_called_on_baseline_root(tmp_path, harness):
+    """Regression: the baseline root node must be persisted to disk.
+
+    Pre-fix, ``Orchestrator.run`` only invoked ``tree_dump.dump_node`` from
+    the per-iter advance path and ``_kill_branch`` — never for the root.
+    ``finalize_tree`` then indexed the root in ``index.json`` while
+    ``tree/node_0/`` was missing on disk (no kernel.py / meta.json), the
+    same shape of half-truth that motivated the dead-end dump fix.
+    """
+    import json
+    from src.runtime import tree_dump
+
+    tree_dump.bind(tmp_path / "tree")
+    try:
+        await _run_orch(harness)
+    finally:
+        tree_dump.unbind()
+
+    node_dir = tmp_path / "tree" / "node_0"
+    assert (node_dir / "kernel.py").exists(), "baseline kernel.py not written"
+    assert (node_dir / "meta.json").exists(), "baseline meta.json not written"
+    meta = json.loads((node_dir / "meta.json").read_text())
+    assert meta["id"] == 0
+    # Root carries the default sentinel iter_no=-1 — same value
+    # ``finalize_tree``'s index entry uses for the baseline.
+    assert meta["iter_no"] == -1
