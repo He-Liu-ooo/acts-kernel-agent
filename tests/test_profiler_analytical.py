@@ -2,7 +2,7 @@
 path inside ``src/eval/profiler.py``.
 
 Pure arithmetic, no GPU, no subprocess. Torch-free: runs in the default
-``/tmp/acts_test_venv`` (pytest + pyyaml). Classification thresholds live
+``~/.venvs/acts_test_venv`` (pytest + pyyaml). Classification thresholds live
 in ``tests/test_roofline.py`` now — this file only exercises the
 per-iteration runtime metrics.
 """

@@ -84,15 +84,15 @@ Run a consistency check across src/, doc/, PRD.md, JOURNAL.md, and PROCESS.md. V
 
 ### Test Environment
 
-Two venvs, split by tier:
+Two venvs, split by tier. **Both live under `~/.venvs/`** so they survive reboots — Ubuntu's `systemd-tmpfiles-setup` runs `D /tmp 1777 root root -` from `/usr/lib/tmpfiles.d/tmp.conf` on every boot, which empties `/tmp` regardless of filesystem type. Do not put venvs (or anything you want to keep) under `/tmp`. If a venv is missing, rebuild from the canonical recipe in [`configs/venvs/3.12.md`](configs/venvs/3.12.md) verbatim — do not subset to "what my current task imports."
 
-- **Tier 1 — torchless unit tests** (`/tmp/acts_test_venv`, Python 3.10): pytest + pyyaml only, no torch. Default for deterministic / mocked tests.
+- **Tier 1 — torchless unit tests** (`~/.venvs/acts_test_venv`, Python 3.10): pytest + pyyaml + pydantic, no torch. Default for deterministic / mocked tests.
   ```
-  source /tmp/acts_test_venv/bin/activate && python -m pytest tests/ -v
+  source ~/.venvs/acts_test_venv/bin/activate && python -m pytest tests/ -v
   ```
-- **Tier 2 — SOL/torch integration + real-GPU tests** (`/tmp/acts_run_venv`, Python 3.12 + cu128 torch + editable `sol_execbench`): required for `@pytest.mark.gpu` suites and any test that imports SOL types or runs on GPU. Setup recipe + smoke test live in [`configs/venvs/3.12.md`](configs/venvs/3.12.md).
+- **Tier 2 — SOL/torch integration + real-GPU tests** (`~/.venvs/acts_run_venv`, Python 3.12 + cu128 torch + editable `sol_execbench` + editable SOLAR + openai-agents + torchview): required for `@pytest.mark.gpu` suites, any test that imports SOL types or runs on GPU, and every live `python -m src.pipeline.optimize` run. Setup recipe + smoke test live in [`configs/venvs/3.12.md`](configs/venvs/3.12.md).
   ```
-  source /tmp/acts_run_venv/bin/activate && python -m pytest tests/ -v
+  source ~/.venvs/acts_run_venv/bin/activate && python -m pytest tests/ -v
   ```
 
 Add new deps to `pyproject.toml` AND to whichever venv(s) the new tests target.

@@ -1,7 +1,7 @@
 """Tests for ``classify_run`` in src/eval/roofline.py.
 
 Pure arithmetic, no GPU, no subprocess. Torch-free: runs in the default
-/tmp/acts_test_venv (pytest + pyyaml). Fixtures are built inline to keep
+~/.venvs/acts_test_venv (pytest + pyyaml). Fixtures are built inline to keep
 conftest.py unchanged.
 """
 
