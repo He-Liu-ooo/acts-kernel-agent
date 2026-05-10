@@ -13,8 +13,108 @@ the snapshot is taken before any user-supplied source is loaded.
 from __future__ import annotations
 
 # IMPORT-ORDER CONTRACT — DO NOT REORDER
-# This must be the first non-stdlib import (the dataclass/typing/asyncio
-# imports below are all stdlib). See module docstring.
+# The ``--gpu-index`` preparse + ``CUDA_VISIBLE_DEVICES`` override below
+# must run before any non-stdlib import. SOL's import chain transitively
+# imports torch, which snapshots the visible-device set on first CUDA
+# call; setting the env after that is a no-op. ``os`` and ``sys`` are
+# stdlib so importing them here is safe.
+# See ``doc/specs/2026-05-10-cli-gpu-index-design.md``.
+import os
+import sys
+
+
+def _preparse_gpu_index(argv: list[str]) -> str:
+    """Minimal argv scan for ``--gpu-index``, runs before any non-stdlib import.
+
+    Returns the flag value as a string (matches ``_GPU_INDEX`` type for
+    argv splicing into ``nvidia-smi -i <idx>``). Defaults to ``"0"`` when
+    the flag is absent or has no value. Does not validate — argparse in
+    ``main()`` handles type/range errors. Supports both
+    ``--gpu-index N`` and ``--gpu-index=N``.
+    """
+    for i, arg in enumerate(argv):
+        if arg == "--gpu-index" and i + 1 < len(argv):
+            return argv[i + 1]
+        if arg.startswith("--gpu-index="):
+            return arg.split("=", 1)[1]
+    return "0"
+
+
+def _nonneg_int(s: str) -> int:
+    """argparse ``type=`` callable: parse non-negative int or raise.
+
+    argparse's default ``type=int`` accepts negatives; this rejects them
+    so ``--gpu-index -1`` fails fast with a clear usage message.
+    """
+    import argparse
+    try:
+        n = int(s)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"expected non-negative integer, got {s!r}"
+        ) from exc
+    if n < 0:
+        raise argparse.ArgumentTypeError(
+            f"expected non-negative integer, got {n}"
+        )
+    return n
+
+
+def _validate_gpu_visible(gpu_index: int, *, reset_only: bool) -> None:
+    """Tier 2 existence check after ``CUDA_VISIBLE_DEVICES`` has been set.
+
+    On failure: prints a single explanatory line to stderr and calls
+    ``sys.exit(1)``. Logger isn't set up yet at this call point — errors
+    go directly to stderr.
+
+    ``reset_only=True`` (operator recovery path via ``--reset-clocks``)
+    skips the torch.cuda checks and uses ``nvidia-smi --list-gpus -i N``
+    instead — recovery shouldn't require torch to be importable.
+    """
+    if reset_only:
+        rc = subprocess.run(
+            ["nvidia-smi", "--list-gpus", "-i", str(gpu_index)],
+            capture_output=True,
+        ).returncode
+        if rc != 0:
+            print(
+                f"GPU {gpu_index} not found by nvidia-smi "
+                f"(--list-gpus -i {gpu_index} returned {rc})",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        return
+
+    import torch
+    if not torch.cuda.is_available():
+        print(
+            "ACTS requires a CUDA-capable PyTorch and a visible GPU; "
+            "none detected. Check that you're in the Tier 2 venv "
+            "(acts_run_venv) and that nvidia-smi works.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    n = torch.cuda.device_count()
+    if n == 0:
+        print(
+            f"GPU {gpu_index} not found. CUDA_VISIBLE_DEVICES={gpu_index} "
+            f"filtered to zero visible devices — index is out of range "
+            f"for this host.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if n > 1:
+        print(
+            f"unexpected: {n} visible CUDA devices after env override "
+            f"(should be 1). Env-handling bug — please file.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
+_GPU_INDEX = _preparse_gpu_index(sys.argv)
+os.environ["CUDA_VISIBLE_DEVICES"] = _GPU_INDEX
+
 import sol_execbench  # noqa: F401 — load-bearing side effects (_ELAPSED_TIME_ADDR snapshot)
 
 import asyncio
@@ -51,12 +151,10 @@ DEFAULT_MODEL_CONFIG_PATH = Path("configs/models/deepseek.json")
 # idempotent so a second call (atexit + finally) is harmless.
 _clock_lock_state: dict[str, object] = {"locked": False, "device_name": ""}
 
-# ACTS uses cuda:0 by default. SOL's ``lock_clocks`` runs nvidia-smi
-# without ``-i <idx>``, which applies to *all* GPUs on the host — on
-# multi-GPU dev boxes that pins clocks on devices ACTS isn't using. We
-# scope every nvidia-smi invocation to GPU 0 here. Future: read from
-# CUDA_VISIBLE_DEVICES.
-_GPU_INDEX = "0"
+# Every ``nvidia-smi`` invocation is scoped to ``-i $_GPU_INDEX``. Without
+# ``-i <idx>`` clock locks apply to *all* GPUs on the host. The value of
+# ``_GPU_INDEX`` is set at module top from the ``--gpu-index`` CLI flag
+# (default ``"0"``); see the import-order block.
 
 
 def _nvidia_smi(
@@ -697,11 +795,27 @@ def main(argv: list[str] | None = None) -> None:
         action="store_true",
         help=(
             "Operator escape hatch for SIGKILL / segfault recovery: reset "
-            "GPU 0 application clocks and exit immediately. Does not run "
-            "the optimization pipeline."
+            "the chosen GPU's application clocks and exit immediately. "
+            "Does not run the optimization pipeline."
+        ),
+    )
+    parser.add_argument(
+        "--gpu-index",
+        type=_nonneg_int,
+        default=0,
+        help=(
+            "GPU to run on (NVML / nvidia-smi index). Default 0. ACTS sets "
+            "CUDA_VISIBLE_DEVICES from this flag, overriding any shell "
+            "setting, so torch and nvidia-smi see the same physical device."
         ),
     )
     args = parser.parse_args(argv)
+
+    assert args.gpu_index == int(_GPU_INDEX), (
+        f"preparse/argparse desync: preparse={_GPU_INDEX!r} "
+        f"argparse={args.gpu_index}"
+    )
+    _validate_gpu_visible(args.gpu_index, reset_only=args.reset_clocks)
 
     # Reset-clocks short-circuit: skip the entire pipeline (no RunContext,
     # no model load, no optimize call) and just clear any sticky lock that

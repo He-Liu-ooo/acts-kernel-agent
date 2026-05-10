@@ -1509,6 +1509,7 @@ def test_main_reset_clocks_short_circuits_pipeline(tmp_path, monkeypatch, capsys
         patch.object(opt_mod, "subprocess") as mock_sp,
         patch("src.runtime.run_context.RunContext.create") as mock_rc_create,
         patch.object(opt_mod.asyncio, "run") as mock_async_run,
+        patch.object(opt_mod, "_validate_gpu_visible"),
     ):
         opt_mod.main(["--reset-clocks"])
 
