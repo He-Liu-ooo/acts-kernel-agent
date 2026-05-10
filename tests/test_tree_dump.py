@@ -199,14 +199,25 @@ def _make_tree_two_levels():
     return tree
 
 
-def test_finalize_tree_writes_four_files(tmp_path):
+def test_finalize_tree_writes_five_files(tmp_path):
     from src.runtime import tree_dump
     tree_dump.bind(tmp_path / "tree")
     try:
         tree = _make_tree_two_levels()
         tree_dump.finalize_tree(tree)
-        for name in ("index.json", "tree.txt", "tree.dot", "tree.mmd"):
+        for name in (
+            "index.json",
+            "tree.txt",
+            "tree.dot",
+            "tree.mmd",
+            "tree.preview.md",
+        ):
             assert (tmp_path / "tree" / name).exists(), name
+        preview = (tmp_path / "tree" / "tree.preview.md").read_text()
+        mmd = (tmp_path / "tree" / "tree.mmd").read_text()
+        assert preview.startswith("```mermaid\n")
+        assert preview.rstrip().endswith("```")
+        assert mmd in preview
     finally:
         tree_dump.unbind()
 

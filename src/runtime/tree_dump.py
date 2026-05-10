@@ -174,7 +174,8 @@ def _node_summary(node: "TreeNode", *, is_best: bool) -> dict:
 
 
 def finalize_tree(tree) -> None:
-    """End-of-run write: tree/{index.json, tree.txt, tree.dot, tree.mmd}.
+    """End-of-run write: tree/{index.json, tree.txt, tree.dot, tree.mmd,
+    tree.preview.md}.
 
     Also rewrites each per-node meta.json's late-bound fields
     (``branch_quality``, ``score``, ``per_workload_latency_us``,
@@ -231,7 +232,11 @@ def finalize_tree(tree) -> None:
         (_root / "index.json").write_text(json.dumps(index, indent=2))
         (_root / "tree.txt").write_text(_render_ascii(tree, best_id))
         (_root / "tree.dot").write_text(_render_dot(tree, best_id))
-        (_root / "tree.mmd").write_text(_render_mermaid(tree, best_id))
+        mermaid_src = _render_mermaid(tree, best_id)
+        (_root / "tree.mmd").write_text(mermaid_src)
+        (_root / "tree.preview.md").write_text(
+            f"```mermaid\n{mermaid_src}```\n"
+        )
     except (OSError, KeyError) as exc:
         logger.warning("tree_dump.finalize_tree failed: %s", exc)
 

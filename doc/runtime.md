@@ -162,11 +162,12 @@ search progresses; end-of-run files are written by
 | `tree/tree.txt`   | ASCII visualization. |
 | `tree/tree.dot`   | Graphviz source — render: `dot -Tpng tree.dot > tree.png`. |
 | `tree/tree.mmd`   | Mermaid source — preview in GitHub / VS Code. |
+| `tree/tree.preview.md` | Markdown wrapper around `tree.mmd` — opens directly in VS Code's built-in Markdown preview (`Ctrl+Shift+V`) when the *Markdown Preview Mermaid Support* extension is installed. |
 
 Module surface mirrors `events.py`: `bind(tree_root)` / `unbind()` /
 `is_bound()` manage the single bound root, `dump_node(node, *, iter_no,
 ncu_rep_src, failure_reason=None, failure_detail=None)` streams one
-committed node, `finalize_tree(tree)` writes the four top-level files.
+committed node, `finalize_tree(tree)` writes the five top-level files.
 Both write paths are no-ops when unbound and swallow `OSError` (logged
 at `WARNING`) so a tree-dump hiccup cannot kill a running search.
 `RunContext.create` calls `bind(run_dir / "tree")` after
