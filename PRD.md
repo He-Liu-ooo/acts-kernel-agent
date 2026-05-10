@@ -276,6 +276,17 @@ The run-level label is threaded into retriever / planner / reviewer every iterat
 
 See JOURNAL → "Bottleneck classify-once (2026-04-22)" for why a per-iter dynamic reclassification (earlier design) was dropped.
 
+### Per-Iteration Analytical Inputs — Shape-Based, Not SOLAR-Derived
+
+The per-iter analytical profiler (`eval/profiler.py::_compute_analytical`) needs `(flops, nbytes)` to compute achieved-TFLOPS, achieved-bandwidth, and %peak. SOLAR is **not** the source for these counts. Instead, `src/benchmark/roofline_shapes.py::compute_roofline_inputs(definition, workload)` derives them from a small per-op-type formula table (canonical `2·M·N·K` for matmul; `C·numel(output)` for elementwise / softmax / rmsnorm; `(0, 0)` sentinel for op types we don't model, signaling the caller to skip analytical profiling rather than feed zeros).
+
+This is a deliberate separation of concerns:
+
+- **SOLAR** owns score correctness — its FLOPs and bytes are physics-accurate, fusion-aware, dtype-aware, and view-elision-aware. Run once at problem load to derive `T_SOL`. Heavy (4-stage Python pipeline) but worth the cost for the primary scoring signal.
+- **Shape-based formulas** own diagnostic signal — coarse, O(1) per call, no SOLAR dependency. Run every iteration (~90 calls per problem) to feed the Reviewer's analytical %peak / bandwidth prose. Tradeoff: overcount on view-heavy / mask-heavy kernels (where SOLAR's per-op overrides matter), but the Reviewer treats these numbers as hints, not ground truth, and bottleneck classification still flows from SOLAR.
+
+Why not pull `(flops, nbytes)` out of SOLAR for the analytical path: (a) the `solar_adapter.SolarResult` API surface is intentionally narrow (`t_sol_us`, `bottleneck`, `arithmetic_intensity`, `ridge_point`) — widening it would tie ACTS to SOLAR's internal field names; (b) the profiler must run on non-SOL paths (placeholder mode, no-SOLAR installs) where SOLAR returns `None`; (c) per-iter SOLAR calls would dominate the wallclock. See JOURNAL → "Per-iteration analytical flops/nbytes — shape-based formulas, not SOLAR-derived (2026-05-10)" for full rationale.
+
 ---
 
 ## Optimization Memory — Persistent Cross-Task Learning
