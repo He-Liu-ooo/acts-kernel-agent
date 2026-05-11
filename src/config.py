@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-import configparser
+import io
 import logging
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+
+import libconf
 
 logger = logging.getLogger(__name__)
 
@@ -110,12 +112,14 @@ class ACTSConfig:
     """Top-level configuration for an ACTS optimization run."""
 
     # Search parameters
-    beam_width: int = 3
+    beam_width: int = 10
     beam_diversity: bool = True
     # When True, the Reviewer registers a `query_metric` tool alongside
     # `submit_review` and runs with `max_turns=6` instead of `4`. Default
     # off — the existing single-call path is the verified default.
-    reviewer_metric_queries: bool = False
+    reviewer_metric_queries: bool = True
+    # Outer-loop iteration budget (Planner→Coder→Reviewer cycles per run),
+    # not a cap on tree path length. Also sets the epsilon decay horizon.
     max_depth: int = 20
     epsilon_start: float = 0.3
     epsilon_end: float = 0.05
@@ -142,6 +146,21 @@ class ACTSConfig:
     # Hardware — loaded from SOLAR arch YAML, or detected at runtime
     hardware: HardwareSpec = field(default_factory=HardwareSpec)
     arch_config_path: str = ""  # Path to SOLAR arch YAML (e.g. "configs/arch/H100_PCIe.yaml")
+    # Physical GPU index for this run (passed to nvidia-smi -i and set as
+    # ``CUDA_VISIBLE_DEVICES`` at module-top of ``pipeline/optimize.py``,
+    # so the selected GPU is logical index 0 from torch's perspective).
+    gpu_index: int = 0
+
+    # Runtime / invocation
+    # ──────────────────────────────────────────────────────────────────
+    # Problem to optimize. Either a SOL-ExecBench problem directory path
+    # (containing ``definition.json`` + ``workload.jsonl``) or the literal
+    # string ``placeholder`` for the built-in no-LLM matmul demo.
+    problem_path: str = "placeholder"
+    # Operator escape hatch for SIGKILL/segfault recovery: when True,
+    # ``main()`` resets the selected GPU's clocks and exits without
+    # running the pipeline. Toggle in the cfg or use a recovery-only cfg.
+    reset_clocks: bool = False
 
     # Override default safetensors blob_roots ([problem_path]) for safetensors
     # loading. Useful when blobs live outside the problem directory (e.g.
@@ -172,14 +191,25 @@ class ACTSConfig:
 
 
 def load_config(path: Path) -> ACTSConfig:
-    """Load ACTSConfig from a .cfg file via configparser.
+    """Load ACTSConfig from a libconfig-format ``.cfg`` file via ``libconf``.
 
-    Values not specified in the file fall back to ACTSConfig defaults.
-    Hardware specs are loaded from a SOLAR arch YAML if ``[hardware]
-    arch_config_path`` is set, otherwise detected at runtime.
+    Schema (every group + key optional; absent fields fall back to ``ACTSConfig``
+    dataclass defaults)::
+
+        runtime:   { problem_path = "..."; reset_clocks = false; };
+        hardware:  { gpu_index = 0; arch_config_path = "..."; };
+        search:    { beam_width = 10; beam_diversity = true; ... };
+        eval:      { warmup_runs = 20; timed_runs = 100; };
+        move_on:   { sol_plateau_window = 3; sol_plateau_delta = 0.01; sol_target = 0.95; };
+        debug:     { max_debug_retries = 3; max_baseline_retries = 3; };
+        memory:    { optimization_memory_top_k = 5; };
+        benchmark: { benchmark_workload_count = 3; };
+
+    Hardware specs come from the SOLAR arch YAML at ``hardware.arch_config_path``
+    when present, otherwise ``detect_hardware()`` at runtime.
     """
-    cfg = configparser.ConfigParser()
-    cfg.read(path)
+    with io.open(path, encoding="utf-8") as f:
+        cfg = libconf.load(f)
     kwargs: dict = {}
     _section_map = {
         "search": [
@@ -191,20 +221,28 @@ def load_config(path: Path) -> ACTSConfig:
         "debug": ["max_debug_retries", "max_baseline_retries"],
         "memory": ["optimization_memory_top_k"],
         "benchmark": ["benchmark_workload_count"],
+        # Invocation-scoped fields absorbed from argparse (2026-05-11).
+        "hardware": ["gpu_index"],
+        "runtime": ["problem_path", "reset_clocks"],
     }
     defaults = ACTSConfig()
     for section, keys in _section_map.items():
-        if not cfg.has_section(section):
+        group = cfg.get(section)
+        if group is None:
             continue
         for key in keys:
-            if cfg.has_option(section, key):
+            if key in group:
                 default_val = getattr(defaults, key)
+                # libconf returns native types (bool/int/float/str); coerce
+                # only when the cfg author used a different-but-compatible
+                # type (e.g. int where float is expected).
+                value = group[key]
                 if isinstance(default_val, bool):
-                    kwargs[key] = cfg.getboolean(section, key)
+                    kwargs[key] = bool(value)
                 else:
-                    kwargs[key] = type(default_val)(cfg.get(section, key))
+                    kwargs[key] = type(default_val)(value)
     # Hardware: load from SOLAR arch YAML if specified, else detect at runtime
-    arch_path_str = cfg.get("hardware", "arch_config_path", fallback="")
+    arch_path_str = (cfg.get("hardware") or {}).get("arch_config_path", "")
     if arch_path_str:
         kwargs["arch_config_path"] = arch_path_str
         yaml_spec = load_hardware_spec(Path(arch_path_str))

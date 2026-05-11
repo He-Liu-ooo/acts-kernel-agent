@@ -274,10 +274,16 @@ def test_baseline_review_fires_on_live_sol_run(tmp_path):
     fixture_dir = repo_root / "tests" / "fixtures" / "sol_simple"
     assert fixture_dir.is_dir(), f"fixture missing: {fixture_dir}"
 
+    # CLI shrank to {--config, --run-dir, --trace-dir} on 2026-05-11;
+    # ``problem_path`` and ``gpu_index`` now live in the libconfig cfg.
+    cfg_file = tmp_path / "acts.cfg"
+    cfg_file.write_text(
+        "hardware: { gpu_index = 0; };\n"
+        f'runtime: {{ problem_path = "{fixture_dir}"; }};\n'
+    )
     cmd = [
         sys.executable, "-m", "src.pipeline.optimize",
-        str(fixture_dir),
-        "--gpu-index", "0",
+        "--config", str(cfg_file),
         "--run-dir", str(tmp_path),
         "--trace-dir=",  # disable trace capture for speed
     ]

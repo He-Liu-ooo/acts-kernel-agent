@@ -1,66 +1,88 @@
-"""Tier 1 tests for --gpu-index CLI flag plumbing in src/pipeline/optimize.py."""
+"""Tier 1 tests for `--config`-driven gpu_index plumbing in src/pipeline/optimize.py.
+
+The CLI shrank to three flags (`--config`, `--run-dir`, `--trace-dir`) on
+2026-05-11; `--gpu-index`, `--reset-clocks`, and the `problem_path`
+positional now live in the `.cfg` file. The module-top preparse opens
+the cfg before any CUDA-aware import so `CUDA_VISIBLE_DEVICES` lands
+in time.
+"""
 
 from __future__ import annotations
 
-import argparse
+import os
+import subprocess
+import sys
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from src.pipeline.optimize import _preparse_gpu_index
+
+# ── config-path preparse ─────────────────────────────────────────────────────
 
 
-def test_preparse_default_when_flag_absent():
-    assert _preparse_gpu_index(["python", "-m", "src.pipeline.optimize"]) == "0"
+def test_preparse_config_path_with_space():
+    from src.pipeline.optimize import _preparse_config_path
+    assert _preparse_config_path(["prog", "--config", "/tmp/x.cfg"]) == "/tmp/x.cfg"
 
 
-def test_preparse_space_form():
-    assert _preparse_gpu_index(["prog", "--gpu-index", "3"]) == "3"
+def test_preparse_config_path_with_equals():
+    from src.pipeline.optimize import _preparse_config_path
+    assert _preparse_config_path(["prog", "--config=/tmp/x.cfg"]) == "/tmp/x.cfg"
 
 
-def test_preparse_equals_form():
-    assert _preparse_gpu_index(["prog", "--gpu-index=2"]) == "2"
+def test_preparse_config_path_absent():
+    from src.pipeline.optimize import _preparse_config_path
+    assert _preparse_config_path(["prog"]) is None
 
 
-def test_preparse_ignores_unrelated_flags():
-    argv = ["prog", "--run-dir", "/tmp/x", "--gpu-index", "1", "--trace-dir="]
-    assert _preparse_gpu_index(argv) == "1"
+def test_preparse_config_path_dangling_flag_returns_none():
+    from src.pipeline.optimize import _preparse_config_path
+    assert _preparse_config_path(["prog", "--config"]) is None
 
 
-def test_preparse_dangling_flag_falls_back_to_default():
-    assert _preparse_gpu_index(["prog", "--gpu-index"]) == "0"
+# ── gpu_index preparse from cfg ──────────────────────────────────────────────
 
 
-from src.pipeline.optimize import _nonneg_int
+def test_preparse_gpu_index_reads_from_cfg(tmp_path):
+    from src.pipeline.optimize import _preparse_gpu_index
+    cfg_file = tmp_path / "acts.cfg"
+    cfg_file.write_text("hardware: { gpu_index = 3; };\n")
+    assert _preparse_gpu_index(["prog", "--config", str(cfg_file)]) == "3"
 
 
-def test_nonneg_int_accepts_zero():
-    assert _nonneg_int("0") == 0
+def test_preparse_gpu_index_no_config_flag_defaults_zero():
+    from src.pipeline.optimize import _preparse_gpu_index
+    assert _preparse_gpu_index(["prog"]) == "0"
 
 
-def test_nonneg_int_accepts_positive():
-    assert _nonneg_int("3") == 3
+def test_preparse_gpu_index_cfg_missing_section_defaults_zero(tmp_path):
+    from src.pipeline.optimize import _preparse_gpu_index
+    cfg_file = tmp_path / "acts.cfg"
+    cfg_file.write_text("search: { beam_width = 5; };\n")
+    assert _preparse_gpu_index(["prog", "--config", str(cfg_file)]) == "0"
 
 
-def test_nonneg_int_rejects_non_integer():
-    with pytest.raises(argparse.ArgumentTypeError, match="non-negative integer"):
-        _nonneg_int("foo")
+def test_preparse_gpu_index_cfg_missing_key_defaults_zero(tmp_path):
+    from src.pipeline.optimize import _preparse_gpu_index
+    cfg_file = tmp_path / "acts.cfg"
+    cfg_file.write_text(
+        'hardware: { arch_config_path = "configs/arch/RTX6000Ada.yaml"; };\n'
+    )
+    assert _preparse_gpu_index(["prog", "--config", str(cfg_file)]) == "0"
 
 
-def test_nonneg_int_rejects_negative():
-    with pytest.raises(argparse.ArgumentTypeError, match="non-negative integer"):
-        _nonneg_int("-1")
+def test_preparse_gpu_index_cfg_path_does_not_exist_defaults_zero(tmp_path):
+    """A nonexistent cfg path must not crash the preparse — argparse in
+    main() handles the bad-path error with a clean message."""
+    from src.pipeline.optimize import _preparse_gpu_index
+    assert _preparse_gpu_index(["prog", "--config", str(tmp_path / "missing.cfg")]) == "0"
 
 
-def test_nonneg_int_rejects_float_string():
-    with pytest.raises(argparse.ArgumentTypeError):
-        _nonneg_int("1.5")
-
-
-from src.pipeline.optimize import _validate_gpu_visible
+# ── validate_gpu_visible — unchanged surface (kept for runtime check) ────────
 
 
 def test_validate_no_cuda_exits(capsys):
+    from src.pipeline.optimize import _validate_gpu_visible
     fake_torch = MagicMock()
     fake_torch.cuda.is_available.return_value = False
     with patch.dict("sys.modules", {"torch": fake_torch}):
@@ -72,6 +94,7 @@ def test_validate_no_cuda_exits(capsys):
 
 
 def test_validate_zero_visible_exits(capsys):
+    from src.pipeline.optimize import _validate_gpu_visible
     fake_torch = MagicMock()
     fake_torch.cuda.is_available.return_value = True
     fake_torch.cuda.device_count.return_value = 0
@@ -85,6 +108,7 @@ def test_validate_zero_visible_exits(capsys):
 
 
 def test_validate_more_than_one_visible_exits(capsys):
+    from src.pipeline.optimize import _validate_gpu_visible
     fake_torch = MagicMock()
     fake_torch.cuda.is_available.return_value = True
     fake_torch.cuda.device_count.return_value = 2
@@ -97,6 +121,7 @@ def test_validate_more_than_one_visible_exits(capsys):
 
 
 def test_validate_happy_path_returns_none():
+    from src.pipeline.optimize import _validate_gpu_visible
     fake_torch = MagicMock()
     fake_torch.cuda.is_available.return_value = True
     fake_torch.cuda.device_count.return_value = 1
@@ -105,6 +130,7 @@ def test_validate_happy_path_returns_none():
 
 
 def test_validate_reset_only_uses_nvidia_smi():
+    from src.pipeline.optimize import _validate_gpu_visible
     fake_proc = MagicMock()
     fake_proc.returncode = 0
     with patch("subprocess.run", return_value=fake_proc) as mock_run:
@@ -114,6 +140,7 @@ def test_validate_reset_only_uses_nvidia_smi():
 
 
 def test_validate_reset_only_nvidia_smi_failure_exits(capsys):
+    from src.pipeline.optimize import _validate_gpu_visible
     fake_proc = MagicMock()
     fake_proc.returncode = 6
     with patch("subprocess.run", return_value=fake_proc):
@@ -124,35 +151,49 @@ def test_validate_reset_only_nvidia_smi_failure_exits(capsys):
     assert "GPU 99 not found by nvidia-smi" in err
 
 
-def test_main_tripwire_catches_preparse_argparse_desync(monkeypatch):
-    """If the module-top _GPU_INDEX disagrees with args.gpu_index, the
-    tripwire assertion fires."""
+# ── argparse rejects retired flags ──────────────────────────────────────────
+
+
+def test_main_rejects_gpu_index_flag(capsys):
+    """`--gpu-index` retired 2026-05-11; lives in cfg `hardware.gpu_index`."""
     from src.pipeline import optimize
-
-    monkeypatch.setattr(optimize, "_GPU_INDEX", "5")
-    monkeypatch.setattr(optimize, "_validate_gpu_visible", lambda *a, **kw: None)
-
-    with pytest.raises(AssertionError, match="preparse/argparse desync"):
-        optimize.main(argv=["--gpu-index", "0", "placeholder"])
+    with pytest.raises(SystemExit):
+        optimize.main(["--gpu-index", "0"])
 
 
-import os
-import subprocess
-import sys
+def test_main_rejects_reset_clocks_flag(capsys):
+    """`--reset-clocks` retired 2026-05-11; lives in cfg `runtime.reset_clocks`."""
+    from src.pipeline import optimize
+    with pytest.raises(SystemExit):
+        optimize.main(["--reset-clocks"])
+
+
+def test_main_rejects_problem_positional(capsys):
+    """`problem_path` positional retired 2026-05-11; lives in cfg `runtime.problem_path`."""
+    from src.pipeline import optimize
+    with pytest.raises(SystemExit):
+        optimize.main(["placeholder"])
+
+
+# ── end-to-end (GPU only) ────────────────────────────────────────────────────
 
 
 @pytest.mark.gpu
 def test_gpu_index_end_to_end_subprocess(tmp_path):
-    """Subprocess invocation: --gpu-index 0 placeholder runs to completion
-    on the dev box, even when the shell's CUDA_VISIBLE_DEVICES is bogus.
-    Verifies the preparse + env override land before SOL imports."""
+    """Subprocess: --config <tmp cfg> runs to completion on the dev box,
+    even when the shell's CUDA_VISIBLE_DEVICES is bogus. Verifies the
+    preparse + env override land before SOL imports."""
+    cfg_file = tmp_path / "acts.cfg"
+    cfg_file.write_text(
+        "hardware: { gpu_index = 0; };\n"
+        'runtime: { problem_path = "placeholder"; };\n'
+    )
     env = {**os.environ, "CUDA_VISIBLE_DEVICES": "999"}
     proc = subprocess.run(
         [sys.executable, "-m", "src.pipeline.optimize",
-         "--gpu-index", "0",
-         "--run-dir", str(tmp_path),
-         "--trace-dir=",
-         "placeholder"],
+         "--config", str(cfg_file),
+         "--run-dir", str(tmp_path / "runs"),
+         "--trace-dir="],
         env=env,
         capture_output=True,
         text=True,
@@ -162,4 +203,4 @@ def test_gpu_index_end_to_end_subprocess(tmp_path):
         f"subprocess failed: rc={proc.returncode}\n"
         f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
     )
-    assert any(tmp_path.iterdir()), "no run_<UTC>/ directory created"
+    assert any((tmp_path / "runs").iterdir()), "no run_<UTC>/ directory created"

@@ -13,51 +13,57 @@ the snapshot is taken before any user-supplied source is loaded.
 from __future__ import annotations
 
 # IMPORT-ORDER CONTRACT — DO NOT REORDER
-# The ``--gpu-index`` preparse + ``CUDA_VISIBLE_DEVICES`` override below
-# must run before any non-stdlib import. SOL's import chain transitively
-# imports torch, which snapshots the visible-device set on first CUDA
-# call; setting the env after that is a no-op. ``os`` and ``sys`` are
-# stdlib so importing them here is safe.
-# See ``doc/specs/2026-05-10-cli-gpu-index-design.md``.
+# The cfg preparse + ``CUDA_VISIBLE_DEVICES`` override below must run
+# before any non-stdlib import that touches CUDA. SOL's import chain
+# transitively imports torch, which snapshots the visible-device set on
+# first CUDA call; setting the env after that is a no-op. ``io``, ``os``,
+# and ``sys`` are stdlib so importing them here is safe. ``libconf`` is
+# pure-Python (no CUDA / torch / SOL imports) so importing it before
+# ``import sol_execbench`` is also safe.
+import io
 import os
 import sys
 
+import libconf
 
-def _preparse_gpu_index(argv: list[str]) -> str:
-    """Minimal argv scan for ``--gpu-index``, runs before any non-stdlib import.
 
-    Returns the flag value as a string (matches ``_GPU_INDEX`` type for
-    argv splicing into ``nvidia-smi -i <idx>``). Defaults to ``"0"`` when
-    the flag is absent or has no value. Does not validate — argparse in
-    ``main()`` handles type/range errors. Supports both
-    ``--gpu-index N`` and ``--gpu-index=N``.
+def _preparse_config_path(argv: list[str]) -> str | None:
+    """Minimal argv scan for ``--config <path>``.
+
+    Returns the path string when ``--config <path>`` or ``--config=<path>``
+    is present, ``None`` otherwise. Does not check that the file exists —
+    argparse in ``main()`` handles bad-path errors with a clean message.
+    A dangling ``--config`` (no following arg) is treated as absent.
     """
     for i, arg in enumerate(argv):
-        if arg == "--gpu-index" and i + 1 < len(argv):
+        if arg == "--config" and i + 1 < len(argv):
             return argv[i + 1]
-        if arg.startswith("--gpu-index="):
+        if arg.startswith("--config="):
             return arg.split("=", 1)[1]
-    return "0"
+    return None
 
 
-def _nonneg_int(s: str) -> int:
-    """argparse ``type=`` callable: parse non-negative int or raise.
+def _preparse_gpu_index(argv: list[str]) -> str:
+    """Resolve the effective ``gpu_index`` before any CUDA-aware import.
 
-    argparse's default ``type=int`` accepts negatives; this rejects them
-    so ``--gpu-index -1`` fails fast with a clear usage message.
+    Reads ``hardware.gpu_index`` from the libconfig-format cfg path
+    scanned out of argv. Returns the value as a string (the form
+    ``CUDA_VISIBLE_DEVICES`` and ``nvidia-smi -i <idx>`` consume).
+    Defaults to ``"0"`` when ``--config`` is absent, the cfg path doesn't
+    exist, the section/key is missing, or the cfg is malformed. Never
+    raises — argparse in ``main()`` surfaces user-facing errors later.
     """
-    import argparse
+    cfg_path = _preparse_config_path(argv)
+    if cfg_path is None:
+        return "0"
+    if not os.path.exists(cfg_path):
+        return "0"
     try:
-        n = int(s)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError(
-            f"expected non-negative integer, got {s!r}"
-        ) from exc
-    if n < 0:
-        raise argparse.ArgumentTypeError(
-            f"expected non-negative integer, got {n}"
-        )
-    return n
+        with io.open(cfg_path, encoding="utf-8") as f:
+            cfg = libconf.load(f)
+        return str(int((cfg.get("hardware") or {}).get("gpu_index", 0)))
+    except (libconf.ConfigParseError, ValueError, OSError):
+        return "0"
 
 
 def _validate_gpu_visible(gpu_index: int, *, reset_only: bool) -> None:
@@ -751,7 +757,7 @@ def main(argv: list[str] | None = None) -> None:
     from dataclasses import asdict
     from datetime import datetime, timezone
 
-    from src.config import ACTSConfig, detect_hardware
+    from src.config import ACTSConfig, detect_hardware, load_config
     from src.pipeline.report import render_report
     from src.runtime import tree_dump
     from src.runtime.events import emit
@@ -760,18 +766,23 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="python -m src.pipeline.optimize",
         description=(
-            "Run the ACTS optimization pipeline against a SOL-ExecBench problem "
-            "directory (containing ``definition.json`` + ``workload.jsonl``), "
-            "or the literal string ``placeholder`` for the matmul demo."
+            "Run the ACTS optimization pipeline. All algorithmic + runtime "
+            "knobs (problem path, gpu_index, reset_clocks, beam_width, …) "
+            "live in a ``.cfg`` file passed via ``--config``; the CLI keeps "
+            "only invocation-scoped flags. Without ``--config``, ACTSConfig "
+            "defaults run the placeholder matmul smoke path."
         ),
     )
     parser.add_argument(
-        "problem_path",
-        nargs="?",
-        default="placeholder",
+        "--config",
+        type=Path,
+        default=None,
         help=(
-            "Path to a SOL-ExecBench problem directory, or ``placeholder`` "
-            "(default) to exercise the no-LLM matmul smoke path."
+            "Path to an ACTS ``.cfg`` file (see configs/example.cfg). "
+            "When omitted, ACTSConfig defaults apply (problem=placeholder, "
+            "gpu_index=0, reset_clocks=False). The module-top preparse "
+            "reads ``[hardware] gpu_index`` from this file before any CUDA-"
+            "aware import so ``CUDA_VISIBLE_DEVICES`` lands in time."
         ),
     )
     parser.add_argument(
@@ -793,37 +804,31 @@ def main(argv: list[str] | None = None) -> None:
             "value (``--trace-dir=``) to disable capture entirely."
         ),
     )
-    parser.add_argument(
-        "--reset-clocks",
-        action="store_true",
-        help=(
-            "Operator escape hatch for SIGKILL / segfault recovery: reset "
-            "the chosen GPU's application clocks and exit immediately. "
-            "Does not run the optimization pipeline."
-        ),
-    )
-    parser.add_argument(
-        "--gpu-index",
-        type=_nonneg_int,
-        default=0,
-        help=(
-            "GPU to run on (NVML / nvidia-smi index). Default 0. ACTS sets "
-            "CUDA_VISIBLE_DEVICES from this flag, overriding any shell "
-            "setting, so torch and nvidia-smi see the same physical device."
-        ),
-    )
     args = parser.parse_args(argv)
 
-    assert args.gpu_index == int(_GPU_INDEX), (
-        f"preparse/argparse desync: preparse={_GPU_INDEX!r} "
-        f"argparse={args.gpu_index}"
+    # Build ACTSConfig: load from --config if given, else dataclass defaults
+    # with detected hardware. Argparse already rejected --gpu-index /
+    # --reset-clocks / positional problem_path — those live in cfg now.
+    if args.config is not None:
+        if not args.config.exists():
+            parser.error(f"--config: file not found: {args.config}")
+        acts_config = load_config(args.config)
+    else:
+        acts_config = ACTSConfig(hardware=detect_hardware())
+
+    # Tripwire: the module-top preparse read [hardware] gpu_index from the
+    # same cfg, so the two must agree. A mismatch means the cfg changed
+    # between import time and main() — a deployment bug, not a user error.
+    assert acts_config.gpu_index == int(_GPU_INDEX), (
+        f"preparse/config desync: preparse={_GPU_INDEX!r} "
+        f"config={acts_config.gpu_index}"
     )
-    _validate_gpu_visible(args.gpu_index, reset_only=args.reset_clocks)
+    _validate_gpu_visible(acts_config.gpu_index, reset_only=acts_config.reset_clocks)
 
     # Reset-clocks short-circuit: skip the entire pipeline (no RunContext,
     # no model load, no optimize call) and just clear any sticky lock that
-    # a prior crashed run left behind.
-    if args.reset_clocks:
+    # a prior crashed run left behind. Toggle via cfg ``[runtime] reset_clocks``.
+    if acts_config.reset_clocks:
         _unlock_gpu0_clocks()
         print(f"GPU {_GPU_INDEX} clocks reset.")
         return
@@ -856,20 +861,19 @@ def main(argv: list[str] | None = None) -> None:
     model_configured = _is_model_configured()
     emit(
         "run_start",
-        problem_path=str(args.problem_path),
+        problem_path=acts_config.problem_path,
         model_configured=model_configured,
     )
     _try_acquire_clock_lock()
-    # Build the ACTSConfig in main() so we have a handle on the resolved
-    # values to dump into report.txt below. Keeps optimize()'s
-    # ``if config is None: ...`` fallback intact for non-CLI callers.
-    acts_config = ACTSConfig(hardware=detect_hardware())
+    # ``acts_config`` is the cfg-resolved instance built before clock
+    # lock; reuse it as both the optimize() input and the report.txt
+    # dump payload below.
     result = None
     report = None
     try:
         try:
             result, report = asyncio.run(
-                optimize(args.problem_path, config=acts_config)
+                optimize(acts_config.problem_path, config=acts_config)
             )
         except Exception:
             emit(

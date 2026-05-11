@@ -23,6 +23,7 @@ dependencies = [
     "pyyaml>=6.0",
     "pydantic>=2.0",
     "safetensors>=0.4",
+    "libconf>=2.0",
 ]
 
 [project.optional-dependencies]

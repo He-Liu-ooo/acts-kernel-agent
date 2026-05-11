@@ -10,14 +10,32 @@ stub baseline on the first iteration.
 
 from __future__ import annotations
 
+import io
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import libconf
 import pytest
 
 from src.config import ACTSConfig, HardwareSpec
 from src.kernels.kernel import Kernel, KernelSpec, KernelType
 from src.pipeline.optimize import _load_problem, optimize
+
+
+def _write_cfg(tmp_path: Path, **overrides) -> Path:
+    """Write a tmp libconfig-format cfg from ``"section.key": value`` overrides.
+
+    Builds a nested dict and dumps via ``libconf.dump``. Returns the cfg
+    path for argv use.
+    """
+    nested: dict = {}
+    for dotted, value in overrides.items():
+        section, key = dotted.split(".", 1)
+        nested.setdefault(section, {})[key] = value
+    path = tmp_path / "acts.cfg"
+    with io.open(path, "w", encoding="utf-8") as f:
+        libconf.dump(nested, f)
+    return path
 
 
 @pytest.fixture(autouse=True)
@@ -534,8 +552,9 @@ def test_main_defaults_to_placeholder_when_no_arg(tmp_path, monkeypatch):
 
 
 def test_main_forwards_problem_path_to_optimize(tmp_path, monkeypatch):
-    """Positional argument selects which SOL-ExecBench problem to run.
-    Forwarded verbatim — the optimize() coroutine handles directory vs literal."""
+    """`[runtime] problem_path` in the cfg selects which SOL-ExecBench
+    problem to run. Forwarded verbatim — optimize() handles directory
+    vs literal."""
     from src.pipeline import optimize as opt_mod
 
     monkeypatch.chdir(tmp_path)
@@ -545,12 +564,18 @@ def test_main_forwards_problem_path_to_optimize(tmp_path, monkeypatch):
         captured["problem_path"] = problem_path
         return MagicMock(), MagicMock()
 
+    cfg_path = _write_cfg(
+        tmp_path,
+        **{"runtime.problem_path": "repo/benchmark/SOL-ExecBench/examples/triton/rmsnorm"},
+    )
+
     with (
         patch.object(opt_mod, "optimize", side_effect=fake_optimize),
         patch("src.pipeline.report.generate_report", return_value=MagicMock()),
         patch("src.pipeline.report.render_report", return_value=""),
+        patch.object(opt_mod, "_GPU_INDEX", "0"),
     ):
-        opt_mod.main(["repo/benchmark/SOL-ExecBench/examples/triton/rmsnorm"])
+        opt_mod.main(["--config", str(cfg_path)])
 
     assert captured["problem_path"] == "repo/benchmark/SOL-ExecBench/examples/triton/rmsnorm"
 
@@ -574,7 +599,7 @@ def test_main_creates_run_dir(tmp_path, monkeypatch):
         patch("src.pipeline.report.generate_report", return_value=MagicMock()),
         patch("src.pipeline.report.render_report", return_value=""),
     ):
-        opt_mod.main(["placeholder", "--run-dir", str(tmp_path / "runs")])
+        opt_mod.main(["--run-dir", str(tmp_path / "runs")])
 
     run_dirs = list((tmp_path / "runs").glob("run_*"))
     assert len(run_dirs) == 1, run_dirs
@@ -606,7 +631,7 @@ def test_main_trace_dir_defaults_under_run_dir(tmp_path, monkeypatch):
         patch("src.pipeline.report.generate_report", return_value=MagicMock()),
         patch("src.pipeline.report.render_report", return_value=""),
     ):
-        opt_mod.main(["placeholder", "--run-dir", str(tmp_path / "runs")])
+        opt_mod.main(["--run-dir", str(tmp_path / "runs")])
 
     # enable_local_trace_capture called with <run-dir>/traces/, not ./traces/
     mock_enable.assert_called_once()
@@ -653,7 +678,7 @@ def test_main_emits_run_start_and_run_end(tmp_path, monkeypatch):
         patch("src.pipeline.report.generate_report", return_value=MagicMock()),
         patch("src.pipeline.report.render_report", return_value=""),
     ):
-        opt_mod.main(["placeholder", "--run-dir", str(tmp_path / "runs")])
+        opt_mod.main(["--run-dir", str(tmp_path / "runs")])
 
     rd = next((tmp_path / "runs").glob("run_*"))
     lines = [json.loads(line) for line in (rd / "events.jsonl").read_text().splitlines() if line.strip()]
@@ -692,7 +717,7 @@ def test_main_emits_run_end_on_exception(tmp_path, monkeypatch):
         patch("src.agents.llm_backend._SDK_AVAILABLE", False),
     ):
         with pytest.raises(RuntimeError, match="boom"):
-            opt_mod.main(["placeholder", "--run-dir", str(tmp_path / "runs")])
+            opt_mod.main(["--run-dir", str(tmp_path / "runs")])
 
     rd = next((tmp_path / "runs").glob("run_*"))
     lines = [json.loads(line) for line in (rd / "events.jsonl").read_text().splitlines() if line.strip()]
@@ -726,7 +751,6 @@ def test_main_explicit_trace_dir_override(tmp_path, monkeypatch):
         patch("src.pipeline.report.render_report", return_value=""),
     ):
         opt_mod.main([
-            "placeholder",
             "--run-dir", str(tmp_path / "runs"),
             "--trace-dir", str(external),
         ])
@@ -761,7 +785,7 @@ def test_main_enables_trace_capture_when_sdk_available(tmp_path, monkeypatch):
         patch("src.pipeline.report.generate_report", return_value=MagicMock()),
         patch("src.pipeline.report.render_report", return_value=""),
     ):
-        opt_mod.main(["placeholder", "--trace-dir", str(tmp_path)])
+        opt_mod.main(["--trace-dir", str(tmp_path)])
 
     mock_enable.assert_called_once_with(tmp_path)
     fake_processor.shutdown.assert_called_once()
@@ -835,7 +859,7 @@ def test_main_completes_run_even_if_trace_setup_raises(tmp_path, monkeypatch):
         patch("src.pipeline.report.render_report", return_value=""),
     ):
         # Must not raise.
-        opt_mod.main(["placeholder", "--trace-dir", str(tmp_path)])
+        opt_mod.main(["--trace-dir", str(tmp_path)])
 
 
 @pytest.mark.asyncio
@@ -863,14 +887,17 @@ async def test_placeholder_mode_never_loads_model():
 
 
 def test_import_order_contract_sol_first():
-    """``import sol_execbench`` must be the first non-stdlib import in
+    """``import sol_execbench`` must be the first CUDA-touching import in
     ``pipeline/optimize.py``. SOL's ``core.bench.reward_hack`` snapshots
     ``torch.cuda.Event.elapsed_time`` at module load — any user-supplied
     torch import landing first would let the snapshot capture a tampered
     address.
 
-    We verify this by reading the source: the first non-stdlib ``import``
-    line (after the docstring) must reference ``sol_execbench``.
+    Pure-Python non-stdlib imports needed by the cfg preparse (``libconf``)
+    are allowed before sol_execbench: they don't touch torch / CUDA, so
+    they can't compromise the reward-hack address snapshot. We verify
+    this by reading the source: the first non-stdlib, non-``libconf``
+    ``import`` must reference ``sol_execbench``.
     """
     from src.pipeline import optimize as opt_mod
 
@@ -878,11 +905,13 @@ def test_import_order_contract_sol_first():
     # Use the AST so docstrings, multi-line strings, and conditional
     # blocks can't trip the parser. Walk top-level body in order; first
     # ``Import`` / ``ImportFrom`` whose top-level package is not stdlib
-    # must be sol_execbench.
+    # and not on the safe-non-CUDA allowlist must be sol_execbench.
     import ast
     import sys
 
     stdlib = set(sys.stdlib_module_names) | {"__future__"}
+    # Pure-Python, non-CUDA modules needed by the module-top cfg preparse.
+    safe_preparse = {"libconf"}
     tree = ast.parse(src)
     found_third_party = None
     for node in tree.body:
@@ -894,12 +923,12 @@ def test_import_order_contract_sol_first():
             mod = node.module.split(".")[0]
         else:
             continue
-        if mod in stdlib:
+        if mod in stdlib or mod in safe_preparse:
             continue
         found_third_party = mod
         break
     assert found_third_party == "sol_execbench", (
-        f"first non-stdlib import must be sol_execbench, got {found_third_party!r}"
+        f"first CUDA-touching import must be sol_execbench, got {found_third_party!r}"
     )
 
 
@@ -977,7 +1006,7 @@ def test_main_emits_clock_lock_unavailable_when_probe_fails(tmp_path, monkeypatc
         patch("src.pipeline.report.generate_report", return_value=MagicMock()),
         patch("src.pipeline.report.render_report", return_value=""),
     ):
-        opt_mod.main(["placeholder", "--run-dir", str(tmp_path / "runs")])
+        opt_mod.main(["--run-dir", str(tmp_path / "runs")])
 
     # _lock_gpu0_clocks must NOT be called when the probe fails.
     mock_lock.assert_not_called()
@@ -1181,7 +1210,7 @@ def test_main_unlocks_clocks_on_normal_exit(tmp_path, monkeypatch):
         patch("src.pipeline.report.generate_report", return_value=MagicMock()),
         patch("src.pipeline.report.render_report", return_value=""),
     ):
-        opt_mod.main(["placeholder", "--run-dir", str(tmp_path / "runs")])
+        opt_mod.main(["--run-dir", str(tmp_path / "runs")])
 
     # First call from the explicit ``finally`` block; the atexit-registered
     # call sees ``locked=False`` (idempotent flag) and no-ops.
@@ -1210,7 +1239,7 @@ def test_main_unlocks_clocks_when_optimize_raises(tmp_path, monkeypatch):
         patch.object(opt_mod, "_unlock_gpu0_clocks") as mock_unlock,
     ):
         with pytest.raises(RuntimeError, match="boom"):
-            opt_mod.main(["placeholder", "--run-dir", str(tmp_path / "runs")])
+            opt_mod.main(["--run-dir", str(tmp_path / "runs")])
 
     assert mock_unlock.call_count >= 1
 
@@ -1497,21 +1526,24 @@ def test_resolve_clock_preset_acts_table_takes_precedence():
 
 
 def test_main_reset_clocks_short_circuits_pipeline(tmp_path, monkeypatch, capsys):
-    """``--reset-clocks`` is the operator escape hatch for the SIGKILL /
-    segfault case: it must reset GPU 0 clocks and exit immediately,
-    without creating a RunContext, loading a model, or invoking
-    ``asyncio.run(optimize(...))``."""
+    """``[runtime] reset_clocks = true`` in the cfg is the operator escape
+    hatch for the SIGKILL / segfault case: it must reset GPU 0 clocks and
+    exit immediately, without creating a RunContext, loading a model, or
+    invoking ``asyncio.run(optimize(...))``."""
     from src.pipeline import optimize as opt_mod
 
     monkeypatch.chdir(tmp_path)
+
+    cfg_path = _write_cfg(tmp_path, **{"runtime.reset_clocks": True})
 
     with (
         patch.object(opt_mod, "subprocess") as mock_sp,
         patch("src.runtime.run_context.RunContext.create") as mock_rc_create,
         patch.object(opt_mod.asyncio, "run") as mock_async_run,
         patch.object(opt_mod, "_validate_gpu_visible"),
+        patch.object(opt_mod, "_GPU_INDEX", "0"),
     ):
-        opt_mod.main(["--reset-clocks"])
+        opt_mod.main(["--config", str(cfg_path)])
 
     # Two subprocess calls: -rgc + -rmc, both scoped to GPU 0.
     assert mock_sp.run.call_count == 2
@@ -1561,7 +1593,7 @@ def test_main_calls_finalize_tree_on_success(tmp_path, monkeypatch):
         patch("src.pipeline.report.generate_report", return_value=MagicMock()),
         patch("src.pipeline.report.render_report", return_value=""),
     ):
-        opt_mod.main(["placeholder", "--run-dir", str(tmp_path / "runs")])
+        opt_mod.main(["--run-dir", str(tmp_path / "runs")])
 
     assert len(calls) == 1
     assert calls[0] is fake_tree
@@ -1588,6 +1620,6 @@ def test_main_does_not_call_finalize_tree_on_exception(tmp_path, monkeypatch):
         patch("src.agents.llm_backend._SDK_AVAILABLE", False),
     ):
         with pytest.raises(RuntimeError, match="test crash"):
-            opt_mod.main(["placeholder", "--run-dir", str(tmp_path / "runs")])
+            opt_mod.main(["--run-dir", str(tmp_path / "runs")])
 
     assert calls == []

@@ -224,17 +224,14 @@ def test_acts_config_reviewer_metric_queries_default_false():
     assert cfg.reviewer_metric_queries is False
 
 
-def test_load_config_reviewer_metric_queries_from_ini():
-    """`load_config` parses [search] reviewer_metric_queries via the
+def test_load_config_reviewer_metric_queries_from_cfg():
+    """`load_config` parses search.reviewer_metric_queries via the
     existing boolean coercion path used by `beam_diversity`."""
     from src.config import load_config
 
-    ini = """\
-[search]
-reviewer_metric_queries = true
-"""
+    cfg_text = "search: { reviewer_metric_queries = true; };\n"
     with tempfile.NamedTemporaryFile(mode="w", suffix=".cfg", delete=False) as f:
-        f.write(ini)
+        f.write(cfg_text)
         f.flush()
         cfg = load_config(Path(f.name))
 
@@ -242,15 +239,12 @@ reviewer_metric_queries = true
 
 
 def test_load_config_reviewer_metric_queries_omitted_uses_default():
-    """When [search] omits the key, fall back to the dataclass default."""
+    """When ``search`` omits the key, fall back to the dataclass default."""
     from src.config import load_config
 
-    ini = """\
-[search]
-beam_width = 5
-"""
+    cfg_text = "search: { beam_width = 5; };\n"
     with tempfile.NamedTemporaryFile(mode="w", suffix=".cfg", delete=False) as f:
-        f.write(ini)
+        f.write(cfg_text)
         f.flush()
         cfg = load_config(Path(f.name))
 
@@ -352,7 +346,7 @@ DRAM_capacity: 51539607552
 freq_GHz: 2.505
 """
     yaml_path = _write_yaml(ada_yaml)
-    cfg_text = f"[hardware]\narch_config_path = {yaml_path}\n"
+    cfg_text = f'hardware: {{ arch_config_path = "{yaml_path}"; }};\n'
     with tempfile.NamedTemporaryFile(mode="w", suffix=".cfg", delete=False) as f:
         f.write(cfg_text)
         cfg_path = Path(f.name)
@@ -507,3 +501,87 @@ def test_detect_hardware_yaml_load_failure_falls_back_to_runtime_only(
     assert spec.name == "NVIDIA Test Bogus"
     assert spec.MAC_per_cycle_bf16_tc == 0.0
     assert any("failed to load" in rec.message for rec in caplog.records)
+
+
+# ── new fields absorbed from argparse (2026-05-11) ───────────────────────────
+
+
+def test_load_config_gpu_index_from_cfg():
+    """`load_config` parses hardware.gpu_index — previously a CLI flag."""
+    from src.config import load_config
+
+    cfg_text = "hardware: { gpu_index = 3; };\n"
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".cfg", delete=False) as f:
+        f.write(cfg_text)
+        f.flush()
+        cfg = load_config(Path(f.name))
+
+    assert cfg.gpu_index == 3
+
+
+def test_load_config_gpu_index_omitted_uses_default():
+    """Absent gpu_index falls back to ACTSConfig default (0)."""
+    from src.config import load_config
+
+    cfg_text = "hardware: { };\n"
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".cfg", delete=False) as f:
+        f.write(cfg_text)
+        f.flush()
+        cfg = load_config(Path(f.name))
+
+    assert cfg.gpu_index == 0
+
+
+def test_load_config_reset_clocks_from_cfg():
+    """`load_config` parses runtime.reset_clocks — previously a CLI flag."""
+    from src.config import load_config
+
+    cfg_text = "runtime: { reset_clocks = true; };\n"
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".cfg", delete=False) as f:
+        f.write(cfg_text)
+        f.flush()
+        cfg = load_config(Path(f.name))
+
+    assert cfg.reset_clocks is True
+
+
+def test_load_config_reset_clocks_omitted_uses_default():
+    """Absent reset_clocks falls back to ACTSConfig default (False)."""
+    from src.config import load_config
+
+    cfg_text = "runtime: { };\n"
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".cfg", delete=False) as f:
+        f.write(cfg_text)
+        f.flush()
+        cfg = load_config(Path(f.name))
+
+    assert cfg.reset_clocks is False
+
+
+def test_load_config_problem_path_from_cfg():
+    """`load_config` parses runtime.problem_path — previously a CLI positional."""
+    from src.config import load_config
+
+    cfg_text = (
+        'runtime: { problem_path = '
+        '"repo/benchmark/SOL-ExecBench/examples/triton/rmsnorm"; };\n'
+    )
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".cfg", delete=False) as f:
+        f.write(cfg_text)
+        f.flush()
+        cfg = load_config(Path(f.name))
+
+    assert cfg.problem_path == "repo/benchmark/SOL-ExecBench/examples/triton/rmsnorm"
+
+
+def test_load_config_problem_path_omitted_uses_default():
+    """Absent problem_path falls back to ACTSConfig default ('placeholder')."""
+    from src.config import load_config
+
+    cfg_text = "runtime: { };\n"
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".cfg", delete=False) as f:
+        f.write(cfg_text)
+        f.flush()
+        cfg = load_config(Path(f.name))
+
+    assert cfg.problem_path == "placeholder"
