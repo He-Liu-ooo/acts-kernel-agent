@@ -1313,6 +1313,28 @@ Triton effectively gives us Tiers 1-3.5. CUDA gives all 6 tiers — but the agen
 
 ## Development Process
 
+### CLI → cfg consolidation (2026-05-11)
+
+**Rationale**: The CLI carried five flags (`problem_path` positional, `--run-dir`, `--trace-dir`, `--reset-clocks`, `--gpu-index`) alongside an unused `load_config()` that read a `.cfg` file. Three of the five (`problem_path`, `--reset-clocks`, `--gpu-index`) were *invocation knobs* that belonged with the algorithmic config (`beam_width`, `sol_target`, …) but had been promoted to CLI for ease-of-tweak. Result: two ways to configure ACTS, and a stranded `load_config()` that nobody called from production.
+
+**Decision**: collapse onto `.cfg` as the single configuration surface, in **libconfig format** (parsed by the pure-Python `libconf` package, added to `pyproject.toml`). CLI shrinks to three flags — `--config`, `--run-dir`, `--trace-dir` — which are the genuinely *per-invocation* knobs (where does this run's cfg/artifacts live). Everything else moves into `ACTSConfig` and `load_config()`:
+
+- `runtime.problem_path` — replaces the positional argument.
+- `runtime.reset_clocks` — replaces `--reset-clocks`. Toggle on, run once, toggle off.
+- `hardware.gpu_index` — replaces `--gpu-index`. Module-top preparse opens the libconfig cfg (via `libconf`, pure-Python and CUDA-free) before any CUDA-aware import, extracts `gpu_index`, and sets `CUDA_VISIBLE_DEVICES`. The ordering constraint is preserved: cfg path is scanned out of `sys.argv` (`_preparse_config_path`), the cfg is opened, the value is read, and `os.environ["CUDA_VISIBLE_DEVICES"]` is set — all before `import sol_execbench`. The import-order contract test (`test_import_order_contract_sol_first`) gains a `libconf` allowlist entry since the package is pure Python and can't compromise SOL's reward-hack address snapshot.
+
+**Why not flatten everything onto CLI instead**: 17 algorithmic knobs as CLI flags would balloon `--help` and force users to memorize or rediscover the surface for every run. `.cfg` already had the right shape (file-based, idempotent, diff-friendly). The argparse path was the orphaned one.
+
+**Why libconfig (libconf) over INI (configparser)**: native types (`bool`, `int`, `float`, `str`, nested groups) without string-coercion plumbing, and proper nested-group syntax instead of flat `[section]` headers. INI's quirks (every value is a string until you call `getboolean`/`getint`/`getfloat`; nested data needs flattening into `[section.subsection]` conventions) accumulated friction that the rewrite removed. libconf is pure Python and adds only ~25 KB to the dep set.
+
+**Why not delete CLI entirely**: `--run-dir` and `--trace-dir` are *truly per-invocation* — every run wants its own artifacts directory. `--config` is the bootstrap pointer; without it the loader doesn't know which cfg to read. Keeping these three preserves the "set everything once in `acts.cfg`, vary only artifacts per run" workflow without one-cfg-per-problem proliferation.
+
+**Default behavior without `--config`**: `ACTSConfig()` with `detect_hardware()` — matches the prior all-defaults path so `python -m src.pipeline.optimize` still runs the placeholder matmul smoke test. The cfg-less path is the smoke test; the cfg path is real work.
+
+**Tripwire**: `main()` asserts `acts_config.gpu_index == int(_GPU_INDEX)` after argparse so the module-top preparse and the in-`main()` load agree. A mismatch means the cfg file was edited between import time and `main()` — a deployment bug, not user error.
+
+**Source**: user observation that "there are two ways to config" in a 2026-05-11 design discussion.
+
 ### Always-runnable framework
 
 **Rationale**: Prevents the common failure mode of building a large codebase that doesn't run until everything is done. By keeping the framework complete-but-shallow, we test pipeline flow early and catch integration issues before investing in deep implementation.

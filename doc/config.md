@@ -4,38 +4,36 @@ Global configuration and hardware detection.
 
 ## Configuration File
 
-Run parameters are set through `.cfg` files (INI format, parsed via `configparser`). Unspecified values fall back to built-in defaults. Hardware specs are loaded from a SOLAR arch YAML if specified, otherwise detected at runtime.
+Run parameters are set through `.cfg` files (libconfig format, parsed via `libconf` in `load_config()`). Unspecified groups + keys fall back to `ACTSConfig` dataclass defaults. Hardware specs are loaded from a SOLAR arch YAML when `hardware.arch_config_path` is set, otherwise detected at runtime. See `configs/example.cfg` for the canonical reference.
 
-```ini
-[search]
-beam_width = 3
-beam_diversity = true
-reviewer_metric_queries = false
-max_depth = 20
-epsilon_start = 0.3
-epsilon_end = 0.05
+```libconfig
+runtime:
+{
+    problem_path = "placeholder";
+    reset_clocks = false;
+};
 
-[eval]
-warmup_runs = 20
-timed_runs = 100
+hardware:
+{
+    gpu_index = 0;
+    arch_config_path = "configs/arch/H100_PCIe.yaml";
+};
 
-[move_on]
-sol_plateau_window = 3
-sol_plateau_delta = 0.01
-sol_target = 0.95
+search:
+{
+    beam_width = 3;
+    beam_diversity = true;
+    reviewer_metric_queries = false;
+    max_depth = 20;
+    epsilon_start = 0.3;
+    epsilon_end = 0.05;
+};
 
-[debug]
-max_debug_retries = 3
-max_baseline_retries = 3
-
-[memory]
-optimization_memory_top_k = 5
-
-[benchmark]
-benchmark_workload_count = 3
-
-[hardware]
-arch_config_path = configs/arch/H100_PCIe.yaml
+eval:        { warmup_runs = 20; timed_runs = 100; };
+move_on:     { sol_plateau_window = 3; sol_plateau_delta = 0.01; sol_target = 0.95; };
+debug:       { max_debug_retries = 3; max_baseline_retries = 3; };
+memory:      { optimization_memory_top_k = 5; };
+benchmark:   { benchmark_workload_count = 3; };
 ```
 
 ## HardwareSpec

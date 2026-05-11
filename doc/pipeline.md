@@ -4,17 +4,23 @@ End-to-end optimization entry points.
 
 ## optimize.py — Main Entry Point
 
-CLI:
+CLI (shrunk on 2026-05-11):
 
 ```
-python -m src.pipeline.optimize [problem_path] [--run-dir DIR] [--trace-dir DIR] [--reset-clocks] [--gpu-index N]
+python -m src.pipeline.optimize [--config FILE] [--run-dir DIR] [--trace-dir DIR]
 ```
 
-- `problem_path` (positional, optional) — SOL-ExecBench problem directory (contains `definition.json` + `workload.jsonl`), or the literal string `placeholder` for the built-in matmul demo. Default `"placeholder"` preserves the no-LLM smoke path.
-- `--run-dir DIR` (optional) — parent directory for per-invocation run artifacts. Defaults to `./runs`. Each invocation creates `<run-dir>/run_<YYYYMMDDTHHMMSS_ffffffZ>/` (see "Run artifacts" below).
-- `--trace-dir DIR` (optional) — directory for per-run JSONL trace files capturing every LLM input/output, tool call, and span via `src.agents.trace_processor.JSONLTraceProcessor`. Default is `None`: when omitted, SDK traces land under `<run-dir>/traces/` inside the per-invocation run directory. Passing `--trace-dir <path>` relocates the traces to `<path>`. Passing `--trace-dir=` (empty string) is a kill switch — no capture.
-- `--reset-clocks` — operator escape hatch. Resets the selected GPU's clocks (via `--gpu-index`, default 0) using `-rgc -i 0` + `-rmc -i 0` (the `-i 0` is the logical index after `CUDA_VISIBLE_DEVICES` remapping). Exits without running any pipeline phase. Use after a SIGKILL / segfault left clocks locked from a prior run; the in-process atexit + signal handler chain (SIGTERM / SIGHUP) covers the normal exit cases.
-- `--gpu-index N` (optional, default `0`) — selects which physical GPU ACTS pins. Module-top preparse extracts the value and sets `CUDA_VISIBLE_DEVICES=N` *before* the `import sol_execbench` line, so SOL (and every downstream CUDA consumer) sees the selected GPU as logical index 0. Validated by `_nonneg_int` (argparse type — rejects negatives / non-integers) and the two-tier `_validate_gpu_visible` helper, which checks the physical index exists on the host and that the remapped logical GPU is reachable. `_validate_gpu_visible(..., reset_only=True)` is used on the `--reset-clocks` path where only the physical-index existence check is required.
+Everything algorithmic + invocation (problem path, GPU index, reset-clocks, beam width, …) lives in a `.cfg` file passed via `--config`. The CLI keeps only three flags — invocation-scoped surfaces that the cfg can't easily own (where artifacts land, which cfg to read).
+
+- `--config FILE` (optional) — path to a libconfig-format ACTS `.cfg` (see `configs/example.cfg`), parsed by `libconf` in `load_config()`. When omitted, `ACTSConfig` dataclass defaults apply (problem=`placeholder`, gpu_index=0, reset_clocks=False) so the no-LLM smoke path stays runnable. The module-top preparse opens the cfg before any CUDA-aware import and reads `hardware.gpu_index` so `CUDA_VISIBLE_DEVICES` lands in time (via `_preparse_config_path` + `_preparse_gpu_index`). A non-existent path raises a clean argparse error in `main()`.
+- `--run-dir DIR` (optional) — parent directory for per-invocation run artifacts. Defaults to `./runs`. Each invocation creates `<run-dir>/run_<YYYYMMDDTHHMMSS_ffffffZ>/`.
+- `--trace-dir DIR` (optional) — directory for per-run JSONL trace files capturing every LLM input/output, tool call, and span via `src.agents.trace_processor.JSONLTraceProcessor`. Default is `None`: when omitted, SDK traces land under `<run-dir>/traces/`. Passing `--trace-dir <path>` relocates them. Passing `--trace-dir=` (empty string) is a kill switch — no capture.
+
+### cfg-resident fields (formerly CLI)
+
+- `runtime.problem_path` — SOL-ExecBench problem directory or literal `"placeholder"`. Default `"placeholder"`.
+- `runtime.reset_clocks` (bool) — operator escape hatch. When `true`, `main()` resets the selected GPU's clocks (`-rgc -i 0` + `-rmc -i 0` on the logical index after `CUDA_VISIBLE_DEVICES` remapping) and exits without running any pipeline phase. Toggle on for one recovery run, then back off. Use after SIGKILL / segfault leaves clocks locked; the in-process atexit + signal handler chain (SIGTERM / SIGHUP) covers normal exits.
+- `hardware.gpu_index` — which physical GPU ACTS pins. Read by the module-top preparse to set `CUDA_VISIBLE_DEVICES` before `import sol_execbench`, so SOL (and every downstream CUDA consumer) sees the selected GPU as logical index 0. The two-tier `_validate_gpu_visible` helper runs after preparse to confirm the index exists on the host and the remapped logical GPU is reachable; on the reset-clocks path it skips torch and uses `nvidia-smi --list-gpus -i N` instead.
 
 ### Phase A: Load Problem
 
@@ -43,14 +49,14 @@ python -m src.pipeline.optimize [problem_path] [--run-dir DIR] [--trace-dir DIR]
 
 ### Clock-lock lifecycle
 
-GPU clocks are locked at run start so per-iter latency isn't poisoned by DVFS-driven frequency drift. The lock targets the single GPU ACTS pins via `--gpu-index N` (default 0); other GPUs on a multi-GPU host are untouched. Because the module-top preparse sets `CUDA_VISIBLE_DEVICES=N` before any CUDA-aware import, the selected GPU is always the logical index 0 from ACTS's perspective, which is what the `nvidia-smi ... -i 0` invocations below address.
+GPU clocks are locked at run start so per-iter latency isn't poisoned by DVFS-driven frequency drift. The lock targets the single GPU ACTS pins via `[hardware] gpu_index` in the cfg (default 0); other GPUs on a multi-GPU host are untouched. Because the module-top preparse sets `CUDA_VISIBLE_DEVICES=N` before any CUDA-aware import, the selected GPU is always the logical index 0 from ACTS's perspective, which is what the `nvidia-smi ... -i 0` invocations below address.
 
 - **Prerequisite** — `nvidia-persistenced.service` must be active on the host (`systemctl is-active nvidia-persistenced`). Persistence mode is what makes the GPU hold its `clocks.applications.*` at the lock target between the `-lgc`/`-lmc` issue and the verify read; without it, the GPU drops back to deep idle, idle DRAM falls to ~810 MHz (vs the 10001 MHz target on RTX 6000 Ada), and `_verify_gpu0_locked` rolls the partial lock back with `verify_failed`. See `configs/venvs/3.12.md` for the one-time enable.
 - **Probe** — `probe_clock_lock_available()` (from SOL) checks whether passwordless `sudo nvidia-smi` is configured. The call site does defensive both-shape handling for the bare-`bool` return (today) vs a future tuple-`(bool, str)` return.
 - **Preset lookup** — `_resolve_clock_preset(device_name)` consults the ACTS-side `_ACTS_CLOCK_PRESETS` table first (currently `RTX 6000 Ada → ClockPreset(2505, 10001)`) and falls back to SOL's `get_clock_preset` for known datacenter cards.
-- **Lock** — `_lock_gpu0_clocks(gpu_mhz, dram_mhz)` runs `nvidia-smi -lgc <m>,<m> -i 0` and `-lmc <m>,<m> -i 0`. Targets the selected GPU only (logical index 0 after `CUDA_VISIBLE_DEVICES` remapping by the `--gpu-index` preparse).
+- **Lock** — `_lock_gpu0_clocks(gpu_mhz, dram_mhz)` runs `nvidia-smi -lgc <m>,<m> -i 0` and `-lmc <m>,<m> -i 0`. Targets the selected GPU only (logical index 0 after `CUDA_VISIBLE_DEVICES` remapping by the cfg-driven `gpu_index` preparse).
 - **Verify** — `_verify_gpu0_locked(gpu_mhz, dram_mhz)` queries `clocks.applications.{graphics,memory}` directly via `nvidia-smi --query-gpu=... --format=csv,noheader,nounits -i 0` and compares against the targets with 50 MHz tolerance. The applications-clocks fields reflect the *target* set by `-lgc`/`-lmc` regardless of whether the GPU is busy or idle, so no torch wake-op is needed (a previous version woke the GPU with a tiny op to dodge an idle-clock read of 210 MHz from `clocks.current.*`; switching the queried field eliminated that workaround entirely).
-- **Lifecycle** — lock attempted at run start (after `run_start` event); state stored in `_clock_lock_state` (locked + device_name); cleanup goes through three paths: (a) explicit `finally` in `main()`, (b) `atexit.register(_unlock_clocks_safe)`, (c) signal handlers `_signal_unlock_handler` for `SIGTERM` + `SIGHUP`. Operator escape hatch via `--reset-clocks` covers the SIGKILL / segfault case.
+- **Lifecycle** — lock attempted at run start (after `run_start` event); state stored in `_clock_lock_state` (locked + device_name); cleanup goes through three paths: (a) explicit `finally` in `main()`, (b) `atexit.register(_unlock_clocks_safe)`, (c) signal handlers `_signal_unlock_handler` for `SIGTERM` + `SIGHUP`. Operator escape hatch via `[runtime] reset_clocks = true` in the cfg covers the SIGKILL / segfault case.
 - **Verify-failure semantics** — `_verify_gpu0_locked` returning False or raising triggers `_rollback_partial_lock(device, reason)`, which calls `_unlock_gpu0_clocks` and emits `clock_lock_unavailable` with `reason="verify_failed"` or `reason="verify_raised:<exc>"`. Lock state stays False.
 - **Event surface** — `clock_lock_unavailable` reasons go through a `ClockLockReason` `StrEnum` (`OK` / `PROBE_RETURNED_FALSE` / `NO_PRESET` / `LOCK_FAILED` / `VERIFY_FAILED` / `UNKNOWN`); exception-derived reasons are free-form strings (`verify_raised:<exc>`).
 

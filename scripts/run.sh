@@ -3,9 +3,12 @@
 # ACTS pipeline. All flags are forwarded to `python -m src.pipeline.optimize`.
 #
 # Usage:
-#   scripts/run.sh                                    # placeholder matmul smoke
-#   scripts/run.sh path/to/problem_dir                # real SOL problem
-#   scripts/run.sh path/to/problem_dir --gpu-index 1  # any optimize.py flag works
+#   scripts/run.sh                                   # placeholder matmul smoke
+#   scripts/run.sh --config configs/example.cfg      # cfg-driven run
+#   scripts/run.sh --config my.cfg --run-dir ./out   # custom artifact dir
+#
+# Problem path, GPU index, and reset-clocks now live in the libconfig
+# `.cfg` (parsed by `libconf`) — see configs/example.cfg.
 
 set -euo pipefail
 
