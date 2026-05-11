@@ -70,7 +70,7 @@ Superpowers skills are invoked **only** for the design phase of the workflow:
 - `superpowers:brainstorming` — workflow step 2 (design discussion). Produces a spec under `doc/specs/`.
 - `superpowers:writing-plans` — runs after brainstorming. Produces an implementation plan under `doc/plans/`.
 
-**Once the spec and plan are written, superpowers is disabled for the remainder of the feature.** Implementation (workflow steps 3–4) follows the plan directly using Read / Edit / Write / Bash and inline TDD; no other superpowers skills are invoked. Explicitly:
+**Once the spec and plan are written, superpowers is disabled for the remainder of the feature.** Implementation (workflow steps 3–4) follows the plan directly using Read / Edit / Write / Bash and inline TDD; no other superpowers skills are invoked. **This applies equally to small bug fixes and one-line changes that skipped steps 1–2** — "no spec/plan exists yet" is not a loophole; the implementation-flavored skills are off at every coding entry point, full stop. Explicitly:
 
 - Do **not** invoke `superpowers:subagent-driven-development`. Implementation is coordinated from the main conversation context, not via the skill's implementer/reviewer subagent loops. Parallel general-purpose Agent dispatches (per workflow step 4 + "Parallel execution") are still allowed and encouraged — the rule bans skill-chain control of implementation, not subagent dispatch itself.
 - Do **not** invoke `superpowers:test-driven-development` or any other implementation-flavored superpowers skill.

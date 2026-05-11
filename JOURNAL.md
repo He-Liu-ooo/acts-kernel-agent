@@ -89,7 +89,7 @@ Persist on `TreeNode.dead_reason` (None on live nodes and legacy checkpoints). T
 
 **Post-prune dump + `finalize_tree` rewrite**: streamed dump runs after `beam_prune` so `branch_quality` reflects post-prune state; `finalize_tree` rewrites every `meta.json` from final tree state at end-of-run. **Why**: streamed-only would silently disagree with `index.json` once the beam fills and evicts already-dumped nodes.
 
-**`failure_reason` / `failure_detail` on `dump_node`** (Codex adversarial round): `_kill_branch` now calls `dump_node` with the kill reason in `meta.json.failure`. **Why**: "why did node 5 die" postmortem needs the DEAD_END node's directory, not just an index entry.
+**`failure_detail` on `dump_node`** (Codex adversarial round): `_kill_branch` now calls `dump_node` with the kill-site prose surfaced into the per-node directory. **Why**: "why did node 5 die" postmortem needs the DEAD_END node's directory, not just an index entry. *Amended 2026-05-11*: the originally-paired `failure_reason` parameter was retired and the nested `meta.json.failure` block flattened — `dead_reason` is now the categorical single source of truth and `failure_detail` carries only kill-site prose. See "Retire nested `failure: {reason, detail}` block" entry below for the merge rationale.
 
 **`.ncu-rep` decoupled from `cache_dir`**: capture path is `(cache_dir or _ncu_tmpdir())`; NCU `-f` handles persistent-tmpdir collisions. **Why**: orchestrator path doesn't pass `cache_dir`, so tying `.ncu-rep` to it would silently drop the report on every real run.
 
@@ -106,6 +106,26 @@ Persist on `TreeNode.dead_reason` (None on live nodes and legacy checkpoints). T
 **Error-swallow contract**: baseline failure (Reviewer call raises, profile fails, etc.) is non-fatal. The helper logs and swallows; `root.last_review` stays `None`. The iter-1 Planner then sees `reviewer_feedback=None` — exactly the same payload it received pre-feature when no baseline review existed. Safe failure mode: degrades to prior behavior rather than aborting the run.
 
 **Reference**: `_apply_baseline_feedback_to_root` in `src/search/orchestrator.py`. The same commit also deduped a prior inline blob-roots resolution block into `_resolve_blob_roots`; that helper is a refactoring side-effect, not a search-semantics change.
+
+### SOL_TARGET termination gate filters on eligible winner, not raw child score (2026-05-11)
+
+**Bug**: pre-fix, the termination check at the advance path in `src/search/orchestrator.py` used `child.score.sol_score >= sol_target`. A Reviewer-judged DEAD_END child could clear `sol_target` while being correctly excluded from `best_node()` via the `dead_reason` filter landed earlier 2026-05-11 ("Distinguishing DEAD_END causes via `dead_reason`" above). The gate fired on the child's raw score and returned `TerminationReason.SOL_TARGET` with `best` pointing to a different (sub-target) eligible node — shipping a sub-target winner under a "target hit" banner.
+
+**Fix**: termination now gates on `best.score is not None and best.score.sol_score >= self._config.sol_target`. The new check can't fire unless a *trustworthy promotable* node meets the bar.
+
+**Invariant**: termination eligibility now matches `best_node()` promotability — single source of truth for "what counts as a winner."
+
+**Source**: Codex adversarial review finding, 2026-05-11.
+
+### Retire nested `failure: {reason, detail}` block — flat `failure_detail` + `dead_reason` only (2026-05-11)
+
+`failure.reason` always duplicated `dead_reason.value` — both were set together at every `_kill_branch` site, so the nested block carried no information that wasn't already on the node.
+
+`dead_reason` is set on **every** DEAD_END node (infra-error kills, beam-pruned, Reviewer-judged) via the node field landed earlier 2026-05-11 ("Distinguishing DEAD_END causes via `dead_reason`" above); the nested `failure` block only covered the infra-error subset, so the two surfaces disagreed on coverage as well as on duplication.
+
+**Merge**: drop `failure_reason` from `dump_node`'s signature in `src/runtime/tree_dump.py`; `meta.json` carries `dead_reason` (categorical, all DEAD_END paths, sourced from `_late_bound_fields(node)["dead_reason"]` in `_build_meta`) plus an optional top-level `failure_detail` (kill-site prose, only when the kill site had a dynamic message — exception text, workload-errors string).
+
+**Result**: `dead_reason` is the single source of truth for the DEAD_END cause; `failure_detail` carries only the prose that doesn't fit in the enum.
 
 ---
 

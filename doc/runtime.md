@@ -81,19 +81,23 @@ Notable semantics:
 
 ### Dead-end reasons
 
-The `branch_dead_end` event's `reason` field is constrained to a fixed set of string constants exported from `events.py`. Telemetry consumers (log parsers, regression tests) key on these strings — they are kept stable. Dynamic detail (which CUDA error message, which exception text) goes into the separate `detail` payload field, not concatenated into `reason`.
+The `branch_dead_end` event's `reason` field carries a `DeadReason` enum member's string value. The enum (`class DeadReason(str, Enum)`, defined in `events.py`) inherits from `str` so members JSON-serialize cleanly as their string value — telemetry consumers (log parsers, regression tests) key on these stable strings. Dynamic detail (which CUDA error message, which exception text) goes into the separate `detail` payload field, not concatenated into `reason`.
 
-Constants:
+`DeadReason` also doubles as the type of `TreeNode.dead_reason` (see [`search.md`](search.md)), so the same enum drives both the telemetry payload and the on-tree distinction between promotable vs. unpromotable DEAD_END nodes. Two of the members (`BEAM_PRUNED`, `REVIEWER_JUDGED`) are not emitted via `branch_dead_end` today — beam pruning is a frontier-management decision, not a "branch died" event, and Reviewer verdicts flow through `reviewer_feedback`. They exist as enum members because the node field is the unified record of why a `DEAD_END` flag is set, regardless of which code path set it.
 
-- `DEAD_REWARD_HACK` (`"reward_hack"`) — channel A process-level reward-hack detector tripped.
-- `DEAD_REWARD_HACK_CONFIRMED` (`"reward_hack_confirmed"`) — channel B re-eval confirmed sol_score's `reward_hack_suspect`.
-- `DEAD_CUDA_ERROR` (`"cuda_error"`) — CUDA runtime error during evaluation.
-- `DEAD_PROFILER_ERROR` (`"profiler_error"`) — profiler subprocess or NCU failure.
-- `DEAD_BENCH_FAILURE` (`"bench_failure"`) — benchmark run did not produce a usable measurement.
-- `DEAD_REPR_LATENCY_UNAVAILABLE` (`"repr_workload_latency_unavailable"`) — representative-workload latency missing/non-finite (sol_score input incomplete).
-- `DEAD_AGENT_FAILURE` (`"agent_failure"`) — agent-side error not covered by the more specific buckets above.
+Members:
 
-`DEAD_REASONS` (frozenset) mirrors `CORE_EVENT_KINDS`'s validation pattern. The orchestrator's `_emit_dead_end` helper validates the `reason` argument against `DEAD_REASONS` and warns (does not raise) on unknown values — schema drift stays visible without aborting the run, matching `emit()`'s unknown-kind policy.
+- `REWARD_HACK` (`"reward_hack"`) — channel A process-level reward-hack detector tripped.
+- `REWARD_HACK_CONFIRMED` (`"reward_hack_confirmed"`) — channel B re-eval confirmed sol_score's `reward_hack_suspect`.
+- `CUDA_ERROR` (`"cuda_error"`) — CUDA runtime error during evaluation.
+- `PROFILER_ERROR` (`"profiler_error"`) — profiler subprocess or NCU failure.
+- `BENCH_FAILURE` (`"bench_failure"`) — benchmark run did not produce a usable measurement.
+- `REPR_LATENCY_UNAVAILABLE` (`"repr_workload_latency_unavailable"`) — representative-workload latency missing/non-finite (sol_score input incomplete).
+- `AGENT_FAILURE` (`"agent_failure"`) — agent-side error not covered by the more specific buckets above.
+- `BEAM_PRUNED` (`"beam_pruned"`) — node lost the beam competition. On-tree only; not emitted as `branch_dead_end`.
+- `REVIEWER_JUDGED` (`"reviewer_judged"`) — Reviewer's verdict for the iter was `DEAD_END`. On-tree only; the verdict flows through `reviewer_feedback` for telemetry.
+
+`DEAD_REASONS` is now `frozenset(DeadReason)`. The orchestrator's `_emit_dead_end` helper takes a typed `DeadReason` argument; the type system enforces validity, so the legacy `if reason not in DEAD_REASONS` warning has been removed.
 
 ## `run_context.py`
 
@@ -167,31 +171,45 @@ search progresses; end-of-run files are written by
 
 Module surface mirrors `events.py`: `bind(tree_root)` / `unbind()` /
 `is_bound()` manage the single bound root, `dump_node(node, *, iter_no,
-ncu_rep_src, failure_reason=None, failure_detail=None)` streams one
-committed node, `finalize_tree(tree)` writes the five top-level files.
-Both write paths are no-ops when unbound and swallow `OSError` (logged
-at `WARNING`) so a tree-dump hiccup cannot kill a running search.
-`RunContext.create` calls `bind(run_dir / "tree")` after
-`events.bind(...)`; `RunContext.close` calls `unbind()`.
+ncu_rep_src, failure_detail=None)` streams one committed node,
+`finalize_tree(tree)` writes the five top-level files. Both write paths
+are no-ops when unbound and swallow `OSError` (logged at `WARNING`) so
+a tree-dump hiccup cannot kill a running search. `RunContext.create`
+calls `bind(run_dir / "tree")` after `events.bind(...)`;
+`RunContext.close` calls `unbind()`.
 
-`failure_reason` / `failure_detail` are populated by `_kill_branch` for
-dead-end branches and surface as a top-level `failure: {reason, detail}`
-object in the node's `meta.json`.
+DEAD_END cause schema in `meta.json`:
+
+- `dead_reason` (top-level, string from `DeadReason.value`) — categorical
+  cause, set on every DEAD_END node regardless of path (infra-error
+  kill, beam-pruned, Reviewer-judged). Single source of truth; comes
+  from `node.dead_reason` via `_late_bound_fields` so it round-trips
+  through `finalize_tree`.
+- `failure_detail` (top-level, string) — kill-site prose, populated by
+  `_kill_branch` only when the kill site carried a dynamic message
+  (exception text, workload-errors string). Absent on beam-pruned and
+  Reviewer-judged paths and on the advance path.
+
+The previous nested `failure: {reason, detail}` block was retired
+because `failure.reason` always duplicated `dead_reason`; only
+`failure.detail` carried unique information.
 
 `finalize_tree` also rewrites each per-node `meta.json`'s late-bound
-fields — `branch_quality`, `score`, `per_workload_latency_us`,
-`children_ids`, and `last_review` (5 fields total) — from the final
-tree state, so any node whose state mutated after its streamed dump
-reflects the truth on disk. The root's
+fields — `branch_quality`, `dead_reason`, `score`,
+`per_workload_latency_us`, `children_ids`, and `last_review` (6 fields
+total) — from the final tree state, so any node whose state mutated
+after its streamed dump reflects the truth on disk. The root's
 `meta.json` is streamed at baseline-completion (orchestrator
 `dump_node(root, ...)` after the baseline benchmark), so the rewrite
 applies to it just as much as to children. Canonical reconciliation
-cases: beam-evicted nodes whose `branch_quality` mutated post-dump,
-nodes whose benchmark or score landed after the initial dump (late
-`score` / `per_workload_latency_us`), and parents that gained
-`children_ids` as later iters attached. The rewrite preserves every
-other key (including `failure`) and skips nodes that never streamed a
-`meta.json` (e.g., a node added before a crash aborted `_kill_branch`).
+cases: beam-evicted nodes whose `branch_quality` + `dead_reason`
+mutate post-dump, Reviewer-judged DEAD_END nodes (kernel ran fine but
+Reviewer's verdict for the iter was DEAD_END), nodes whose benchmark
+or score landed after the initial dump (late `score` /
+`per_workload_latency_us`), and parents that gained `children_ids` as
+later iters attached. The rewrite preserves every other key (including
+`failure_detail`) and skips nodes that never streamed a `meta.json`
+(e.g., a node added before a crash aborted `_kill_branch`).
 
 ### Trace cross-reference
 
