@@ -99,6 +99,7 @@ class OptimizationReport:
     termination_reason: str = ""
     reward_hack_suspect: bool = False
     calibration_warning: bool = False
+    hardware_spec: HardwareSpec | None = None
 
 
 def generate_report(
@@ -156,6 +157,7 @@ def generate_report(
             winner_profiling_per_workload={},
             total_iterations=result.total_iterations,
             termination_reason=termination,
+            hardware_spec=hardware_spec,
         )
     path = result.tree.path_to_node(best.id)
     trace = [n.action_applied for n in path if n.action_applied]
@@ -242,6 +244,7 @@ def generate_report(
             winner_roofline_per_workload=per_workload_roofline,
             total_iterations=result.total_iterations,
             termination_reason=termination,
+            hardware_spec=hardware_spec,
         )
     return OptimizationReport(
         baseline_latency_us=score.baseline_latency_us,
@@ -258,6 +261,7 @@ def generate_report(
         termination_reason=termination,
         reward_hack_suspect=score.reward_hack_suspect,
         calibration_warning=score.calibration_warning,
+        hardware_spec=hardware_spec,
     )
 
 
@@ -303,7 +307,43 @@ def render_report(report: OptimizationReport) -> str:
         lines.append("  [AUDIT] reward_hack_suspect — candidate beats T_SOL (physics violation)")
     if report.calibration_warning:
         lines.append("  [AUDIT] calibration_warning — baseline already at/below T_SOL")
+    if report.hardware_spec is not None:
+        lines.extend(_render_hardware_spec_block(report.hardware_spec))
     return "\n".join(lines)
+
+
+def _render_hardware_spec_block(hw: "HardwareSpec") -> list[str]:
+    """Render the frozen merged HardwareSpec as a fixed-format block.
+
+    Always emits all fields, even when zero — degraded-detection runs
+    show zeros so the absence-of-detection case is visible at a glance
+    rather than silently omitted.
+    """
+    return [
+        "Hardware spec",
+        f"  Name:               {hw.name or '(unknown)'}",
+        f"  Frequency:          {hw.freq_GHz} GHz",
+        f"  SRAM capacity:      {hw.SRAM_capacity} B",
+        f"  SRAM B/cycle:       {hw.SRAM_byte_per_cycle}",
+        f"  DRAM capacity:      {hw.DRAM_capacity} B",
+        f"  DRAM B/cycle:       {hw.DRAM_byte_per_cycle}",
+        f"  MAC/cycle FP32 SM:  {hw.MAC_per_cycle_fp32_sm}",
+        f"  MAC/cycle TF32 TC:  {hw.MAC_per_cycle_tf32_tc}",
+        f"  MAC/cycle FP16 TC:  {hw.MAC_per_cycle_fp16_tc}",
+        f"  MAC/cycle BF16 TC:  {hw.MAC_per_cycle_bf16_tc}",
+        f"  MAC/cycle FP8  TC:  {hw.MAC_per_cycle_fp8_tc}",
+        f"  MAC/cycle INT8 TC:  {hw.MAC_per_cycle_int8_tc}",
+        f"  MAC/cycle NVFP4 TC: {hw.MAC_per_cycle_nvfp4_tc}",
+        f"  Peak DRAM BW:       {hw.peak_memory_bandwidth_gb_s:.2f} GB/s",
+        f"  Peak SRAM BW:       {hw.peak_sram_bandwidth_gb_s:.2f} GB/s",
+        f"  Peak FP32:          {hw.peak_flops_fp32:.2f} TFLOPS",
+        # FP16 and BF16 reported on separate lines: ``MAC_per_cycle_fp16_tc``
+        # and ``MAC_per_cycle_bf16_tc`` are distinct fields, and on hardware
+        # where they differ (or one is zero with the other populated), a
+        # combined label would misstate one of the throughputs.
+        f"  Peak FP16:          {hw.peak_flops_fp16:.2f} TFLOPS",
+        f"  Peak BF16:          {hw.peak_flops_bf16:.2f} TFLOPS",
+    ]
 
 
 def _render_profiling_block(

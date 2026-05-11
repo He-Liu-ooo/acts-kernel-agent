@@ -747,8 +747,11 @@ def main(argv: list[str] | None = None) -> None:
     """
     import argparse
     import atexit
+    import json
+    from dataclasses import asdict
     from datetime import datetime, timezone
 
+    from src.config import ACTSConfig, detect_hardware
     from src.pipeline.report import render_report
     from src.runtime import tree_dump
     from src.runtime.events import emit
@@ -857,11 +860,17 @@ def main(argv: list[str] | None = None) -> None:
         model_configured=model_configured,
     )
     _try_acquire_clock_lock()
+    # Build the ACTSConfig in main() so we have a handle on the resolved
+    # values to dump into report.txt below. Keeps optimize()'s
+    # ``if config is None: ...`` fallback intact for non-CLI callers.
+    acts_config = ACTSConfig(hardware=detect_hardware())
     result = None
     report = None
     try:
         try:
-            result, report = asyncio.run(optimize(args.problem_path))
+            result, report = asyncio.run(
+                optimize(args.problem_path, config=acts_config)
+            )
         except Exception:
             emit(
                 "run_end",
@@ -892,7 +901,23 @@ def main(argv: list[str] | None = None) -> None:
         # so the ``tree_dump.bind(...)`` is still live. Never raises
         # (tree_dump.finalize_tree swallows OSError); no-op when unbound.
         tree_dump.finalize_tree(result.tree)
-        print(render_report(report))
+        rendered_report = render_report(report)
+        # Config dump appended to the persisted report only — keeps the
+        # terminal print focused on results. ``default=str`` coerces
+        # Path / enum values that aren't JSON-native.
+        config_dump = (
+            "\n\n=== ACTSConfig (resolved at run start) ===\n"
+            + json.dumps(asdict(acts_config), default=str, indent=2)
+            + "\n"
+        )
+        if ctx.run_dir is not None:
+            try:
+                (ctx.run_dir / "report.txt").write_text(
+                    rendered_report + config_dump
+                )
+            except OSError as exc:
+                logger.warning("report.txt write failed: %s", exc)
+        print(rendered_report)
         if ctx.trace_processor is not None and hasattr(ctx.trace_processor, "path"):
             print(f"\nLLM trace: {ctx.trace_processor.path}")
         if ctx.run_dir is not None:

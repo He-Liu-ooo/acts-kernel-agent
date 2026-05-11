@@ -506,3 +506,86 @@ class TestRenderProfilingBlock:
                 "mismatch — see report.py:184 fallback to "
                 "aggregate_latency_s)."
             )
+
+
+# ── Hardware-spec block in report (2026-05-10) ─────────────────────────
+
+
+class TestHardwareSpecInReport:
+    def test_generate_report_populates_hardware_spec_when_provided(self):
+        from src.config import HardwareSpec
+
+        hw = HardwareSpec(
+            name="NVIDIA RTX 6000 Ada Generation",
+            freq_GHz=2.505,
+            SRAM_capacity=100663296,
+            DRAM_capacity=50876841984,
+        )
+        report = generate_report(_build_result(best_id=2), hardware_spec=hw)
+        assert report.hardware_spec is hw
+
+    def test_generate_report_hardware_spec_defaults_to_none(self):
+        report = generate_report(_build_result(best_id=2))
+        assert report.hardware_spec is None
+
+    def test_render_includes_hardware_spec_block_when_populated(self):
+        from src.config import HardwareSpec
+
+        hw = HardwareSpec(
+            name="NVIDIA RTX 6000 Ada Generation",
+            freq_GHz=2.505,
+            SRAM_capacity=100663296,
+            DRAM_capacity=50876841984,
+            SRAM_byte_per_cycle=2200,
+            DRAM_byte_per_cycle=383,
+            MAC_per_cycle_fp32_sm=18185,
+            MAC_per_cycle_bf16_tc=72695,
+        )
+        report = generate_report(_build_result(best_id=2), hardware_spec=hw)
+        text = render_report(report)
+        assert "Hardware spec" in text
+        assert "NVIDIA RTX 6000 Ada Generation" in text
+        assert "2.505" in text
+        assert "Peak FP32:" in text
+        assert "Peak DRAM BW:" in text
+
+    def test_render_omits_hardware_spec_block_when_none(self):
+        report = generate_report(_build_result(best_id=2))
+        text = render_report(report)
+        assert "Hardware spec" not in text
+
+    def test_render_includes_block_with_zeros_for_degraded_spec(self):
+        """User chose 'always print full block': a default HardwareSpec()
+        (all zeros, empty name) still emits the block."""
+        from src.config import HardwareSpec
+
+        hw = HardwareSpec()  # all defaults — degraded detection
+        report = generate_report(_build_result(best_id=2), hardware_spec=hw)
+        text = render_report(report)
+        assert "Hardware spec" in text
+        assert "Peak FP32:          0.00 TFLOPS" in text
+
+    def test_render_separates_fp16_and_bf16_peaks(self):
+        """Codex review [P2]: BF16 and FP16 throughput must render as
+        distinct lines. Hardware where MAC_per_cycle_fp16_tc !=
+        MAC_per_cycle_bf16_tc would otherwise see a misleading combined
+        ``BF16/FP16`` label."""
+        from src.config import HardwareSpec
+
+        hw = HardwareSpec(
+            name="hypothetical-divergent",
+            freq_GHz=2.0,
+            MAC_per_cycle_fp16_tc=20000,  # 80 TFLOPS @ 2 GHz
+            MAC_per_cycle_bf16_tc=10000,  # 40 TFLOPS @ 2 GHz — half
+        )
+        report = generate_report(_build_result(best_id=2), hardware_spec=hw)
+        text = render_report(report)
+
+        # Distinct lines, distinct values:
+        assert "Peak FP16:" in text
+        assert "Peak BF16:" in text
+        # The merged "BF16/FP16" label must be gone — it was the bug.
+        assert "BF16/FP16" not in text
+        # Values reflect their own MAC/cycle, not a shared one:
+        assert "Peak FP16:          80.00 TFLOPS" in text
+        assert "Peak BF16:          40.00 TFLOPS" in text
