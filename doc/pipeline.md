@@ -7,13 +7,14 @@ End-to-end optimization entry points.
 CLI:
 
 ```
-python -m src.pipeline.optimize [problem_path] [--run-dir DIR] [--trace-dir DIR] [--reset-clocks]
+python -m src.pipeline.optimize [problem_path] [--run-dir DIR] [--trace-dir DIR] [--reset-clocks] [--gpu-index N]
 ```
 
 - `problem_path` (positional, optional) — SOL-ExecBench problem directory (contains `definition.json` + `workload.jsonl`), or the literal string `placeholder` for the built-in matmul demo. Default `"placeholder"` preserves the no-LLM smoke path.
 - `--run-dir DIR` (optional) — parent directory for per-invocation run artifacts. Defaults to `./runs`. Each invocation creates `<run-dir>/run_<YYYYMMDDTHHMMSS_ffffffZ>/` (see "Run artifacts" below).
 - `--trace-dir DIR` (optional) — directory for per-run JSONL trace files capturing every LLM input/output, tool call, and span via `src.agents.trace_processor.JSONLTraceProcessor`. Default is `None`: when omitted, SDK traces land under `<run-dir>/traces/` inside the per-invocation run directory. Passing `--trace-dir <path>` relocates the traces to `<path>`. Passing `--trace-dir=` (empty string) is a kill switch — no capture.
-- `--reset-clocks` — operator escape hatch. Resets GPU 0 clocks (`-rgc -i 0` + `-rmc -i 0`) and exits without running any pipeline phase. Use after a SIGKILL / segfault left clocks locked from a prior run; the in-process atexit + signal handler chain (SIGTERM / SIGHUP) covers the normal exit cases.
+- `--reset-clocks` — operator escape hatch. Resets the selected GPU's clocks (via `--gpu-index`, default 0) using `-rgc -i 0` + `-rmc -i 0` (the `-i 0` is the logical index after `CUDA_VISIBLE_DEVICES` remapping). Exits without running any pipeline phase. Use after a SIGKILL / segfault left clocks locked from a prior run; the in-process atexit + signal handler chain (SIGTERM / SIGHUP) covers the normal exit cases.
+- `--gpu-index N` (optional, default `0`) — selects which physical GPU ACTS pins. Module-top preparse extracts the value and sets `CUDA_VISIBLE_DEVICES=N` *before* the `import sol_execbench` line, so SOL (and every downstream CUDA consumer) sees the selected GPU as logical index 0. Validated by `_nonneg_int` (argparse type — rejects negatives / non-integers) and the two-tier `_validate_gpu_visible` helper, which checks the physical index exists on the host and that the remapped logical GPU is reachable. `_validate_gpu_visible(..., reset_only=True)` is used on the `--reset-clocks` path where only the physical-index existence check is required.
 
 ### Phase A: Load Problem
 
@@ -42,12 +43,12 @@ python -m src.pipeline.optimize [problem_path] [--run-dir DIR] [--trace-dir DIR]
 
 ### Clock-lock lifecycle
 
-GPU clocks are locked at run start so per-iter latency isn't poisoned by DVFS-driven frequency drift. The lock targets GPU 0 only (the GPU ACTS uses); GPUs 1+ on a multi-GPU host are untouched.
+GPU clocks are locked at run start so per-iter latency isn't poisoned by DVFS-driven frequency drift. The lock targets the single GPU ACTS pins via `--gpu-index N` (default 0); other GPUs on a multi-GPU host are untouched. Because the module-top preparse sets `CUDA_VISIBLE_DEVICES=N` before any CUDA-aware import, the selected GPU is always the logical index 0 from ACTS's perspective, which is what the `nvidia-smi ... -i 0` invocations below address.
 
 - **Prerequisite** — `nvidia-persistenced.service` must be active on the host (`systemctl is-active nvidia-persistenced`). Persistence mode is what makes the GPU hold its `clocks.applications.*` at the lock target between the `-lgc`/`-lmc` issue and the verify read; without it, the GPU drops back to deep idle, idle DRAM falls to ~810 MHz (vs the 10001 MHz target on RTX 6000 Ada), and `_verify_gpu0_locked` rolls the partial lock back with `verify_failed`. See `configs/venvs/3.12.md` for the one-time enable.
 - **Probe** — `probe_clock_lock_available()` (from SOL) checks whether passwordless `sudo nvidia-smi` is configured. The call site does defensive both-shape handling for the bare-`bool` return (today) vs a future tuple-`(bool, str)` return.
 - **Preset lookup** — `_resolve_clock_preset(device_name)` consults the ACTS-side `_ACTS_CLOCK_PRESETS` table first (currently `RTX 6000 Ada → ClockPreset(2505, 10001)`) and falls back to SOL's `get_clock_preset` for known datacenter cards.
-- **Lock** — `_lock_gpu0_clocks(gpu_mhz, dram_mhz)` runs `nvidia-smi -lgc <m>,<m> -i 0` and `-lmc <m>,<m> -i 0`. GPU 0 only.
+- **Lock** — `_lock_gpu0_clocks(gpu_mhz, dram_mhz)` runs `nvidia-smi -lgc <m>,<m> -i 0` and `-lmc <m>,<m> -i 0`. Targets the selected GPU only (logical index 0 after `CUDA_VISIBLE_DEVICES` remapping by the `--gpu-index` preparse).
 - **Verify** — `_verify_gpu0_locked(gpu_mhz, dram_mhz)` queries `clocks.applications.{graphics,memory}` directly via `nvidia-smi --query-gpu=... --format=csv,noheader,nounits -i 0` and compares against the targets with 50 MHz tolerance. The applications-clocks fields reflect the *target* set by `-lgc`/`-lmc` regardless of whether the GPU is busy or idle, so no torch wake-op is needed (a previous version woke the GPU with a tiny op to dodge an idle-clock read of 210 MHz from `clocks.current.*`; switching the queried field eliminated that workaround entirely).
 - **Lifecycle** — lock attempted at run start (after `run_start` event); state stored in `_clock_lock_state` (locked + device_name); cleanup goes through three paths: (a) explicit `finally` in `main()`, (b) `atexit.register(_unlock_clocks_safe)`, (c) signal handlers `_signal_unlock_handler` for `SIGTERM` + `SIGHUP`. Operator escape hatch via `--reset-clocks` covers the SIGKILL / segfault case.
 - **Verify-failure semantics** — `_verify_gpu0_locked` returning False or raising triggers `_rollback_partial_lock(device, reason)`, which calls `_unlock_gpu0_clocks` and emits `clock_lock_unavailable` with `reason="verify_failed"` or `reason="verify_raised:<exc>"`. Lock state stays False.
@@ -89,6 +90,8 @@ Re-runs the correctness gate on the best kernel to confirm results are reproduci
 
 `generate_report(result, *, workloads=None, input_generators=None, hardware_spec=None, cache_dir=None, definition=None, definition_path=None, blob_roots=None, arch_yaml_path=None) -> OptimizationReport`
 
+The returned `OptimizationReport` also carries `hardware_spec: HardwareSpec | None` (defaults to `None`); `optimize()` populates it from the resolved/substituted spec so the report ships its calibration context end-to-end.
+
 Reads the best node's `ScoreResult` and walks `result.tree.path_to_node(best.id)` to build the root-to-best action sequence. The root's `action_applied` is the empty-string baseline placeholder and is filtered out of the trace. When `best.score is None` (scoring failed), the returned report surfaces only `termination_reason` + `total_iterations` without crashing.
 
 When `workloads` + `hardware_spec` are supplied, `generate_report` iterates the selected workloads once. Per-workload bottlenecks are sourced from SOLAR via `derive_t_sol_from_solar(definition, workload, hardware_spec, arch_yaml_path=...).bottleneck` (SOLAR is authoritative). Workloads where SOLAR returns `None` or where `definition is None` are **omitted** from `winner_per_workload_bottlenecks` rather than falling back to the analytical band classifier (`classify_bottleneck` in `eval/roofline.py` is the analytical band classifier; it is no longer used for per-workload labels). When `input_generators` is also supplied, the same loop re-profiles the winning kernel on each workload into `winner_profiling_per_workload`. The two passes are fused so `(flops, nbytes)` are computed once per workload and shared between SOLAR-call and the re-profile call. `blob_roots` is forwarded into `profile_kernel` so the NCU subprocess driver resolves safetensors-backed inputs against the same root list as the in-process generator (defaults to `[definition_path.parent]` when unspecified).
@@ -108,12 +111,15 @@ When `workloads` + `hardware_spec` are supplied, `generate_report` iterates the 
 | `termination_reason` | str | Why search stopped (plain string, unwrapped from `TerminationReason` enum) |
 | `reward_hack_suspect` | bool | Propagated from best node's `ScoreResult` — candidate beats `T_SOL` |
 | `calibration_warning` | bool | Propagated from best node's `ScoreResult` — baseline already at/below `T_SOL` |
+| `hardware_spec` | `HardwareSpec \| None` | Resolved hardware spec used for this run (post-placeholder-substitution). `None` when the spec couldn't be derived. Surfaced verbatim by `_render_hardware_spec_block` at the tail of `render_report`. |
 
 `render_report(report: OptimizationReport) -> str`
 
 Multi-line CLI summary. Skips the scoring block when `baseline_latency_us == 0` so a degenerate run (no scored best node) doesn't print misleading "0.00us / 0.00x" lines. Emits `Bottleneck (run): <label>` when `report.bottleneck` is set, and `Bottleneck (per workload): uuid=label, ...` when the per-workload dict is non-empty (enum values are rendered via `.value` at the string boundary). When `reward_hack_suspect` / `calibration_warning` are set, emits an `[AUDIT]` line per flag so operators scanning the output can't miss a physics-violating or poorly-calibrated result.
 
 When `winner_profiling_per_workload` is populated, a "Winner profile (per workload)" block follows, with one analytical line per workload plus optional NCU lines. If every per-workload profile is degraded with `ncu_binary_not_found` (common on machines without the NCU CLI), the NCU block is suppressed to keep the output tidy.
+
+When `report.hardware_spec is not None`, `render_report` appends a trailing **"Hardware spec"** block emitted by `_render_hardware_spec_block` (in `src/pipeline/report.py`). The block always emits **every** field — including zero-valued ones — so a degraded/partial detection (e.g. a real GPU with peaks left at zero) is visible in the report rather than papered over by selective field rendering. This is the calibration-visibility contract: the operator should be able to see exactly which hardware peaks fed the run's scoring without cross-referencing config files.
 
 #### Per-workload latency degraded rendering
 
@@ -131,11 +137,13 @@ When `winner_profiling_per_workload` is populated, a "Winner profile (per worklo
 
 ### Run artifacts
 
-Every CLI invocation creates a fresh `<run-dir>/run_<YYYYMMDDTHHMMSS_ffffffZ>/` directory (default `./runs/run_<UTC>/`) holding three files:
+Every CLI invocation creates a fresh `<run-dir>/run_<YYYYMMDDTHHMMSS_ffffffZ>/` directory (default `./runs/run_<UTC>/`) holding:
 
 - `run.log` — human-readable text log of the invocation.
 - `events.jsonl` — structured event stream (27 kinds in `CORE_EVENT_KINDS`) emitted by the orchestrator and `RunContext`.
 - `traces/acts_trace_<UTC>.jsonl` — SDK per-call records (LLM inputs/outputs, tool calls, spans) written by `JSONLTraceProcessor`. Relocated when `--trace-dir <path>` is passed; absent when `--trace-dir=` disables capture.
+- `report.txt` — final `render_report(report)` text persisted alongside the stdout print, plus an appended `=== ACTSConfig (resolved at run start) ===` block (JSON dump of the dataclass `main()` constructed for this invocation). Best-effort write; an `OSError` is logged at `WARNING` and skipped. The terminal print stays focused on results — only the persisted file carries the config dump.
+- `tree/` — per-node + tree-level dump (see `doc/runtime.md` "Tree dump" section).
 
 The `httpx`, `openai`, and `agents` SDK loggers are silenced to WARNING so `run.log` stays focused on pipeline events.
 

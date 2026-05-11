@@ -78,6 +78,16 @@ Some optimizations require passing through a performance valley (e.g., restructu
 
 **Amendment 2026-05-08 — `finalize_tree` refreshes late-bound node fields.** The 2026-05-08 root-dump fix (item #1: call `dump_node(root, …)` after baseline `per_workload_latency_us` assignment) wrote `node_0/meta.json` *before* `root.score` was computed, leaving `score: null` in the persisted artifact even though `index.json` and the in-memory tree had the scored baseline. `finalize_tree` already rewrote `branch_quality` post-prune; extending it to also refresh `score`, `per_workload_latency_us`, and (post a second Codex review) `children_ids` for already-dumped nodes addresses this regression class structurally — any future late-bound node field gets the same treatment without needing every dump-call site to be moved or duplicated. Codex adversarial review caught the original `score` instance; a follow-up `/codex:review` caught `children_ids` (root dumps with `children_ids: []` and the field stayed null even after iters added children). The refresh-finalize approach was preferred over moving the root dump call (which would only fix the known fields, not the class). New regression tests assert `node_0/meta.json["score"]` and `["children_ids"]` match the in-memory root after `finalize_tree` runs. Lesson: when extending the refresh-field list, enumerate **all** dump-time-captured fields that can be late-bound, not just the ones the latest review surfaced.
 
+### Baseline review pass at iter=0 (2026-05-10/11)
+
+**Why baseline review**: prior to this change the Reviewer only ran on child nodes (iter≥1), so the Planner's first expansion of the root had no `reviewer_feedback` to ground its proposals. With the new Planner-consumes-parent-`last_review` flow ("Planner now consumes parent's last_review" in Agents below), the root needs a `last_review` populated by a profile + review pass before iter 1 starts. Orchestrator now runs `profile_kernel(root)` + `Reviewer.review(prev_sol_score=None)` at iter=0 via a new `_apply_baseline_feedback_to_root` helper, then writes `root.last_review = feedback` and emits the standard `reviewer_feedback` event with `iter=0`.
+
+**Why `DEAD_END` is clamped at baseline**: the Reviewer's `branch_quality` verdict is grounded in the delta against a parent. At baseline there is no parent — `prev_sol_score=None` — so a `DEAD_END` verdict has no signal to support it. If the baseline review returned `DEAD_END` and we honored it, the frontier would empty as `ALL_DEAD_END` *before* the first iteration ran. Clamp policy: if the baseline review returns `DEAD_END`, downgrade to the next-worst quality before storing. Subsequent iterations restore the normal Reviewer contract (parent score available → all four verdicts are admissible).
+
+**Error-swallow contract**: baseline failure (Reviewer call raises, profile fails, etc.) is non-fatal. The helper logs and swallows; `root.last_review` stays `None`. The iter-1 Planner then sees `reviewer_feedback=None` — exactly the same payload it received pre-feature when no baseline review existed. Safe failure mode: degrades to prior behavior rather than aborting the run.
+
+**Reference**: `_apply_baseline_feedback_to_root` in `src/search/orchestrator.py`. The same commit also deduped a prior inline blob-roots resolution block into `_resolve_blob_roots`; that helper is a refactoring side-effect, not a search-semantics change.
+
 ---
 
 ## Agents
@@ -222,6 +232,20 @@ Orchestrator-side handling of `ImplementationError` is wired (option γ, 2026-04
 **Exponential backoff with ±25% jitter**: `delay * 2^(attempt-1) * uniform(0.75, 1.25)`. Jitter prevents thundering-herd synchronization when multiple in-flight agents hit the same rate-limit wall at once — all waking up at exactly the same instant would just hit the limit again.
 
 **Named-logger observability**: `logger.info` per retry, `logger.warning` on exhaustion — both include the exception class name. The Reviewer uses this to populate `error_reason` when it falls back, so a downstream operator reading the log can tell "rate-limited 3× then exhausted" from "unreachable endpoint" without reading the code.
+
+### Planner now consumes parent's last_review (2026-05-10)
+
+**Rationale**: the Planner's user prompt previously carried profiling deltas + run-bottleneck but not the prior iteration's Reviewer verdict. Adding `parent.last_review` to the prompt closes the loop — the Reviewer's diagnosis of *the parent kernel* directly informs *the next plan that extends it*. Implemented via a new `TreeNode.last_review: ReviewerFeedback | None` field (read at orchestrator line ~537, written at line ~939+ on each child after its review), plus the existing `parent_profiling_summary` it already consumed.
+
+**Why a curated subset, not the full `ReviewerFeedback`**: a new module-level helper `_render_review_for_planner(fb)` in `src/agents/reviewer.py` returns only `outcome` / `bottleneck_diagnosis` / `suggestions` / `conditional_assessment`. The other Reviewer fields are deliberately omitted:
+
+- *`metric_deltas` skipped* — the Planner already gets profiling deltas via `parent_profiling_summary` (per-iter, structured). Re-emitting them through the Reviewer's distilled narrative would duplicate data and risk drift between the two surfaces.
+- *`bottleneck_classification` skipped* — the Planner already gets `run_bottleneck` (passed as a separate arg from the orchestrator). The Reviewer's per-node classification was added for completeness, but for planning purposes the run-level label is the authoritative one.
+- *`branch_quality` skipped* — search-engine concern (beam pruning + quarantine gates). Surfacing it in the Planner's prompt would risk the model self-censoring on `PLATEAU`/`DEAD_END` parents rather than letting the search engine handle pruning. The Planner's job is to propose; the search engine decides what survives.
+
+**Serialization**: `_serialize_review_feedback` / `_deserialize_review_feedback` were added so `TreeNode.last_review` round-trips through `tree/node_<id>/meta.json` and survives legacy-checkpoint restores (nodes saved before the field existed deserialize with `last_review=None`).
+
+**Tracking note**: the helper's docstring currently references a spec document under `doc/specs/`. Per CLAUDE.md, specs/plans are not committed and get deleted post-merge, so that reference will become dangling. Recording the rationale here in JOURNAL is what makes the docstring's spec reference unnecessary going forward — readers looking for "why this subset" should land here, not on a missing file.
 
 ---
 
@@ -1202,6 +1226,24 @@ A kernel can shift its effective bottleneck only by changing its data access pat
 **Why these three fields**: `DRAM_capacity` is the GPU-family fingerprint (Ada 48 GB ≠ H100 80 GB). `SRAM_capacity` (L2) is the within-family discriminator (Ada 96 MB vs H100 50 MB) — catches mismatches DRAM alone misses (e.g. Ada vs L40S, both 48 GB DRAM). `freq_GHz` — both sources report boost clock, so >10% delta is almost certainly wrong YAML rather than legitimate variance.
 
 **Why not `name`**: aliases vary (`"RTX6000Ada"` vs `"NVIDIA RTX 6000 Ada Generation"`); fuzzy matching would either miss real mismatches or raise on the legitimate alias case.
+
+### `hardware_spec` carried on `OptimizationReport` (2026-05-10/11)
+
+**Rationale**: `OptimizationReport` previously rendered run metadata (winner score, per-workload latencies, bottleneck labels) but did not record the resolved `HardwareSpec` the run actually used. That left `report.txt` postmortems missing the single most important piece of provenance — *which hardware peaks did the SOL score / roofline classification get computed against?* — and forced the reader to cross-reference the `ACTSConfig` dump (which is pre-substitution and only carries the YAML path, not the resolved values).
+
+**Implementation**: new `hardware_spec: HardwareSpec | None = None` field on `OptimizationReport`, threaded through `generate_report(...)` so callers populate it from the same `HardwareSpec` instance the orchestrator used. `render_report` calls a new `_render_hardware_spec_block` helper when populated; otherwise the block is omitted (back-compat with checkpoints / older callers that don't pass it).
+
+**Why "always emit all fields, even zero"** (per `_render_hardware_spec_block`'s docstring): degraded-detection runs — no CUDA driver, unregistered GPU, placeholder substitution — populate `HardwareSpec` with zeros on the fields detection couldn't fill. Rendering "Tensor-core FP16 peak: 0.0 TFLOPS" makes the degradation visible at a glance. The alternative — skipping zero fields — would silently render a half-populated block that looks plausible until the reader notices a missing peak entry, which is the worst kind of observability bug.
+
+**Distinction from the `ACTSConfig` dump**: the `=== ACTSConfig (resolved at run start) ===` JSON block records what the user / CLI asked for — YAML path, placeholder name, override flags. `hardware_spec` records what the system resolved that into. Both are needed: the config tells you the request, the spec tells you the answer.
+
+### `report.txt` + ACTSConfig JSON dump persistence (2026-05-10/11)
+
+**Rationale**: prior to this change, the rendered optimization report only existed on stdout — once the terminal scrolled past or the run was launched via a script, the report was lost. `<run_dir>/` already had `events.jsonl`, traces, the search tree dump, and `run.log`, but no human-readable summary of "what shipped." Adding `<run_dir>/report.txt` as a persisted artifact closes that gap.
+
+**Why split stdout vs persisted file**: terminal output stays focused on the live results (the operator running interactively wants to *read* it); `<run_dir>/report.txt` carries the full rendered report plus an `=== ACTSConfig (resolved at run start) ===` JSON dump appended below it for offline postmortem and reproducibility. The two surfaces serve different consumers — keeping them separate avoids cluttering the live stdout with the config dump while still capturing it for reproducibility.
+
+**Best-effort write contract**: `main()` writes `report.txt` after `optimize()` returns. The write is wrapped in a try/except on `OSError` (disk full, permissions, read-only mount) that logs a `WARNING` and continues — a failed persistence write does *not* abort the run or mask the successful optimization result. The run's primary artifacts (tree dump, events, traces) have already landed by this point; the report is a derived, secondary artifact, so a write failure here degrades observability rather than correctness.
 
 ---
 

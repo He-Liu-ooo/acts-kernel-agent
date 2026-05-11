@@ -40,6 +40,8 @@ def per_iter_anti_cheat(critical_names: list[str]) -> Iterator[AntiCheatContext]
     check_monkey_patch()
     ctx = AntiCheatContext(snapshot=snapshot, namespace=namespace, threads_before=threads_before)
     try:
+        # Yield the context object and transfer control to the with-block body.
+        # bench = benchmark_kernel(...)
         yield ctx
     finally:
         # Run exit-side checks unconditionally so a body that raised for an

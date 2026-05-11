@@ -2,7 +2,7 @@
 
 Per-run observability substrate: one run directory, three streaming sinks plus a per-node search-tree dump, structured events.
 
-Every ACTS run produces exactly one `runs/run_<UTC>/` directory holding a human-readable log, a structured JSONL event stream, SDK trace records, and a per-node dump of the search tree. The runtime module owns setup, file handles, and teardown for all four.
+Every ACTS run produces exactly one `runs/run_<UTC>/` directory holding a human-readable log, a structured JSONL event stream, SDK trace records, a per-node dump of the search tree, and a rendered end-of-run report. The runtime module owns setup, file handles, and teardown for all five.
 
 ## Run directory layout
 
@@ -13,9 +13,10 @@ Every ACTS run produces exactly one `runs/run_<UTC>/` directory holding a human-
 | `run.log` | Human-readable stdlib log (DEBUG to file, INFO to stderr). | `tail -f` during a run; post-mortem text search. |
 | `events.jsonl` | Structured ACTS-narrative events, one JSON object per line, RFC-8259 valid. | Tooling via `jq`; scoring / progress dashboards. |
 | `traces/acts_trace_<UTC>.jsonl` | SDK-level records per LLM call and per tool call, written by `JSONLTraceProcessor`. | Ground-truth replay of agent conversations. |
-| `tree/` | Per-committed-node `node_<id>/{kernel.py, ncu.json, ncu.ncu-rep, meta.json}` (streamed per-iter) + end-of-run `index.json` / `tree.{txt,dot,mmd}` (visualizations). Written by `tree_dump`. | Postmortem inspection of every kernel + score + status the search produced; cross-referenced into `traces/*.jsonl` via the SDK `workflow_name="acts_iter"` metadata. |
+| `report.txt` | Rendered end-of-run `OptimizationReport` plus an `=== ACTSConfig (resolved at run start) ===` JSON block. Written best-effort by `optimize.main()`; `OSError` during write degrades to a WARNING and the run continues. | Human-readable end-of-run summary; post-mortem reproduction of the exact resolved config. |
+| `tree/` | Per-committed-node `node_<id>/{kernel.py, ncu.json, ncu.ncu-rep, meta.json}` (streamed per-iter) + end-of-run `index.json` / `tree.{txt,dot,mmd,preview.md}` (visualizations). Written by `tree_dump`. | Postmortem inspection of every kernel + score + status the search produced; cross-referenced into `traces/*.jsonl` via the SDK `workflow_name="acts_iter"` metadata. |
 
-The four artifact families are independent: `events.jsonl` records the orchestrator's narrative (what the search did); `traces/*.jsonl` records what the SDK actually dispatched; `tree/` records every committed node's full state. Cross-referencing them is how you verify claims that any single stream cannot make on its own — see the truthfulness note on `coder_submitted` below, and the `tree/` section's trace cross-reference recipe.
+The five artifact families are independent: `events.jsonl` records the orchestrator's narrative (what the search did); `traces/*.jsonl` records what the SDK actually dispatched; `tree/` records every committed node's full state; `report.txt` carries the rendered end-of-run summary + resolved config. Cross-referencing them is how you verify claims that any single stream cannot make on its own — see the truthfulness note on `coder_submitted` below, and the `tree/` section's trace cross-reference recipe.
 
 ## `timefmt.py`
 
@@ -178,9 +179,10 @@ dead-end branches and surface as a top-level `failure: {reason, detail}`
 object in the node's `meta.json`.
 
 `finalize_tree` also rewrites each per-node `meta.json`'s late-bound
-fields — `branch_quality`, `score`, `per_workload_latency_us`, and
-`children_ids` — from the final tree state, so any node whose state
-mutated after its streamed dump reflects the truth on disk. The root's
+fields — `branch_quality`, `score`, `per_workload_latency_us`,
+`children_ids`, and `last_review` (5 fields total) — from the final
+tree state, so any node whose state mutated after its streamed dump
+reflects the truth on disk. The root's
 `meta.json` is streamed at baseline-completion (orchestrator
 `dump_node(root, ...)` after the baseline benchmark), so the rewrite
 applies to it just as much as to children. Canonical reconciliation

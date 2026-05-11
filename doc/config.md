@@ -108,7 +108,7 @@ Mutable dataclass. All parameters for a single optimization run.
 
 - `load_config(path) -> ACTSConfig`: Parse `.cfg` file, fall back to defaults. Loads arch YAML if `[hardware] arch_config_path` is set; after load, calls `validate_hardware_spec()` against `detect_hardware()` and logs a `WARNING` per mismatch.
 - `load_hardware_spec(path) -> HardwareSpec`: Parse a SOLAR arch config YAML into a `HardwareSpec`.
-- `detect_hardware() -> HardwareSpec`: Query CUDA runtime via `torch.cuda.get_device_properties(0)`, then auto-load the registered arch YAML for the detected device (if any) and merge. Steps:
+- `detect_hardware() -> HardwareSpec`: Query CUDA runtime via `torch.cuda.get_device_properties(0)` (device 0 of the visible set; ACTS pins this via `--gpu-index N` at module top, so device 0 is the operator-selected GPU), then auto-load the registered arch YAML for the detected device (if any) and merge. Steps:
   1. Probe runtime-knowable fields:
      - `name` — GPU model string (e.g. "NVIDIA RTX 6000 Ada Generation")
      - `freq_GHz` — boost clock from `clock_rate / 1_000_000` (kHz → GHz)
