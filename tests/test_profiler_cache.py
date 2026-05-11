@@ -19,6 +19,7 @@ Covers, per spec §4.3 and Task #4 acceptance criteria:
 
 from __future__ import annotations
 
+import json
 import os
 import stat
 from pathlib import Path
@@ -779,3 +780,59 @@ def test_no_triton_jit_in_source_falls_back_to_entrypoint(
     _profile(kernel, sample_workload, sample_workload)
 
     assert captured.get("kernel_name") == "bare_entrypoint"
+
+
+# ── raw_metrics persisted + rehydrated (2026-05-11) ────────────────────────
+
+
+def test_cache_hit_rehydrates_raw_metrics(
+    tmp_path, fake_ncu, sample_kernel, sample_workload
+):
+    """Cache hits must rehydrate ``raw_metrics`` from disk so the Reviewer's
+    ``query_metric`` tool keeps working on re-profile. The raw dict was
+    already persisted by ``_save_ncu_cache``; this test pins the loader to
+    surface it again instead of silently returning ``{}``."""
+    counter, _ = fake_ncu
+    cache_dir = tmp_path / "cache"
+
+    first = _call_profile(sample_kernel, sample_workload, cache_dir=cache_dir)
+    assert _reads_counter(counter) == 1
+    assert first.raw_metrics, "fresh-profile path should have populated raw_metrics"
+
+    second = _call_profile(sample_kernel, sample_workload, cache_dir=cache_dir)
+    assert _reads_counter(counter) == 1, "second call must be a cache hit"
+
+    # The whole point: cache-hit raw_metrics matches fresh-profile raw_metrics.
+    assert second.raw_metrics == first.raw_metrics
+
+
+def test_cache_hit_legacy_payload_missing_raw_field_loads_empty(
+    tmp_path, sample_kernel, sample_workload
+):
+    """Pre-2026-05-11 cache entries that were written without a ``raw`` field
+    on the JSON payload still load — ``raw_metrics`` defaults to ``{}`` for
+    back-compat instead of crashing the load and forcing a re-profile."""
+    from src.eval.profiler import _cache_path, _load_ncu_cache
+
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    key = "legacy_key"
+    # Hand-craft a legacy payload: only ``ncu`` field, no ``raw``.
+    legacy_payload = {
+        "ncu": {
+            "sm_occupancy_pct": 42.0,
+            "l2_hit_rate_pct": 80.0,
+            "tensor_core_util_pct": 30.0,
+            "warp_stall_dominant": "memory_dependency",
+            "warp_stall_dominant_pct": 10.0,
+            "warp_stall_runner_up": "execution_dependency",
+            "warp_stall_runner_up_pct": 5.0,
+        },
+    }
+    _cache_path(cache_dir, key).write_text(json.dumps(legacy_payload))
+
+    loaded = _load_ncu_cache(cache_dir, key)
+    assert loaded is not None
+    ncu, raw = loaded
+    assert ncu.sm_occupancy_pct == 42.0
+    assert raw == {}

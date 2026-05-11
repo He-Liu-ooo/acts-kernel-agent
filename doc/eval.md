@@ -84,14 +84,14 @@ Real implementation. Coordinates three layers of reward-hack defense:
 
 **1. Correctness-level — Stage 5 of `verify_correctness`.** Randomized inputs at seeds `1000..1000+n_anti_cheat_trials-1` evaluated under strict tolerance (`strict_atol=1e-5`, `strict_rtol=1e-4`). Catches kernels that pass on canned seeds but diverge on random inputs.
 
-**2. Performance-level — scorer flags.** `compute_sol_score` sets `reward_hack_suspect` when `T_k < T_SOL` (candidate beats hardware speed-of-light) and `calibration_warning` when `T_b <= T_SOL` (baseline already at limit). The orchestrator's `_reward_hack_re_eval` re-runs the candidate under SOL strict tolerance when `score.reward_hack_suspect` fires and emits `reward_hack_confirmed` (then `_kill_branch(reason=DEAD_REWARD_HACK_CONFIRMED)`) or `reward_hack_cleared`.
+**2. Performance-level — scorer flags.** `compute_sol_score` sets `reward_hack_suspect` when `T_k < T_SOL` (candidate beats hardware speed-of-light) and `calibration_warning` when `T_b <= T_SOL` (baseline already at limit). The orchestrator's `_reward_hack_re_eval` re-runs the candidate under SOL strict tolerance when `score.reward_hack_suspect` fires and emits `reward_hack_confirmed` (then `_kill_branch(reason=DeadReason.REWARD_HACK_CONFIRMED)`) or `reward_hack_cleared`.
 
 **3. Process-level — SOL `reward_hack` detector set.** The `per_iter_anti_cheat(critical_names)` context manager wraps each evaluation:
 
 - *On entry:* `snapshot_critical_functions(namespace, critical_names)` over `vars(torch.cuda.Event)` plus `check_monkey_patch()` — the latter validates SOL's module-load `_ELAPSED_TIME_ADDR` snapshot, fires only if a candidate patched `torch.cuda.Event.elapsed_time` after sol_execbench import. The import-order contract in `pipeline/optimize.py` (SOL imported first) keeps this snapshot trustworthy.
 - *On exit (unconditional):* `check_thread_injection(threads_before, threading.active_count())` and `check_eval_integrity(snapshot, namespace)`. Run unconditionally so a body that raised for any reason still gets validated; a tampered run is more important to surface than whatever caused the body to error.
 
-`check_lazy_outputs_after_bench(outputs)` runs after the bench loop and validates that every produced tensor is a strict `type(t) is torch.Tensor` (rejects FakeTensor / lazy proxies). Any `RewardHackDetected` raised by these checks propagates to the orchestrator's `_kill_branch(reason=DEAD_REWARD_HACK)`.
+`check_lazy_outputs_after_bench(outputs)` runs after the bench loop and validates that every produced tensor is a strict `type(t) is torch.Tensor` (rejects FakeTensor / lazy proxies). Any `RewardHackDetected` raised by these checks propagates to the orchestrator's `_kill_branch(reason=DeadReason.REWARD_HACK)`.
 
 **Helpers.**
 
@@ -168,7 +168,7 @@ Optional (defaults to 0.0 when absent — tensor-core metric is missing on NCU 2
 
 Warp stalls are explicitly enumerated (18 reasons) under the prefix `smsp__average_warp_latency_issue_stalled_<reason>.pct` because NCU does not expand wildcards; top-2 stalls (by percentage, ties broken by reason name) populate `warp_stall_dominant`/`warp_stall_runner_up`.
 
-`raw_metrics` preserves the full parsed NCU metric dict so future Reviewer prompts can reference metrics outside the curated set without a code change.
+`raw_metrics` preserves the full parsed NCU metric dict so future Reviewer prompts can reference metrics outside the curated set without a code change. The dict is persisted to the per-key JSON cache and rehydrated on cache hits (since 2026-05-11), so `Reviewer.query_metric` works the same on a re-profile as on the originating iteration. Pre-2026-05-11 cache entries without a `raw` field load with `raw_metrics={}` for back-compat.
 
 ### NCU subprocess driver — `_profiler_driver.py`
 

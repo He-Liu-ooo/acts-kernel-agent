@@ -855,15 +855,29 @@ def _cache_path(cache_dir: Path, key: str) -> Path:
     return cache_dir / f"{key}.json"
 
 
-def _load_ncu_cache(cache_dir: Path, key: str) -> NCUMetrics | None:
-    """Read and rehydrate a cached ``NCUMetrics``. Returns ``None`` on any
-    error (missing file, corrupt JSON, missing field, unknown field) — a
-    corrupt cache entry is treated as a silent miss, not a crash."""
+def _load_ncu_cache(
+    cache_dir: Path, key: str
+) -> tuple[NCUMetrics, dict[str, float]] | None:
+    """Read and rehydrate a cached ``(NCUMetrics, raw_metrics)`` pair.
+    Returns ``None`` on any error (missing file, corrupt JSON, missing
+    ``ncu`` field, unknown ``ncu`` field) — a corrupt cache entry is
+    treated as a silent miss, not a crash.
+
+    Pre-2026-05-11 cache entries written without a ``raw`` field load
+    with ``raw_metrics={}`` — same shape as a degraded re-profile would
+    produce on that path.
+    """
     try:
         payload = json.loads(_cache_path(cache_dir, key).read_text())
-        return NCUMetrics(**payload["ncu"])
+        ncu = NCUMetrics(**payload["ncu"])
     except (OSError, ValueError, KeyError, TypeError):
         return None
+    raw = payload.get("raw") or {}
+    # Belt-and-braces: ensure raw is a mapping; if a legacy/corrupt entry
+    # has it as a list/scalar, treat as missing.
+    if not isinstance(raw, dict):
+        raw = {}
+    return ncu, raw
 
 
 def _save_ncu_cache(
@@ -911,9 +925,11 @@ def profile_kernel(
 
     1. Always compute ``_compute_analytical``. Raises ``ProfilerError`` on
        impossible inputs — the branch dies.
-    2. If ``cache_dir`` is given and a cached NCUMetrics exists under the
+    2. If ``cache_dir`` is given and a cached entry exists under the
        (source-hash, workload, mode, metric-set-version) key, rehydrate
-       it and skip the subprocess.
+       both the curated ``NCUMetrics`` and the full ``raw_metrics`` dict
+       and skip the subprocess. The Reviewer's ``query_metric`` tool
+       depends on ``raw_metrics`` being populated.
     3. Operator escape hatch — ``ACTS_DISABLE_NCU=1`` short-circuits with
        reason ``ncu_disabled_via_env``.
     4. Process-wide skip — once a previous call observed an OS-level
@@ -973,15 +989,18 @@ def profile_kernel(
     if cache_dir is not None:
         cached = _load_ncu_cache(cache_dir, key)
         if cached is not None:
-            # Cache stores only the NCU piece — ``raw_metrics`` is
-            # populated only on the freshly-parsed path. ``ncu_rep_path``
-            # surfaces the previously-written ``.ncu-rep`` when it's still
-            # on disk; if a sibling run pruned it, fall back to ``None``
-            # (callers treat that as "no report to copy").
+            # Cache stores both the curated NCUMetrics and the full raw
+            # metric dict — the Reviewer's ``query_metric`` tool reads
+            # ``raw_metrics`` and would otherwise see ``[no data]`` for
+            # every query on a cache hit. ``ncu_rep_path`` surfaces the
+            # previously-written ``.ncu-rep`` when it's still on disk;
+            # if a sibling run pruned it, fall back to ``None`` (callers
+            # treat that as "no report to copy").
+            cached_ncu, cached_raw = cached
             return ProfilingResult(
                 analytical=analytical,
-                ncu=cached,
-                raw_metrics={},
+                ncu=cached_ncu,
+                raw_metrics=cached_raw,
                 ncu_rep_path=ncu_rep_out if ncu_rep_out.exists() else None,
             )
 

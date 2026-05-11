@@ -50,6 +50,25 @@ Some optimizations require passing through a performance valley (e.g., restructu
 - `"plateau"` — diminishing returns
 - `"dead_end"` — fundamental mismatch, prune immediately
 
+### Distinguishing DEAD_END causes via `dead_reason` (2026-05-11)
+
+**Problem**: `branch_quality == DEAD_END` collapsed three semantically distinct causes onto the same flag. The same node could be DEAD_END because of (a) infrastructure error (CUDA crash, profiler failure, bench failure, reward-hack confirmation), (b) Reviewer's verdict that the branch is regressed/over, or (c) beam-pruning eviction. Reasons WERE distinguished in telemetry (`branch_dead_end` event's reason codes in `events.py`), but never on the node — so `best_node()` had to exclude every DEAD_END node uniformly to stay safe against case (a). That meant a beam-pruned node carrying the run's best valid score was invisible to the final winner pick, the plateau tracker, and the report — Codex's adversarial review flagged this as a silent-slow-ship hazard.
+
+**Fix**: Lift the existing telemetry reason codes (`DEAD_REWARD_HACK`, `DEAD_CUDA_ERROR`, …) into a typed `DeadReason(str, Enum)` in `events.py` with two new members for the previously-unrecorded cases:
+
+- `BEAM_PRUNED` — set by `beam.beam_prune` when a node loses the beam competition. Score is trustworthy.
+- `REVIEWER_JUDGED` — set by the orchestrator when the Reviewer's `branch_quality` verdict is `DEAD_END`. Kernel ran fine; the Reviewer just classified the branch as over.
+
+Persist on `TreeNode.dead_reason` (None on live nodes and legacy checkpoints). The `(str, Enum)` base keeps members JSON-serializable as their string value, so the same enum drives both telemetry payloads and checkpoint records — single source of truth for the wire format.
+
+**Behavior change in `best_node()`**: filter on `dead_reason` rather than the DEAD_END flag alone. Beam-pruned nodes are eligible (their score is valid); Reviewer-judged and all infra-error reasons stay excluded; legacy DEAD_END nodes without a recorded reason are excluded as a safe default. The `frontier()` filter is unchanged — every DEAD_END cause should remove a node from future expansion.
+
+**Tree-viz colors**: three semantic shade groups (`dead_beam_pruned` lightest → `dead_reviewer_judged` medium → `dead_infra_error` darkest) instead of a single dead-end shade. Generic `dead_end` color stays as fallback for legacy checkpoints.
+
+**Why an enum, not string constants**: the user picked enum over string constants for type safety + grouping under one symbol. The codebase already uses the `BranchQuality(str, Enum)` pattern, so this is consistent. The module-level `DEAD_*` aliases that existed in `events.py` were removed (not kept as enum-member aliases) to prevent drift between two ways of referring to the same value.
+
+**Why `DEAD_REASONS = frozenset(DeadReason)` survived**: kept as the membership set even though enum typing already enforces validity, because it's still the natural way to iterate over "all dead reasons" in tests and visualization code. Runtime validation of `_emit_dead_end(reason)` was removed — the typed parameter does the work.
+
 ### Serial beam expansion (2026-04-19, /simplify review)
 
 **Rationale**: `Orchestrator.run()` expands one frontier node per iteration despite `beam_width ≥ 1`. Parallelizing via `asyncio.gather` across the top-k picks would amortize three sequential LLM calls (Planner → Coder → Reviewer) across k concurrent branches — the largest wallclock-latency win available. Deliberately deferred because three downstream components assume single-writer semantics on the tree:
@@ -659,6 +678,17 @@ Post-task Distillation     — tree → memory entries + KB entries
 **Update timing**: During a task, experiences live only in search tree. Optimization memory entries come from previous tasks only. Distillation happens once at task end.
 
 **Relationship between stores**: Optimization memory tells Planner *what to do*; Reviewer KB tells Reviewer *what's happening*. Mutually reinforcing — better diagnosis leads to more accurate memory, which leads to better decisions, which produce clearer signals.
+
+### Persist `raw_metrics` across the NCU cache (2026-05-11)
+
+`_save_ncu_cache` already wrote the full raw CSV-parsed metric dict to disk alongside the curated `NCUMetrics`; the loader threw the raw half away on rehydration, hard-coding `raw_metrics={}` on cache hits.
+
+**Why surface it now**: the Reviewer's `query_metric` tool reads from `ProfilingResult.raw_metrics`. Today the Reviewer only runs in the iteration that produced the profile, so the cache-hit gap wasn't noticed. But three concrete future scenarios all need persisted raw:
+- **Re-Review cached profiles** — A/B-testing Reviewer prompts against historical runs.
+- **Bottleneck-shift / per-workload-speedup investigations** (existing trigger-gated entries in PROCESS.md) — cross-iteration metric trajectories where the smoking gun lives outside the curated set.
+- **Metric-set-version drift** — adding a new curated field shouldn't require re-profiling every cached kernel; the data was already on disk.
+
+**Why now and not later**: the change was a five-line loader fix plus one call-site update. Cost in disk is ~5 KB per profile (~0.5 MB per 30-iter run), trivial next to the ~80 KB `.ncu-rep` we already accept. No new on-disk format — `_save_ncu_cache` was already persisting raw, the loader just wasn't reading it back. Pre-2026-05-11 cache entries without a `raw` field load with `raw_metrics={}` for back-compat — same shape as a degraded re-profile would produce.
 
 ---
 
