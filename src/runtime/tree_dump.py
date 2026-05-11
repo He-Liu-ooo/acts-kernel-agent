@@ -14,6 +14,8 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from src.runtime.events import DeadReason
+
 if TYPE_CHECKING:
     from src.search.tree import TreeNode
 
@@ -43,7 +45,6 @@ def is_bound() -> bool:
 
 def dump_node(node: "TreeNode", *, iter_no: int,
               ncu_rep_src: Path | None,
-              failure_reason: str | None = None,
               failure_detail: str | None = None) -> None:
     """Stream-write tree/node_<id>/ for one committed node.
 
@@ -51,11 +52,14 @@ def dump_node(node: "TreeNode", *, iter_no: int,
     profiling.raw_metrics is non-empty; ncu.ncu-rep when ncu_rep_src
     points to an existing file. No-op when unbound; never raises.
 
-    When ``failure_reason`` or ``failure_detail`` is non-None, meta.json
-    additionally carries a top-level ``failure`` object — used by the
-    dead-end branch in the orchestrator. Validation of ``failure_reason``
-    against ``DEAD_REASONS`` is the caller's responsibility; this layer
-    is pure transport.
+    When ``failure_detail`` is non-None, meta.json carries a top-level
+    ``failure_detail`` field — the prose exception text from the kill
+    site (CUDA OOM message, missing UUID, etc.). The categorical
+    DEAD_END cause lives on ``node.dead_reason`` and surfaces in
+    meta.json as the top-level ``dead_reason`` field via
+    ``_late_bound_fields``; the two together replace the old
+    ``failure: {reason, detail}`` block, which duplicated ``dead_reason``
+    on the reason axis.
     """
     if _root is None:
         return
@@ -66,7 +70,6 @@ def dump_node(node: "TreeNode", *, iter_no: int,
         meta = _build_meta(
             node,
             iter_no=iter_no,
-            failure_reason=failure_reason,
             failure_detail=failure_detail,
         )
         (node_dir / "meta.json").write_text(json.dumps(meta, indent=2))
@@ -106,7 +109,16 @@ def _late_bound_fields(node: "TreeNode") -> dict[str, Any]:
     after the streamed dump (beam eviction, post-dump scoring, late-attached
     children, post-review feedback attach). Both the initial ``_build_meta``
     write and the ``finalize_tree`` rewrite read from here so the on-disk
-    shape stays consistent if a future late-bound field joins."""
+    shape stays consistent if a future late-bound field joins.
+
+    ``dead_reason`` is late-bound for the same reason as ``branch_quality``:
+    beam pruning and the Reviewer-judged path can flip a node's status
+    after its initial dump. It's the single source of truth for the
+    DEAD_END cause across all three paths (infra-error kills,
+    beam-pruning, Reviewer-judged); the kill-site prose lives separately
+    as ``failure_detail`` and is only present when the kill site carried
+    a dynamic message (exception text, workload-errors string).
+    """
     from src.search.tree import (
         _serialize_per_workload_latency,
         _serialize_review_feedback,
@@ -115,6 +127,11 @@ def _late_bound_fields(node: "TreeNode") -> dict[str, Any]:
 
     return {
         "branch_quality": _branch_quality_str(node),
+        "dead_reason": (
+            node.dead_reason.value
+            if isinstance(node.dead_reason, DeadReason)
+            else None
+        ),
         "score": _serialize_score(node.score),
         # Spec §4.4 contract: empty dict (not null) on unmeasured nodes —
         # the shared serializer returns None, so coerce.
@@ -127,13 +144,12 @@ def _late_bound_fields(node: "TreeNode") -> dict[str, Any]:
 
 
 def _build_meta(node: "TreeNode", *, iter_no: int,
-                failure_reason: str | None = None,
                 failure_detail: str | None = None) -> dict:
     """Compose meta.json shape from a TreeNode. See spec §4.4.
 
-    When either ``failure_reason`` or ``failure_detail`` is non-None,
-    a top-level ``failure`` object is appended to the result. When
-    both are None (the dominant advance-path case), the key is absent.
+    When ``failure_detail`` is non-None, a top-level ``failure_detail``
+    field is appended — the kill-site prose. The categorical DEAD_END
+    cause comes in via ``_late_bound_fields(node)["dead_reason"]``.
     """
     analytical = (
         asdict(node.profiling.analytical)
@@ -151,8 +167,8 @@ def _build_meta(node: "TreeNode", *, iter_no: int,
         "trace_workflow": "acts_iter",
         **_late_bound_fields(node),
     }
-    if failure_reason is not None or failure_detail is not None:
-        result["failure"] = {"reason": failure_reason, "detail": failure_detail}
+    if failure_detail is not None:
+        result["failure_detail"] = failure_detail
     return result
 
 
@@ -166,11 +182,13 @@ def _node_summary(node: "TreeNode", *, is_best: bool) -> dict:
     sol_score = node.score.sol_score if node.score is not None else None
     speedup = node.score.speedup if node.score is not None else None
     is_dead = node.branch_quality == BranchQuality.DEAD_END
+    dr = node.dead_reason.value if isinstance(node.dead_reason, DeadReason) else None
     return {
         "id": node.id,
         "iter_no": node.iter_no,
         "action": node.action_applied or "baseline",
         "branch_quality": bq,
+        "dead_reason": dr,
         "sol_score": sol_score,
         "speedup": speedup,
         "is_best": is_best,
@@ -183,12 +201,13 @@ def finalize_tree(tree) -> None:
     tree.preview.md}.
 
     Also rewrites each per-node meta.json's late-bound fields
-    (``branch_quality``, ``score``, ``per_workload_latency_us``,
-    ``children_ids``) from the final tree state, so nodes whose state
+    (``branch_quality``, ``dead_reason``, ``score``,
+    ``per_workload_latency_us``, ``children_ids``, ``last_review``)
+    from the final tree state, so nodes whose state
     mutated after their streamed dump (beam eviction, root dumped
     pre-scoring, or root dumped before iters attached children) reflect
     the truth on disk. The rewrite preserves every other key (including
-    ``failure``) and skips nodes that never streamed a meta.json.
+    ``failure_detail``) and skips nodes that never streamed a meta.json.
 
     No-op when unbound. Never raises."""
     if _root is None:
@@ -276,19 +295,63 @@ def _render_ascii(tree, best_id: int) -> str:
     return "\n".join(lines) + "\n"
 
 
-# Single source of truth for branch-quality colors, shared by DOT and
-# Mermaid renderers. Keys are ``BranchQuality.value`` strings plus two
-# pseudo-classes: ``"neutral"`` for null branch_quality (root / not-yet-
-# reviewed), ``"best"`` for the run's winning node (overrides any
-# branch_quality color).
+# Single source of truth for node colors, shared by DOT and Mermaid
+# renderers. Keys are ``BranchQuality.value`` strings plus pseudo-classes:
+# ``"neutral"`` for null branch_quality (root / not-yet-reviewed),
+# ``"best"`` for the run's winning node (overrides any other color),
+# and dead-reason-derived classes that refine the generic ``"dead_end"``
+# shade into three semantic groups:
+#   - ``"dead_beam_pruned"``: node ran fine, lost the beam competition
+#     (lightest — score still valid as a final answer).
+#   - ``"dead_reviewer_judged"``: node ran fine, Reviewer judged the
+#     branch over (medium — score exists but Reviewer says don't promote).
+#   - ``"dead_infra_error"``: node never produced a trustworthy score
+#     (darkest — CUDA / profiler / bench / reward-hack failures).
+# Generic ``"dead_end"`` remains as the legacy-checkpoint fallback when
+# ``dead_reason`` is None.
 _BQ_COLORS = {
     "promising": "#c8f7c5",
     "plateau": "#fff4c2",
     "blocked_potential": "#d8d8f0",
     "dead_end": "#f7c8c8",
+    "dead_beam_pruned": "#fae3e3",
+    "dead_reviewer_judged": "#f7c8c8",
+    "dead_infra_error": "#d88a8a",
     "neutral": "#e0e0e0",
     "best": "#88e088",
 }
+
+# Map ``DeadReason.value`` strings to one of the three dead-* color
+# classes above. The only non-infra-error reasons are listed explicitly;
+# every other ``DeadReason`` member is bucketed as ``dead_infra_error``.
+# A new non-infra category must add itself to ``_NON_INFRA_DEAD`` —
+# defaulting to infra-error matches the historical shape of additions
+# (every reason added after BEAM_PRUNED / REVIEWER_JUDGED has been an
+# infra-error variant).
+_NON_INFRA_DEAD: dict[DeadReason, str] = {
+    DeadReason.BEAM_PRUNED: "dead_beam_pruned",
+    DeadReason.REVIEWER_JUDGED: "dead_reviewer_judged",
+}
+_DEAD_REASON_CLASS: dict[str, str] = {
+    r.value: _NON_INFRA_DEAD.get(r, "dead_infra_error") for r in DeadReason
+}
+
+
+def _node_color_class(summary: dict) -> str:
+    """Pick the color class for one node summary.
+
+    Precedence: best > dead-reason refinement > branch_quality >
+    neutral. Legacy DEAD_END nodes (no ``dead_reason``) fall back to
+    the generic ``dead_end`` shade.
+    """
+    if summary["is_best"]:
+        return "best"
+    if summary["is_dead"]:
+        dr = summary.get("dead_reason")
+        if dr is not None:
+            return _DEAD_REASON_CLASS.get(dr, "dead_end")
+        return "dead_end"
+    return summary["branch_quality"] or "neutral"
 
 
 def _render_dot(tree, best_id: int) -> str:
@@ -301,7 +364,7 @@ def _render_dot(tree, best_id: int) -> str:
     ]
     for n in tree.nodes():
         s = _node_summary(n, is_best=(n.id == best_id))
-        cls = "best" if s["is_best"] else (s["branch_quality"] or "neutral")
+        cls = _node_color_class(s)
         color = _BQ_COLORS[cls]
         score_part = f"SOL={s['sol_score']:.2f}" if s["sol_score"] is not None else ""
         bq_part = s["branch_quality"].upper() if s["branch_quality"] else ""
@@ -314,6 +377,8 @@ def _render_dot(tree, best_id: int) -> str:
             label_lines.append(f"speedup={s['speedup']:.2f}x")
         if bq_part:
             label_lines.append(bq_part)
+        if s.get("dead_reason"):
+            label_lines.append(s["dead_reason"].upper())
         label = "\\n".join(label_lines)
         lines.append(f'  n{n.id} [label="{label}", fillcolor="{color}"];')
     lines.append("")
@@ -331,12 +396,13 @@ def _render_mermaid(tree, best_id: int) -> str:
     lines = ["graph TD"]
     for n in tree.nodes():
         s = _node_summary(n, is_best=(n.id == best_id))
-        cls = "best" if s["is_best"] else (s["branch_quality"] or "neutral")
+        cls = _node_color_class(s)
         action = s["action"] if s["action"] else "baseline"
         score_part = f"SOL={s['sol_score']:.2f}" if s["sol_score"] is not None else "SOL=n/a"
         star = " ★" if s["is_best"] else ""
         bq_part = f"<br/>{s['branch_quality'].upper()}" if s["branch_quality"] else ""
-        label = f"iter={s['iter_no']} · {action}{star}<br/>{score_part}{bq_part}"
+        dr_part = f"<br/>{s['dead_reason'].upper()}" if s.get("dead_reason") else ""
+        label = f"iter={s['iter_no']} · {action}{star}<br/>{score_part}{bq_part}{dr_part}"
         lines.append(f'  n{n.id}["{label}"]:::{cls}')
     for n in tree.nodes():
         if n.parent_id is None:

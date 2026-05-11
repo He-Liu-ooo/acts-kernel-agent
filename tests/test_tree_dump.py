@@ -337,30 +337,38 @@ def test_render_mermaid_emits_edges():
     assert "n1 --> n2" in text
 
 
-def test_dump_node_failure_metadata_in_meta(tmp_path):
-    """When failure_reason and failure_detail are set, meta.json carries
-    them under a top-level 'failure' key."""
+def test_dump_node_failure_detail_in_meta(tmp_path):
+    """When ``failure_detail`` is set + the node carries ``dead_reason``,
+    meta.json carries ``failure_detail`` at the top level and ``dead_reason``
+    (via late-bound fields). Replaces the old ``failure: {reason, detail}``
+    block — ``dead_reason`` now owns the categorical axis."""
     import json
+    from src.agents.reviewer import BranchQuality
     from src.runtime import tree_dump
+    from src.runtime.events import DeadReason
     tree_dump.bind(tmp_path / "tree")
     try:
         node = _make_node(with_score=False, with_profiling=False)
+        node.branch_quality = BranchQuality.DEAD_END
+        node.dead_reason = DeadReason.CUDA_ERROR
         tree_dump.dump_node(
             node, iter_no=2, ncu_rep_src=None,
-            failure_reason="cuda_error",
             failure_detail="illegal memory access",
         )
         meta = json.loads((tmp_path / "tree" / "node_1" / "meta.json").read_text())
-        assert meta["failure"] == {
-            "reason": "cuda_error",
-            "detail": "illegal memory access",
-        }
+        assert meta["dead_reason"] == "cuda_error"
+        assert meta["failure_detail"] == "illegal memory access"
+        assert "failure" not in meta, (
+            "old nested failure block must be gone — dead_reason + "
+            "failure_detail at top level replace it"
+        )
     finally:
         tree_dump.unbind()
 
 
-def test_dump_node_no_failure_key_when_both_none(tmp_path):
-    """The 'failure' key is absent from meta.json on the advance path."""
+def test_dump_node_no_failure_detail_on_advance_path(tmp_path):
+    """``failure_detail`` is absent from meta.json on the advance path
+    (no kill-site prose to record)."""
     import json
     from src.runtime import tree_dump
     tree_dump.bind(tmp_path / "tree")
@@ -368,27 +376,29 @@ def test_dump_node_no_failure_key_when_both_none(tmp_path):
         node = _make_node()
         tree_dump.dump_node(node, iter_no=1, ncu_rep_src=None)
         meta = json.loads((tmp_path / "tree" / "node_1" / "meta.json").read_text())
-        assert "failure" not in meta
+        assert "failure_detail" not in meta
+        assert "failure" not in meta  # legacy nested key gone too
     finally:
         tree_dump.unbind()
 
 
-def test_dump_node_failure_reason_only(tmp_path):
-    """One field set, the other None — meta.failure carries reason and
-    detail=None (still emit the key when at least one is set)."""
+def test_dump_node_dead_reason_without_failure_detail(tmp_path):
+    """A DEAD_END node with a categorical reason but no kill-site prose
+    (e.g., beam-pruned or Reviewer-judged) — meta carries ``dead_reason``
+    without ``failure_detail``."""
     import json
+    from src.agents.reviewer import BranchQuality
     from src.runtime import tree_dump
+    from src.runtime.events import DeadReason
     tree_dump.bind(tmp_path / "tree")
     try:
         node = _make_node(with_score=False, with_profiling=False)
-        tree_dump.dump_node(
-            node, iter_no=2, ncu_rep_src=None,
-            failure_reason="profiler_error",
-            failure_detail=None,
-        )
+        node.branch_quality = BranchQuality.DEAD_END
+        node.dead_reason = DeadReason.BEAM_PRUNED
+        tree_dump.dump_node(node, iter_no=2, ncu_rep_src=None)
         meta = json.loads((tmp_path / "tree" / "node_1" / "meta.json").read_text())
-        assert meta["failure"]["reason"] == "profiler_error"
-        assert meta["failure"]["detail"] is None
+        assert meta["dead_reason"] == "beam_pruned"
+        assert "failure_detail" not in meta
     finally:
         tree_dump.unbind()
 
@@ -419,31 +429,32 @@ def test_finalize_tree_rewrites_evicted_node_branch_quality(tmp_path):
         tree_dump.unbind()
 
 
-def test_finalize_tree_preserves_failure_key_on_rewrite(tmp_path):
-    """A node already streamed with a failure key (from _kill_branch)
-    keeps the failure key after finalize_tree's rewrite — the rewrite
-    only swaps branch_quality."""
+def test_finalize_tree_preserves_failure_detail_on_rewrite(tmp_path):
+    """A node already streamed with ``failure_detail`` (from
+    ``_kill_branch``) keeps it after ``finalize_tree``'s rewrite — the
+    rewrite only refreshes the late-bound fields, and ``failure_detail``
+    is not one of them. ``dead_reason`` is late-bound (and may also have
+    been set at stream time), so it round-trips through the late-bound
+    refresh path."""
     import json
+    from src.agents.reviewer import BranchQuality
     from src.runtime import tree_dump
+    from src.runtime.events import DeadReason
     tree_dump.bind(tmp_path / "tree")
     try:
         tree = _make_tree_two_levels()
-        # Dump node 1 as a dead-end with failure metadata.
-        from src.agents.reviewer import BranchQuality
         node1 = tree.get_node(1)
         node1.branch_quality = BranchQuality.DEAD_END
+        node1.dead_reason = DeadReason.CUDA_ERROR
         tree_dump.dump_node(
             node1, iter_no=node1.iter_no, ncu_rep_src=None,
-            failure_reason="cuda_error",
             failure_detail="illegal memory access",
         )
         tree_dump.finalize_tree(tree)
         meta1 = json.loads((tmp_path / "tree" / "node_1" / "meta.json").read_text())
         assert meta1["branch_quality"] == "dead_end"
-        assert meta1["failure"] == {
-            "reason": "cuda_error",
-            "detail": "illegal memory access",
-        }
+        assert meta1["dead_reason"] == "cuda_error"
+        assert meta1["failure_detail"] == "illegal memory access"
     finally:
         tree_dump.unbind()
 

@@ -18,13 +18,7 @@ from typing import TYPE_CHECKING, Any, Callable
 from src.agents.reviewer import BranchQuality, _render_review_for_planner
 from src.runtime import tree_dump
 from src.runtime.events import (
-    DEAD_BENCH_FAILURE,
-    DEAD_CUDA_ERROR,
-    DEAD_PROFILER_ERROR,
-    DEAD_REASONS,
-    DEAD_REPR_LATENCY_UNAVAILABLE,
-    DEAD_REWARD_HACK,
-    DEAD_REWARD_HACK_CONFIRMED,
+    DeadReason,
     ITER_ADVANCED,
     ITER_DEAD_END,
     ITER_SKIPPED,
@@ -208,17 +202,16 @@ def _per_workload_us(bench) -> list[float | None]:
     return [finite_or_none(v) for v in bench.per_workload_latency_us.values()]
 
 
-def _emit_dead_end(iter_no: int, reason: str, *, detail: str | None = None) -> None:
+def _emit_dead_end(iter_no: int, reason: DeadReason, *, detail: str | None = None) -> None:
     """Fire ``branch_dead_end`` + ``iter_end`` for a DEAD_END iteration.
 
-    *reason* must be one of ``DEAD_REASONS`` so telemetry consumers can
-    pivot on the stable code rather than parse a free-form string. Any
-    dynamic context (CUDA error message, exception text) goes into
-    *detail* and is emitted as a separate payload field.
+    *reason* is a ``DeadReason`` enum member; its string value goes on
+    the wire so telemetry consumers can pivot on the stable code rather
+    than parse a free-form string. Any dynamic context (CUDA error
+    message, exception text) goes into *detail* and is emitted as a
+    separate payload field.
     """
-    if reason not in DEAD_REASONS:
-        logger.warning("unknown branch_dead_end reason: %s", reason)
-    payload: dict[str, Any] = {"reason": reason}
+    payload: dict[str, Any] = {"reason": reason.value}
     if detail is not None:
         payload["detail"] = detail
     emit("branch_dead_end", iter=iter_no, **payload)
@@ -300,12 +293,17 @@ class Orchestrator:
         parent: TreeNode,
         iter_no: int,
         *,
-        reason: str,
+        reason: DeadReason,
         detail: str | None = None,
         bumps_agent_failures: bool = False,
     ) -> None:
         """Mark a child DEAD_END, prune the beam, decay epsilon, and emit
         the standard ``branch_dead_end`` + ``iter_end`` pair.
+
+        Records *reason* on ``child.dead_reason`` so downstream consumers
+        (``best_node``, memory distillation, tree viz) can distinguish
+        infrastructure-error kills from other DEAD_END causes —
+        ``branch_quality`` alone collapses every cause into a single flag.
 
         *bumps_agent_failures* is True for agent-output failures
         (Coder/Planner produced a buggy/cheating kernel — accountable to
@@ -316,10 +314,9 @@ class Orchestrator:
         and ``decay`` live in ``run()``'s frame; this helper handles the
         per-site DEAD_END side-effects only.
         """
-        from src.agents.reviewer import BranchQuality
         from src.search.beam import beam_prune
 
-        child.branch_quality = BranchQuality.DEAD_END
+        child.mark_dead(reason)
         if bumps_agent_failures:
             parent.consecutive_agent_failures += 1
         beam_prune(
@@ -332,11 +329,14 @@ class Orchestrator:
         # of the six call sites) so the dump can't drift out of sync with
         # _kill_branch's other side-effects. No profiling on the dead-end
         # path → ncu_rep_src is None.
+        # ``failure_reason`` is omitted — the categorical cause lives on
+        # ``child.dead_reason`` (set above at line 318) and surfaces in
+        # meta.json via ``_late_bound_fields``. Only the kill-site prose
+        # (``detail``) needs to flow through ``dump_node``.
         tree_dump.dump_node(
             child,
             iter_no=iter_no,
             ncu_rep_src=None,
-            failure_reason=reason,
             failure_detail=detail,
         )
         _emit_dead_end(iter_no, reason, detail=detail)
@@ -761,7 +761,7 @@ class Orchestrator:
                 )
                 self._kill_branch(
                     child, parent, iter_no,
-                    reason=DEAD_REWARD_HACK,
+                    reason=DeadReason.REWARD_HACK,
                     detail=str(e)[:120],
                     bumps_agent_failures=True,
                 )
@@ -795,7 +795,7 @@ class Orchestrator:
                 )
                 self._kill_branch(
                     child, parent, iter_no,
-                    reason=DEAD_CUDA_ERROR,
+                    reason=DeadReason.CUDA_ERROR,
                     detail=msg[:120],
                 )
                 epsilon = max(self._config.epsilon_end, epsilon - decay)
@@ -820,7 +820,7 @@ class Orchestrator:
                 )
                 self._kill_branch(
                     child, parent, iter_no,
-                    reason=DEAD_BENCH_FAILURE,
+                    reason=DeadReason.BENCH_FAILURE,
                     detail=dead_detail,
                 )
                 epsilon = max(self._config.epsilon_end, epsilon - decay)
@@ -862,7 +862,7 @@ class Orchestrator:
                 )
                 self._kill_branch(
                     child, parent, iter_no,
-                    reason=DEAD_REPR_LATENCY_UNAVAILABLE,
+                    reason=DeadReason.REPR_LATENCY_UNAVAILABLE,
                 )
                 epsilon = max(self._config.epsilon_end, epsilon - decay)
                 continue
@@ -892,7 +892,7 @@ class Orchestrator:
                     )
                     self._kill_branch(
                         child, parent, iter_no,
-                        reason=DEAD_PROFILER_ERROR,
+                        reason=DeadReason.PROFILER_ERROR,
                         detail=str(e)[:120],
                     )
                     epsilon = max(self._config.epsilon_end, epsilon - decay)
@@ -955,7 +955,7 @@ class Orchestrator:
                     )
                     self._kill_branch(
                         child, parent, iter_no,
-                        reason=DEAD_REWARD_HACK_CONFIRMED,
+                        reason=DeadReason.REWARD_HACK_CONFIRMED,
                         bumps_agent_failures=True,
                     )
                     epsilon = max(self._config.epsilon_end, epsilon - decay)
@@ -1034,7 +1034,10 @@ class Orchestrator:
                         iter_no,
                         feedback.error_reason or "unknown",
                     )
-                child.branch_quality = feedback.branch_quality
+                if feedback.branch_quality == BranchQuality.DEAD_END:
+                    child.mark_dead(DeadReason.REVIEWER_JUDGED)
+                else:
+                    child.branch_quality = feedback.branch_quality
                 child.last_review = feedback
                 emit(
                     "reviewer_feedback",
@@ -1067,7 +1070,10 @@ class Orchestrator:
             # Single end-of-iter best scan — reused for target / plateau checks.
             best = tree.best_node()
             emit("iter_end", iter=iter_no, outcome=ITER_ADVANCED)
-            if child.score.sol_score >= self._config.sol_target:
+            # Gate on the eligible winner: a REVIEWER_JUDGED child can
+            # clear ``sol_target`` but be excluded by ``best_node()``;
+            # using ``child.score`` here would ship a sub-target winner.
+            if best.score.sol_score >= self._config.sol_target:
                 return SearchResult(
                     best,
                     iter_no,

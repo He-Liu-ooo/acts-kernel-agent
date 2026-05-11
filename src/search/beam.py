@@ -5,6 +5,7 @@ from __future__ import annotations
 import random
 
 from src.agents.reviewer import BranchQuality
+from src.runtime.events import DeadReason
 from src.search.tree import SearchTree, TreeNode
 
 # Branch-quality bonus added to raw SOL score for ranking.
@@ -54,7 +55,7 @@ def beam_prune(tree: SearchTree, beam_width: int, *, enable_diversity: bool = Tr
     if not enable_diversity:
         pruned_ids = []
         for node in frontier[beam_width:]:
-            node.branch_quality = BranchQuality.DEAD_END
+            node.mark_dead(DeadReason.BEAM_PRUNED)
             pruned_ids.append(node.id)
         return pruned_ids
 
@@ -86,7 +87,7 @@ def beam_prune(tree: SearchTree, beam_width: int, *, enable_diversity: bool = Tr
     pruned_ids = []
     for node in frontier:
         if node.id not in kept:
-            node.branch_quality = BranchQuality.DEAD_END
+            node.mark_dead(DeadReason.BEAM_PRUNED)
             pruned_ids.append(node.id)
     return pruned_ids
 

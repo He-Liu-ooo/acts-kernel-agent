@@ -10,6 +10,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from src.runtime.events import DeadReason
+
 if TYPE_CHECKING:
     from src.agents.reviewer import BranchQuality, ReviewerFeedback
     from src.eval.profiler import ProfilingResult
@@ -55,6 +57,24 @@ class TreeNode:
     # iteration via _render_review_for_planner. None on legacy checkpoints
     # predating this field.
     last_review: "ReviewerFeedback | None" = None
+    # Distinguishes the DEAD_END causes that ``branch_quality`` collapses
+    # (see ``SearchTree.best_node`` for the eligibility taxonomy). ``None``
+    # on live nodes and legacy checkpoints; paired with
+    # ``branch_quality = DEAD_END`` at every kill site via ``mark_dead``.
+    dead_reason: "DeadReason | None" = None
+
+    def mark_dead(self, reason: "DeadReason") -> None:
+        """Mark this node DEAD_END and record the cause atomically.
+
+        Every DEAD_END node must carry a ``dead_reason``; otherwise
+        ``_eligible_for_best`` falls back to the legacy-unknown branch
+        and excludes the node from ``best_node``. Use this method instead
+        of writing ``branch_quality`` + ``dead_reason`` separately.
+        """
+        from src.agents.reviewer import BranchQuality
+
+        self.branch_quality = BranchQuality.DEAD_END
+        self.dead_reason = reason
 
 
 # A parent that has caused this many consecutive Planner/Coder failures
@@ -130,24 +150,39 @@ class SearchTree:
     def best_node(self) -> TreeNode:
         """Return the node with the highest SOL score.
 
-        DEAD_END nodes are excluded — a branch killed by reward-hack
-        confirmation, compile failure, or the profile gauntlet may still
-        carry the score its bench produced, but that score is invalid as
-        a final answer (the kernel is either incorrect or hardware-cap-
-        violating).
+        DEAD_END nodes are filtered by ``dead_reason``, not the flag
+        alone. ``branch_quality == DEAD_END`` collapses three distinct
+        causes (infra error, Reviewer verdict, beam-pruning eviction),
+        but only two of them invalidate the node's measured score:
 
-        Quarantined nodes (``consecutive_agent_failures >= QUARANTINE_THRESHOLD``)
-        are intentionally still candidates here — quarantine prevents a
-        deterministically-failing parent from being re-selected for
-        further expansion, but its own measured score remains a valid
-        final answer if it happens to be the run's best.
+        - **Infra-error reasons** (CUDA_ERROR, BENCH_FAILURE,
+          PROFILER_ERROR, REWARD_HACK*, REPR_LATENCY_UNAVAILABLE,
+          AGENT_FAILURE) — the kernel never produced a trustworthy
+          measurement. Excluded.
+        - **REVIEWER_JUDGED** — the kernel ran fine but the Reviewer
+          classified the branch as regressed/over. Excluded so the run's
+          winner aligns with the Reviewer's verdict, not a
+          Reviewer-rejected score that happens to be numerically best.
+        - **BEAM_PRUNED** — the kernel ran fine, the bench measurement
+          is valid, the node simply lost the beam competition. Its score
+          is just as trustworthy as any live node's, so it stays eligible
+          here. Without this carve-out, a high-scoring node evicted at
+          iter K is invisible to the winner pick when later iterations
+          regress — exactly the silent-slow-ship hazard Codex flagged.
+
+        Legacy DEAD_END nodes (no ``dead_reason`` recorded) are excluded
+        as a safe default — we don't know which class they belong to.
+
+        Quarantined nodes (``consecutive_agent_failures >=
+        QUARANTINE_THRESHOLD``) are intentionally still candidates here
+        — quarantine prevents a deterministically-failing parent from
+        being re-selected for further expansion, but its own measured
+        score remains a valid final answer if it happens to be the run's
+        best.
         """
-        from src.agents.reviewer import BranchQuality
-
         scored = [
             n for n in self._nodes.values()
-            if n.score is not None
-            and n.branch_quality != BranchQuality.DEAD_END
+            if n.score is not None and _eligible_for_best(n)
         ]
         if not scored:
             # Fall back to root
@@ -231,6 +266,23 @@ class SearchTree:
         return tree
 
 
+# ── best-node eligibility ────────────────────────────────────────────────────
+
+def _eligible_for_best(node: TreeNode) -> bool:
+    """Decide whether a node's score is trustworthy enough to win the run.
+
+    See ``SearchTree.best_node`` for the rationale. A node is eligible iff
+    its branch_quality is not DEAD_END, OR it was killed by beam pruning
+    (in which case the measurement is still valid — only frontier
+    eligibility was revoked).
+    """
+    from src.agents.reviewer import BranchQuality
+
+    if node.branch_quality != BranchQuality.DEAD_END:
+        return True
+    return node.dead_reason == DeadReason.BEAM_PRUNED
+
+
 # ── serialization helpers ────────────────────────────────────────────────────
 
 def _serialize_node(node: TreeNode) -> dict:
@@ -243,6 +295,7 @@ def _serialize_node(node: TreeNode) -> dict:
         "action_applied": node.action_applied,
         "depth": node.depth,
         "branch_quality": node.branch_quality.value if isinstance(node.branch_quality, BranchQuality) else None,
+        "dead_reason": node.dead_reason.value if isinstance(node.dead_reason, DeadReason) else None,
         "score": _serialize_score(node.score),
         "kernel": _serialize_kernel(node.kernel),
         "profiling": _serialize_profiling(node.profiling),
@@ -400,6 +453,14 @@ def _deserialize_node(data: dict) -> TreeNode:
     if data["branch_quality"] is not None:
         bq = BranchQuality(data["branch_quality"])
 
+    # ``.get(..., None)`` keeps pre-dead_reason checkpoints loadable —
+    # legacy DEAD_END nodes simply have no recorded cause; downstream
+    # code treats that as "unknown" rather than raising.
+    dr = None
+    dr_raw = data.get("dead_reason")
+    if dr_raw is not None:
+        dr = DeadReason(dr_raw)
+
     k = data["kernel"]
     ks = k["spec"]
     def_path = Path(ks["definition_path"]) if ks["definition_path"] else None
@@ -449,6 +510,7 @@ def _deserialize_node(data: dict) -> TreeNode:
         # ``.get(..., None)`` keeps pre-last_review checkpoints loadable —
         # legacy nodes have no Reviewer feedback recorded.
         last_review=_deserialize_review_feedback(data.get("last_review")),
+        dead_reason=dr,
     )
 
 

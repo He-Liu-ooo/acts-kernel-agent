@@ -457,29 +457,30 @@ async def test_dump_node_called_on_committed_node(harness, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_dump_node_called_on_dead_end_with_failure_reason(harness, monkeypatch):
+async def test_dump_node_called_on_dead_end_with_dead_reason(harness, monkeypatch):
     """Dead-end iterations now DO call ``tree_dump.dump_node`` so operators
     inspecting "why did node N die" find a meta.json with the kill reason.
 
     The original Task-13 invariant (dead-ends do NOT dump) flipped when
     Codex caught that ``finalize_tree`` indexes the dead-end node in
     ``index.json`` while the per-node directory was missing — same node,
-    two truths. Dead-end dumps now carry ``failure_reason`` /
-    ``failure_detail`` from the kill path; on the partial-bench path the
-    reason is ``DEAD_BENCH_FAILURE`` and the detail describes the
-    workload errors.
+    two truths. Dead-end dumps carry the categorical cause via
+    ``node.dead_reason`` (single source of truth across all DEAD_END
+    paths) and the kill-site prose via ``failure_detail``; on the
+    partial-bench path the reason is ``DeadReason.BENCH_FAILURE`` and
+    the detail describes the workload errors.
     """
     from src.runtime import tree_dump
-    from src.search.orchestrator import DEAD_BENCH_FAILURE, Orchestrator
+    from src.runtime.events import DeadReason
+    from src.search.orchestrator import Orchestrator
 
     captured: list[dict] = []
 
-    def spy(node, *, iter_no, ncu_rep_src,
-            failure_reason=None, failure_detail=None):
+    def spy(node, *, iter_no, ncu_rep_src, failure_detail=None):
         captured.append({
             "id": node.id, "iter_no": iter_no,
             "ncu_rep_src": ncu_rep_src,
-            "failure_reason": failure_reason,
+            "dead_reason": node.dead_reason,
             "failure_detail": failure_detail,
         })
 
@@ -517,8 +518,9 @@ async def test_dump_node_called_on_dead_end_with_failure_reason(harness, monkeyp
     assert rec["iter_no"] == 1
     # No profiling on the dead-end path → ncu_rep_src is None.
     assert rec["ncu_rep_src"] is None
-    # failure_reason came from the kill site.
-    assert rec["failure_reason"] == DEAD_BENCH_FAILURE
+    # dead_reason is set on the node by _kill_branch (replaces the old
+    # failure_reason kwarg, which duplicated dead_reason.value).
+    assert rec["dead_reason"] == DeadReason.BENCH_FAILURE
     # detail is non-None (the orchestrator built a workload-errors string).
     assert rec["failure_detail"] is not None
     assert "wl-1" in rec["failure_detail"]
@@ -539,8 +541,7 @@ async def test_dump_node_called_after_beam_prune(harness, monkeypatch):
 
     captured: list[dict] = []
 
-    def spy(node, *, iter_no, ncu_rep_src,
-            failure_reason=None, failure_detail=None):
+    def spy(node, *, iter_no, ncu_rep_src, failure_detail=None):
         captured.append({
             "id": node.id,
             "branch_quality": node.branch_quality,
@@ -587,8 +588,7 @@ async def test_dump_node_receives_real_ncu_rep_src_on_advance(harness, monkeypat
 
     captured: list[dict] = []
 
-    def spy(node, *, iter_no, ncu_rep_src,
-            failure_reason=None, failure_detail=None):
+    def spy(node, *, iter_no, ncu_rep_src, failure_detail=None):
         # Skip the baseline root dump (id=0); this test verifies the
         # advance-path child dump receives the populated ncu_rep_path.
         if node.id == 0:

@@ -11,6 +11,7 @@ import json
 import logging
 import math
 import threading
+from enum import Enum
 from typing import Any, IO
 
 from src.runtime.timefmt import iso_ts
@@ -68,24 +69,40 @@ ITER_ADVANCED = "advanced"
 ITER_DEAD_END = "dead_end"
 ITER_SKIPPED = "skipped"
 
-# Reason codes for the ``branch_dead_end`` event. Telemetry consumers
-# (log parsers, regression tests) key on these strings — keep them stable.
-# Dynamic detail (which CUDA error message, which exception text) goes into
-# the separate ``detail`` payload field, not concatenated into the reason.
-DEAD_REWARD_HACK = "reward_hack"
-DEAD_REWARD_HACK_CONFIRMED = "reward_hack_confirmed"
-DEAD_CUDA_ERROR = "cuda_error"
-DEAD_PROFILER_ERROR = "profiler_error"
-DEAD_BENCH_FAILURE = "bench_failure"
-DEAD_REPR_LATENCY_UNAVAILABLE = "repr_workload_latency_unavailable"
-# Reserved — emission deferred to dead-agent failure handling.
-DEAD_AGENT_FAILURE = "agent_failure"
+class DeadReason(str, Enum):
+    """Why a branch was marked DEAD_END.
 
-DEAD_REASONS: frozenset[str] = frozenset({
-    DEAD_REWARD_HACK, DEAD_REWARD_HACK_CONFIRMED, DEAD_CUDA_ERROR,
-    DEAD_PROFILER_ERROR, DEAD_BENCH_FAILURE, DEAD_REPR_LATENCY_UNAVAILABLE,
-    DEAD_AGENT_FAILURE,
-})
+    Inherits from ``str`` so members JSON-serialize as their string value
+    directly — telemetry payloads (``branch_dead_end.reason``) and
+    persisted tree checkpoints (``TreeNode.dead_reason``) store the same
+    stable wire form. Telemetry consumers (log parsers, regression tests)
+    key on these strings; keep values stable.
+
+    Three causes today (kept distinct so downstream readers — ``best_node``,
+    memory distillation, tree viz — can treat them differently rather than
+    collapsing them into a single dead-end signal):
+
+      - Reviewer-judged: kernel ran with a valid score, Reviewer
+        classified the branch as regressed/over → REVIEWER_JUDGED.
+      - Beam-pruned: kernel ran with a valid score, lost the beam
+        competition → BEAM_PRUNED. Score remains trustworthy as a
+        final answer.
+      - Infrastructure error: kernel never produced a trustworthy score
+        (CUDA error, profiler crash, bench failure, reward-hack
+        confirmation, …). One member per error class.
+    """
+
+    REWARD_HACK = "reward_hack"
+    REWARD_HACK_CONFIRMED = "reward_hack_confirmed"
+    CUDA_ERROR = "cuda_error"
+    PROFILER_ERROR = "profiler_error"
+    BENCH_FAILURE = "bench_failure"
+    REPR_LATENCY_UNAVAILABLE = "repr_workload_latency_unavailable"
+    # Reserved — emission deferred to dead-agent failure handling.
+    AGENT_FAILURE = "agent_failure"
+    BEAM_PRUNED = "beam_pruned"
+    REVIEWER_JUDGED = "reviewer_judged"
+
 
 _events_fh: IO[str] | None = None
 _lock = threading.Lock()

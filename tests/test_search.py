@@ -1108,3 +1108,333 @@ def _promising_review_stub():
         bottleneck_classification="memory_bound",
         branch_quality=BranchQuality.PROMISING,
     )
+
+
+# ── dead_reason: distinguishing why a branch died ───────────────────────────
+
+class TestDeadReasonField:
+    """Three semantically distinct causes collapse into branch_quality
+    DEAD_END today (Reviewer-judged regression, beam-pruning eviction,
+    infrastructure error). The dead_reason field records which one so
+    downstream consumers (best_node, memory distillation, tree viz) can
+    treat them differently. branch_quality stays the binary
+    frontier-eligibility flag."""
+
+    def test_beam_pruned_node_records_beam_pruned_reason(self):
+        from src.runtime.events import DeadReason
+        from src.search.beam import beam_prune
+
+        tree = SearchTree()
+        root = tree.add_root(_make_kernel())
+        root.score = _make_score(0.1)
+        root.action_applied = "baseline"
+        winners = []
+        losers = []
+        for i in range(3):
+            n = tree.add_child(root.id, _make_kernel(), f"win_{i}")
+            n.score = _make_score(0.8 - i * 0.01)
+            winners.append(n)
+        for i in range(2):
+            n = tree.add_child(root.id, _make_kernel(), f"lose_{i}")
+            n.score = _make_score(0.3 - i * 0.01)
+            losers.append(n)
+
+        beam_prune(tree, beam_width=3, enable_diversity=False)
+
+        for n in losers:
+            assert n.branch_quality == BranchQuality.DEAD_END
+            assert n.dead_reason == DeadReason.BEAM_PRUNED, (
+                f"beam-pruned node {n.id} should carry "
+                f"DeadReason.BEAM_PRUNED, got {n.dead_reason}"
+            )
+        for n in winners:
+            assert n.dead_reason is None
+
+    @pytest.mark.asyncio
+    async def test_bench_failure_records_bench_failure_reason(self, _orch_harness):
+        """An infrastructure-error kill via _kill_branch must propagate
+        the reason onto the node, not just into telemetry."""
+        from src.eval.benchmark import BenchmarkError, BenchmarkResult
+        from src.runtime.events import DeadReason
+        from src.search.orchestrator import Orchestrator
+
+        h = _orch_harness
+        baseline_bench = BenchmarkResult(median_latency_us=100.0, timed_runs=1)
+        with patch(
+            "src.eval.benchmark.benchmark_kernel",
+            side_effect=[
+                baseline_bench,
+                BenchmarkError("only 0/3 workloads survived"),
+            ],
+        ):
+            orch = Orchestrator(h.config, h.planner, h.coder, h.reviewer, h.retriever)
+            result = await orch.run(h.baseline, workloads=None, roofline=h.roofline)
+
+        children = [n for n in result.tree._nodes.values() if n.parent_id is not None]
+        assert len(children) == 1
+        assert children[0].branch_quality == BranchQuality.DEAD_END
+        assert children[0].dead_reason == DeadReason.BENCH_FAILURE
+
+    @pytest.mark.asyncio
+    async def test_reviewer_dead_end_records_reviewer_judged_reason(
+        self, _orch_harness
+    ):
+        """When the Reviewer returns branch_quality=DEAD_END on a kernel
+        that ran healthy (had a valid score, no infra error), the node's
+        dead_reason must distinguish that case from infra-error kills."""
+        from src.agents.reviewer import ReviewerFeedback
+        from src.eval.profiler import AnalyticalMetrics, ProfilingResult
+        from src.runtime.events import DeadReason
+        from src.search.orchestrator import Orchestrator
+
+        h = _orch_harness
+        h.reviewer.review.return_value = ReviewerFeedback(
+            outcome="regressed",
+            bottleneck_classification="memory_bound",
+            branch_quality=BranchQuality.DEAD_END,
+        )
+
+        stub_profile = ProfilingResult(
+            analytical=AnalyticalMetrics(
+                achieved_tflops=1.0,
+                achieved_bandwidth_gb_s=1.0,
+                pct_peak_compute=0.5,
+                pct_peak_bandwidth=0.5,
+            ),
+            ncu=None,
+            raw_metrics={},
+        )
+        with (
+            patch("src.eval.benchmark.benchmark_kernel", return_value=h.bench),
+            patch("src.eval.profiler.profile_kernel", return_value=stub_profile),
+        ):
+            orch = Orchestrator(h.config, h.planner, h.coder, h.reviewer, h.retriever)
+            result = await orch.run(h.baseline, workloads=None, roofline=h.roofline)
+
+        children = [n for n in result.tree._nodes.values() if n.parent_id is not None]
+        assert len(children) == 1
+        child = children[0]
+        assert child.branch_quality == BranchQuality.DEAD_END
+        assert child.dead_reason == DeadReason.REVIEWER_JUDGED, (
+            "Reviewer-judged DEAD_END must record REVIEWER_JUDGED, not "
+            "be conflated with infra-error kills"
+        )
+        # And the child must have a valid score — the kernel ran fine,
+        # the Reviewer just classified the branch as dead.
+        assert child.score is not None
+
+    def test_save_load_preserves_dead_reason(self, tmp_path: Path):
+        from src.runtime.events import DeadReason
+
+        tree = _build_scored_tree()
+        # Tag node 2 as beam-pruned, node 3 as a CUDA-error kill.
+        tree.get_node(2).branch_quality = BranchQuality.DEAD_END
+        tree.get_node(2).dead_reason = DeadReason.BEAM_PRUNED
+        tree.get_node(3).branch_quality = BranchQuality.DEAD_END
+        tree.get_node(3).dead_reason = DeadReason.CUDA_ERROR
+
+        save_path = tmp_path / "tree.json"
+        tree.save(save_path)
+        loaded = SearchTree.load(save_path)
+
+        assert loaded.get_node(2).dead_reason == DeadReason.BEAM_PRUNED
+        assert loaded.get_node(3).dead_reason == DeadReason.CUDA_ERROR
+        # Live nodes stay None.
+        assert loaded.get_node(0).dead_reason is None
+        assert loaded.get_node(1).dead_reason is None
+
+    def test_meta_json_late_bound_fields_includes_dead_reason(self):
+        """The per-node ``meta.json`` (on-disk record at
+        ``<run_dir>/tree/node_<id>/``) is built from
+        ``tree_dump._late_bound_fields``. ``dead_reason`` is now the
+        single source of truth for the DEAD_END cause across all three
+        paths (infra-error kill, beam-pruned, Reviewer-judged) — without
+        it in the late-bound set, beam-pruned and Reviewer-judged nodes
+        would carry ``branch_quality: dead_end`` with no recorded cause
+        (those paths don't carry ``failure_detail`` either), re-creating
+        the exact conflation this change set out to eliminate."""
+        from src.runtime.events import DeadReason
+        from src.runtime.tree_dump import _late_bound_fields
+
+        tree = _build_scored_tree()
+        # Beam-pruned: kernel ran fine, lost beam.
+        beam_pruned = tree.get_node(2)
+        beam_pruned.branch_quality = BranchQuality.DEAD_END
+        beam_pruned.dead_reason = DeadReason.BEAM_PRUNED
+        assert _late_bound_fields(beam_pruned)["dead_reason"] == "beam_pruned"
+
+        # Reviewer-judged: kernel ran fine, Reviewer said over.
+        reviewer_dead = tree.get_node(3)
+        reviewer_dead.branch_quality = BranchQuality.DEAD_END
+        reviewer_dead.dead_reason = DeadReason.REVIEWER_JUDGED
+        assert _late_bound_fields(reviewer_dead)["dead_reason"] == "reviewer_judged"
+
+        # Live node: no dead_reason recorded.
+        live = tree.get_node(1)
+        assert _late_bound_fields(live)["dead_reason"] is None
+
+    def test_deserialize_legacy_checkpoint_dead_reason_none(self, tmp_path: Path):
+        """A checkpoint written before dead_reason existed (no field in
+        the node dict) must load with dead_reason=None — not raise."""
+        import json
+
+        # Minimal legacy node shape: no dead_reason key.
+        legacy = {
+            "next_id": 1,
+            "nodes": {
+                "0": {
+                    "id": 0,
+                    "parent_id": None,
+                    "children_ids": [],
+                    "action_applied": "",
+                    "depth": 0,
+                    "branch_quality": "dead_end",
+                    "score": None,
+                    "kernel": {
+                        "spec": {
+                            "name": "root",
+                            "kernel_type": "matmul",
+                            "flop_count": 0,
+                            "memory_bytes": 0,
+                            "input_shapes": [],
+                            "definition_path": None,
+                            "pytorch_reference": None,
+                            "t_sol_us": None,
+                        },
+                        "source_code": "# stub",
+                        "num_warps": 0,
+                        "num_stages": 0,
+                        "block_size": 0,
+                        "triton_kernel_name": "",
+                        "dps": False,
+                    },
+                    "profiling": None,
+                    "per_workload_latency_us": None,
+                    "consecutive_agent_failures": 0,
+                    "iter_no": -1,
+                    "last_review": None,
+                },
+            },
+        }
+        path = tmp_path / "legacy.json"
+        path.write_text(json.dumps(legacy))
+
+        loaded = SearchTree.load(path)
+        n = loaded.get_node(0)
+        assert n.branch_quality == BranchQuality.DEAD_END
+        assert n.dead_reason is None
+
+
+class TestBestNodeHonorsDeadReason:
+    """best_node()'s exclusion of DEAD_END nodes is intentional for
+    infrastructure failures (no valid score) and Reviewer-judged
+    regressions, but beam-pruned nodes have valid scores — they were
+    measured cleanly and only lost the beam competition. Excluding them
+    means a high-scoring node pruned at iter 5 is invisible to the
+    final winner picker when iter 6+ regresses."""
+
+    @pytest.mark.parametrize(
+        "reason_name, eligible",
+        [
+            # Beam-pruned: clean measurement, only frontier eligibility
+            # was revoked — must stay eligible as the run's winner.
+            ("BEAM_PRUNED", True),
+            # Reviewer-judged: kernel ran fine, but the Reviewer's verdict
+            # overrides the raw score (excluded so the winner aligns with
+            # the verdict, not a numerically-best Reviewer-rejected node).
+            ("REVIEWER_JUDGED", False),
+            # Infra-error kills: score exists on the node but is not
+            # trustworthy as a final answer.
+            ("CUDA_ERROR", False),
+            ("BENCH_FAILURE", False),
+            ("PROFILER_ERROR", False),
+            ("REWARD_HACK_CONFIRMED", False),
+        ],
+    )
+    def test_best_node_eligibility_by_dead_reason(self, reason_name, eligible):
+        from src.runtime.events import DeadReason
+
+        tree = _build_scored_tree()
+        # Node 3 (c) carries the run's best SOL (0.8). Mark it DEAD_END
+        # with the parametrized reason and verify whether best_node
+        # picks it up or skips it.
+        tree.get_node(3).mark_dead(DeadReason[reason_name])
+
+        best = tree.best_node()
+        if eligible:
+            assert best.id == 3, (
+                f"{reason_name} must stay eligible — its measurement is trustworthy"
+            )
+        else:
+            assert best.id != 3, (
+                f"{reason_name} must be excluded — its score is not a valid final answer"
+            )
+
+
+class TestSolTargetTerminationGate:
+    """SOL_TARGET termination must be gated on the *eligible winner*, not
+    on the raw child score. A child can score above sol_target while
+    being Reviewer-judged DEAD_END (e.g., LLM hallucinated DEAD_END on a
+    legitimate high scorer — the project already acknowledges this in
+    ``_apply_baseline_feedback_to_root`` baseline-clamping). In that case
+    ``best_node()`` excludes the child and returns a different node whose
+    score may be below target. Pre-fix, line 1075 still used
+    ``child.score.sol_score`` and triggered SOL_TARGET termination,
+    shipping an inferior kernel under a "target hit" banner."""
+
+    @pytest.mark.asyncio
+    async def test_no_sol_target_when_above_target_child_is_reviewer_dead(self, _orch_harness):
+        from src.agents.reviewer import ReviewerFeedback
+        from src.eval.benchmark import BenchmarkResult
+        from src.eval.profiler import AnalyticalMetrics, ProfilingResult
+        from src.search.orchestrator import Orchestrator, TerminationReason
+
+        h = _orch_harness
+        # Two distinct bench results so the child has a non-trivial SOL
+        # score. (T_b=100, T_k=51, T_SOL=50) → sol_score ≈ 0.98 — above
+        # the default sol_target=0.95.
+        baseline_bench = BenchmarkResult(median_latency_us=100.0, timed_runs=1)
+        child_bench = BenchmarkResult(median_latency_us=51.0, timed_runs=1)
+
+        h.reviewer.review.return_value = ReviewerFeedback(
+            outcome="branch judged unsalvageable",
+            bottleneck_classification="memory_bound",
+            branch_quality=BranchQuality.DEAD_END,
+        )
+
+        stub_profile = ProfilingResult(
+            analytical=AnalyticalMetrics(
+                achieved_tflops=1.0,
+                achieved_bandwidth_gb_s=1.0,
+                pct_peak_compute=0.5,
+                pct_peak_bandwidth=0.5,
+            ),
+            ncu=None,
+            raw_metrics={},
+        )
+        with (
+            patch(
+                "src.eval.benchmark.benchmark_kernel",
+                side_effect=[baseline_bench, child_bench],
+            ),
+            patch("src.eval.profiler.profile_kernel", return_value=stub_profile),
+        ):
+            orch = Orchestrator(
+                h.config, h.planner, h.coder, h.reviewer, h.retriever
+            )
+            result = await orch.run(
+                h.baseline, workloads=None, roofline=h.roofline
+            )
+
+        assert result.termination_reason != TerminationReason.SOL_TARGET, (
+            "child.sol_score=0.98 cleared the 0.95 target, but Reviewer "
+            "returned DEAD_END so the child is REVIEWER_JUDGED and "
+            "best_node() returns the root (score 0.0). Terminating as "
+            "SOL_TARGET here ships a sub-target winner under a 'target "
+            "hit' banner — exactly the silent-success failure the "
+            "dead_reason exclusion was meant to prevent."
+        )
+        assert result.best_node.score.sol_score < h.config.sol_target, (
+            "Sanity: the eligible best should be below target (root score "
+            "is 0.0), so the only correct termination is non-SOL_TARGET."
+        )
