@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from src.agents.reviewer import BranchQuality
+    from src.agents.reviewer import BranchQuality, ReviewerFeedback
     from src.eval.profiler import ProfilingResult
     from src.eval.scorer import ScoreResult
     from src.kernels.kernel import Kernel
@@ -48,6 +48,13 @@ class TreeNode:
     # Iteration index (1-based) that produced this node. ``-1`` for the
     # root and for legacy checkpoints predating the field.
     iter_no: int = -1
+    # Latest Reviewer feedback for *this* kernel. Populated:
+    #   - For root: by the baseline review pass during Phase A setup.
+    #   - For children: at the iteration that scored them (after review()).
+    # Read by the Planner when this node becomes a parent in some future
+    # iteration via _render_review_for_planner. None on legacy checkpoints
+    # predating this field.
+    last_review: "ReviewerFeedback | None" = None
 
 
 # A parent that has caused this many consecutive Planner/Coder failures
@@ -242,6 +249,7 @@ def _serialize_node(node: TreeNode) -> dict:
         "per_workload_latency_us": _serialize_per_workload_latency(node.per_workload_latency_us),
         "consecutive_agent_failures": node.consecutive_agent_failures,
         "iter_no": node.iter_no,
+        "last_review": _serialize_review_feedback(node.last_review),
     }
 
 
@@ -284,6 +292,55 @@ def _serialize_profiling(profiling):
         "raw_metrics": dict(profiling.raw_metrics),
         "degraded_reason": profiling.degraded_reason,
     }
+
+
+def _serialize_review_feedback(fb) -> dict | None:
+    """Serialize a ReviewerFeedback for checkpoint / meta.json. None → None;
+    enums coerce to ``.value`` strings; everything else is JSON-native.
+    Shared by ``_serialize_node`` (checkpoint) and ``tree_dump._late_bound_fields``
+    (meta.json) so the two on-disk shapes stay consistent.
+    """
+    if fb is None:
+        return None
+    bc = fb.bottleneck_classification
+    return {
+        "outcome": fb.outcome,
+        "metric_deltas": dict(fb.metric_deltas),
+        "bottleneck_classification": bc.value if hasattr(bc, "value") else bc,
+        "bottleneck_diagnosis": fb.bottleneck_diagnosis,
+        "suggestions": list(fb.suggestions),
+        "branch_quality": fb.branch_quality.value,
+        "conditional_assessment": fb.conditional_assessment,
+        "degraded": fb.degraded,
+        "error_reason": fb.error_reason,
+    }
+
+
+def _deserialize_review_feedback(data: dict | None):
+    """Reconstruct a ReviewerFeedback from its serialized dict. None → None.
+    ``branch_quality`` is rebuilt as the BranchQuality enum;
+    ``bottleneck_classification`` stays as the stored string (the
+    dataclass field type is ``str`` — see ``ReviewerFeedback`` definition).
+    Missing keys fall back to dataclass defaults so legacy checkpoints
+    that wrote a partial dict still load.
+    """
+    if data is None:
+        return None
+    from src.agents.reviewer import BranchQuality, ReviewerFeedback
+
+    return ReviewerFeedback(
+        outcome=data.get("outcome", ""),
+        metric_deltas=dict(data.get("metric_deltas", {})),
+        bottleneck_classification=data.get("bottleneck_classification", ""),
+        bottleneck_diagnosis=data.get("bottleneck_diagnosis", ""),
+        suggestions=list(data.get("suggestions", [])),
+        branch_quality=BranchQuality(
+            data.get("branch_quality", BranchQuality.PROMISING.value)
+        ),
+        conditional_assessment=data.get("conditional_assessment", ""),
+        degraded=data.get("degraded", False),
+        error_reason=data.get("error_reason", ""),
+    )
 
 
 def _serialize_score(score: ScoreResult | None) -> dict | None:
@@ -389,6 +446,9 @@ def _deserialize_node(data: dict) -> TreeNode:
         # ``.get(..., -1)`` keeps pre-iter_no checkpoints loadable —
         # legacy nodes default to the same sentinel as the root.
         iter_no=data.get("iter_no", -1),
+        # ``.get(..., None)`` keeps pre-last_review checkpoints loadable —
+        # legacy nodes have no Reviewer feedback recorded.
+        last_review=_deserialize_review_feedback(data.get("last_review")),
     )
 
 

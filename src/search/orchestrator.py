@@ -15,6 +15,7 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
+from src.agents.reviewer import BranchQuality, _render_review_for_planner
 from src.runtime import tree_dump
 from src.runtime.events import (
     DEAD_BENCH_FAILURE,
@@ -110,6 +111,43 @@ class SearchResult:
     termination_reason: TerminationReason
     tree: SearchTree
     run_bottleneck: BottleneckType | None = None
+
+
+def _apply_baseline_feedback_to_root(root, feedback) -> None:
+    """Attach baseline Reviewer feedback to root, with DEAD_END clamping.
+
+    Always sets ``root.last_review = feedback`` so the iter-1 Planner
+    receives the diagnosis / suggestions / conditional_assessment as
+    prompt context. Propagates ``branch_quality`` to ``root.branch_quality``
+    only when it's NOT ``DEAD_END`` — a baseline review has no parent
+    delta to compare against, so an LLM hallucinating ``DEAD_END`` would
+    otherwise empty the frontier and exit the run as ``ALL_DEAD_END``
+    before iter 1 can plan. (Codex adversarial-review finding [high],
+    2026-05-10.)
+    """
+    root.last_review = feedback
+    if feedback.branch_quality != BranchQuality.DEAD_END:
+        root.branch_quality = feedback.branch_quality
+    else:
+        logger.warning(
+            "Baseline review returned DEAD_END (no parent delta to ground it) — "
+            "ignoring for tree state; root stays expandable. last_review "
+            "diagnosis still propagates to iter 1's Planner.",
+        )
+
+
+def _resolve_blob_roots(safetensors_blob_roots, problem_definition_path):
+    """Resolve the ``blob_roots`` argument for ``profile_kernel``.
+
+    Config override wins. When unset, fall back to the problem directory
+    so safetensors-backed workloads resolve their blobs against the same
+    root the in-process generator used. ``problem_definition_path`` is
+    None on the placeholder path (no SOL problem dir to fall back to);
+    pass None through so the profiler driver omits the field.
+    """
+    if problem_definition_path is None:
+        return safetensors_blob_roots
+    return safetensors_blob_roots or [problem_definition_path.parent]
 
 
 def _representative_latency_s(bench, workloads, repr_idx: int) -> float | None:
@@ -482,6 +520,75 @@ class Orchestrator:
             input_generators[repr_idx] if input_generators else (lambda seed: ())
         )
 
+        # Baseline review pass (spec 2026-05-10): profile + review root so
+        # the Planner expanding root in iter 1 receives a meaningful
+        # parent.last_review instead of None. Skipped on the placeholder
+        # path (no input_generators / no workloads). All errors are
+        # swallowed: a baseline-pass failure must not abort the run —
+        # the worst case is iter 1 sees reviewer_feedback=None, which
+        # is exactly the pre-feature behavior.
+        baseline_repr_latency_s = _representative_latency_s(
+            baseline_bench, workloads, repr_idx
+        )
+        if (
+            input_generators and workloads
+            and iter_flops > 0 and iter_nbytes > 0
+            and baseline_repr_latency_s is not None
+            and math.isfinite(baseline_repr_latency_s)
+        ):
+            try:
+                root.profiling = profile_kernel(
+                    baseline,
+                    repr_workload_axes,
+                    repr_input_generator,
+                    hardware_spec=self._config.hardware,
+                    flops=iter_flops,
+                    nbytes=iter_nbytes,
+                    latency_s=baseline_repr_latency_s,
+                    problem_definition_path=problem_definition_path,
+                    blob_roots=_resolve_blob_roots(
+                        self._config.safetensors_blob_roots,
+                        problem_definition_path,
+                    ),
+                )
+            except ProfilerError as exc:
+                logger.warning(
+                    "Baseline profile failed (%s) — skipping baseline review; "
+                    "iter 1 Planner will see reviewer_feedback=None.",
+                    exc,
+                )
+
+        if root.profiling is not None:
+            baseline_feedback = None
+            try:
+                with _iter_trace(0, "reviewer"):
+                    baseline_feedback = await self._reviewer.review(
+                        kernel_source=baseline.source_code,
+                        profiling_summary="",
+                        sol_score=root.score.sol_score,
+                        headroom_pct=(1.0 - root.score.sol_score) * 100,
+                        bottleneck=run_bottleneck,
+                        profiling=root.profiling,
+                        roofline=roofline,
+                        prev_sol_score=None,
+                        iter_idx=0,
+                    )
+            except Exception as exc:  # noqa: BLE001 — baseline review must not abort
+                logger.warning(
+                    "Baseline review failed (%s) — root.last_review stays None; "
+                    "iter 1 Planner will see reviewer_feedback=None.",
+                    exc,
+                )
+            if baseline_feedback is not None:
+                _apply_baseline_feedback_to_root(root, baseline_feedback)
+                emit(
+                    "reviewer_feedback",
+                    iter=0,
+                    verdict=baseline_feedback.branch_quality.value,
+                    suggestion_short=baseline_feedback.outcome[:120],
+                    degraded=baseline_feedback.degraded,
+                )
+
         for iteration in range(self._config.max_depth):
             iter_no = iteration + 1
             frontier = tree.frontier()
@@ -534,7 +641,7 @@ class Orchestrator:
                         past_experiences=experiences,
                         available_actions=[],
                         tree_context=tree.render_path(parent.id),
-                        reviewer_feedback=None,
+                        reviewer_feedback=_render_review_for_planner(parent.last_review),
                         bottleneck=run_bottleneck,
                     )
             except PlanningError as exc:
@@ -626,6 +733,7 @@ class Orchestrator:
             dead_detail: str | None = None
             bench = None
             try:
+                # Wrap benchmark_kernel(...) with pre- and post-execution anti-cheat checks.
                 with per_iter_anti_cheat(self._config.anti_cheat_critical_names):
                     bench = benchmark_kernel(
                         child_kernel,
@@ -760,20 +868,10 @@ class Orchestrator:
                 continue
 
             if iter_flops > 0 and iter_nbytes > 0:
-                # blob_roots default mirrors ``_load_problem``: prefer the
-                # config override, otherwise fall back to the problem
-                # directory so safetensors-backed workloads resolve their
-                # blobs against the same root the in-process generator used.
-                # ``problem_definition_path`` is None for the placeholder
-                # path (no SOL problem dir to fall back to) — pass None
-                # through so the driver omits the field.
-                if problem_definition_path is not None:
-                    profile_blob_roots = (
-                        self._config.safetensors_blob_roots
-                        or [problem_definition_path.parent]
-                    )
-                else:
-                    profile_blob_roots = self._config.safetensors_blob_roots
+                profile_blob_roots = _resolve_blob_roots(
+                    self._config.safetensors_blob_roots,
+                    problem_definition_path,
+                )
                 try:
                     profiling = profile_kernel(
                         child_kernel,
@@ -937,6 +1035,7 @@ class Orchestrator:
                         feedback.error_reason or "unknown",
                     )
                 child.branch_quality = feedback.branch_quality
+                child.last_review = feedback
                 emit(
                     "reviewer_feedback",
                     iter=iter_no,

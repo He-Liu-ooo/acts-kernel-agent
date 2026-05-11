@@ -128,6 +128,30 @@ class ReviewerFeedback:
     error_reason: str = ""
 
 
+def _render_review_for_planner(fb: "ReviewerFeedback | None") -> str | None:
+    """Render the curated Reviewer subset for the next Planner call.
+
+    Returns None when fb is None so the Planner's prompt-section guard
+    (``if reviewer_feedback:``) omits the section entirely.
+
+    Renders four high-signal fields: outcome, bottleneck_diagnosis,
+    suggestions, conditional_assessment. Skipped: metric_deltas (Planner
+    has profiling), bottleneck_classification (Planner has run_bottleneck),
+    branch_quality (search-engine concern).
+    See ``doc/specs/2026-05-10-planner-receives-reviewer-feedback-design.md``.
+    """
+    if fb is None:
+        return None
+    lines = [f"Outcome: {fb.outcome}"]
+    if fb.bottleneck_diagnosis:
+        lines.append(f"Diagnosis: {fb.bottleneck_diagnosis}")
+    if fb.suggestions:
+        lines.append("Suggestions: " + "; ".join(fb.suggestions))
+    if fb.conditional_assessment:
+        lines.append(f"What would unlock progress: {fb.conditional_assessment}")
+    return "\n".join(lines)
+
+
 def render_profiling_summary(
     profiling: "ProfilingResult | None",
     roofline: "RooflineResult | None" = None,

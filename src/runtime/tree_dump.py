@@ -102,12 +102,16 @@ def _branch_quality_str(node: "TreeNode") -> str | None:
 
 
 def _late_bound_fields(node: "TreeNode") -> dict[str, Any]:
-    """Single source of truth for the four meta.json fields that mutate
+    """Single source of truth for the meta.json fields that mutate
     after the streamed dump (beam eviction, post-dump scoring, late-attached
-    children). Both the initial ``_build_meta`` write and the
-    ``finalize_tree`` rewrite read from here so the on-disk shape stays
-    consistent if a future late-bound field joins."""
-    from src.search.tree import _serialize_per_workload_latency, _serialize_score
+    children, post-review feedback attach). Both the initial ``_build_meta``
+    write and the ``finalize_tree`` rewrite read from here so the on-disk
+    shape stays consistent if a future late-bound field joins."""
+    from src.search.tree import (
+        _serialize_per_workload_latency,
+        _serialize_review_feedback,
+        _serialize_score,
+    )
 
     return {
         "branch_quality": _branch_quality_str(node),
@@ -118,6 +122,7 @@ def _late_bound_fields(node: "TreeNode") -> dict[str, Any]:
             node.per_workload_latency_us
         ) or {},
         "children_ids": list(node.children_ids),
+        "last_review": _serialize_review_feedback(node.last_review),
     }
 
 

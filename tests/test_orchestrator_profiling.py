@@ -975,8 +975,12 @@ class TestRooflineInputsDerivedPerIteration:
             )
 
         # profile_kernel must have been called with nonzero flops / nbytes
-        # derived from the helper — NOT the spec's zeros.
-        assert profile_fake.call_count == 1
+        # derived from the helper — NOT the spec's zeros. Two calls
+        # expected: the baseline-review profile pass during Phase A
+        # (spec 2026-05-10) plus the per-iter child profile.
+        assert profile_fake.call_count == 2
+        # Inspect the per-iter (last) call — same flops/nbytes as the
+        # baseline call since iter_flops/iter_nbytes are run-invariant.
         kwargs = profile_fake.call_args.kwargs
         expected_flops = 2 * 128 * 128 * 64  # 2·M·N·K
         expected_nbytes = (128 * 64 + 64 * 128 + 128 * 128) * 4  # fp32 I/O
