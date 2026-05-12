@@ -526,6 +526,7 @@ def _extract_ncu_csv(rep_path: Path, *, timeout_s: float = 30.0) -> tuple[str, i
             timeout=timeout_s,
             env=_ncu_env(),
             check=False,
+            start_new_session=True,
         )
     except FileNotFoundError:
         return "", -1, True, "ncu_binary_not_found"
@@ -754,6 +755,12 @@ def _run_ncu(
     argv[0] = binary
 
     try:
+        # start_new_session=True: isolate NCU from the parent's signal
+        # group. GPU 0 runs in persistence mode, so a SIGKILL'd parent
+        # leaves an orphan NCU still holding a CUDA context + clock-lock
+        # state for tens of seconds. Putting NCU in its own session lets
+        # it complete (or fail on its own timeout) rather than die
+        # mid-write and strand GPU state.
         completed = subprocess.run(
             argv,
             capture_output=True,
@@ -761,6 +768,7 @@ def _run_ncu(
             timeout=timeout_s,
             env=env,
             check=False,
+            start_new_session=True,
         )
     except FileNotFoundError:
         # Race: shutil.which found ncu but it vanished before exec.

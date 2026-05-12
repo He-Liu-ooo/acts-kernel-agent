@@ -154,8 +154,14 @@ DEFAULT_MODEL_CONFIG_PATH = Path("configs/models/deepseek.json")
 # called at most once per process and the ``atexit`` cleanup needs to see
 # the same state the lock helpers wrote. ``locked`` is True only when
 # both GPU and DRAM clocks were verified after locking; the cleanup is
-# idempotent so a second call (atexit + finally) is harmless.
-_clock_lock_state: dict[str, object] = {"locked": False, "device_name": ""}
+# idempotent so a second call (atexit + finally) is harmless. ``ctx``
+# holds the live ``RunContext`` so the SIGTERM/SIGHUP handler can flush
+# events.jsonl + SDK traces before the process dies — set by ``main()``
+# after ``RunContext.create``; cleared by ``_close_ctx_safe`` to make
+# the helper idempotent across signal-then-finally paths.
+_clock_lock_state: dict[str, object] = {
+    "locked": False, "device_name": "", "ctx": None,
+}
 
 # Every ``nvidia-smi`` invocation is scoped to ``-i $_GPU_INDEX``. Without
 # ``-i <idx>`` clock locks apply to *all* GPUs on the host. The value of
@@ -361,22 +367,62 @@ def _unlock_clocks_safe() -> None:
         _clock_lock_state["locked"] = False
 
 
+def _close_ctx_safe() -> None:
+    """Idempotent RunContext close for signal + finally — swallows all exceptions.
+
+    On SIGTERM/SIGHUP neither ``atexit`` nor ``main()``'s ``finally``
+    runs, so without this the final batches of ``events.jsonl`` and SDK
+    traces never flush. ``RunContext.close()`` is itself idempotent (it
+    checks ``self._closed``); we also clear the slot so the mock-count
+    assertion in tests stays at 1 across repeated calls.
+    """
+    ctx = _clock_lock_state.get("ctx")
+    if ctx is None:
+        return
+    try:
+        ctx.close()
+    except Exception as exc:
+        logger.error("RunContext.close() failed during cleanup: %s", exc)
+    finally:
+        _clock_lock_state["ctx"] = None
+
+
 def _signal_unlock_handler(signum: int, frame) -> None:  # noqa: ARG001 — frame required by signal protocol
     """Best-effort unlock on SIGTERM / SIGHUP, then propagate the signal.
 
     ``atexit`` does NOT fire on uncaught signals (SIGTERM from
     ``kill <pid>`` / systemd, SIGHUP from SSH session drop), so we'd
-    otherwise leak a clock lock. After unlocking we restore the default
-    disposition for *signum* and re-raise it via ``os.kill`` rather than
-    calling ``sys.exit`` — that preserves the conventional signal-class
-    exit code (128 + signum) for shells / process supervisors.
+    otherwise leak a clock lock and skip the RunContext flush. Unlock
+    clocks first (faster + more critical for shared-GPU hosts), then
+    close the ctx so events.jsonl + SDK traces flush. Finally restore
+    the default disposition for *signum* and re-raise it via ``os.kill``
+    rather than calling ``sys.exit`` — that preserves the conventional
+    signal-class exit code (128 + signum) for shells / process
+    supervisors.
 
     Not registered for SIGINT: KeyboardInterrupt → ``atexit`` already
     cleans up Ctrl-C cleanly, and a custom handler would interfere.
     """
     _unlock_clocks_safe()
+    _close_ctx_safe()
     signal.signal(signum, signal.SIG_DFL)
     os.kill(os.getpid(), signum)
+
+
+def _finalize_run_safe(ctx) -> None:
+    """End-of-run cleanup: unlock clocks, close ctx. Idempotent / never raises.
+
+    Called from ``main()``'s ``finally`` block. Unlock first (faster +
+    more critical for shared-GPU hosts with persistence mode), then
+    flush the RunContext (events.jsonl, SDK traces). ``ctx.close()`` is
+    wrapped because the finally is bottom-of-stack and must not mask
+    the original run-exit cause.
+    """
+    _unlock_clocks_safe()
+    try:
+        ctx.close()
+    except Exception as exc:
+        logger.error("RunContext.close() failed during finalize: %s", exc)
 
 
 class UnknownBenchmarkFormat(RuntimeError):
@@ -841,6 +887,10 @@ def main(argv: list[str] | None = None) -> None:
         trace_dir=args.trace_dir if args.trace_dir else None,
         capture_traces=args.trace_dir != "",
     )
+    # Slot the ctx for ``_close_ctx_safe`` before signal handlers install
+    # so SIGTERM/SIGHUP between this line and the first ``emit`` still
+    # flushes (the handler is harmless if no events have been written).
+    _clock_lock_state["ctx"] = ctx
     atexit.register(ctx.close)
 
     # Clock-lock lifecycle. We register the atexit cleanup before the
@@ -853,8 +903,9 @@ def main(argv: list[str] | None = None) -> None:
     atexit.register(_unlock_clocks_safe)
     # ``atexit`` does NOT fire on SIGTERM (kill <pid>, systemd) or SIGHUP
     # (SSH session drop) — install best-effort signal handlers so those
-    # paths also unlock before the process dies. SIGINT is intentionally
-    # not handled: KeyboardInterrupt → atexit already covers Ctrl-C.
+    # paths also unlock + flush the ctx before the process dies. SIGINT
+    # is intentionally not handled: KeyboardInterrupt → atexit already
+    # covers Ctrl-C.
     signal.signal(signal.SIGTERM, _signal_unlock_handler)
     signal.signal(signal.SIGHUP, _signal_unlock_handler)
 
@@ -927,8 +978,7 @@ def main(argv: list[str] | None = None) -> None:
         if ctx.run_dir is not None:
             print(f"Run dir: {ctx.run_dir}")
     finally:
-        _unlock_clocks_safe()
-        ctx.close()
+        _finalize_run_safe(ctx)
 
 
 def _try_acquire_clock_lock() -> None:

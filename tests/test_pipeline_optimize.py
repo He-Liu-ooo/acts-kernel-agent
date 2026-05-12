@@ -1446,15 +1446,20 @@ def test_verify_gpu0_locked_does_not_invoke_torch():
 
 def test_signal_unlock_handler_unlocks_then_propagates():
     """The SIGTERM/SIGHUP handler must (1) call ``_unlock_clocks_safe``,
-    (2) restore the default disposition for the signal, and (3) re-raise
-    the signal via ``os.kill`` so the process dies with the conventional
-    signal-class exit code (128 + signum) rather than via ``sys.exit``."""
+    (2) call ``_close_ctx_safe`` (clocks-first, ctx-flush-second so the
+    unlock doesn't wait on trace I/O), (3) restore the default
+    disposition for the signal, and (4) re-raise the signal via
+    ``os.kill`` so the process dies with the conventional signal-class
+    exit code (128 + signum) rather than via ``sys.exit``."""
     import signal as real_signal
+    from unittest.mock import call
 
     from src.pipeline import optimize as opt_mod
 
+    parent = MagicMock()
     with (
-        patch.object(opt_mod, "_unlock_clocks_safe") as mock_unlock,
+        patch.object(opt_mod, "_unlock_clocks_safe", parent.unlock) as mock_unlock,
+        patch.object(opt_mod, "_close_ctx_safe", parent.close) as mock_close,
         patch.object(opt_mod.signal, "signal") as mock_sig,
         patch.object(opt_mod.os, "kill") as mock_kill,
         patch.object(opt_mod.os, "getpid", return_value=12345),
@@ -1462,10 +1467,123 @@ def test_signal_unlock_handler_unlocks_then_propagates():
         opt_mod._signal_unlock_handler(real_signal.SIGTERM, None)
 
     mock_unlock.assert_called_once()
+    mock_close.assert_called_once()
+    # Order matters: unlock first, ctx-close second.
+    assert parent.mock_calls == [call.unlock(), call.close()]
     # Default disposition must be restored for the specific signal.
     mock_sig.assert_called_once_with(real_signal.SIGTERM, real_signal.SIG_DFL)
     # Re-raise via os.kill against this pid.
     mock_kill.assert_called_once_with(12345, real_signal.SIGTERM)
+
+
+# ── _close_ctx_safe (signal-handler ctx flush) ────────────────────────
+
+
+def test_close_ctx_safe_idempotent():
+    """Registering a ctx then calling ``_close_ctx_safe`` twice must
+    invoke ``ctx.close()`` exactly once — the helper clears the slot
+    after the first call so the second call short-circuits via the
+    ``ctx is None`` guard."""
+    from src.pipeline import optimize as opt_mod
+
+    fake_ctx = MagicMock()
+    saved = opt_mod._clock_lock_state.get("ctx")
+    opt_mod._clock_lock_state["ctx"] = fake_ctx
+    try:
+        opt_mod._close_ctx_safe()
+        opt_mod._close_ctx_safe()
+    finally:
+        opt_mod._clock_lock_state["ctx"] = saved
+
+    fake_ctx.close.assert_called_once()
+
+
+def test_close_ctx_safe_swallows_exceptions(caplog):
+    """If ``ctx.close()`` raises (e.g. trace processor write fails on
+    shutdown), the helper must swallow the exception and log at error
+    level — the cleanup path can't propagate or it'd mask the original
+    exit cause."""
+    import logging
+
+    from src.pipeline import optimize as opt_mod
+
+    fake_ctx = MagicMock()
+    fake_ctx.close.side_effect = RuntimeError("trace flush boom")
+    saved = opt_mod._clock_lock_state.get("ctx")
+    opt_mod._clock_lock_state["ctx"] = fake_ctx
+    try:
+        with caplog.at_level(logging.ERROR, logger=opt_mod.logger.name):
+            opt_mod._close_ctx_safe()  # must not raise
+    finally:
+        opt_mod._clock_lock_state["ctx"] = saved
+
+    fake_ctx.close.assert_called_once()
+    assert any(
+        "trace flush boom" in rec.getMessage() and rec.levelno == logging.ERROR
+        for rec in caplog.records
+    )
+
+
+def test_close_ctx_safe_noop_when_no_ctx():
+    """No registered ctx (slot is ``None``) → helper returns without
+    touching anything. Covers the pre-``RunContext.create`` window where
+    a stray signal could otherwise NPE on ``None.close()``."""
+    from src.pipeline import optimize as opt_mod
+
+    saved = opt_mod._clock_lock_state.get("ctx")
+    opt_mod._clock_lock_state["ctx"] = None
+    try:
+        opt_mod._close_ctx_safe()  # must not raise
+    finally:
+        opt_mod._clock_lock_state["ctx"] = saved
+
+
+# ── _finalize_run_safe (finally-block cleanup) ────────────────────────
+
+
+def test_finalize_run_safe_unlock_then_close():
+    """``_finalize_run_safe`` must unlock clocks BEFORE closing the ctx.
+    Unlock is the load-bearing step for shared-GPU hosts (persistence
+    mode keeps clocks pinned across process exit); ctx.close() flushes
+    events.jsonl + SDK traces."""
+    from unittest.mock import call
+
+    from src.pipeline import optimize as opt_mod
+
+    parent = MagicMock()
+    parent.attach_mock(MagicMock(), "unlock")
+    parent.attach_mock(MagicMock(), "close")
+    fake_ctx = MagicMock()
+    fake_ctx.close = parent.close
+    with patch.object(opt_mod, "_unlock_clocks_safe", parent.unlock):
+        opt_mod._finalize_run_safe(fake_ctx)
+
+    parent.unlock.assert_called_once()
+    parent.close.assert_called_once()
+    assert parent.mock_calls == [call.unlock(), call.close()]
+
+
+def test_finalize_run_safe_swallows_ctx_close_exception(caplog):
+    """``ctx.close()`` raising in the finalize path must not propagate —
+    the finally block is the bottom-of-stack cleanup and can't mask the
+    original run-exit cause."""
+    import logging
+
+    from src.pipeline import optimize as opt_mod
+
+    fake_ctx = MagicMock()
+    fake_ctx.close.side_effect = RuntimeError("trace flush boom")
+    with (
+        patch.object(opt_mod, "_unlock_clocks_safe"),
+        caplog.at_level(logging.ERROR, logger=opt_mod.logger.name),
+    ):
+        opt_mod._finalize_run_safe(fake_ctx)  # must not raise
+
+    fake_ctx.close.assert_called_once()
+    assert any(
+        "trace flush boom" in rec.getMessage() and rec.levelno == logging.ERROR
+        for rec in caplog.records
+    )
 
 
 # ── ACTS-first clock preset resolution ────────────────────────────────

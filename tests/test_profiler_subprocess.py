@@ -1848,3 +1848,86 @@ def test_extract_ncu_csv_propagates_tmpdir_env(tmp_path, monkeypatch):
         "Must match _run_ncu's TMPDIR exactly so capture and import see the "
         "same user-scoped tempdir."
     )
+
+
+# ── NCU process-group isolation (start_new_session) ───────────────────────
+#
+# Both NCU subprocess invocations must launch in a new session so that a
+# SIGKILL of the parent ACTS process does not propagate to NCU mid-profile.
+# GPU 0 runs in persistence mode; an orphaned NCU killed mid-write leaves
+# CUDA context + clock-lock state stranded for tens of seconds. Pin the
+# kwarg here so a future refactor of either call site doesn't silently
+# drop the isolation.
+
+
+def test_run_ncu_uses_new_session(
+    monkeypatch, sample_kernel, sample_workload
+):
+    """``_run_ncu`` must pass ``start_new_session=True`` to ``subprocess.run``
+    so NCU runs in its own session — see module-docstring rationale."""
+    import subprocess
+    from src.eval import profiler as profiler_mod
+
+    profiler_mod._reset_ncu_permission_cache()
+    monkeypatch.delenv(profiler_mod._NCU_DISABLE_ENV, raising=False)
+    force_ncu_discovery(monkeypatch, fallback_present=True)
+
+    captured: dict[str, object] = {}
+
+    def fake_run(argv, **kwargs):
+        captured["start_new_session"] = kwargs.get(
+            "start_new_session", "<MISSING>"
+        )
+        return subprocess.CompletedProcess(
+            args=argv, returncode=0, stdout="", stderr=""
+        )
+
+    monkeypatch.setattr(profiler_mod.subprocess, "run", fake_run)
+
+    _run_ncu(
+        sample_kernel,
+        sample_workload,
+        _identity_input_generator,
+        timeout_s=10.0,
+        mode="curated",
+    )
+
+    assert captured.get("start_new_session") is True, (
+        "_run_ncu must pass start_new_session=True so NCU is isolated from "
+        "the parent's signal group. A SIGKILL'd parent with persistence-mode "
+        "GPU 0 leaves an orphan NCU stranding CUDA context + clock-lock state."
+    )
+
+
+def test_extract_ncu_csv_uses_new_session(tmp_path, monkeypatch):
+    """``_extract_ncu_csv`` must pass ``start_new_session=True``. Same
+    rationale as ``_run_ncu``: the import call also holds GPU state briefly
+    via NCU's CUDA-aware decode path on some driver versions, and we want
+    both legs of the profile to share isolation semantics."""
+    import subprocess
+    from src.eval import profiler as profiler_mod
+    from src.eval.profiler import _extract_ncu_csv
+
+    force_ncu_discovery(monkeypatch, fallback_present=True)
+
+    captured: dict[str, object] = {}
+
+    def fake_run(argv, **kwargs):
+        captured["start_new_session"] = kwargs.get(
+            "start_new_session", "<MISSING>"
+        )
+        return subprocess.CompletedProcess(
+            args=argv, returncode=0, stdout="", stderr=""
+        )
+
+    monkeypatch.setattr(profiler_mod.subprocess, "run", fake_run)
+
+    rep_path = tmp_path / "report.ncu-rep"
+    rep_path.write_text("ncu-rep-marker")
+
+    _extract_ncu_csv(rep_path)
+
+    assert captured.get("start_new_session") is True, (
+        "_extract_ncu_csv must pass start_new_session=True so the import "
+        "subprocess shares isolation semantics with the capture call."
+    )
