@@ -162,6 +162,30 @@ For clearest first-pass signal:
 3. Remaining L1 picks once the Tier-2 venv + clock-lock + NCU pipeline is trusted.
 4. L2 picks only after a clean L1 round — they're slower to debug.
 
+## Capability directions
+
+Directions the framework itself could grow in to raise the ceiling on what
+the agent system is *capable* of achieving — orthogonal to the
+budget-allocation methodology above. Each entry names a gap observed in
+practice and the framework response it argues for.
+
+1. **Global vision over local-knob optimization.** A kernel-level win on
+   one knob — better coalescing, higher SM occupancy, fewer warp stalls
+   — does **not** necessarily translate into an end-to-end kernel
+   performance advance. A change that improves occupancy can spill more
+   registers, evict L2 lines another fused stage depends on, or shift
+   the bottleneck from compute to memory (or vice versa) without
+   improving wallclock. The framework should teach the LLM to reason
+   *globally* about the kernel: how a local change propagates through
+   the rest of the program, which bottleneck it moves the kernel
+   toward/away from, and whether the resulting operating point is
+   actually closer to SOL. Concretely this means the Planner / Reviewer
+   contract should surface bottleneck-shift evidence (not just
+   per-iter metric deltas) and the prompt scaffolding should pose the
+   optimization decision as "where does this move us in the
+   compute-vs-memory plane and is that the right direction," not "is
+   metric X higher than before."
+
 ## Status
 
 Brainstorming in progress. Next step: pick the experiment shape, then write
