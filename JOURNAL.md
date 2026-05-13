@@ -453,6 +453,8 @@ This matches the cost shape of the rest of the pipeline: cheap per-iteration sig
 | NCU CSV parse failure | Unexpected format (new CUDA version, partial output) | Log, fall back to analytical-only. Branch NOT killed. |
 | Analytical computation failure | Missing `flops`/`bytes` (shouldn't happen post-SOLAR) or zero latency | Branch IS killed — classification is required downstream. Matches `BenchmarkResult.is_fully_successful`'s fail-closed contract. |
 
+> *Superseded 2026-05-13 (analytical-missing row).* The "branch IS killed" outcome no longer holds for the missing-flops/bytes case. `profile_kernel(nbytes=0)` now sets `analytical=None` and continues with NCU alone; the orchestrator's `(flops > 0 and nbytes > 0)` gate was removed. Bottleneck classification was already decoupled from analytical at 2026-04-22 ("Bottleneck classify-once"), so the "required downstream" justification no longer applies. Zero-latency still kills the branch via the existing `BenchmarkResult.is_fully_successful` path. See "a+b decoupling — SOLAR counts surfaced, analytical roofline tolerates missing inputs (2026-05-13)" above.
+
 Subprocess timeout default: **30 s per candidate** (covers `--section` replay for reasonable kernel sizes; malformed/hung kernels are killed fast enough not to stall the search). Configurable via `profiler_timeout_s`.
 
 **Cache layout — source-hash keyed, no eviction**. Same pattern as `kernels/compiler.py`'s compile cache:
@@ -735,6 +737,27 @@ Post-task Distillation     — tree → memory entries + KB entries
 - **Metric-set-version drift** — adding a new curated field shouldn't require re-profiling every cached kernel; the data was already on disk.
 
 **Why now and not later**: the change was a five-line loader fix plus one call-site update. Cost in disk is ~5 KB per profile (~0.5 MB per 30-iter run), trivial next to the ~80 KB `.ncu-rep` we already accept. No new on-disk format — `_save_ncu_cache` was already persisting raw, the loader just wasn't reading it back. Pre-2026-05-11 cache entries without a `raw` field load with `raw_metrics={}` for back-compat — same shape as a degraded re-profile would produce.
+
+### a+b decoupling — SOLAR counts surfaced, analytical roofline tolerates missing inputs (2026-05-13)
+
+**Motivating evidence**: `runs/run_20260513T030257_891519Z` ran 3 iterations against an L1 SOL-ExecBench problem. Every L1 `Definition` carries `op_type=None`, so `compute_roofline_inputs` (the shape-formula path) bailed to `(0, 0)`, and the orchestrator's `if iter_flops > 0 and iter_nbytes > 0` gate skipped profiling entirely with a `"skipping profile — no (flops, nbytes) for op_type=…"` warning. The Reviewer never fired, the Planner saw no diagnostic feedback, and the search picked `t1_block_size_tuning` three times in a row, all regressed, all stamped `branch_quality=promising` because the Reviewer was disabled. The final report showed `Bottleneck (run): compute_bound` with empty per-workload data.
+
+**Decision — two-layer decoupling, "a + b"**:
+
+1. **(a) Surface SOLAR's own `total_flops` / `total_fused_bytes`** through `SolarResult` → `RooflineResult`, and let `compute_roofline_inputs(definition, workload, *, roofline=None)` prefer them over shape formulas when both are positive. SOLAR already counts MACs and bytes during its einsum analysis (`perf["workload"]["total_flops"]`, `perf[roofline_model]["memory_bytes"]`); the adapter just wasn't carrying them across the boundary. Every L1 problem SOLAR can analyze now feeds analytical with real counts even when `op_type=None`.
+2. **(b) Make analytical optional**. `ProfilingResult.analytical: AnalyticalMetrics | None` with a new `has_analytical` property; `profile_kernel(nbytes=0)` skips `_compute_analytical` and sets `analytical=None`; NCU still runs. Both orchestrator gates (`iter_flops > 0 and iter_nbytes > 0`) were dropped — the Reviewer is no longer gated on analytical availability. Per-iter call sites pass `roofline=roofline` so (a) takes effect; Phase C re-profile (`report.py::_resolve_workload_roofline`) reordered to derive SOLAR first, then call `compute_roofline_inputs` with `roofline=solar`.
+
+**Why both, not just (a)**: SOLAR can also fail (bridge can't synthesize a `Model`, unresolved axes, optional dep absent). With (a) alone, those cases still kill the iteration. (b) is the catch-all — even when SOLAR fails *and* the shape formula bails, NCU survives and the Reviewer gets occupancy / stall / L2-hit signals. Analytical degrades to "[unavailable — no byte count]" in rendered prose; bottleneck classification stays SOLAR-sourced via `classify_run` (which doesn't read analytical anyway, per the 2026-04-22 entry).
+
+**Renderer / serializer fan-out (Codex-review-driven fixes)**: making `analytical` Optional forced three call sites to grow guards. `reviewer.py::_render_profiling_for_reviewer` and `orchestrator.py::_render_profiling_for_planner` were reading `a.pct_peak_compute` unconditionally (would `AttributeError` on `None`); `tree_dump.py::_build_meta` and `tree.py::_serialize_profiling` / `_deserialize_profiling` called `asdict(node.profiling.analytical)` and rebuilt unconditionally (would `TypeError` on `None`). All four guard on `has_analytical` now. Checkpoints written before today deserialize with `analytical={...}` as before; post-fix checkpoints with `analytical=None` round-trip cleanly.
+
+**Why not "just author shape formulas for L1 op_types"**: the L1 problem family has hundreds of distinct kernels — flux_rope, gelu_tanh, swiglu_quant, attention variants. Hand-coding a flop formula per kernel-type is exactly the work SOLAR exists to automate. (a) reuses that work; the shape-formula table stays as the SOLAR-less fallback for placeholder / custom-problem paths.
+
+**Tradeoff carried forward**: SOLAR-derived counts inherit SOLAR's accuracy contract (exact for MAC-dominated ops, 0 for pure-elementwise — the `0.0` AI case the `SolarResult` docstring documents). When SOLAR returns `total_flops > 0, total_fused_bytes > 0`, the analytical profiler's `%peak_compute` / `%peak_bandwidth` are as physics-accurate as the SOL score itself. When SOLAR returns 0 for either, the shape formula path runs; when both fall through, analytical drops out entirely and the Reviewer leans on NCU.
+
+**Partially resolves PROCESS Backlog item "SOLAR-vs-shape-formula reconciliation (2026-05-10)"**: the reconciliation that backlog item asked for — SOLAR counts winning over shape formulas where both are available — landed via (a). Per-op overrides (zero-copy views, mask-typed bools) remain deferred; that's where SOLAR's counts still beat shape formulas by *more* than the shape formulas can recover, and where Reviewer prose drifts on view-heavy kernels.
+
+**/simplify pass folded in**: added `has_analytical` property mirroring the existing `has_ncu`; cut narrative comments down to load-bearing rationale; dropped defensive `getattr` lookups now that the field is explicitly typed `Optional`.
 
 ---
 
@@ -1292,6 +1315,8 @@ A kernel can shift its effective bottleneck only by changing its data access pat
 5. **`KernelSpec.flop_count` / `memory_bytes` are static; workloads are parametric.** `_definition_to_kernel_spec` (`src/pipeline/optimize.py:677`) deliberately leaves both at 0 — a SOL `Definition` describes a problem family, but `(flops, nbytes)` depend on the concrete `Workload.var_axes` (M/N/K). They can't live on the spec; `compute_roofline_inputs(definition, workload)` is the per-iter, per-workload bridge between the static spec and the dynamic profile call.
 
 **Tradeoff**: shape-based formulas overcount in the cases SOLAR's per-op overrides handle (zero-copy view ops, embedding gathered-rows, bool-typed masks). The Reviewer's analytical %peak signals will be biased downward for kernels heavy in those ops. Acceptable because (a) bottleneck classification is SOLAR-sourced, not analytical-sourced; (b) the Reviewer treats analytical %peak as a hint, not ground truth. Filed in PROCESS Backlog → "SOLAR-vs-shape-formula reconciliation" as a candidate for future discussion if Reviewer prose starts disagreeing with measured behavior on view-heavy / mask-heavy kernels.
+
+> *Partially superseded 2026-05-13.* Reason #1 above — "the SOLAR adapter doesn't expose raw counts" — no longer holds. `SolarResult.total_flops` and `total_fused_bytes` are now surfaced through `RooflineResult` and outrank the shape-formula path inside `compute_roofline_inputs(..., roofline=...)`. The shape-formula table stays as the fallback when SOLAR isn't available *or* its counts are 0 (pure-elementwise / reduction kernels where SOLAR's MAC counter excludes non-MAC ops). Reasons #2–#5 (cost asymmetry, fidelity tiers, static-vs-parametric spec) still motivate keeping shape formulas as that fallback — the change is precedence-only, not removal. See "a+b decoupling — SOLAR counts surfaced, analytical roofline tolerates missing inputs (2026-05-13)" above.
 
 ### Hardware spec validation (2026-04-27)
 
