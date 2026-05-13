@@ -286,6 +286,32 @@ Orchestrator-side handling of `ImplementationError` is wired (option γ, 2026-04
 
 **Tracking note**: the helper's docstring currently references a spec document under `doc/specs/`. Per CLAUDE.md, specs/plans are not committed and get deleted post-merge, so that reference will become dangling. Recording the rationale here in JOURNAL is what makes the docstring's spec reference unnecessary going forward — readers looking for "why this subset" should land here, not on a missing file.
 
+### Cross-attempt memory: thread prior baseline-attempt errors into next `translate()` (2026-05-13)
+
+**Motivating evidence**: `runs/run_20260512T153106_544768Z` ran 3 baseline-generation attempts × 8 turns. All three failed on the same `AttributeError("module 'triton.language' has no attribute 'tanh'")`. Attempt 1 hit it on turn 2 and evolved past it; attempts 2 and 3 re-emitted `tl.tanh` on their *first* turn, because each `Runner.run` starts with an empty SDK message history. Within an attempt the SDK typed-item list feeds tool errors back; across attempts the feedback was zero. Fix: `baseline_generator` accumulates per-attempt tool errors into `AttemptFailure` records and renders them into the next `translate()` user prompt under "## Prior attempt failures" with `### Attempt N` sub-headers.
+
+**Cumulative across attempts, not last-attempt-only**. Attempt 3 sees errors from attempts 1 AND 2 in chronological order. With `max_baseline_retries=3` the section is bounded at ~8 KB even pathologically, and recurring errors are themselves load-bearing signal — same `tl.tanh` in Attempts 1 AND 2 means the model is persistently wrong, not unlucky once. Truncating to the last attempt would destroy that signal.
+
+**Verbatim tool-error strings, not LLM-curated summaries**. The model already saw these strings in-loop on the attempts where they happened; replaying as-is needs no interpretation. Curation would need either heuristic regex extraction (brittle on Triton tracebacks) or another LLM call (cost + new failure surface).
+
+**`AttemptFailure` colocated with `ImplementationError` in `coder.py`** (consumer side), imported by `baseline_generator.py` (producer side). Tiny frozen dataclass — producer crosses the boundary in one direction, consumer already owns the matching `ImplementationError`.
+
+**`_record_failure` helper collapses 4 FAILED-branch sites**. All three tool factories (`_make_compile_tool`, `_make_correctness_tool`, `_make_submit_tool`) had identical `if error_log is not None: error_log.append(msg); return msg` patterns. Helper makes the next factory automatically participate — alternative is a fourth copy-paste and a near-certain miss on the fifth.
+
+**Submit-tool wired through `error_log` (Codex catch)**. Without this, an attempt that fails *only* at submit time (Pydantic reject) has empty `tool_errors` and the prompt-builder emits the "no tool errors recorded — likely a reasoning-content budget issue" placeholder — actively misleading. Threading the shared list through `_make_submit_tool` (~10 lines + 4 tests) fixes the submit-failure path, which is also the shape most likely to recur identically across attempts (reasoning lands where the schema rejects, cold-start retry lands in the same place).
+
+**Trigger-gated tech debt — prompt-size cap deferred**. Codex flagged that pathological Triton tracebacks could push the cumulative section past the context window on tighter-context providers, and `BadRequestError` is not in `RETRIABLE_EXCEPTIONS` so failure is terminal. Tracked in `PROCESS.md` — DeepSeek-reasoner's 128 K is comfortably bounded; first non-DeepSeek provider trip motivates a concrete cap shape better than guessing now.
+
+### Reviewer launch-bound guard + regression-row rewrite (2026-05-13)
+
+**Two coordinated edits to `src/prompts/reviewer/system.md`**, both costing frontier nodes pre-fix: the Reviewer mis-attributed latency to occupancy on launch-bound workloads and stamped `dead_end` on regressions that still had a stated unblock pathway.
+
+**Launch-bound guard — banded interpretation of `pct_peak: bw`.** Three bands: `< 5%` → launch-bound (~3 µs fixed overhead, occupancy not the lever); `[5%, 50%]` → partially amortized (occupancy *may* be a lever but isn't necessarily THE one); `> 70%` → near memory ceiling (fusion / precision / L2-reuse). Mechanical "raise occupancy / shrink block / add parallelism" suggestions based on a low occupancy number alone are forbidden — any occupancy-targeting suggestion must cite a specific stall metric. Matching anti-pattern added.
+
+**Regression-row rewrite — `dead_end` requires absent OR repeated-pathway failure.** Pre-rewrite, any `SOL delta < −0.02` regression mapped to `dead_end`. New rule: regression with a non-empty `conditional_assessment` pathway not yet failed on an ancestor/sibling = `blocked_potential`; regression with no pathway OR pathway already regressed on parent/sibling = `dead_end`.
+
+**Why it matters.** `frontier()` permanently excludes DEAD_END nodes (see "Distinguishing DEAD_END causes via `dead_reason`" above) — mis-stamping a recoverable regression removes a promotable node from search forever. `blocked_potential` already meant "branch isn't over, next action is the unblock"; the rewrite extends that semantic from bottleneck-masking to regression-with-stated-lever. The launch-bound guard is the upstream half — cleaner diagnoses produce cleaner branch-quality verdicts.
+
 ---
 
 ## Action Library
@@ -1353,6 +1379,16 @@ Triton effectively gives us Tiers 1-3.5. CUDA gives all 6 tiers — but the agen
 
 **Deliberately out of scope (v1)**: no Rich/tqdm live terminal UI (plain stdlib + `jq` is enough), no log rotation / disk quota / size caps (one run ≈ a few MB), no remote log shipping (Loki / Datadog), no "resume a run into the same run-dir" (new `main()` always creates a fresh `run_<UTC>/` — resume is a checkpoint concern, not a logger one), no cross-run aggregation index, no per-agent sub-loggers beyond stdlib `getLogger(__name__)`. Revisit triggers: live UX pain during multi-hour batches (→ Rich), disk pressure on long CI (→ rotation), need to compare runs (→ index).
 
+### `ACTS_OPENAI_DEBUG` opt-in for openai/httpx DEBUG logs (2026-05-13)
+
+**Context.** The logger entry above clamps `openai`, `httpx`, and `agents` at WARNING uniformly — their DEBUG output (per-request bodies, full message histories) would bury the per-iter ACTS narrative in `run.log`. Right default until a thinking-model failure (DeepSeek-reasoner returning `finish_reason="length"` mid-tool-call, empty `choices[0]`, malformed reasoning block) has to be diagnosed from `run.log` alone — at which point the silenced lines are exactly the ones needed.
+
+**`_silenced_loggers()` gates on `ACTS_OPENAI_DEBUG`** (`"1"` / `"true"` / `"yes"` truthy). When set, only `agents` stays at WARNING; `openai` and `httpx` inherit root-logger DEBUG, so request/response bodies, `finish_reason`, and raw `choices[0]` land in `<run_dir>/run.log`. `agents` stays silenced — its DEBUG noise is structural SDK trace plumbing already captured in `<run_dir>/traces/*.jsonl`.
+
+**Why env-var, not a cfg flag.** Diagnostic verbosity is a per-invocation knob and shouldn't drift into the persisted `acts.cfg`. Also: cfg is read after `RunContext.create()` (per "CLI → cfg consolidation, 2026-05-11"), so cfg-threaded would be a layer-ordering change for a debug-only path.
+
+**Why default off.** Request bodies — system prompts, tool definitions, full message histories — persist to disk. Verbose (tens of KB per Planner call) and may carry sensitive data (kernel sources, NCU dumps, fixture API tokens). Default-on would silently fatten `run.log` and create a leak surface in shared-checkpoint scenarios.
+
 ### Correctness tolerance — adopt SOL-ExecBench's defaults verbatim (2026-04-26)
 
 **Context**: First successful logger run against `examples/triton/rmsnorm/` exposed that the Coder was producing structurally correct bf16 RMSNorm kernels — compile passing, math right — that all failed correctness with `max_abs ≈ 7.812e-3` on workload 2/3. That value is exactly `2^-7`, the bf16 ULP at unit magnitude. Our `verify_correctness` defaults (`atol=rtol=1e-3`, `required_matched_ratio=1.0` hardcoded in `TorchComparisonPolicy.compare`) sat *below* bf16's quantization noise floor, making the acceptance test mathematically unsatisfiable for the dtype. The Coder kept iterating until the turn budget ran out, producing the misleading symptom `MaxTurnsExceeded`.
@@ -1368,6 +1404,16 @@ Triton effectively gives us Tiers 1-3.5. CUDA gives all 6 tiers — but the agen
 **Drift sentinel**: `tests/test_correctness.py::test_verify_correctness_atol_rtol_defaults_match_sol_execbench` reads `ToleranceSpec()` defaults at runtime and asserts the function signature defaults match. If SOL bumps to e.g. `1.5e-2`, the test fails and forces an update. Test skips gracefully when `sol_execbench` isn't importable (tier-1 venv).
 
 **What's NOT in scope**: dtype-aware tolerance table (e.g., bf16→1e-2, fp16→5e-3, fp32→1e-4) — premature; SOL itself didn't bother and treats one set of defaults as universal. Per-problem `tolerance` overrides — schema-supported by SOL's `Workload.tolerance` field but never exercised in any shipped example, so plumbing it through buys nothing today. Loosening the anti-cheat strict tolerances — those are an independent gate and the previous strict values still match how the stage is documented in PROCESS / doc/eval.
+
+### Workload `tolerance` overrides stage-5 anti-cheat (2026-05-13)
+
+**Amendment to the 2026-04-26 "Correctness tolerance" entry above.** Two of its "NOT in scope" items now flip: per-problem `Workload.tolerance` overrides are wired through, *and* they override stage-5 strict tolerances (not just stages 1–4). `verify_correctness` reads `workload.tolerance` at the top — when present, its `max_atol` / `max_rtol` overwrite `atol` / `rtol` *and* `strict_atol` / `strict_rtol` for the rest of the call.
+
+**Why override even the strict gate.** Stage 5's prior hardcoded `1e-5` / `1e-4` were tighter than SOL's defaults so a kernel couldn't pass on canned seeds and fail elsewhere. Once a workload ships an explicit `ToleranceSpec`, that spec *is* the acceptance contract — rejecting at a stricter bar rejects kernels the benchmark would accept (same failure mode the 2026-04-26 entry fixed for the loose defaults). The anti-cheat semantic ("fresh seeds, no overfit to canned inputs") is preserved by stage 5's seed-1000+ trials; only the tolerance changes.
+
+**Opt-in via workload presence.** Callers passing `workload=None` keep the prior tight `1e-5` / `1e-4` behaviour verbatim. Override fires only when both a `Workload` is supplied AND its `tolerance` attribute is non-None.
+
+**Drift sentinel.** `tests/test_correctness.py` pins three cases: tighter workload tol fails stage 1, looser workload tol passes stage 5 where defaults fail, and `workload=None` preserves defaults. The strict-override case is load-bearing.
 
 ### Planner + Reviewer submit-tool migration (2026-04-26)
 

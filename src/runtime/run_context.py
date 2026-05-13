@@ -4,6 +4,7 @@ FH binding, SDK trace processor wire-up. See ``doc/runtime.md``.
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -17,6 +18,21 @@ logger = logging.getLogger(__name__)
 
 _LOG_FORMAT = "%(asctime)s %(name)s %(levelname)s %(message)s"
 _SILENCED_LOGGERS = ("httpx", "openai", "agents")
+
+
+def _silenced_loggers() -> tuple[str, ...]:
+    """Return the loggers to clamp to WARNING for this run.
+
+    ``ACTS_OPENAI_DEBUG=1`` removes ``openai`` and ``httpx`` from the
+    silenced set so the openai Python SDK's DEBUG-level request/response
+    bodies (including ``finish_reason`` and raw ``choices[0]``) land in
+    ``run_<UTC>/run.log``. Opt-in because every request body — system
+    prompt, tool definitions, full message history — gets persisted to
+    disk, which is verbose and may carry sensitive data.
+    """
+    if os.environ.get("ACTS_OPENAI_DEBUG", "").lower() in ("1", "true", "yes"):
+        return ("agents",)
+    return _SILENCED_LOGGERS
 
 
 @dataclass
@@ -108,7 +124,7 @@ class RunContext:
                 root_logger.setLevel(logging.DEBUG)
             root_logger.addHandler(file_handler)
             root_logger.addHandler(stream_handler)
-            for name in _SILENCED_LOGGERS:
+            for name in _silenced_loggers():
                 logging.getLogger(name).setLevel(logging.WARNING)
         except OSError as exc:
             cls._cleanup_partial_setup(events_fh, file_handler, stream_handler)

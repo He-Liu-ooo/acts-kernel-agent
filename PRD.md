@@ -39,18 +39,19 @@ Best-first tree search with beam constraint.
 
 Plus a deterministic orchestrator (code, not LLM) that manages tree state, beam selection, and move-on criteria.
 
-**LLM SDK**: Agents are built on the OpenAI Agents SDK. The SDK provides the agent runtime (`Agent`, `Runner.run`, `function_tool`) and model-swapping via `OpenAIChatCompletionsModel` — any OpenAI-compatible API works by changing the base URL. All three agents are tool-using: Coder carries compile + correctness + `submit_kernel`; Planner carries `submit_plan`; Reviewer carries `submit_review` plus the optional `query_metric` tool (gated by `ACTSConfig.reviewer_metric_queries`, default off). Submit tools deliver each agent's structured output, retrying in-loop on Pydantic validation failure within a per-agent turn budget (4 by default; 6 for Reviewer when `query_metric` is enabled). Callers still treat each agent as one external call — multi-turn behavior is internal to the agent's tool loop.
+**LLM SDK**: Agents are built on the OpenAI Agents SDK. The SDK provides the agent runtime (`Agent`, `Runner.run`, `function_tool`) and model-swapping via `OpenAIChatCompletionsModel` — any OpenAI-compatible API works by changing the base URL. All three agents are tool-using: Coder carries compile + correctness + `submit_kernel`; Planner carries `submit_plan`; Reviewer carries `submit_review` plus the optional `query_metric` tool (gated by `ACTSConfig.reviewer_metric_queries`, default off). Submit tools deliver each agent's structured output, retrying in-loop on Pydantic validation failure within a per-agent turn budget (4 by default; 6 for Reviewer when `query_metric` is enabled). Callers still treat each agent as one external call — multi-turn behavior is internal to the agent's tool loop. Reasoning-mode toggles and provider extras are plumbed through `ModelConfig` into `make_run_config`'s `ModelSettings` — `reasoning_effort` becomes `Reasoning(effort=...)` and `extra_body` is forwarded verbatim into the chat completions request — so thinking-mode models (DeepSeek v4-pro, OpenAI o-series) and provider-specific request-body extensions (DeepSeek's `{"thinking": {"type": "enabled"}}`) work without an adapter rewrite.
 
-**LLM Backend**: Default model is **DeepSeek V3** for all three agents. Selection rationale:
+**LLM Backend**: Default model is **DeepSeek v4-pro** for all three agents (thinking-mode enabled, `reasoning_effort=high`, 384K max output, 1M context — see `configs/models/deepseek.json`). Selection rationale:
 - Triton/CUDA knowledge is strong and well-represented in pretraining data
 - Reliable JSON mode for Pydantic structured output (critical for agent contracts)
-- ~$0.27/1M input tokens — viable for 100+ planning iterations per kernel optimization
+- Native thinking-mode lets a single model serve all three agent roles — heavier reasoning for Coder rewrites and Reviewer diagnosis, the same model for Planner technique selection
 - Native OpenAI-compatible API — drops directly into `llm_backend.py` with zero adapter code
 - Production-stable API with known reliability characteristics
 
 **Evaluated alternatives**:
-- *DeepSeek R1*: Stronger reasoning but 2x cost and chain-of-thought latency overhead. Overkill for technique selection; may be useful for Coder on complex kernel rewrites. Reserve for per-agent model specialization if V3 proves insufficient.
-- *GLM-5.1 (Zhipu)*: Demonstrated kernel optimization capability (KernelBench L3: 3.6x geometric mean, 14h CUDA optimization reaching 35.7x speedup). SWE-bench Pro #1 (claimed). Open-source, self-hostable via vLLM. However: structured output reliability unverified, no production API pricing yet, new release without independent benchmarks. **Evaluate when API stabilizes** — kernel domain expertise may outperform DeepSeek V3 for the Coder agent.
+- *DeepSeek V3 (non-thinking)*: The prior default. Cheaper per token and lower latency without chain-of-thought, but weaker on the long-context kernel-rewrite path. Kept as a fallback option when budget or latency dominates correctness; switch by pointing `configs/models/deepseek.json` at `deepseek-chat` and clearing `reasoning_effort` / `extra_body`.
+- *DeepSeek R1*: Stronger reasoning than V3 but historically 2x cost and chain-of-thought latency overhead; superseded by v4-pro for the default slot. Still a candidate for per-agent specialization if v4-pro proves insufficient on a specific role.
+- *GLM-5.1 (Zhipu)*: Demonstrated kernel optimization capability (KernelBench L3: 3.6x geometric mean, 14h CUDA optimization reaching 35.7x speedup). SWE-bench Pro #1 (claimed). Open-source, self-hostable via vLLM. However: structured output reliability unverified, no production API pricing yet, new release without independent benchmarks. **Evaluate when API stabilizes** — kernel domain expertise may outperform DeepSeek v4-pro for the Coder agent.
 - *Qwen2.5-Coder*: Good code generation, OpenAI-compatible. No differentiated kernel optimization capability.
 
 **Model specialization** (future): `llm_backend.py` supports per-agent model configs. If evaluation shows benefit, use a stronger/domain-specialized model for Coder (where kernel expertise matters most) and a cheaper model for Planner/Reviewer (where structured output reliability matters most).
@@ -123,7 +124,7 @@ Note: `anti_cheat.py` has three landed surfaces (real, not skeleton). **Correctn
 | 2. Shape sweep | Multiple input sizes (tiny → xlarge) | Coder self-corrects |
 | 3. Numerical stability | NaN/Inf detection, precision check | Coder self-corrects |
 | 4. Determinism | Repeated runs must produce identical outputs | Coder self-corrects |
-| 5. Anti-cheat | Randomized inputs, strict tolerance, no output caching | Coder self-corrects |
+| 5. Anti-cheat | Randomized inputs, strict tolerance, no output caching. When `workload.tolerance` (SOL `ToleranceSpec`) is set, its `max_atol` / `max_rtol` override every stage — including stage 5's `strict_atol` / `strict_rtol` — so anti-cheat matches the workload's per-problem spec rather than the hardcoded strict defaults. | Coder self-corrects |
 
 Any failure → Coder's tool loop retries (up to `max_debug_retries`). If budget exhausted, branch is marked dead. Fast-but-wrong kernels are never benchmarked.
 

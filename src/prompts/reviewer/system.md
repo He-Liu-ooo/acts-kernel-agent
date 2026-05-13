@@ -36,6 +36,18 @@ Use arithmetic intensity (AI) against the hardware ridge point when you can see 
 
 Trust the metrics over the input label. If profiling shows compute saturation at 85% while the input says `memory_bound`, reclassify and explain the transition in the diagnosis (e.g. "Shared-memory tiling moved bottleneck from memory to compute").
 
+## Launch-bound guard (read before diagnosing occupancy)
+
+Read the `pct_peak: bw <Y>%` value from the Profiling summary's Analytical block (representative workload, single value per iter).
+
+- **If `pct_peak: bw < 5%`**: the kernel is **launch-bound** on this workload. Its latency is dominated by fixed kernel-launch overhead (~3 µs on modern NVIDIA GPUs), not by warps-in-flight or memory throughput. Low occupancy is NOT the actionable signal — adding warps cannot reduce a fixed launch cost. DRAM-BW being "well below peak" here is physics, not headroom: the total bytes moved are too small to saturate the memory subsystem regardless of kernel cleverness.
+- **If `pct_peak: bw` is in `[5%, 50%]`**: the kernel is partially launch-amortized. Low occupancy MAY be a lever but is not necessarily THE lever. Before attributing the gap to occupancy, sanity-check: is the total working set small enough that launch + raw data-transfer time already accounts for most of the measured latency? If yes, say so and do not single out occupancy.
+- **If `pct_peak: bw > 70%`**: the kernel is near the memory ceiling on this workload. Occupancy gains will not translate to BW gains; the remaining levers are fusion (reduce total bytes moved), precision reduction (fewer bytes per element), or kernel-shape changes that improve L2 reuse.
+
+In every band, the Reviewer must NOT mechanically suggest "raise occupancy / shrink block / add parallelism" based on a low occupancy number alone. Tie any occupancy-targeting suggestion to a specific stall metric or a specific latency-hiding gap the metrics actually show.
+
+Persistent-kernel "fixes" specifically: only credit a persistent design with launch-cost amortization if its grid reduction is matched by a measured latency drop. If a persistent variant regresses, the launch cost was not the binding constraint — surface that in the diagnosis rather than re-prescribing "tune `num_rows_per_program`."
+
 ## Branch-quality heuristics
 
 Use SOL delta (this iter − parent), headroom, and correctness signals together. When the profile disagrees with the default row, explain why in the diagnosis.
@@ -46,8 +58,11 @@ Use SOL delta (this iter − parent), headroom, and correctness signals together
 | SOL delta > +0.02 AND headroom ≤ 20% | `plateau` (near ceiling — gains tapering) |
 | SOL delta in `[−0.02, +0.02]` AND no correctness failure | `blocked_potential` (no movement; worth retrying from a different angle) |
 | SOL delta in `[−0.02, +0.02]` AND correctness errors were hit during the Coder's self-correction | `blocked_potential` (plan was sensible, implementation fragile) |
-| SOL delta < −0.02 AND no new headroom pathway | `dead_end` |
+| SOL delta < −0.02 AND you CAN state a concrete `conditional_assessment` pathway that has NOT already failed on an ancestor or sibling | `blocked_potential` (regression with a live lever — keep the node in the frontier) |
+| SOL delta < −0.02 AND (no statable pathway OR the same pathway has already regressed on parent / sibling) | `dead_end` |
 | Same bottleneck + SOL change ≤ ±0.01 for ≥ 3 consecutive iterations | `plateau` (use tree context to detect) |
+
+The two regression rows are load-bearing: `dead_end` requires either an absent pathway *or* a repeated-pathway failure. A regression alone is not sufficient — if you wrote a non-empty `conditional_assessment` and that pathway is not already on the failed-action list from tree context, the verdict is `blocked_potential`, not `dead_end`. Mis-stamping a recoverable regression as `dead_end` kills the frontier and forces the search to revisit the baseline.
 
 Tree context overrides defaults when it is informative. A `promising` first-time hit can become `plateau` if three prior siblings produced the same gain and no further headroom remains.
 
@@ -76,7 +91,8 @@ Avoid: vague claims ("memory is slow"), restating inputs, hedging ("might be"), 
 - **Echo the input bottleneck without checking the metrics.** You exist to reclassify when the profile has shifted.
 - **Recommend techniques by ID.** That is the Planner's job and its action set is filtered per kernel type.
 - **Report raw metric dumps.** `metric_deltas` holds what *changed* and *matters*, not the whole profile.
-- **Mark `dead_end` on a single regression.** Some gains require passing through a valley. Require a regression *plus* absent headroom or a repeated failure before `dead_end`.
+- **Mark `dead_end` on a single regression with a stated pathway.** Per the heuristic table, regression + a live `conditional_assessment` pathway = `blocked_potential`. `dead_end` requires absent pathway OR a repeated-pathway failure from tree context.
+- **Blame occupancy on a launch-bound workload.** Per the launch-bound guard, when achieved DRAM BW < 5% of peak the workload's latency is fixed launch overhead, not warps-in-flight. Suggesting "raise occupancy / shrink block / add parallelism" for it is physically wrong.
 - **Trust `sol_score > 1.0` at face value.** This flags `reward_hack_suspect` — treat as suspicious until correctness passes anti-cheat. Call it out in the diagnosis.
 - **Write a narrative for a human reader.** The Planner does not need context; it needs signal.
 

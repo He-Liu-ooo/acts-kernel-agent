@@ -124,6 +124,8 @@ One-shot setup, idempotent only via `close()`:
 4. Call `_wire_trace_capture(target)` to register the SDK trace processor with the resolved `traces_dir` (skipped entirely when `capture_traces=False`).
 5. Return the populated `RunContext`.
 
+Setting `ACTS_OPENAI_DEBUG` to a truthy value (`"1"`, `"true"`, `"yes"`, case-insensitive) drops `openai` and `httpx` from the silenced set so the SDK's DEBUG-level request/response bodies — including `finish_reason`, raw `choices[0]`, and full request/response payloads — land in `<run_dir>/run.log`. Intended as an opt-in escape hatch for diagnosing thinking-model failures; `agents` stays silenced. **Warning**: persisted request bodies and response payloads may include API keys, system prompts, or other sensitive content — do not share `run.log` from a debug-mode run without redaction.
+
 On any `OSError` during setup, `_cleanup_partial_setup(...)` tears down whatever was created, falls back to a null-paths `RunContext` with a stderr-only `basicConfig`, and returns it. The caller sees no exception — a partial disk failure must not kill the run.
 
 ### `close()`
@@ -226,6 +228,69 @@ jq 'select(.metadata.iter == 3 and .metadata.agent == "reviewer")' \
 
 `meta.json.trace_workflow` always equals `"acts_iter"` so the filter
 recipe is documented in the file itself.
+
+### Trace record schema
+
+Each line in `traces/acts_trace_<ts>.jsonl` is one of two events emitted
+by the OpenAI Agents SDK: `span_end` (a unit of work closed) or
+`trace_end` (a top-level trace closed). Spans are written in
+close-order, so children appear in the file **before** their parents.
+
+**`event: "span_end"` envelope** — common to every span line:
+
+| Field | Meaning |
+|---|---|
+| `span_id` | Unique id for this span. |
+| `trace_id` | Trace this span belongs to; spans of one agent invocation share it. |
+| `parent_id` | Span this one nests under, or `null` for the trace root. Forms the tree `agent ⊃ custom "turn" ⊃ generation` / `function`. |
+| `started_at` / `ended_at` | ISO-8601 UTC; subtract for duration. |
+| `span_data` | Polymorphic payload — shape selected by `span_data.type`. |
+| `error` | `null` on success, or `{message, data}` on failure (e.g. agent span carries `{"message": "Max turns exceeded", "data": {"max_turns": 8}}` when the Coder loop hits its cap). |
+
+**`event: "trace_end"` envelope**:
+
+| Field | Meaning |
+|---|---|
+| `trace_id` | Matches the trace's spans. |
+| `name` | SDK default `"Agent workflow"`. |
+| `started_at` / `ended_at` | `null` unless explicitly enabled; span timestamps are authoritative. |
+| `metadata` | Free-form caller tags (the orchestrator sets `{iter, agent}` here per the cross-reference recipe above). |
+
+**`span_data` shapes**, dispatched on `type`:
+
+- `type: "agent"` — the agent loop. Fields: `name` (agent identity,
+  e.g. `"Coder-Translator"`), `handoffs` (other agents reachable), `tools`
+  (list of exposed tool names, e.g.
+  `["compile_kernel_tool", "check_correctness_tool", "submit_kernel"]`),
+  `output_type` (structured-output schema; `"str"` when the agent emits
+  via a tool call rather than a typed return).
+- `type: "generation"` — one LLM round-trip. Fields: `input` (list of
+  `{role, content}` messages sent), `output` (list of assistant
+  messages — each carries `content`, `refusal`, `role`, `annotations`,
+  `audio`, `function_call`, `tool_calls`, `reasoning_content`; reasoning
+  CoT lands in `reasoning_content` separately from `content`), `model`,
+  `model_config` (full request config: sampling knobs, `reasoning.effort`,
+  Anthropic-style `extra_body.thinking`, `base_url`, retry/cache flags),
+  `usage` (`requests`, `input_tokens`, `output_tokens`, `total_tokens`,
+  `input_tokens_details.cached_tokens`,
+  `output_tokens_details.reasoning_tokens`).
+- `type: "function"` — one tool call. Fields: `name` (tool name),
+  `input` (JSON-stringified args), `output` (tool return as string),
+  `mcp_data` (`null` for in-process Python tools; populated when the
+  tool came from an MCP server).
+- `type: "custom"` — project-defined marker emitted by ACTS, not the
+  SDK. Fields: `name` (`"turn"` or `"task"`), `data` (free-form dict
+  using `sdk_span_type` as the discriminator; turn markers carry
+  `turn`, `agent_name`, and a per-turn `usage` aggregate of
+  `input_tokens` / `output_tokens` / `cached_input_tokens`). Used by
+  the orchestrator to roll up token usage per agent call without
+  re-walking every child `generation`.
+
+**Counting turns**: one Agents-SDK turn = one model call + zero-or-more
+tool calls the model requested in that response. A typical Coder turn
+that calls one tool produces three `span_end` lines — the
+`generation`, the `function`, and the enclosing `custom "turn"`. A
+reasoning-only turn produces two (no `function` child).
 
 ### `★ best` convention
 

@@ -101,6 +101,67 @@ Recorded for the brainstorming pass that produces the first experiment spec:
   claim without exploding cost? (SOL-ExecBench subset, balanced across
   memory-bound / compute-bound / mixed?)
 
+## Candidate benchmarks for first experiments
+
+Selected from SOL-ExecBench (`repo/benchmark/SOL-ExecBench/data/benchmark/`)
+for the first budget-allocation sweeps. Selection criteria:
+
+- **Forward-only** — backward-kernel SOLAR support is on PROCESS.md's Active
+  queue, not yet shipped.
+- **BF16 / FP32 only** — dev host is RTX 6000 Ada (Ada Lovelace); no native
+  NVFP4 and limited FP8 tensor cores. Quant tier (33 problems) is skipped.
+- **Max workload ≫ launch overhead** — at least one workload per problem
+  delivers tens to hundreds of GFLOPs / GB so kernel runtime ≫ ~10 µs
+  launch latency. ACTS's per-iter timing signal stays well above noise.
+- **Known optimization headroom** — mixed compute + memory or fusion-rich
+  patterns where the agentic baseline typically sits below SOL (paper §1
+  reports median SOL score 0.732 — plenty of problems with room to grow).
+
+### L1 — single-operation kernels
+
+| Path (under `data/benchmark/`) | Why | Max-workload work | Optimization handles |
+|---|---|---|---|
+| `L1/048_fused_gate_up_projection_with_swiglu` | Gemma3 fused MLP gate+up+SwiGLU. Pure compute-bound, two parallel BF16 matmuls 3072→24576. | bs=4, seq=2048 → ~1.2 TFLOPs MM | Fused gate/up GEMM, SwiGLU epilogue fusion, tiling, TF32/BF16 trade. |
+| `L1/067_flash_attention_gqa_ultralong` | Nemotron-8B-UltraLong, seq up to 16384. Naive attention falls off a cliff — flash is the canonical win. Largest expected SOL gap. | bs=1, seq=16384, hidden=4096, 32Q/8KV | Flash tiling, online softmax, causal short-circuit, KV repeat fusion. |
+| `L1/092_gqa_attention_with_qk_norm` | GLM-4.5-Air GQA with extreme 96Q/8KV (12× repeat) + QK RMSNorm + RoPE. Multi-knob attention block. | bs=32, seq=256, hidden=4096 → ~30+ GFLOPs MM | QK-norm placement, GQA broadcast fusion, fused QKV GEMM. |
+| `L1/074_fused_gated_mlp_silu` | Parakeet gated MLP at moderate scale (1024→4096). Same SwiGLU pattern as #1, ~10× smaller. | bs=16, seq=512 → ~140 GFLOPs | Same as #1; cross-scale comparison. |
+| `L1/075_grouped_query_self_attention_with_rope` | Parakeet GQA self-attn, 16Q/4KV, hidden=1024. Smaller control attention workload. | bs=16, seq=512, hidden=1024 → ~25+ GFLOPs | Flash vs naive SDPA, RoPE precomp, output proj fusion. |
+
+### L2 — multi-operation fused kernels
+
+| Path (under `data/benchmark/`) | Why | Optimization handles |
+|---|---|---|
+| `L2/002_decoder_layer_full_block` | LLaMA-3 full decoder layer (RMSNorm + GQA + SwiGLU MLP + residuals). The canonical transformer step. | Every LLM-serving optimization that matters lives here: layer fusion, residual-in-norm, GEMM tiling, attention variants. |
+| `L2/019_decoder_layer_fused_attention_mlp` | Qwen2VL decoder with multimodal 3D RoPE + 28Q/4KV GQA. Like above + extra fusion surface. | 3D RoPE fusion, GQA broadcast, SwiGLU epilogue. |
+| `L2/062_decoder_complete_layer` | Canary-Qwen-2.5B with self-attn + **cross-attn** + MLP in one layer. Cross-attention is a fusion surface L1 doesn't expose. | KV-cache reuse, cross-attn K/V projection fusion, dual-RMSNorm placement. |
+| `L2/070_basic_transformer_block` | SDXL Refiner UNet BasicTransformerBlock: self-attn + cross-attn + GEGLU. Diffusion workload pattern (spatial 2D) — different shape regime. | Cross-attn text conditioning, GEGLU vs SwiGLU activation, spatial-vs-sequence axis trade-offs. |
+| `L2/082_moe_layer_complete_forward_with_residual` | Complete MoE layer (sparse routing + per-expert MLP + weighted combine). Distinct optimization domain from dense decoders. | Expert dispatch (batched vs scattered), routing softmax fusion, expert-parallel layout. |
+
+### Caveats
+
+- **Triton-only Coder.** MoE sparse dispatch (L2 #5) and `cu_seqlens` patterns
+  are genuinely hard to express in Triton — expect more iter-0 baseline-gen
+  failures. Fallback substitute for L2 #5 if instability dominates:
+  `L2/059_decoder_layer_full_block` (another dense decoder, different model).
+- **Per-problem SOL headroom is only visible after the iter-0 baseline.**
+  Triage rule: anything with baseline SOL ≤ 0.5 (read from `report.txt`)
+  has clear ACTS room. Use a single cheap pass per candidate to filter.
+- **L2 is 3–10× heavier than L1** (paper §Table 2 caption). Wallclock-budget
+  the L2 sweeps accordingly.
+- **Per-workload variance.** Each spec carries ~16 dynamically-shaped
+  workloads; the representative workload (first in `workload.jsonl`) is
+  usually small-batch and may understate the win on bigger shapes. Phase C
+  re-profiles the winner against every workload — read the per-workload
+  speedup table to confirm the optimization generalized.
+
+### Suggested order to try
+
+For clearest first-pass signal:
+1. `L1/048_fused_gate_up_projection_with_swiglu` — textbook SwiGLU+tiling win.
+2. `L1/067_flash_attention_gqa_ultralong` — dramatic flash-attention before/after.
+3. Remaining L1 picks once the Tier-2 venv + clock-lock + NCU pipeline is trusted.
+4. L2 picks only after a clean L1 round — they're slower to debug.
+
 ## Status
 
 Brainstorming in progress. Next step: pick the experiment shape, then write
