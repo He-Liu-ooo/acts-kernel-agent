@@ -421,7 +421,21 @@ def verify_correctness(
     ``normalize_outputs``. When ``kernel`` is None or ``kernel.dps`` is
     False, the gate calls ``candidate_fn(*inputs)`` and treats the return
     value as the output (legacy / non-DPS path).
+
+    When *workload* carries a ``tolerance`` (SOL-ExecBench's
+    ``ToleranceSpec``), its ``max_atol`` / ``max_rtol`` override **every**
+    stage's tolerance — stages 1–4 *and* the anti-cheat stage 5. Anti-cheat
+    therefore relaxes from the hardcoded ``strict_atol`` / ``strict_rtol``
+    to the workload's per-problem spec. This is the deliberate "match the
+    workload exactly" policy; callers that want the prior tighter
+    anti-cheat behaviour pass ``workload=None`` (the override is opt-in via
+    workload presence).
     """
+    if workload is not None and getattr(workload, "tolerance", None) is not None:
+        atol = workload.tolerance.max_atol
+        rtol = workload.tolerance.max_rtol
+        strict_atol = workload.tolerance.max_atol
+        strict_rtol = workload.tolerance.max_rtol
     policy = policy or TorchComparisonPolicy()
     norm = build_normalize_context(definition)
     candidate_fn = maybe_wrap_dps_candidate(

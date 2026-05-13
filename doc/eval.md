@@ -39,11 +39,13 @@ Run by the orchestrator. Never part of the Coder's tool loop — prevents the LL
 
 | Stage | What | Seeds | Tolerance | On failure |
 |-------|------|-------|-----------|------------|
-| 1. Smoke test | Single input, output matches oracle | 42 | `atol/rtol` (default `1e-2`, mirrors SOL-ExecBench) | Coder self-corrects |
-| 2. Shape sweep | N trials with varying seeds | `0..n_sweep_trials-1` (default 5) | `atol/rtol` | Coder self-corrects |
-| 3. Numerical stability | Match oracle **and** output finite (no NaN/Inf) | 7 | `atol/rtol` | Coder self-corrects |
-| 4. Determinism | Match oracle **and** two runs on identical input are bitwise-equal | 11 | `atol/rtol` | Coder self-corrects |
-| 5. Anti-cheat | Randomized inputs under strict tolerance | `1000..1000+n_anti_cheat_trials-1` (default 3) | `strict_atol=1e-5`, `strict_rtol=1e-4` | Coder self-corrects |
+| 1. Smoke test | Single input, output matches oracle | 42 | `atol/rtol` (default `1e-2`, mirrors SOL-ExecBench) † | Coder self-corrects |
+| 2. Shape sweep | N trials with varying seeds | `0..n_sweep_trials-1` (default 5) | `atol/rtol` † | Coder self-corrects |
+| 3. Numerical stability | Match oracle **and** output finite (no NaN/Inf) | 7 | `atol/rtol` † | Coder self-corrects |
+| 4. Determinism | Match oracle **and** two runs on identical input are bitwise-equal | 11 | `atol/rtol` † | Coder self-corrects |
+| 5. Anti-cheat | Randomized inputs under strict tolerance | `1000..1000+n_anti_cheat_trials-1` (default 3) | `strict_atol=1e-5`, `strict_rtol=1e-4` † | Coder self-corrects |
+
+† When `workload.tolerance` is non-None (SOL-ExecBench's `ToleranceSpec`), its `max_atol` / `max_rtol` override **every** stage's tolerance — stages 1–4 *and* the stage 5 strict thresholds — so the gate matches the per-problem spec verbatim. Pass `workload=None` to keep the hardcoded defaults.
 
 Stages short-circuit on first failure — a failing `CorrectnessResult` carries `failed_stage: CorrectnessStage` and `error_message`. Any failure triggers the Coder's self-correction loop (up to `max_debug_retries`); budget exhaustion marks the branch dead.
 
@@ -78,11 +80,13 @@ The three SOL-aware kwargs drive the multi-output / DPS flow:
 - `definition` — when provided, both candidate and reference outputs flow through SOL's `normalize_outputs` so multi-output (tuple / dict) returns get compared name-by-name under per-name dtypes from `definition.outputs`. When `None`, the gate falls back to comparing raw outputs directly (preserves back-compat with non-SOL benchmarks and the scalar-policy unit tests that drive the gate without a `Definition`).
 - `kernel` + `workload` — required when the candidate's host wrapper is destination-passing-style (`kernel.dps=True`). The gate then allocates output buffers per call via `allocate_dps_outputs(definition, workload, device=...)` (which delegates to `sol_execbench.core.bench.io.allocate_outputs`) and invokes `candidate_fn(*inputs, *outputs)`; the filled buffers serve as the candidate's outputs for the per-stage comparison. The reference oracle is always return-by-value — it's the PyTorch `run()` from `definition.json` and is never DPS — so the comparison sides line up via `normalize_outputs`. When `kernel` is `None` or `kernel.dps` is `False`, the gate calls `candidate_fn(*inputs)` and treats the return value as the output (legacy / non-DPS path).
 
+`workload` also carries the per-problem tolerance: when `workload.tolerance` is non-None, its `max_atol` / `max_rtol` override the `atol` / `rtol` kwargs **and** the `strict_atol` / `strict_rtol` kwargs for stage 5. The override is opt-in via workload presence — callers that want the prior tighter anti-cheat behaviour pass `workload=None` and keep the hardcoded defaults.
+
 ### `anti_cheat.py`
 
 Real implementation. Coordinates three layers of reward-hack defense:
 
-**1. Correctness-level — Stage 5 of `verify_correctness`.** Randomized inputs at seeds `1000..1000+n_anti_cheat_trials-1` evaluated under strict tolerance (`strict_atol=1e-5`, `strict_rtol=1e-4`). Catches kernels that pass on canned seeds but diverge on random inputs.
+**1. Correctness-level — Stage 5 of `verify_correctness`.** Randomized inputs at seeds `1000..1000+n_anti_cheat_trials-1` evaluated under strict tolerance — the `strict_atol=1e-5` / `strict_rtol=1e-4` defaults apply when `workload.tolerance` is None; otherwise the workload's `max_atol` / `max_rtol` override them (same override that drives stages 1–4 — see the footnote on the 5-stage table). Catches kernels that pass on canned seeds but diverge on random inputs.
 
 **2. Performance-level — scorer flags.** `compute_sol_score` sets `reward_hack_suspect` when `T_k < T_SOL` (candidate beats hardware speed-of-light) and `calibration_warning` when `T_b <= T_SOL` (baseline already at limit). The orchestrator's `_reward_hack_re_eval` re-runs the candidate under SOL strict tolerance when `score.reward_hack_suspect` fires and emits `reward_hack_confirmed` (then `_kill_branch(reason=DeadReason.REWARD_HACK_CONFIRMED)`) or `reward_hack_cleared`.
 

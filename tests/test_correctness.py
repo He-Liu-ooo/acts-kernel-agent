@@ -269,6 +269,74 @@ def test_verify_correctness_atol_rtol_defaults_match_sol_execbench():
     assert sig.parameters["rtol"].default == sol_defaults.max_rtol
 
 
+# ── Workload tolerance override ────────────────────────────────────────────
+
+
+class _FakeTol:
+    def __init__(self, max_atol: float, max_rtol: float) -> None:
+        self.max_atol = max_atol
+        self.max_rtol = max_rtol
+
+
+class _FakeWorkload:
+    """Duck-typed Workload — verify_correctness only reads
+    ``workload.tolerance.max_atol`` and ``workload.tolerance.max_rtol`` for
+    the override logic. Real ``sol_execbench.Workload`` is heavier
+    (pydantic, axes, inputs, uuid); not needed for this unit test."""
+
+    def __init__(self, max_atol: float, max_rtol: float) -> None:
+        self.tolerance = _FakeTol(max_atol, max_rtol)
+
+
+def test_workload_tolerance_overrides_loose_default_to_tight():
+    """A candidate that passes both the loose (1e-2) and strict (1e-5)
+    defaults fails when the workload's tolerance is 1e-3 — the workload's
+    value wins. Absolute-error 5e-3 satisfies ScalarPolicy at every default
+    threshold (smallest loose seed-0 ≈ 3e-2; smallest strict seed-1000
+    ≈ 0.2) but exceeds the workload's 1e-3 atol at stage 1."""
+    def slightly_off(x: float) -> float:
+        return x * 2.0 + 5e-3
+
+    r_default = verify_correctness(slightly_off, _ref, _gen, policy=ScalarPolicy())
+    assert r_default.passed is True
+
+    r_tight = verify_correctness(
+        slightly_off, _ref, _gen, policy=ScalarPolicy(),
+        workload=_FakeWorkload(max_atol=1e-3, max_rtol=0.0),
+    )
+    assert r_tight.passed is False
+    assert r_tight.failed_stage is CorrectnessStage.SMOKE_TEST
+
+
+def test_workload_tolerance_overrides_strict_anti_cheat_to_loose():
+    """A candidate with 0.1% relative error passes the loose defaults at
+    stages 1–4 (rtol*|ref| dominates) but fails the strict anti-cheat
+    threshold at stage 5 (rtol drops 100×). With a workload at
+    atol=rtol=1e-2 the override loosens anti-cheat too and the candidate
+    passes — confirming the override applies to stage 5, not just 1–4."""
+    def slightly_off(x: float) -> float:
+        return x * 2.0 * 1.001   # 0.1% relative error
+
+    r_default = verify_correctness(slightly_off, _ref, _gen, policy=ScalarPolicy())
+    assert r_default.passed is False
+    assert r_default.failed_stage is CorrectnessStage.ANTI_CHEAT
+
+    r_loose = verify_correctness(
+        slightly_off, _ref, _gen, policy=ScalarPolicy(),
+        workload=_FakeWorkload(max_atol=1e-2, max_rtol=1e-2),
+    )
+    assert r_loose.passed is True
+
+
+def test_workload_tolerance_override_is_opt_in():
+    """When no workload is passed, the existing defaults still apply."""
+    def good(x: float) -> float:
+        return x * 2.0
+
+    r = verify_correctness(good, _ref, _gen, policy=ScalarPolicy())
+    assert r.passed is True
+
+
 # ── Multi-output normalization (SOL ``normalize_outputs`` integration) ───
 
 
