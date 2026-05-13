@@ -312,6 +312,39 @@ Orchestrator-side handling of `ImplementationError` is wired (option γ, 2026-04
 
 **Why it matters.** `frontier()` permanently excludes DEAD_END nodes (see "Distinguishing DEAD_END causes via `dead_reason`" above) — mis-stamping a recoverable regression removes a promotable node from search forever. `blocked_potential` already meant "branch isn't over, next action is the unblock"; the rewrite extends that semantic from bottleneck-masking to regression-with-stated-lever. The launch-bound guard is the upstream half — cleaner diagnoses produce cleaner branch-quality verdicts.
 
+### Sibling-aware Planner/Reviewer contracts + regression-polarity rules (2026-05-13)
+
+**Motivating evidence**: postmortem of `runs/run_20260513T090733_257562Z` (3 iters, plateau-out). Iter 2 spawned from node 1 (parent SOL 0.5051), picked `t1_block_size_tuning` with BLOCK_N=32, regressed to 0.4339 (Δ −0.071). Iter 3 spawned from the *same parent* node 1 and re-picked `t1_block_size_tuning` with a nearly identical rationale — because the iter-3 Planner saw `tree.render_path(parent.id)` (root→parent only) and `parent.last_review`, and had **no view of node 2's existence**. The iter-2 Reviewer compounded the bias: `conditional_assessment` read "the block-size tuning action space is still wide open — only one configuration has been tried" — a promote-the-class phrasing emitted *after* a regression, pulling the next Planner straight back into the failed action.
+
+**Two contract drifts being closed**:
+
+1. **Planner amnesia on siblings.** The Planner's user prompt had no sibling channel. Closed by adding `SearchTree.render_siblings(parent_id, exclude_id=None)` and threading the result through `PlannerAgent.build_user_prompt` as a new `## Siblings already tried from this parent` section (inserted between `## Search tree context` and `## Reviewer feedback`). Reviewer gets the same section (between `## Search tree context` and `## Knowledge base context`) with `exclude_id=child.id` so it doesn't see itself. Omit-when-empty pattern matches the existing `tree_context` / `reviewer_feedback` gating.
+
+2. **Reviewer suggestion-polarity bias on regression.** A new "Regression-polarity rules" subsection in `prompts/reviewer/system.md` (after "Suggestion rules", before "Anti-patterns") encodes the **Moderate polarity rule**: on a regression iter, the Reviewer MAY prescribe a parameter fix for the same `action_applied` ID **only if** `bottleneck_diagnosis` cites a specific metric movement and ties it to the parameter changed (e.g. "BLOCK_N=32 drove L1 hit rate 62% → 0%, so a larger BLOCK_N restores reuse"). Without the metric chain, the Reviewer must stay diagnostic — no "tune this action's space further" / "wide open" / "only one configuration tried" language. The matching Planner rule: do NOT re-pick a sibling's regressed action unless the Reviewer's current diagnosis grounds a param change in a metric delta.
+
+**Why Moderate, not Strict or Light**:
+
+- **Strict** (never re-propose a failed action, ever) was rejected as too rigid — it rules out legitimate "tried BLOCK_N=32, the L1-hit-rate metric chain says try BLOCK_N=16" moves. The action class isn't the unit of failure; the (action, params) tuple is, and only when the metric story doesn't ground a different params choice.
+- **Light** (only ban specific phrases) was rejected as insufficient — the Reviewer would learn to paraphrase. The rule needs to attach to *evidence* (metric → param tie), not vocabulary.
+- **Moderate** ties the escape hatch to grounded reasoning: the Reviewer can re-propose the action class iff it shows its work.
+
+**Why one-line per sibling, not the full Reviewer summary**:
+
+Each sibling line is `<action_applied> {<params>}: SOL <score> (Δ <delta vs parent>), <reviewer outcome>, <branch_quality>` — ~80–120 chars. At beam_width=10 the section is ~1.2 KB; comfortably inside DeepSeek-reasoner's 128K window. Rendering each sibling's full Reviewer summary (multi-paragraph `bottleneck_diagnosis` + suggestions list) would inflate this 20–40× without adding decision-relevant signal — the Planner's question is "what action class regressed and by how much," not "what was the Reviewer's full prose on each sibling." Token economy wins; the orchestrator already has the full Reviewer feedback in the trace if a postmortem needs it. Sentinels (`"SOL n/a"`, `"(no review yet)"`, `"(unscored)"`) render still-scoring siblings rather than skipping them, so the Planner sees in-flight siblings too.
+
+**Why prompt-only on both agent sides (no schema changes)**:
+
+`PlannerOutput` and `ReviewerFeedbackOutput` stay as-is. Adding sibling-visibility fields to the schemas would change the SDK strict-schema surface (which already trips on `dict[str, X]` per the option-α migrations in this file) and propagate through every consumer of those types. Prompt-only edits ship as new kwargs on `build_user_prompt` / `plan` / `review`, with the section omitted when `sibling_context == ""` — zero blast radius outside the prompt assembly path. The `repeated_pathway_dead_end` event is added to `CORE_EVENT_KINDS` (alongside the new `sibling_context_rendered` event) for telemetry, but neither event is a verdict — `dead_reason` stays the single source of truth.
+
+**Definition of "regressed sibling"**: SOL delta vs parent < −0.02. The −0.02 threshold matches the existing branch-quality cut in `reviewer/system.md` L61–62; using the numeric delta rather than the Reviewer's free-form `outcome` label avoids depending on prose that varies across runs. Siblings without scores (still-running / errored) are not counted as regressed but still render with sentinels.
+
+**Out of scope (deliberately)**:
+
+- **Plateau-rule changes** (`detect_plateau` window/delta or running-best-vs-per-iter basis) — separate concern from this postmortem; the iter-3 regression would have killed the branch correctly under either plateau policy if the Planner had seen its sibling.
+- **`MemoryStore` / `Experience` changes** — within-run sibling memory comes from the live tree, not the cross-run experience store. `MemoryStore` remains a cross-run concern with its own design surface.
+- **`_kill_branch` / `DeadReason` enum changes** — `repeated_pathway_dead_end` is an *event* (jq-able from `events.jsonl`), not a new dead reason. The kill path stays `REVIEWER_JUDGED` when the Reviewer's verdict is `dead_end`, including for sibling-grounded kills.
+- **Lint events for Planner-picked-failed-sibling-action or Reviewer-suggestion-polarity-violations** — deferred until we observe the prompt rules failing. The risk acknowledgement: the Moderate polarity rule depends on LLM compliance. If postmortems show the model writing metric chains that don't actually tie metric to param, the escalation path is a post-hoc lint event, not tightening the prompt further.
+
 ---
 
 ## Action Library
