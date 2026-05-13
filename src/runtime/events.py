@@ -59,6 +59,18 @@ CORE_EVENT_KINDS: frozenset[str] = frozenset({
     "reward_hack_confirmed",
     "reward_hack_cleared",
     "calibration_warning",
+    # Sibling-aware Planner/Reviewer contracts (see
+    # doc/specs/2026-05-13-sibling-aware-agent-contracts-design.md).
+    # ``sibling_context_rendered`` fires once per Planner call AND once
+    # per Reviewer call whenever the parent has been expanded before
+    # (sibling_context != ""). Payload: ``parent_node_id``,
+    # ``sibling_count``, ``regressed_actions``, ``consumer``
+    # (``"planner"`` | ``"reviewer"``).
+    "sibling_context_rendered",
+    # Fires when Reviewer verdict is dead_end AND child.action_applied
+    # already regressed on a sibling — the existing system.md L61-62 rule
+    # has now actually fired. Payload: ``action``, ``sibling_iter``.
+    "repeated_pathway_dead_end",
 })
 
 # ``iter_end.outcome`` values. Kept as string constants (not an enum) so

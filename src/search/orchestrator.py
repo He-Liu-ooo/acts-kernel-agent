@@ -256,6 +256,35 @@ def detect_plateau(
     return max(recent) - min(recent) <= delta + 1e-9
 
 
+def _render_and_emit_sibling_context(
+    tree: "SearchTree",
+    parent: "TreeNode",
+    *,
+    iter_no: int,
+    consumer: str,
+    exclude_id: int | None = None,
+) -> tuple[str, list[tuple[str, int]]]:
+    """Render the sibling section and emit ``sibling_context_rendered``.
+
+    Returns ``(sibling_context, regressed)``. ``regressed`` is returned
+    so the Reviewer-side caller can reuse it for the
+    ``repeated_pathway_dead_end`` check without a second tree walk.
+    """
+    sibling_context = tree.render_siblings(parent.id, exclude_id=exclude_id)
+    regressed = tree.regressed_sibling_actions(parent.id, exclude_id=exclude_id)
+    if sibling_context:
+        sibling_count = len(parent.children_ids) - (1 if exclude_id is not None else 0)
+        emit(
+            "sibling_context_rendered",
+            iter=iter_no,
+            parent_node_id=str(parent.id),
+            sibling_count=sibling_count,
+            regressed_actions=[a for a, _ in regressed],
+            consumer=consumer,
+        )
+    return sibling_context, regressed
+
+
 class Orchestrator:
     """Deterministic orchestrator managing the tree search loop.
 
@@ -641,6 +670,12 @@ class Orchestrator:
             # let the next select_next pick a different parent. Mirrors the
             # Coder skip-iter pattern below — a single agent hiccup cannot
             # kill a multi-iteration run.
+            # Sibling context closes the prior contract drift where Planner
+            # was blind to prior children of the same parent. See
+            # doc/specs/2026-05-13-sibling-aware-agent-contracts-design.md.
+            sibling_context, _ = _render_and_emit_sibling_context(
+                tree, parent, iter_no=iter_no, consumer="planner",
+            )
             try:
                 with _iter_trace(iter_no, "planner"):
                     plan = await self._planner.plan(
@@ -651,6 +686,7 @@ class Orchestrator:
                         tree_context=tree.render_path(parent.id),
                         reviewer_feedback=_render_review_for_planner(parent.last_review),
                         bottleneck=run_bottleneck,
+                        sibling_context=sibling_context,
                     )
             except PlanningError as exc:
                 logger.warning(
@@ -718,7 +754,13 @@ class Orchestrator:
                 triton_kernel_name=coder_output.triton_kernel_name,
                 dps=getattr(coder_output, "dps", False),
             )
-            child = tree.add_child(parent.id, child_kernel, plan.technique, iter_no=iter_no)
+            child = tree.add_child(
+                parent.id,
+                child_kernel,
+                plan.technique,
+                iter_no=iter_no,
+                action_params=dict(plan.params) if plan.params else None,
+            )
             # Successful child generation clears the parent's counter so
             # one transient blip earlier in the run doesn't permanently
             # quarantine an otherwise-productive node.
@@ -1013,6 +1055,10 @@ class Orchestrator:
                 child.branch_quality = BranchQuality.PROMISING
             else:
                 prev_sol = parent.score.sol_score if parent.score is not None else None
+                reviewer_sibling_context, regressed = _render_and_emit_sibling_context(
+                    tree, parent, iter_no=iter_no,
+                    consumer="reviewer", exclude_id=child.id,
+                )
                 with _iter_trace(iter_no, "reviewer"):
                     feedback = await self._reviewer.review(
                         kernel_source=new_source,
@@ -1026,6 +1072,7 @@ class Orchestrator:
                         roofline=roofline,
                         reviewer_metric_queries=self._config.reviewer_metric_queries,
                         iter_idx=iter_no,
+                        sibling_context=reviewer_sibling_context,
                     )
                 if feedback.degraded:
                     logger.warning(
@@ -1035,6 +1082,20 @@ class Orchestrator:
                     )
                 if feedback.branch_quality == BranchQuality.DEAD_END:
                     child.mark_dead(DeadReason.REVIEWER_JUDGED)
+                    # Leading-indicator event: the existing system.md rule
+                    # "regression + same pathway on sibling = dead_end"
+                    # actually fired with sibling evidence. Lets postmortems
+                    # count successful sibling-driven prunes without
+                    # re-walking the tree.
+                    for action, sibling_iter in regressed:
+                        if action == child.action_applied:
+                            emit(
+                                "repeated_pathway_dead_end",
+                                iter=iter_no,
+                                action=action,
+                                sibling_iter=sibling_iter,
+                            )
+                            break
                 else:
                     child.branch_quality = feedback.branch_quality
                 child.last_review = feedback

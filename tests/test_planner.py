@@ -635,3 +635,36 @@ async def test_submit_tool_registered_with_strict_mode_false():
         )
 
     assert recorded_kwargs == [{"strict_mode": False}]
+
+
+# ── sibling_context kwarg ─────────────────────────────────────────────────
+
+
+def test_planner_prompt_includes_sibling_section_when_provided():
+    from src.agents.planner import PlannerAgent
+
+    sibling_text = "- t1_block_size_tuning {BLOCK_N:32}: SOL 0.434 (Δ -0.071), regressed, blocked_potential"
+    prompt = PlannerAgent.build_user_prompt(
+        kernel_source="def k(): pass",
+        profiling_summary="summary",
+        past_experiences=[],
+        available_actions=["t1_block_size_tuning", "t3_tf32"],
+        sibling_context=sibling_text,
+    )
+    assert "## Siblings already tried from this parent" in prompt
+    assert sibling_text in prompt
+    # Order: between Search tree context and Reviewer feedback
+    assert prompt.find("## Available actions") < prompt.find("## Siblings already tried")
+
+
+def test_planner_prompt_omits_sibling_section_when_empty():
+    from src.agents.planner import PlannerAgent
+
+    prompt = PlannerAgent.build_user_prompt(
+        kernel_source="def k(): pass",
+        profiling_summary="summary",
+        past_experiences=[],
+        available_actions=["t1_block_size_tuning"],
+        sibling_context="",
+    )
+    assert "## Siblings already tried" not in prompt

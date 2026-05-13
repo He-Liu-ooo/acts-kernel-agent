@@ -450,6 +450,7 @@ class ReviewerAgent:
         profiling: "ProfilingResult | None" = None,
         roofline: "RooflineResult | None" = None,
         reviewer_metric_queries: bool = False,
+        sibling_context: str = "",
     ) -> str:
         """Assemble the user prompt from runtime data.
 
@@ -479,6 +480,11 @@ class ReviewerAgent:
 
         if tree_context:
             sections.append("## Search tree context\n" + tree_context)
+
+        if sibling_context:
+            sections.append(
+                "## Siblings already tried from this parent\n" + sibling_context
+            )
 
         if kb_context:
             sections.append("## Knowledge base context\n" + kb_context)
@@ -514,6 +520,7 @@ class ReviewerAgent:
         roofline: "RooflineResult | None" = None,
         reviewer_metric_queries: bool = False,
         iter_idx: int = 0,
+        sibling_context: str = "",
     ) -> ReviewerFeedback:
         """Interpret eval results into structured Reviewer feedback.
 
@@ -558,6 +565,7 @@ class ReviewerAgent:
             profiling=profiling,
             roofline=roofline,
             reviewer_metric_queries=reviewer_metric_queries,
+            sibling_context=sibling_context,
         )
 
         captured: dict = {}

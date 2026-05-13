@@ -183,6 +183,7 @@ class PlannerAgent:
         tree_context: str = "",
         reviewer_feedback: str | None = None,
         bottleneck: BottleneckType | None = None,
+        sibling_context: str = "",
     ) -> str:
         """Assemble the user prompt from runtime data.
 
@@ -220,6 +221,11 @@ class PlannerAgent:
         if tree_context:
             sections.append("## Search tree context\n" + tree_context)
 
+        if sibling_context:
+            sections.append(
+                "## Siblings already tried from this parent\n" + sibling_context
+            )
+
         if reviewer_feedback:
             sections.append("## Reviewer feedback\n" + reviewer_feedback)
 
@@ -236,6 +242,7 @@ class PlannerAgent:
         tree_context: str = "",
         reviewer_feedback: str | None = None,
         bottleneck: BottleneckType | None = None,
+        sibling_context: str = "",
     ) -> OptimizationPlan:
         """Generate a structured optimization plan for the next iteration.
 
@@ -258,6 +265,7 @@ class PlannerAgent:
             tree_context=tree_context,
             reviewer_feedback=reviewer_feedback,
             bottleneck=bottleneck,
+            sibling_context=sibling_context,
         )
 
         captured: dict = {}

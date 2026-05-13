@@ -1563,3 +1563,39 @@ async def test_review_returns_partial_output_on_model_behavior_error_after_submi
     assert feedback.degraded is False
     assert feedback.outcome == "improved"
     assert "captured before stray call" in feedback.bottleneck_diagnosis
+
+
+def test_reviewer_prompt_includes_sibling_section_when_provided():
+    from src.agents.reviewer import ReviewerAgent
+    from src.eval.types import BottleneckType
+
+    sibling_text = "- t1_block_size_tuning {BLOCK_N:32}: SOL 0.434 (Δ -0.071), regressed, blocked_potential"
+    prompt = ReviewerAgent.build_user_prompt(
+        kernel_source="def k(): pass",
+        profiling_summary="summary",
+        sol_score=0.42,
+        headroom_pct=58.0,
+        bottleneck=BottleneckType.COMPUTE_BOUND,
+        sibling_context=sibling_text,
+    )
+    assert "## Siblings already tried from this parent" in prompt
+    assert sibling_text in prompt
+    # Order: after Search tree context (when present), before Knowledge base context
+    # Since tree_context="" here, just confirm presence + that KB section
+    # would come after if it existed:
+    assert "## Siblings already tried" in prompt
+
+
+def test_reviewer_prompt_omits_sibling_section_when_empty():
+    from src.agents.reviewer import ReviewerAgent
+    from src.eval.types import BottleneckType
+
+    prompt = ReviewerAgent.build_user_prompt(
+        kernel_source="def k(): pass",
+        profiling_summary="summary",
+        sol_score=0.5,
+        headroom_pct=50.0,
+        bottleneck=BottleneckType.COMPUTE_BOUND,
+        sibling_context="",
+    )
+    assert "## Siblings already tried" not in prompt

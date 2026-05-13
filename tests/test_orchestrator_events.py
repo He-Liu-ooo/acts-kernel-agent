@@ -685,3 +685,324 @@ async def test_dump_node_called_on_baseline_root(tmp_path, harness):
     # Root carries the default sentinel iter_no=-1 — same value
     # ``finalize_tree``'s index entry uses for the baseline.
     assert meta["iter_no"] == -1
+
+
+# ── sibling-aware contracts (2026-05-13) ────────────────────────────────
+
+
+def test_regressed_sibling_actions_returns_only_regressed():
+    """``regressed_sibling_actions`` filters siblings by Δ-SOL > 0.02 vs parent."""
+    from dataclasses import dataclass
+    from src.agents.reviewer import BranchQuality
+    from src.kernels.kernel import Kernel, KernelSpec, KernelType
+    from src.search.tree import SearchTree
+
+    @dataclass
+    class _StubScore:
+        sol_score: float
+
+    spec = KernelSpec(name="t", kernel_type=KernelType.ELEMENTWISE,
+                      flop_count=0, memory_bytes=0, input_shapes=[],
+                      pytorch_reference="", t_sol_us=1.0)
+    tree = SearchTree()
+    root = tree.add_root(Kernel(spec=spec, source_code=""))
+    root.score = _StubScore(sol_score=0.5)
+
+    # Regressed by 0.07 (>= threshold)
+    c1 = tree.add_child(root.id, Kernel(spec=spec, source_code=""),
+                        action_applied="t1_block_size_tuning", iter_no=1)
+    c1.score = _StubScore(sol_score=0.43)
+    c1.branch_quality = BranchQuality.BLOCKED_POTENTIAL
+
+    # Marginal (-0.01, below threshold)
+    c2 = tree.add_child(root.id, Kernel(spec=spec, source_code=""),
+                        action_applied="t3_tf32", iter_no=2)
+    c2.score = _StubScore(sol_score=0.49)
+
+    # No score yet (still scoring)
+    tree.add_child(root.id, Kernel(spec=spec, source_code=""),
+                   action_applied="t2_prefetching", iter_no=3)
+
+    out = tree.regressed_sibling_actions(root.id)
+    assert out == [("t1_block_size_tuning", 1)]
+
+
+def test_regressed_sibling_actions_respects_exclude_id():
+    from dataclasses import dataclass
+    from src.kernels.kernel import Kernel, KernelSpec, KernelType
+    from src.search.tree import SearchTree
+
+    @dataclass
+    class _StubScore:
+        sol_score: float
+
+    spec = KernelSpec(name="t", kernel_type=KernelType.ELEMENTWISE,
+                      flop_count=0, memory_bytes=0, input_shapes=[],
+                      pytorch_reference="", t_sol_us=1.0)
+    tree = SearchTree()
+    root = tree.add_root(Kernel(spec=spec, source_code=""))
+    root.score = _StubScore(sol_score=0.5)
+    c1 = tree.add_child(root.id, Kernel(spec=spec, source_code=""),
+                        action_applied="t1_block_size_tuning", iter_no=1)
+    c1.score = _StubScore(sol_score=0.43)
+    c2 = tree.add_child(root.id, Kernel(spec=spec, source_code=""),
+                        action_applied="t3_loop_unroll", iter_no=2)
+    c2.score = _StubScore(sol_score=0.40)
+
+    out = tree.regressed_sibling_actions(root.id, exclude_id=c1.id)
+    assert out == [("t3_loop_unroll", 2)]
+
+
+def test_regressed_sibling_actions_excludes_neutral_boundary_sibling():
+    """A sibling at exactly Δ = -0.02 from parent is in the neutral band
+    ([-0.02, +0.02]) per reviewer/system.md branch-quality table, so the
+    helper must NOT flag it as regressed. Strict inequality is load-bearing."""
+    from dataclasses import dataclass
+    from src.kernels.kernel import Kernel, KernelSpec, KernelType
+    from src.search.tree import SearchTree
+
+    @dataclass
+    class _StubScore:
+        sol_score: float
+
+    spec = KernelSpec(name="t", kernel_type=KernelType.ELEMENTWISE,
+                      flop_count=0, memory_bytes=0, input_shapes=[],
+                      pytorch_reference="", t_sol_us=1.0)
+    tree = SearchTree()
+    root = tree.add_root(Kernel(spec=spec, source_code=""))
+    root.score = _StubScore(sol_score=0.50)
+    boundary = tree.add_child(root.id, Kernel(spec=spec, source_code=""),
+                              action_applied="t1_block_size_tuning", iter_no=1)
+    boundary.score = _StubScore(sol_score=0.48)  # Δ = -0.02, neutral
+    just_past = tree.add_child(root.id, Kernel(spec=spec, source_code=""),
+                               action_applied="t3_loop_unroll", iter_no=2)
+    just_past.score = _StubScore(sol_score=0.479)  # Δ = -0.021, regressed
+
+    out = tree.regressed_sibling_actions(root.id)
+    assert out == [("t3_loop_unroll", 2)]
+
+
+def test_regressed_sibling_actions_empty_when_parent_unscored():
+    from src.kernels.kernel import Kernel, KernelSpec, KernelType
+    from src.search.tree import SearchTree
+
+    spec = KernelSpec(name="t", kernel_type=KernelType.ELEMENTWISE,
+                      flop_count=0, memory_bytes=0, input_shapes=[],
+                      pytorch_reference="", t_sol_us=1.0)
+    tree = SearchTree()
+    root = tree.add_root(Kernel(spec=spec, source_code=""))
+    # parent has no score → helper returns []
+    tree.add_child(root.id, Kernel(spec=spec, source_code=""),
+                   action_applied="t1_block_size_tuning", iter_no=1)
+    assert tree.regressed_sibling_actions(root.id) == []
+
+
+@pytest.mark.asyncio
+async def test_sibling_context_rendered_fires_for_planner_and_reviewer(
+    tmp_path, harness,
+):
+    """A 2-iter run where iter 2 reuses iter 1's parent emits
+    ``sibling_context_rendered`` once for the planner call and once for
+    the reviewer call in iter 2 — and NEVER in iter 1 (no sibling exists)."""
+    from src.search import beam as _beam
+
+    # max_depth=2 so a second iteration runs. Force select_next to always
+    # return root so both iters spawn siblings off the same parent.
+    harness.config = ACTSConfig(
+        hardware=_rtx6000_ada(),
+        max_depth=2,
+        beam_width=3,
+        sol_plateau_window=99,
+    )
+
+    # Make iter 1's child regress against root so it qualifies as a
+    # "regressed sibling" for the iter-2 emit. baseline 100us, iter-1
+    # child 400us, iter-2 child 400us; t_sol=50us. SOL drops to ~0.143,
+    # comfortably below root's 0.5 by more than the 0.02 threshold.
+    bench_seq = [
+        BenchmarkResult(median_latency_us=100.0, timed_runs=1),  # baseline
+        BenchmarkResult(median_latency_us=400.0, timed_runs=1),  # iter 1 child
+        BenchmarkResult(median_latency_us=400.0, timed_runs=1),  # iter 2 child
+    ]
+
+    fh = (tmp_path / "events.jsonl").open("w", buffering=1)
+    events.bind(fh)
+    try:
+        with (
+            patch("src.eval.benchmark.benchmark_kernel", side_effect=bench_seq),
+            patch("src.eval.profiler.profile_kernel",
+                  MagicMock(return_value=_make_profile())),
+            patch.object(_beam, "select_next",
+                         side_effect=lambda tree, eps: tree.get_node(0)),
+        ):
+            from src.search.orchestrator import Orchestrator
+            orch = Orchestrator(
+                harness.config, harness.planner, harness.coder,
+                harness.reviewer, harness.retriever,
+            )
+            await orch.run(
+                harness.baseline, workloads=None, roofline=harness.roofline,
+            )
+    finally:
+        events.unbind()
+        fh.close()
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "events.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    sibling_events = [r for r in records if r["kind"] == "sibling_context_rendered"]
+
+    # Exactly two emits: planner side and reviewer side, both in iter 2.
+    assert len(sibling_events) == 2, [r for r in sibling_events]
+    consumers = sorted(r["consumer"] for r in sibling_events)
+    assert consumers == ["planner", "reviewer"]
+    for ev in sibling_events:
+        assert ev["iter"] == 2
+        assert ev["parent_node_id"] == "0"
+        assert "tiling" in ev["regressed_actions"]
+
+    # Planner-side fires BEFORE the iter-2 planner_selected event.
+    planner_ev = next(r for r in sibling_events if r["consumer"] == "planner")
+    planner_selected_iter2 = next(
+        r for r in records
+        if r["kind"] == "planner_selected" and r["iter"] == 2
+    )
+    assert records.index(planner_ev) < records.index(planner_selected_iter2)
+
+
+@pytest.mark.asyncio
+async def test_repeated_pathway_dead_end_fires_when_reviewer_judges_dead(
+    tmp_path, harness,
+):
+    """When the iter-2 child's action matches a regressed sibling and the
+    Reviewer verdict is DEAD_END, ``repeated_pathway_dead_end`` fires."""
+    from src.search import beam as _beam
+
+    harness.config = ACTSConfig(
+        hardware=_rtx6000_ada(),
+        max_depth=2,
+        beam_width=3,
+        sol_plateau_window=99,
+    )
+    # Iter 2 reviewer judges DEAD_END.
+    review_seq = [
+        ReviewerFeedback(
+            outcome="regressed",
+            bottleneck_classification="memory_bound",
+            branch_quality=BranchQuality.BLOCKED_POTENTIAL,
+        ),
+        ReviewerFeedback(
+            outcome="regressed",
+            bottleneck_classification="memory_bound",
+            branch_quality=BranchQuality.DEAD_END,
+        ),
+    ]
+    harness.reviewer.review = AsyncMock(side_effect=review_seq)
+
+    bench_seq = [
+        BenchmarkResult(median_latency_us=100.0, timed_runs=1),
+        BenchmarkResult(median_latency_us=400.0, timed_runs=1),
+        BenchmarkResult(median_latency_us=400.0, timed_runs=1),
+    ]
+
+    fh = (tmp_path / "events.jsonl").open("w", buffering=1)
+    events.bind(fh)
+    try:
+        with (
+            patch("src.eval.benchmark.benchmark_kernel", side_effect=bench_seq),
+            patch("src.eval.profiler.profile_kernel",
+                  MagicMock(return_value=_make_profile())),
+            patch.object(_beam, "select_next",
+                         side_effect=lambda tree, eps: tree.get_node(0)),
+        ):
+            from src.search.orchestrator import Orchestrator
+            orch = Orchestrator(
+                harness.config, harness.planner, harness.coder,
+                harness.reviewer, harness.retriever,
+            )
+            await orch.run(
+                harness.baseline, workloads=None, roofline=harness.roofline,
+            )
+    finally:
+        events.unbind()
+        fh.close()
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "events.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    repeated = [r for r in records if r["kind"] == "repeated_pathway_dead_end"]
+    assert len(repeated) == 1
+    assert repeated[0]["iter"] == 2
+    assert repeated[0]["action"] == "tiling"
+    assert repeated[0]["sibling_iter"] == 1
+
+
+@pytest.mark.asyncio
+async def test_repeated_pathway_dead_end_does_not_fire_without_sibling_match(
+    tmp_path, harness,
+):
+    """No ``repeated_pathway_dead_end`` when the iter-2 child's action
+    differs from any regressed sibling (even when verdict == DEAD_END)."""
+    from src.search import beam as _beam
+
+    harness.config = ACTSConfig(
+        hardware=_rtx6000_ada(),
+        max_depth=2,
+        beam_width=3,
+        sol_plateau_window=99,
+    )
+    # Different action per iter — iter 1 = "tiling", iter 2 = "fusion".
+    plan_seq = [
+        OptimizationPlan(tier=3, technique="tiling", params={},
+                         target_region="", rationale="r1"),
+        OptimizationPlan(tier=3, technique="fusion", params={},
+                         target_region="", rationale="r2"),
+    ]
+    harness.planner.plan = AsyncMock(side_effect=plan_seq)
+    harness.reviewer.review = AsyncMock(side_effect=[
+        ReviewerFeedback(outcome="regressed",
+                         bottleneck_classification="memory_bound",
+                         branch_quality=BranchQuality.BLOCKED_POTENTIAL),
+        ReviewerFeedback(outcome="regressed",
+                         bottleneck_classification="memory_bound",
+                         branch_quality=BranchQuality.DEAD_END),
+    ])
+    bench_seq = [
+        BenchmarkResult(median_latency_us=100.0, timed_runs=1),
+        BenchmarkResult(median_latency_us=400.0, timed_runs=1),
+        BenchmarkResult(median_latency_us=400.0, timed_runs=1),
+    ]
+
+    fh = (tmp_path / "events.jsonl").open("w", buffering=1)
+    events.bind(fh)
+    try:
+        with (
+            patch("src.eval.benchmark.benchmark_kernel", side_effect=bench_seq),
+            patch("src.eval.profiler.profile_kernel",
+                  MagicMock(return_value=_make_profile())),
+            patch.object(_beam, "select_next",
+                         side_effect=lambda tree, eps: tree.get_node(0)),
+        ):
+            from src.search.orchestrator import Orchestrator
+            orch = Orchestrator(
+                harness.config, harness.planner, harness.coder,
+                harness.reviewer, harness.retriever,
+            )
+            await orch.run(
+                harness.baseline, workloads=None, roofline=harness.roofline,
+            )
+    finally:
+        events.unbind()
+        fh.close()
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "events.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    repeated = [r for r in records if r["kind"] == "repeated_pathway_dead_end"]
+    assert repeated == []
