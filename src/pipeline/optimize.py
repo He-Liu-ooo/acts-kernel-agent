@@ -472,7 +472,9 @@ async def optimize(
     An LLM is used when ``configs/models/<provider>.json`` exists (default
     path ``configs/models/deepseek.json``, overridable via
     ``ACTS_MODEL_CONFIG``); otherwise every agent runs in no-op mode and
-    only the placeholder demo is exercised end-to-end.
+    only the placeholder demo is exercised end-to-end. The API key may
+    live in the JSON or in ``$OPENAI_API_KEY`` (see
+    ``llm_backend.load_model_config``).
     """
     from src.agents.coder import CoderAgent
     from src.agents.planner import PlannerAgent

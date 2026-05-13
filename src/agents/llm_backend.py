@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import random
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,10 +30,12 @@ try:
         Runner,
         RunResult,
     )
+    from openai.types.shared.reasoning import Reasoning
 
     _SDK_AVAILABLE = True
 except ModuleNotFoundError:  # pragma: no cover
     _SDK_AVAILABLE = False
+    Reasoning = None  # type: ignore[assignment,misc]
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +69,36 @@ class ModelConfig:
     base_url: str
     api_key: str
     timeout: int = 300
+    # When set, overrides every per-agent ``make_run_config(temperature=...)``
+    # call. Required for reasoning-style models that reject anything other
+    # than a fixed temperature (Moonshot Kimi-K2: only 1.0; OpenAI o1:
+    # only 1.0; DeepSeek-Reasoner: only 1.0). When None, per-agent values
+    # are used unchanged.
+    force_temperature: float | None = None
+    # When set, overrides ``make_run_config``'s default ``max_tokens=4096``.
+    # Properties of the *model*, not the run — Kimi-K2 supports 256k,
+    # DeepSeek-Reasoner typically caps lower. None keeps the historical
+    # 4096 default for any caller / provider that hasn't opted in.
+    max_tokens: int | None = None
+    # When set, threaded through as ``ModelSettings(reasoning=Reasoning(effort=...))``
+    # so the SDK forwards it as ``reasoning_effort`` to the provider.
+    # Required for thinking-mode models (DeepSeek-v4-pro, OpenAI o-series).
+    # ``"low" | "medium" | "high"`` — provider-defined.
+    reasoning_effort: str | None = None
+    # When set, threaded through as ``ModelSettings(extra_body=...)`` for
+    # provider-specific request-body extensions. DeepSeek-v4-pro uses
+    # ``{"thinking": {"type": "enabled"}}`` to turn on its thinking mode.
+    # Opaque dict — passed verbatim into the chat completions request body.
+    extra_body: dict | None = None
+
+
+# Module-level overrides populated by ``load_model_config`` and consulted
+# by ``make_run_config``. Kept here (not in ACTSConfig) because the
+# constraints are properties of the *model*, not the run.
+_FORCE_TEMPERATURE: float | None = None
+_MAX_TOKENS_OVERRIDE: int | None = None
+_REASONING_EFFORT_OVERRIDE: str | None = None
+_EXTRA_BODY_OVERRIDE: dict | None = None
 
 
 def load_model_config(path: Path) -> ModelConfig:
@@ -74,17 +107,77 @@ def load_model_config(path: Path) -> ModelConfig:
     Expected format::
 
         {
-            "model": "deepseek-chat",
+            "model": "deepseek-v4-pro",
             "url": "https://api.deepseek.com/v1",
-            "api_key": "sk-..."
+            "api_key": "sk-...",                    # optional — see api-key
+            "force_temperature": 1.0,               # optional
+            "max_tokens": 393216,                   # optional
+            "reasoning_effort": "high",             # optional — thinking models
+            "extra_body": {"thinking": {"type": "enabled"}}  # optional
         }
+
+    Keeping ``api_key`` out of the JSON is the recommended path so the
+    config file can be committed without leaking a secret. The loader
+    tries (in order) the JSON literal, ``$OPENAI_API_KEY``, then
+    ``$DEEPSEEK_API_KEY`` — the last matches the env var the DeepSeek
+    SDK examples use. If none supplies a key, ``ValueError`` is raised
+    naming all three sources.
     """
     data = json.loads(path.read_text())
+    api_key = (
+        data.get("api_key")
+        or os.environ.get("OPENAI_API_KEY", "")
+        or os.environ.get("DEEPSEEK_API_KEY", "")
+    )
+    if not api_key:
+        raise ValueError(
+            f"No API key for model config {path!s}: set 'api_key' in the "
+            "JSON or export $OPENAI_API_KEY / $DEEPSEEK_API_KEY."
+        )
+    force_temp = data.get("force_temperature")
+    max_tokens_override = data.get("max_tokens")
+    reasoning_effort_override = data.get("reasoning_effort")
+    extra_body_override = data.get("extra_body")
+    global _FORCE_TEMPERATURE, _MAX_TOKENS_OVERRIDE
+    global _REASONING_EFFORT_OVERRIDE, _EXTRA_BODY_OVERRIDE
+    _FORCE_TEMPERATURE = float(force_temp) if force_temp is not None else None
+    _MAX_TOKENS_OVERRIDE = int(max_tokens_override) if max_tokens_override is not None else None
+    _REASONING_EFFORT_OVERRIDE = (
+        str(reasoning_effort_override) if reasoning_effort_override is not None else None
+    )
+    _EXTRA_BODY_OVERRIDE = (
+        dict(extra_body_override) if extra_body_override is not None else None
+    )
+    if _FORCE_TEMPERATURE is not None:
+        logger.info(
+            "Model config %s pins temperature=%s for every agent (overrides "
+            "per-agent values).",
+            path, _FORCE_TEMPERATURE,
+        )
+    if _MAX_TOKENS_OVERRIDE is not None:
+        logger.info(
+            "Model config %s sets max_tokens=%s for every agent.",
+            path, _MAX_TOKENS_OVERRIDE,
+        )
+    if _REASONING_EFFORT_OVERRIDE is not None:
+        logger.info(
+            "Model config %s sets reasoning_effort=%s for every agent.",
+            path, _REASONING_EFFORT_OVERRIDE,
+        )
+    if _EXTRA_BODY_OVERRIDE is not None:
+        logger.info(
+            "Model config %s sets extra_body keys=%s for every agent.",
+            path, sorted(_EXTRA_BODY_OVERRIDE.keys()),
+        )
     return ModelConfig(
         model=data["model"],
         base_url=data["url"],
-        api_key=data["api_key"],
+        api_key=api_key,
         timeout=data.get("timeout", 300),
+        force_temperature=_FORCE_TEMPERATURE,
+        max_tokens=_MAX_TOKENS_OVERRIDE,
+        reasoning_effort=_REASONING_EFFORT_OVERRIDE,
+        extra_body=_EXTRA_BODY_OVERRIDE,
     )
 
 
@@ -154,11 +247,34 @@ def make_run_config(
     temperature: float = 0.0,
     max_tokens: int = 4096,
 ) -> RunConfig:
-    """Create a RunConfig with ModelSettings."""
+    """Create a RunConfig with ModelSettings.
+
+    Honors the module-level overrides populated by ``load_model_config``:
+    ``_FORCE_TEMPERATURE`` (reasoning models that reject temp ≠ 1.0:
+    Kimi-K2, o1, DeepSeek-Reasoner / -v4-pro), ``_MAX_TOKENS_OVERRIDE``
+    (long-context models where 4096 truncates legitimate output),
+    ``_REASONING_EFFORT_OVERRIDE`` (thinking-mode toggle for DeepSeek-v4-pro
+    and OpenAI o-series), and ``_EXTRA_BODY_OVERRIDE`` (provider-specific
+    request-body extensions, e.g. DeepSeek's ``{"thinking": {"type":
+    "enabled"}}``).
+    """
+    effective_temperature = (
+        _FORCE_TEMPERATURE if _FORCE_TEMPERATURE is not None else temperature
+    )
+    effective_max_tokens = (
+        _MAX_TOKENS_OVERRIDE if _MAX_TOKENS_OVERRIDE is not None else max_tokens
+    )
+    reasoning_obj = (
+        Reasoning(effort=_REASONING_EFFORT_OVERRIDE)
+        if _REASONING_EFFORT_OVERRIDE is not None and Reasoning is not None
+        else None
+    )
     return RunConfig(
         model_settings=ModelSettings(
-            temperature=temperature,
-            max_tokens=max_tokens,
+            temperature=effective_temperature,
+            max_tokens=effective_max_tokens,
+            reasoning=reasoning_obj,
+            extra_body=_EXTRA_BODY_OVERRIDE,
         ),
     )
 
