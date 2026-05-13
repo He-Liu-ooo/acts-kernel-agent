@@ -90,6 +90,110 @@ def test_dump_node_writes_kernel_and_meta(tmp_path):
         tree_dump.unbind()
 
 
+def test_render_profiling_for_planner_handles_analytical_none():
+    """Per the a+b decoupling (2026-05-13), the Planner's lightweight
+    profile renderer must guard ``profiling.analytical is None`` before
+    reading ``pct_peak_*`` fields. Pre-fix this raised AttributeError
+    inside the orchestrator's iter-1 expansion when the baseline (or any
+    parent) was profiled with nbytes=0 — aborted the whole search before
+    Planner/Reviewer ever ran.
+
+    Codex adversarial review Finding #1 (high)."""
+    from src.eval.profiler import NCUMetrics, ProfilingResult
+    from src.search.orchestrator import _render_profiling_for_planner
+
+    ncu_only = ProfilingResult(
+        analytical=None,
+        ncu=NCUMetrics(
+            sm_occupancy_pct=8.3, l2_hit_rate_pct=42.0,
+            tensor_core_util_pct=0.0,
+            warp_stall_dominant="long_scoreboard",
+            warp_stall_dominant_pct=85.0,
+            warp_stall_runner_up="wait", warp_stall_runner_up_pct=10.0,
+        ),
+        raw_metrics={},
+    )
+    # Must not raise. NCU lines still appear; pct_peak_* lines omitted.
+    rendered = _render_profiling_for_planner(ncu_only)
+    assert "pct_peak_compute" not in rendered
+    assert "pct_peak_bandwidth" not in rendered
+    assert "sm_occupancy=8.3%" in rendered
+    assert "dominant_stall=long_scoreboard" in rendered
+
+
+def test_render_profiling_for_planner_full_path_unchanged():
+    """Regression guard: when analytical IS present, the renderer's
+    output keeps the same shape it always had (pct_peak_compute /
+    pct_peak_bandwidth lead the summary)."""
+    from src.eval.profiler import AnalyticalMetrics, ProfilingResult
+    from src.search.orchestrator import _render_profiling_for_planner
+
+    p = ProfilingResult(
+        analytical=AnalyticalMetrics(
+            achieved_tflops=1.0, achieved_bandwidth_gb_s=100.0,
+            pct_peak_compute=0.1, pct_peak_bandwidth=0.5,
+        ),
+        ncu=None,
+        raw_metrics={},
+    )
+    rendered = _render_profiling_for_planner(p)
+    assert "pct_peak_compute=10.0%" in rendered
+    assert "pct_peak_bandwidth=50.0%" in rendered
+
+
+def test_dump_node_handles_analytical_none(tmp_path):
+    """Per the a+b decoupling (2026-05-13), ``ProfilingResult.analytical``
+    can be ``None`` when the per-iter byte count was 0 (SOLAR + shape
+    formulas both failed). ``_build_meta`` must serialize ``analytical``
+    as JSON-null instead of crashing on ``asdict(None)`` — the surrounding
+    ``dump_node`` only catches ``OSError`` so a TypeError here would
+    abort the run mid-profile. NCU data still rides through.
+
+    Codex adversarial review Finding #2 (high)."""
+    import json
+    from src.agents.reviewer import BranchQuality
+    from src.eval.profiler import NCUMetrics, ProfilingResult
+    from src.eval.scorer import ScoreResult
+    from src.kernels.kernel import Kernel, KernelSpec, KernelType
+    from src.runtime import tree_dump
+    from src.search.tree import TreeNode
+
+    spec = KernelSpec(name="t", kernel_type=KernelType.ELEMENTWISE,
+                      flop_count=0, memory_bytes=0, input_shapes=[],
+                      pytorch_reference="", t_sol_us=1.0)
+    kernel = Kernel(spec=spec, source_code="def kernel_fn(): pass\n")
+    ncu_only = ProfilingResult(
+        analytical=None,
+        ncu=NCUMetrics(
+            sm_occupancy_pct=12.3, l2_hit_rate_pct=45.6,
+            tensor_core_util_pct=0.0,
+            warp_stall_dominant="long_scoreboard",
+            warp_stall_dominant_pct=80.0,
+            warp_stall_runner_up="wait", warp_stall_runner_up_pct=10.0,
+        ),
+        raw_metrics={"foo": 1.0},
+    )
+    node = TreeNode(id=1, kernel=kernel, parent_id=0,
+                    action_applied="x", iter_no=1,
+                    branch_quality=BranchQuality.PROMISING,
+                    score=ScoreResult(sol_score=0.5, baseline_latency_us=100.0,
+                                      candidate_latency_us=100.0, t_sol_us=25.0,
+                                      speedup=1.0, reward_hack_suspect=False,
+                                      calibration_warning=False),
+                    profiling=ncu_only, depth=1)
+
+    tree_dump.bind(tmp_path / "tree")
+    try:
+        tree_dump.dump_node(node, iter_no=1, ncu_rep_src=None)
+        meta = json.loads((tmp_path / "tree" / "node_1" / "meta.json").read_text())
+        assert meta["analytical"] is None
+        # NCU still serialized via ncu.json so the Reviewer keeps its signal.
+        ncu_json = json.loads((tmp_path / "tree" / "node_1" / "ncu.json").read_text())
+        assert ncu_json["foo"] == 1.0
+    finally:
+        tree_dump.unbind()
+
+
 def test_dump_node_skips_ncu_when_degraded(tmp_path):
     from src.runtime import tree_dump
     tree_dump.bind(tmp_path / "tree")

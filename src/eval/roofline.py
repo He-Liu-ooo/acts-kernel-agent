@@ -82,6 +82,10 @@ class RooflineResult:
     source: str = "builtin"  # "solar" or "builtin"
     arithmetic_intensity: float = 0.0  # MACs/byte — see class docstring
     ridge_point: float = 0.0  # MACs/byte — see class docstring
+    # SOLAR-derived absolute counts when ``source == "solar"``; 0 on the
+    # builtin path. Preferred over shape formulas in ``compute_roofline_inputs``.
+    total_flops: int = 0
+    total_fused_bytes: int = 0
 
 
 def derive_t_sol_from_solar(
@@ -123,6 +127,8 @@ def derive_t_sol_from_solar(
         source="solar",
         arithmetic_intensity=solar_result.arithmetic_intensity,
         ridge_point=solar_result.ridge_point,
+        total_flops=solar_result.total_flops,
+        total_fused_bytes=solar_result.total_fused_bytes,
     )
 
 

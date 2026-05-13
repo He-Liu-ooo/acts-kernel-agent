@@ -466,6 +466,164 @@ class TestReportWinnerReprofile:
         assert report.winner_profiling_per_workload == {}
 
 
+class TestReportGateFlipForFlopsZero:
+    """Regression coverage for Codex adversarial review Finding #3 (medium).
+
+    Pre-fix the final report kept the old ``flops <= 0 or nbytes <= 0`` skip
+    gate at the per-workload loop, so fused / ``op_type=None`` L1 problems —
+    the exact case the a+b plumbing was meant to enable — got dropped from
+    the per-workload re-profile pass even when the search loop had usable
+    analytical data from the same SOLAR run. The gate now skips only when
+    ``nbytes <= 0``, and ``_resolve_workload_roofline`` passes the
+    per-workload SOLAR ``RooflineResult`` through to
+    ``compute_roofline_inputs`` so SOLAR's authoritative counts win over
+    the shape-formula fallback."""
+
+    def test_generate_report_reprofiles_workload_with_flops_zero(self, harness):
+        """A workload where ``compute_roofline_inputs`` returns
+        ``(0, nbytes)`` (fused kernel, op_type=None, resolvable shapes)
+        must still get profile_kernel called and its result attached to
+        ``winner_profiling_per_workload``. Pre-fix this workload was
+        skipped entirely."""
+        from sol_execbench.core.data import Definition, Workload
+        from src.eval.scorer import ScoreResult
+        from src.pipeline.report import generate_report
+        from src.search.orchestrator import SearchResult, TerminationReason
+        from src.search.tree import SearchTree
+
+        tree = SearchTree()
+        root = tree.add_root(_make_kernel("root"))
+        root.score = ScoreResult(
+            sol_score=0.3, baseline_latency_us=100.0,
+            candidate_latency_us=100.0, t_sol_us=50.0, speedup=1.0,
+        )
+        child = tree.add_child(root.id, _make_kernel("child"), "tiling")
+        child.score = ScoreResult(
+            sol_score=0.8, baseline_latency_us=100.0,
+            candidate_latency_us=60.0, t_sol_us=50.0, speedup=1.67,
+        )
+        child.profiling = _make_profile()
+        child.per_workload_latency_us = {"wl0": 60.0}
+        search_result = SearchResult(
+            best_node=child, total_iterations=1,
+            termination_reason=TerminationReason.BUDGET, tree=tree,
+        )
+
+        # Definition with op_type omitted (the every-L1 default). Shapes
+        # resolve so _io_bytes computes a positive nbytes; _flops returns 0
+        # because the shape-formula dispatch can't match op_type=None.
+        definition = Definition.model_validate({
+            "name": "fused_unknown",
+            "axes": {"N": {"type": "var"}},
+            "inputs": {"x": {"shape": ["N"], "dtype": "float32"}},
+            "outputs": {"y": {"shape": ["N"], "dtype": "float32"}},
+            "reference": "def run(x): return x\n",
+        })
+        workloads = [Workload.model_validate(
+            {"uuid": "wl0", "axes": {"N": 256}, "inputs": {}}
+        )]
+        gens = [lambda s: ()]
+
+        profile_fake = MagicMock(return_value=_make_profile())
+        # SOLAR-unavailable path: derive_t_sol_from_solar returns None, so
+        # the SOLAR-counts source is empty and we exercise the shape-formula
+        # fallback. ``compute_roofline_inputs`` returns ``(0, 2048)``
+        # under the a+b contract (was ``(0, 0)`` pre-fix).
+        # ``derive_t_sol_from_solar`` is imported lazily inside
+        # ``generate_report`` (after the gate), so patch its source module
+        # rather than the alias in ``report``.
+        with patch(
+            "src.eval.roofline.derive_t_sol_from_solar",
+            return_value=None,
+        ), patch("src.eval.profiler.profile_kernel", profile_fake):
+            report = generate_report(
+                search_result,
+                workloads=workloads,
+                input_generators=gens,
+                hardware_spec=harness.config.hardware,
+                definition=definition,
+            )
+
+        assert profile_fake.call_count == 1, (
+            "report's per-workload re-profile must fire for op_type=None "
+            "kernels with resolvable shapes (post a+b gate flip)"
+        )
+        assert "wl0" in report.winner_profiling_per_workload
+
+    def test_generate_report_reprofiles_workload_with_nbytes_zero(self, harness):
+        """Codex review P2 (post Pass-2): a workload where
+        ``_resolve_workload_roofline`` returns ``(0, 0)`` — SOLAR unavailable
+        AND shape resolution fails — must still flow into ``profile_kernel``
+        so Phase C's NCU-only diagnostic survives. Pre-Codex-P2 the report
+        gated on ``nbytes <= 0`` and silently dropped these workloads, even
+        though the per-iter loop in the orchestrator accepts ``nbytes=0``
+        and produces ``ProfilingResult(analytical=None, ncu=...)``. The two
+        paths now match: no gate; ``profile_kernel`` handles the contract."""
+        from sol_execbench.core.data import Definition, Workload
+        from src.eval.scorer import ScoreResult
+        from src.pipeline.report import generate_report
+        from src.search.orchestrator import SearchResult, TerminationReason
+        from src.search.tree import SearchTree
+
+        tree = SearchTree()
+        root = tree.add_root(_make_kernel("root"))
+        root.score = ScoreResult(
+            sol_score=0.3, baseline_latency_us=100.0,
+            candidate_latency_us=100.0, t_sol_us=50.0, speedup=1.0,
+        )
+        child = tree.add_child(root.id, _make_kernel("child"), "tiling")
+        child.score = ScoreResult(
+            sol_score=0.8, baseline_latency_us=100.0,
+            candidate_latency_us=60.0, t_sol_us=50.0, speedup=1.67,
+        )
+        child.profiling = _make_profile()
+        child.per_workload_latency_us = {"wl0": 60.0}
+        search_result = SearchResult(
+            best_node=child, total_iterations=1,
+            termination_reason=TerminationReason.BUDGET, tree=tree,
+        )
+
+        # Definition whose ``M`` axis is an expr the lightweight resolver
+        # refuses to evaluate → ``_safe_input_shapes`` returns ``None`` →
+        # ``_io_bytes`` returns 0. Combined with SOLAR returning None
+        # (patched below) this gives ``_resolve_workload_roofline`` →
+        # ``(0, 0)``. Pre-fix the report skipped this workload; post-fix
+        # ``profile_kernel`` is still called and NCU runs.
+        definition = Definition.model_validate({
+            "name": "expr_axis_kernel",
+            "axes": {
+                "N": {"type": "var"},
+                "M": {"type": "expr", "expression": "N // 2"},
+            },
+            "inputs": {"x": {"shape": ["M"], "dtype": "float32"}},
+            "outputs": {"y": {"shape": ["M"], "dtype": "float32"}},
+            "reference": "def run(x): return x\n",
+        })
+        workloads = [Workload.model_validate(
+            {"uuid": "wl0", "axes": {"N": 256}, "inputs": {}}
+        )]
+        gens = [lambda s: ()]
+
+        profile_fake = MagicMock(return_value=_make_profile())
+        with patch(
+            "src.eval.roofline.derive_t_sol_from_solar",
+            return_value=None,
+        ), patch("src.eval.profiler.profile_kernel", profile_fake):
+            report = generate_report(
+                search_result,
+                workloads=workloads,
+                input_generators=gens,
+                hardware_spec=harness.config.hardware,
+                definition=definition,
+            )
+
+        assert profile_fake.call_count == 1, (
+            "post-Codex-P2 the report must call profile_kernel even when "
+            "nbytes resolves to 0 — profile_kernel handles it (NCU only)"
+        )
+        assert "wl0" in report.winner_profiling_per_workload
+
+
 class TestReportRenderingIncludesProfiling:
     def test_render_report_emits_analytical_and_ncu_blocks(self):
         """Rendered report should surface the run-level bottleneck,
@@ -988,11 +1146,21 @@ class TestRooflineInputsDerivedPerIteration:
         assert kwargs["nbytes"] == expected_nbytes
 
     @pytest.mark.asyncio
-    async def test_unknown_op_type_skips_profile_without_dead_end(self, harness):
-        """When the helper returns (0, 0) — e.g. an op_type we haven't modelled
-        — the orchestrator must skip the profile_kernel call, leave
-        ``child.profiling = None``, and keep the branch alive (PROMISING).
-        A zero-spec op must not DEAD_END the whole search."""
+    async def test_unknown_op_type_still_profiles_branch_stays_alive(self, harness):
+        """When ``compute_roofline_inputs`` can't derive flops (op_type
+        unknown to the shape-formula table) but CAN still derive nbytes
+        from the workload's tensor shapes, the orchestrator must call
+        ``profile_kernel`` anyway and keep the branch alive. This is the
+        a+b decoupling (2026-05-13): the Reviewer fires on whatever data
+        analytical + NCU produced, and ``flops=0`` is a supported input
+        to ``_compute_analytical`` (compute-side metrics fall through to 0,
+        bandwidth-side metrics are still derived from the real byte count).
+
+        Pre-fix behavior was: gate on ``flops > 0 and nbytes > 0`` so
+        ``profile_kernel`` was silently skipped on every L1 SOL-ExecBench
+        problem (all of them have ``op_type=None``); the Reviewer was
+        never invoked, the Planner had no diagnostic feedback, and the
+        search plateaued without learning."""
         from src.agents.reviewer import BranchQuality
         from sol_execbench.core.data import Definition, Workload
         from src.search.orchestrator import Orchestrator
@@ -1052,14 +1220,19 @@ class TestRooflineInputsDerivedPerIteration:
                 definition=definition,
             )
 
-        assert profile_fake.call_count == 0, (
-            "profile_kernel must be skipped when the helper returns (0, 0)"
+        assert profile_fake.call_count >= 1, (
+            "profile_kernel must be called even when flops=0 — analytical "
+            "handles flops=0 internally (achieved_tflops=0, BW metrics still "
+            "valid from the real byte count) and NCU runs regardless"
         )
         children = [n for n in result.tree._nodes.values() if n.parent_id is not None]
         assert len(children) == 1
-        assert children[0].profiling is None
+        # Profiling is attached (the fake returned _make_profile()), not None.
+        assert children[0].profiling is not None
         # Branch must stay alive — the profile is an enrichment, not a gate.
-        assert children[0].branch_quality is BranchQuality.PROMISING
+        # PROMISING is the orchestrator's default when the Reviewer keeps it
+        # alive; with the fake profile the Reviewer fires normally.
+        assert children[0].branch_quality is not BranchQuality.DEAD_END
 
 
 class TestFailFastOnZeroHardware:

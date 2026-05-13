@@ -278,9 +278,14 @@ class NCUMetrics:
 
 @dataclass(frozen=True)
 class ProfilingResult:
-    """Merged analytical + NCU view of one iteration's kernel."""
+    """Merged analytical + NCU view of one iteration's kernel.
 
-    analytical: AnalyticalMetrics
+    ``analytical`` is ``None`` when no byte count was derivable — the
+    Reviewer fires on whichever of analytical / NCU is present. Renderers
+    must guard via ``has_analytical`` before reading ``achieved_*`` fields.
+    """
+
+    analytical: AnalyticalMetrics | None
     ncu: NCUMetrics | None = None
     raw_metrics: dict[str, float] = field(default_factory=dict)
     degraded_reason: str | None = None
@@ -299,9 +304,13 @@ class ProfilingResult:
     def has_ncu(self) -> bool:
         return self.ncu is not None
 
+    @property
+    def has_analytical(self) -> bool:
+        return self.analytical is not None
+
     @classmethod
     def make_degraded(
-        cls, analytical: "AnalyticalMetrics", reason: str
+        cls, analytical: "AnalyticalMetrics | None", reason: str
     ) -> "ProfilingResult":
         """Construct a degraded ProfilingResult: no NCU data, empty raw
         metrics, with the given reason explaining why. Logs the reason at
@@ -953,14 +962,18 @@ def profile_kernel(
     7. Parse CSV; parser-side failure → degraded, no cache.
     8. Both green → persist NCUMetrics, return full ProfilingResult.
 
-    NCU failures never raise. Analytical failures always raise.
+    NCU failures never raise. ``nbytes == 0`` skips analytical entirely
+    (``analytical=None``); NCU still runs.
     """
-    analytical = _compute_analytical(
-        flops=flops,
-        nbytes=nbytes,
-        latency_s=latency_s,
-        hardware_spec=hardware_spec,
-    )
+    if nbytes > 0:
+        analytical = _compute_analytical(
+            flops=flops,
+            nbytes=nbytes,
+            latency_s=latency_s,
+            hardware_spec=hardware_spec,
+        )
+    else:
+        analytical = None
 
     # Resolve the NCU-target kernel name BEFORE the cache check so it
     # participates in the cache key — otherwise two Kernels with identical

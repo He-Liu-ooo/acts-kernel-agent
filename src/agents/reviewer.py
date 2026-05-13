@@ -174,17 +174,22 @@ def render_profiling_summary(
     if profiling is None:
         return "[no profiling data — profile_kernel did not run]"
 
-    a = profiling.analytical
-    lines = ["### Analytical (roofline)"]
-    if roofline is not None:
-        lines.extend([
-            f"- arithmetic_intensity: {roofline.arithmetic_intensity:.3f} MACs/byte",
-            f"- ridge_point: {roofline.ridge_point:.3f} MACs/byte",
-        ])
-    lines.extend([
-        f"- achieved: {a.achieved_tflops:.2f} TFLOPS / {a.achieved_bandwidth_gb_s:.2f} GB/s",
-        f"- pct_peak: compute {a.pct_peak_compute * 100:.1f}% · bw {a.pct_peak_bandwidth * 100:.1f}%",
-    ])
+    lines: list[str] = []
+    if profiling.has_analytical or roofline is not None:
+        lines.append("### Analytical (roofline)")
+        if roofline is not None:
+            lines.extend([
+                f"- arithmetic_intensity: {roofline.arithmetic_intensity:.3f} MACs/byte",
+                f"- ridge_point: {roofline.ridge_point:.3f} MACs/byte",
+            ])
+        if profiling.has_analytical:
+            a = profiling.analytical
+            lines.extend([
+                f"- achieved: {a.achieved_tflops:.2f} TFLOPS / {a.achieved_bandwidth_gb_s:.2f} GB/s",
+                f"- pct_peak: compute {a.pct_peak_compute * 100:.1f}% · bw {a.pct_peak_bandwidth * 100:.1f}%",
+            ])
+        else:
+            lines.append("- achieved / pct_peak: [unavailable — no byte count]")
 
     ncu = profiling.ncu
     if ncu is not None:

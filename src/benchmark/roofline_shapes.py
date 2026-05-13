@@ -22,6 +22,8 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from sol_execbench.core.data import Definition, Workload
 
+    from src.eval.roofline import RooflineResult
+
 
 # Bytes per element for the dtype strings SOL-ExecBench emits. Keys are
 # lower-cased before lookup so ``torch.float16`` and ``FLOAT16`` both hit.
@@ -53,21 +55,27 @@ _PER_ELEM_FLOPS: dict[str, int] = {
 
 def compute_roofline_inputs(
     definition: Definition, workload: Workload,
+    *,
+    roofline: "RooflineResult | None" = None,
 ) -> tuple[int, int]:
     """Return ``(flops, nbytes)`` for ``definition`` running at ``workload``.
 
-    ``(0, 0)`` means "we don't have a formula here" — callers must treat
-    that as a signal to skip analytical profiling rather than feed zeros
-    into ``_compute_analytical`` (which would raise).
-
-    Used only to feed ``profile_kernel(flops=, nbytes=)`` for analytical
-    arithmetic-intensity / %peak math. Bottleneck classification goes
-    through SOLAR (``derive_t_sol_from_solar``), not these counts.
+    Preference: SOLAR counts on *roofline* when both positive → shape-formula
+    fallback (dispatched on ``definition.op_type``) → nbytes-only when only
+    flops can't be derived (fused / op_type=None kernels with resolvable
+    shapes; ``_compute_analytical`` accepts flops=0). ``(0, 0)`` only when
+    nbytes is unresolvable too — callers then skip analytical and run NCU
+    alone.
     """
+    if roofline is not None and roofline.total_flops > 0 and roofline.total_fused_bytes > 0:
+        return int(roofline.total_flops), int(roofline.total_fused_bytes)
+
     nbytes = _io_bytes(definition, workload)
     flops = _flops(definition, workload)
-    if flops <= 0 or nbytes <= 0:
+    if nbytes <= 0:
         return 0, 0
+    if flops <= 0:
+        return 0, nbytes
     return flops, nbytes
 
 

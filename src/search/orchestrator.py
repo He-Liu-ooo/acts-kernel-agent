@@ -174,15 +174,20 @@ def _render_profiling_for_planner(profiling, roofline=None) -> str:
 
     ``arithmetic_intensity`` is sourced from ``roofline`` (run-level
     invariant in MACs/byte). Omitted when ``roofline`` is None.
+
+    Omits ``pct_peak_*`` when ``profiling.analytical`` is None (nbytes
+    couldn't be derived) — NCU + roofline lines still ride through.
     """
-    a = profiling.analytical
-    lines = [
-        f"pct_peak_compute={a.pct_peak_compute * 100:.1f}%",
-        f"pct_peak_bandwidth={a.pct_peak_bandwidth * 100:.1f}%",
-    ]
+    lines: list[str] = []
+    if profiling.has_analytical:
+        a = profiling.analytical
+        lines.extend([
+            f"pct_peak_compute={a.pct_peak_compute * 100:.1f}%",
+            f"pct_peak_bandwidth={a.pct_peak_bandwidth * 100:.1f}%",
+        ])
     if roofline is not None:
         lines.append(f"arithmetic_intensity={roofline.arithmetic_intensity:.3f}")
-    if profiling.ncu is not None:
+    if profiling.has_ncu:
         n = profiling.ncu
         lines.append(f"sm_occupancy={n.sm_occupancy_pct:.1f}%")
         lines.append(f"l2_hit_rate={n.l2_hit_rate_pct:.1f}%")
@@ -505,8 +510,10 @@ class Orchestrator:
         # the loop instead of recomputing every iteration.
         if definition is not None and workloads:
             from src.benchmark.roofline_shapes import compute_roofline_inputs
+            # roofline= so SOLAR counts outrank shape formulas — shape
+            # formulas bail on every op_type=None problem (every L1 case).
             iter_flops, iter_nbytes = compute_roofline_inputs(
-                definition, workloads[repr_idx]
+                definition, workloads[repr_idx], roofline=roofline,
             )
             # The profiler driver receives the workload as a JSON-serializable
             # dict (mode="json" so SOL's pydantic input variants flatten to
@@ -530,9 +537,10 @@ class Orchestrator:
         baseline_repr_latency_s = _representative_latency_s(
             baseline_bench, workloads, repr_idx
         )
+        # No (flops, nbytes) gate — profile_kernel handles nbytes=0
+        # (analytical=None, NCU still runs). Baseline-pass is best-effort.
         if (
             input_generators and workloads
-            and iter_flops > 0 and iter_nbytes > 0
             and baseline_repr_latency_s is not None
             and math.isfinite(baseline_repr_latency_s)
         ):
@@ -867,46 +875,37 @@ class Orchestrator:
                 epsilon = max(self._config.epsilon_end, epsilon - decay)
                 continue
 
-            if iter_flops > 0 and iter_nbytes > 0:
-                profile_blob_roots = _resolve_blob_roots(
-                    self._config.safetensors_blob_roots,
-                    problem_definition_path,
+            # No gate — profile_kernel accepts flops=0 (pct_peak_compute=0)
+            # and nbytes=0 (analytical=None, NCU still runs).
+            profile_blob_roots = _resolve_blob_roots(
+                self._config.safetensors_blob_roots,
+                problem_definition_path,
+            )
+            try:
+                profiling = profile_kernel(
+                    child_kernel,
+                    repr_workload_axes,
+                    repr_input_generator,
+                    hardware_spec=self._config.hardware,
+                    flops=iter_flops,
+                    nbytes=iter_nbytes,
+                    latency_s=repr_workload_latency_s,
+                    problem_definition_path=problem_definition_path,
+                    blob_roots=profile_blob_roots,
                 )
-                try:
-                    profiling = profile_kernel(
-                        child_kernel,
-                        repr_workload_axes,
-                        repr_input_generator,
-                        hardware_spec=self._config.hardware,
-                        flops=iter_flops,
-                        nbytes=iter_nbytes,
-                        latency_s=repr_workload_latency_s,
-                        problem_definition_path=problem_definition_path,
-                        blob_roots=profile_blob_roots,
-                    )
-                except ProfilerError as e:
-                    logger.warning(
-                        "Iteration %d: profile_kernel failed (%s) — marking branch dead_end",
-                        iter_no,
-                        e,
-                    )
-                    self._kill_branch(
-                        child, parent, iter_no,
-                        reason=DeadReason.PROFILER_ERROR,
-                        detail=str(e)[:120],
-                    )
-                    epsilon = max(self._config.epsilon_end, epsilon - decay)
-                    continue
-            else:
-                # No formula for this op_type. The profile is an enrichment,
-                # not a gate — keep the branch alive and let the retriever
-                # fall back to roofline.bottleneck.
+            except ProfilerError as e:
                 logger.warning(
-                    "Iteration %d: skipping profile — no (flops, nbytes) for "
-                    "op_type=%r (branch stays alive)",
-                    iteration + 1,
-                    definition.op_type if definition is not None else "<no-definition>",
+                    "Iteration %d: profile_kernel failed (%s) — marking branch dead_end",
+                    iter_no,
+                    e,
                 )
+                self._kill_branch(
+                    child, parent, iter_no,
+                    reason=DeadReason.PROFILER_ERROR,
+                    detail=str(e)[:120],
+                )
+                epsilon = max(self._config.epsilon_end, epsilon - decay)
+                continue
             child.profiling = profiling
             if profiling is not None:
                 ncu = profiling.ncu

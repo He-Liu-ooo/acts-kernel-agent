@@ -340,7 +340,12 @@ def _serialize_profiling(profiling):
     if profiling is None:
         return None
     return {
-        "analytical": asdict(profiling.analytical),
+        # analytical=None for nbytes=0 profiles; preserved round-trip.
+        "analytical": (
+            asdict(profiling.analytical)
+            if profiling.has_analytical
+            else None
+        ),
         "ncu": asdict(profiling.ncu) if profiling.ncu is not None else None,
         "raw_metrics": dict(profiling.raw_metrics),
         "degraded_reason": profiling.degraded_reason,
@@ -527,12 +532,19 @@ def _deserialize_profiling(data):
     # keys on legacy checkpoints are silently ignored — those fields live at
     # the run level now (see ``classify_run`` for classification,
     # ``RooflineResult`` for AI / ridge_point).
-    analytical = AnalyticalMetrics(
-        achieved_tflops=a["achieved_tflops"],
-        achieved_bandwidth_gb_s=a["achieved_bandwidth_gb_s"],
-        pct_peak_compute=a["pct_peak_compute"],
-        pct_peak_bandwidth=a["pct_peak_bandwidth"],
-    )
+    #
+    # ``a is None`` on checkpoints written post-2026-05-13 for nodes where
+    # nbytes was 0 at profile time (a+b decoupling: analytical was skipped,
+    # NCU may still be present). Mirror the serializer's None-passthrough.
+    if a is None:
+        analytical = None
+    else:
+        analytical = AnalyticalMetrics(
+            achieved_tflops=a["achieved_tflops"],
+            achieved_bandwidth_gb_s=a["achieved_bandwidth_gb_s"],
+            pct_peak_compute=a["pct_peak_compute"],
+            pct_peak_bandwidth=a["pct_peak_bandwidth"],
+        )
     ncu = None
     if data.get("ncu") is not None:
         n = data["ncu"]

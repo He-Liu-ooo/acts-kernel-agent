@@ -147,6 +147,41 @@ class TestFrontierQuarantine:
         rehydrated = _deserialize_node(legacy)
         assert rehydrated.consecutive_agent_failures == 0
 
+    def test_checkpoint_round_trips_analytical_none(self):
+        """Per the a+b decoupling (2026-05-13), ``ProfilingResult.analytical``
+        can be ``None`` when nbytes was 0 at profile time. The checkpoint
+        path must serialize this as JSON-null and rehydrate it as ``None``
+        — pre-fix ``_serialize_profiling`` did ``asdict(profiling.analytical)``
+        unconditionally and ``_deserialize_profiling`` did
+        ``a["achieved_tflops"]`` unconditionally, so both ends would crash
+        on the new contract.
+
+        Codex adversarial review Finding #2 (high)."""
+        from src.eval.profiler import NCUMetrics, ProfilingResult
+        from src.search.tree import _deserialize_node, _serialize_node
+
+        tree = SearchTree()
+        root = tree.add_root(_make_kernel())
+        root.profiling = ProfilingResult(
+            analytical=None,
+            ncu=NCUMetrics(
+                sm_occupancy_pct=10.0, l2_hit_rate_pct=20.0,
+                tensor_core_util_pct=0.0,
+                warp_stall_dominant="long_scoreboard",
+                warp_stall_dominant_pct=50.0,
+                warp_stall_runner_up="wait", warp_stall_runner_up_pct=25.0,
+            ),
+            raw_metrics={"foo": 1.0},
+        )
+
+        rehydrated = _deserialize_node(_serialize_node(root))
+        assert rehydrated.profiling is not None
+        assert rehydrated.profiling.analytical is None
+        # NCU + raw_metrics still round-trip intact.
+        assert rehydrated.profiling.ncu is not None
+        assert rehydrated.profiling.ncu.sm_occupancy_pct == 10.0
+        assert rehydrated.profiling.raw_metrics == {"foo": 1.0}
+
 
 # ── beam pruning: diversity-aware (B2) ───────────────────────────────────────
 

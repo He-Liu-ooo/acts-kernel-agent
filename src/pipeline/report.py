@@ -48,16 +48,20 @@ def _resolve_workload_roofline(
     definition: Definition | None,
     workload: Workload,
     kernel,
+    roofline=None,
 ) -> tuple[int, int]:
     """Return ``(flops, nbytes)`` for a workload. SOL path derives from
     Definition + Workload via ``compute_roofline_inputs``; placeholder
-    path falls back to the kernel spec's populated counts. Returns
-    ``(0, 0)`` when the op_type has no formula — caller decides how to
-    handle.
+    path falls back to the kernel spec's populated counts.
+
+    *roofline* (optional ``RooflineResult``) lets SOLAR counts outrank
+    the shape-formula fallback — same precedence as the orchestrator.
+    Returns ``(0, nbytes)`` when only flops can't be derived; ``(0, 0)``
+    only when shape resolution also failed.
     """
     if definition is not None:
         from src.benchmark.roofline_shapes import compute_roofline_inputs
-        return compute_roofline_inputs(definition, workload)
+        return compute_roofline_inputs(definition, workload, roofline=roofline)
     return kernel.spec.flop_count, kernel.spec.memory_bytes
 
 
@@ -185,11 +189,10 @@ def generate_report(
 
         generators = input_generators if do_reprofile else [None] * len(workloads)
         for w, ig in zip(workloads, generators):
-            flops, nbytes = _resolve_workload_roofline(definition, w, best.kernel)
-            if flops <= 0 or nbytes <= 0:
-                # No formula → skip both classification and re-profile for
-                # this workload rather than poisoning the dicts.
-                continue
+            # SOLAR first so its counts feed compute_roofline_inputs via
+            # roofline= below — otherwise shape formulas bail on op_type=None
+            # and the report silently drops workloads SOLAR could classify.
+            solar = None
             if definition is not None:
                 solar = derive_t_sol_from_solar(
                     definition, w, hardware_spec, arch_yaml_path=arch_yaml_path,
@@ -200,6 +203,10 @@ def generate_report(
                     # surface AI / ridge_point (run-level invariants in
                     # MACs/byte) alongside the per-workload profile.
                     per_workload_roofline[w.uuid] = solar
+            flops, nbytes = _resolve_workload_roofline(
+                definition, w, best.kernel, roofline=solar,
+            )
+            # No (flops, nbytes) gate — symmetric with the per-iter loop.
             if not do_reprofile:
                 continue
 
@@ -409,13 +416,19 @@ def _render_profiling_block(
                 if rr is not None
                 else ""
             )
-            lines.append(
-                f"    [{uuid}] "
-                f"{roofline_prefix}"
-                f"{a.achieved_tflops:.2f} TFLOPS / {a.achieved_bandwidth_gb_s:.2f} GB/s "
-                f"(pct_peak: compute {a.pct_peak_compute * 100:.1f}% · "
-                f"bw {a.pct_peak_bandwidth * 100:.1f}%)"
-            )
+            if not p.has_analytical:
+                lines.append(
+                    f"    [{uuid}] {roofline_prefix}"
+                    "[analytical unavailable — no byte count]"
+                )
+            else:
+                lines.append(
+                    f"    [{uuid}] "
+                    f"{roofline_prefix}"
+                    f"{a.achieved_tflops:.2f} TFLOPS / {a.achieved_bandwidth_gb_s:.2f} GB/s "
+                    f"(pct_peak: compute {a.pct_peak_compute * 100:.1f}% · "
+                    f"bw {a.pct_peak_bandwidth * 100:.1f}%)"
+                )
         if all_ncu_missing:
             continue
         if p.ncu is not None:

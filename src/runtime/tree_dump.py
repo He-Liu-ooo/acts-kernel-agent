@@ -151,11 +151,10 @@ def _build_meta(node: "TreeNode", *, iter_no: int,
     field is appended — the kill-site prose. The categorical DEAD_END
     cause comes in via ``_late_bound_fields(node)["dead_reason"]``.
     """
-    analytical = (
-        asdict(node.profiling.analytical)
-        if node.profiling is not None
-        else None
-    )
+    # ``asdict(None)`` raises; dump_node only catches OSError.
+    analytical = None
+    if node.profiling is not None and node.profiling.has_analytical:
+        analytical = asdict(node.profiling.analytical)
     result: dict = {
         "id": node.id,
         "parent_id": node.parent_id,

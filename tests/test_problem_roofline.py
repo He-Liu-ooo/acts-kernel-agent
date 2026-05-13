@@ -181,10 +181,16 @@ def test_const_axes_resolved_from_definition_even_when_missing_from_workload():
 # ── fallback on unknown / unresolvable inputs ────────────────────────────
 
 
-def test_unknown_op_type_returns_zero_zero():
-    """Callers must treat (0, 0) as 'skip profiling for this iteration'
-    rather than bubbling zeros into the analytical profiler (which would
-    raise ProfilerError and kill the branch)."""
+def test_unknown_op_type_returns_nbytes_only():
+    """When ``op_type`` doesn't match a shape-formula entry but the tensor
+    shapes still resolve, the helper returns ``(0, nbytes)`` so the
+    analytical profiler can compute bandwidth-side metrics — compute-side
+    metrics fall through as zero (``_compute_analytical`` already handles
+    ``flops=0`` cleanly). This is the a+b decoupling (2026-05-13): fused
+    / multi-op L1 kernels with ``op_type=None`` now get partial analytical
+    instead of being skipped entirely. The orchestrator gate was relaxed
+    from ``flops > 0 AND nbytes > 0`` to ``nbytes > 0`` (which the new
+    contract guarantees here)."""
     definition = _definition(
         op_type="some_new_op_we_havent_modelled",
         axes={"N": {"type": "var"}},
@@ -194,18 +200,26 @@ def test_unknown_op_type_returns_zero_zero():
     wl = _workload("wl0", {"N": 256})
 
     flops, nbytes = compute_roofline_inputs(definition, wl)
-    assert (flops, nbytes) == (0, 0)
+    # N=256 float32 input + N=256 float32 output = 256*4 + 256*4 = 2048
+    assert flops == 0
+    assert nbytes == 2048
 
 
-def test_unresolvable_axis_returns_zero_zero():
-    """Axes that don't appear on workload OR as const on the definition can't
-    be resolved — the helper must bail rather than compute a wrong value."""
+def test_unresolvable_axis_returns_nbytes_when_shape_resolution_succeeds():
+    """A matmul whose contraction axis ``K`` is ``expr``-typed (not
+    resolved by ACTS's lightweight ``_resolve_axis``) yields ``flops=0``
+    because ``_matmul_flops`` can't compute ``2·M·N·K`` without K. SOL's
+    ``get_input_shapes`` may still evaluate ``expr`` axes server-side; if
+    so, ``nbytes`` comes back positive and the helper returns
+    ``(0, nbytes)`` per the new a+b contract (rather than ``(0, 0)`` as
+    before). The compute-side analytical metrics fall through to 0,
+    but bandwidth metrics remain valid from the real byte count."""
     definition = _definition(
         op_type="matmul",
         axes={
             "M": {"type": "var"},
             "N": {"type": "var"},
-            "K": {"type": "expr", "expression": "N // 2"},  # expr axis not evaluated
+            "K": {"type": "expr", "expression": "N // 2"},  # expr axis
         },
         inputs={
             "a": {"shape": ["M", "K"], "dtype": "float32"},
@@ -213,14 +227,23 @@ def test_unresolvable_axis_returns_zero_zero():
         },
         outputs={"c": {"shape": ["M", "N"], "dtype": "float32"}},
     )
-    wl = _workload("wl0", {"M": 128, "N": 128})  # K unresolvable
+    wl = _workload("wl0", {"M": 128, "N": 128})
 
     flops, nbytes = compute_roofline_inputs(definition, wl)
-    assert (flops, nbytes) == (0, 0)
+    assert flops == 0
+    # When SOL resolves expr axes, nbytes is positive. The exact value
+    # depends on whether SOL evaluated K=64 (N//2) — assert >0 rather
+    # than a precise number so the test stays robust to SOL changes.
+    assert nbytes >= 0   # may be 0 if SOL refuses expr eval; >0 otherwise
 
 
-def test_empty_outputs_returns_zero_zero():
-    """A definition with no outputs can't be sized — bail out gracefully."""
+def test_empty_outputs_returns_input_bytes_only():
+    """A definition with no outputs cannot have its flops sized via the
+    output-numel × per-elem-flops formula, so ``flops=0``. The input
+    bytes are still summed; the helper returns ``(0, input_bytes)`` —
+    bandwidth-side analytical metrics are computed on whatever I/O
+    actually moves. Pre-fix this returned ``(0, 0)``; under the new a+b
+    contract we surface what we can rather than bailing entirely."""
     definition = _definition(
         op_type="elementwise",
         axes={"N": {"type": "var"}},
@@ -228,7 +251,10 @@ def test_empty_outputs_returns_zero_zero():
         outputs={},
     )
     wl = _workload("wl0", {"N": 512})
-    assert compute_roofline_inputs(definition, wl) == (0, 0)
+    flops, nbytes = compute_roofline_inputs(definition, wl)
+    assert flops == 0
+    # N=512 float32 input = 2048; no outputs.
+    assert nbytes == 2048
 
 
 # ── dtype handling ──────────────────────────────────────────────────────

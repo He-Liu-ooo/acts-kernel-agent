@@ -75,6 +75,12 @@ class SolarResult:
     arithmetic_intensity: float = 0.0  # MACs/byte — see class docstring
     ridge_point: float = 0.0  # MACs/byte — precision-aware, see class docstring
     roofline_model: str = "fused"  # which SOLAR model was used
+    # SOLAR-derived absolute counts (``total_flops`` = MAC×2 + non-MAC ops;
+    # ``total_fused_bytes`` from the matching ``roofline_model`` section).
+    # Preferred over shape formulas in ``compute_roofline_inputs`` when
+    # positive; 0 means SOLAR didn't surface them and callers fall back.
+    total_flops: int = 0
+    total_fused_bytes: int = 0
 
 
 # SOLAR uses bare strings ("memory" / "compute" / "balanced"); ACTS uses
@@ -389,10 +395,19 @@ def derive_t_sol(
     arch = perf.get("arch", {})
     ridge_point = float(arch.get("ridge_point", 0.0))
 
+    # ``memory_bytes`` read from the SAME section as ``runtime_ms`` so AI
+    # stays self-consistent (fused vs unfused differ). ``.get(..., 0)``
+    # tolerates SOLAR schema drift — falls back to shape formulas.
+    workload_section = perf.get("workload", {})
+    total_flops = int(workload_section.get("total_flops", 0))
+    total_fused_bytes = int(section.get("memory_bytes", 0))
+
     return SolarResult(
         t_sol_us=runtime_ms * 1000.0,  # ms → us
         bottleneck=_SOLAR_BOTTLENECK_TO_ENUM.get(bottleneck_str, BottleneckType.MEMORY_BOUND),
         arithmetic_intensity=arithmetic_intensity,
         ridge_point=ridge_point,
         roofline_model=roofline_model,
+        total_flops=total_flops,
+        total_fused_bytes=total_fused_bytes,
     )
