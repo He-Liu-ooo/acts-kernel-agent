@@ -24,6 +24,8 @@ still runs — invoked by the submit tool body — preserving the
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -103,8 +105,38 @@ class KernelCodeOutput(BaseModel):
         return self
 
 
+@dataclass(frozen=True)
+class AttemptFailure:
+    """One failed baseline-generation attempt's tool-error trace.
+
+    Captured by ``baseline_generator.generate_triton_baseline`` after each
+    ``ImplementationError`` (and after post-translate compile / correctness
+    failures) and threaded into the next ``translate()`` call so the Coder's
+    user prompt can surface what didn't work in prior attempts.
+
+    ``tool_errors`` is chronological — the order the SDK loop fired the
+    FAILED tool returns during the attempt. Empty list when the attempt
+    terminated without invoking any tool (reasoning-content truncation
+    pathology). See ``doc/specs/2026-05-13-cross-attempt-memory-design.md``.
+    """
+
+    attempt_no: int  # 1-indexed, matches emit() event payloads
+    tool_errors: list[str] = field(default_factory=list)
+
+
 class ImplementationError(Exception):
-    """Raised when the Coder cannot produce a valid kernel implementation."""
+    """Raised when the Coder cannot produce a valid kernel implementation.
+
+    ``tool_errors`` carries the chronological list of FAILED strings the
+    compile / correctness tools returned during the SDK loop. Empty when
+    no tool calls happened (reasoning-content truncation). Carried out so
+    ``baseline_generator`` can thread it into the next attempt's prompt
+    via ``AttemptFailure``.
+    """
+
+    def __init__(self, message: str, *, tool_errors: list[str] | None = None) -> None:
+        super().__init__(message)
+        self.tool_errors = tool_errors or []
 
 
 # ── tool factories ──────────────────────────────────────────────────────
@@ -115,15 +147,37 @@ class ImplementationError(Exception):
 # SDK installed.
 
 
+def _record_failure(error_log: list[str] | None, msg: str) -> str:
+    """Append *msg* to *error_log* (when supplied) and return it.
+
+    Shared by every tool factory's FAILED return branch so the
+    "if error_log is not None: error_log.append(msg)" pattern lives in
+    one place. ``_run_tool_agent`` binds the same ``tool_errors`` list
+    to every factory, so each tool's failure rides out via
+    ``ImplementationError.tool_errors`` for cross-attempt memory.
+    """
+    if error_log is not None:
+        error_log.append(msg)
+    return msg
+
+
 def _make_compile_tool(
     kernel_spec: KernelSpec,
     cache_dir: Path | None = None,
+    *,
+    error_log: list[str] | None = None,
 ) -> Callable[[str], str]:
     """Build a compile tool bound to a specific KernelSpec.
 
     The tool wraps ``kernels.compiler.compile_kernel``. Success returns
     a short confirmation; failure returns the full compiler traceback so
     the Coder can read the error and fix it.
+
+    When *error_log* is supplied, every FAILED return string is appended
+    to it in-place. ``_run_tool_agent`` uses this to capture cross-turn
+    errors so they can ride out as ``ImplementationError.tool_errors``
+    for cross-attempt memory. Success returns are not logged — they
+    are not failures to remember.
     """
 
     def compile_kernel_tool(source_code: str) -> str:
@@ -133,7 +187,10 @@ def _make_compile_tool(
             return (
                 f"Compilation successful (entrypoint: '{kernel_spec.entrypoint}')."
             )
-        return f"Compilation FAILED:\n{result.error_message}"
+        return _record_failure(
+            error_log,
+            f"Compilation FAILED:\n{result.error_message}",
+        )
 
     return compile_kernel_tool
 
@@ -147,6 +204,7 @@ def _make_correctness_tool(
     policy: ComparisonPolicy | None = None,
     definition: Any | None = None,
     workloads: list[Any] | None = None,
+    error_log: list[str] | None = None,
 ) -> Callable[..., str]:
     """Build a correctness tool bound to a KernelSpec + oracle + workload generators.
 
@@ -165,6 +223,12 @@ def _make_correctness_tool(
     (``def kernel_fn(x, out_a, out_b)``) can be checked against the
     PyTorch oracle that returns its outputs by value. A length mismatch
     is a contract bug at the factory level (raised eagerly).
+
+    When *error_log* is supplied, every FAILED / aborted return string is
+    appended to it in-place. ``_run_tool_agent`` uses this to capture
+    cross-turn errors so they can ride out as
+    ``ImplementationError.tool_errors`` for cross-attempt memory.
+    Success returns are not logged.
     """
     if not input_generators:
         raise ValueError(
@@ -182,9 +246,10 @@ def _make_correctness_tool(
         kernel = Kernel(spec=kernel_spec, source_code=source_code, dps=dps)
         compiled = compile_kernel(kernel, cache_dir=cache_dir)
         if not compiled.success:
-            return (
+            return _record_failure(
+                error_log,
                 "Correctness aborted — candidate failed to compile:\n"
-                f"{compiled.error_message}"
+                f"{compiled.error_message}",
             )
         total = len(input_generators)
         max_err = 0.0
@@ -201,9 +266,10 @@ def _make_correctness_tool(
             )
             if not result.passed:
                 stage = result.failed_stage.value if result.failed_stage else "unknown"
-                return (
+                return _record_failure(
+                    error_log,
                     f"Correctness FAILED on workload {idx + 1}/{total} "
-                    f"at stage [{stage}]:\n{result.error_message}"
+                    f"at stage [{stage}]:\n{result.error_message}",
                 )
             max_err = max(max_err, result.max_abs_error)
         return (
@@ -214,7 +280,11 @@ def _make_correctness_tool(
     return check_correctness_tool
 
 
-def _make_submit_tool(captured: dict) -> Callable[[str, str], str]:
+def _make_submit_tool(
+    captured: dict,
+    *,
+    error_log: list[str] | None = None,
+) -> Callable[[str, str], str]:
     """Build a submit tool that captures the LLM's final ``KernelCodeOutput``.
 
     The tool runs the ``KernelCodeOutput`` Pydantic validator inside the
@@ -227,6 +297,14 @@ def _make_submit_tool(captured: dict) -> Callable[[str, str], str]:
 
     *captured* is a dict (not a single-element list / nullable variable)
     because tests construct one per call and assert via ``"output" in captured``.
+
+    *error_log* mirrors the compile / correctness tools: when supplied,
+    every validation-failure return string is appended to it in-place so
+    cross-attempt memory captures the actual reason an attempt failed
+    when the failure happens at submit time. Without this, the
+    prior-failures section would render the misleading
+    "no tool errors recorded" placeholder for an attempt that DID
+    invoke ``submit_kernel`` but had its payload rejected.
     """
 
     def submit_kernel(
@@ -241,7 +319,10 @@ def _make_submit_tool(captured: dict) -> Callable[[str, str], str]:
                 dps=dps,
             )
         except ValidationError as exc:
-            return format_submit_validation_error("submit_kernel", exc)
+            return _record_failure(
+                error_log,
+                format_submit_validation_error("submit_kernel", exc),
+            )
         return SUBMIT_OK_SENTINEL
 
     return submit_kernel
@@ -325,7 +406,13 @@ class CoderAgent:
         definition: Any | None = None,
         workloads: list[Any] | None = None,
     ) -> KernelCodeOutput:
-        compile_tool = function_tool(_make_compile_tool(kernel_spec))
+        # Shared across all three tool factories so every FAILED return
+        # rides out via ``ImplementationError.tool_errors`` for the
+        # baseline_generator's cross-attempt memory.
+        tool_errors: list[str] = []
+        compile_tool = function_tool(
+            _make_compile_tool(kernel_spec, error_log=tool_errors)
+        )
         correctness_tool = function_tool(
             _make_correctness_tool(
                 kernel_spec,
@@ -333,13 +420,13 @@ class CoderAgent:
                 input_generators=input_generators,
                 definition=definition,
                 workloads=workloads,
+                error_log=tool_errors,
             )
         )
-        # Per-call capture slot for the submit tool — populated when the
-        # LLM calls ``submit_kernel`` with a Pydantic-valid (source,
-        # triton_kernel_name) pair.
         captured: dict = {}
-        submit_tool = function_tool(_make_submit_tool(captured))
+        submit_tool = function_tool(
+            _make_submit_tool(captured, error_log=tool_errors)
+        )
         agent = Agent(
             name=agent_name,
             instructions=instructions,
@@ -363,14 +450,19 @@ class CoderAgent:
                 return captured["output"]
             raise ImplementationError(
                 f"Coder exhausted turn budget ({self._max_turns}) without "
-                "calling submit_kernel."
+                "calling submit_kernel.",
+                tool_errors=tool_errors,
             ) from exc
         if result is None:
-            raise ImplementationError("LLM call failed after all retries.")
+            raise ImplementationError(
+                "LLM call failed after all retries.",
+                tool_errors=tool_errors,
+            )
         if "output" not in captured:
             raise ImplementationError(
                 "Coder did not call submit_kernel before terminating — "
-                "no final kernel was emitted."
+                "no final kernel was emitted.",
+                tool_errors=tool_errors,
             )
         return captured["output"]
 
@@ -430,18 +522,57 @@ class CoderAgent:
     def build_translate_prompt(
         reference_source: str,
         kernel_spec: KernelSpec,
+        *,
+        prior_failures: Sequence[AttemptFailure] = (),
     ) -> str:
-        """Assemble the user prompt for a one-shot PyTorch→Triton port."""
+        """Assemble the user prompt for a one-shot PyTorch→Triton port.
+
+        When *prior_failures* is non-empty, prepends a "## Prior attempt
+        failures" section listing each attempt's tool errors so the model
+        can avoid repeating the same kernel + same error across
+        ``Runner.run`` boundaries. Threaded by
+        ``baseline_generator.generate_triton_baseline`` after each
+        ``ImplementationError`` catch. Empty default = no section rendered
+        (backward-compatible for callers that don't supply it). See
+        ``doc/specs/2026-05-13-cross-attempt-memory-design.md``.
+        """
         safe_reference = reference_source.replace("```", r"\`\`\`")
-        sections = [
-            "## PyTorch reference\n```python\n" + safe_reference + "\n```",
-            (
-                "## Target kernel\n"
-                f"- Name: {kernel_spec.name}\n"
-                f"- Entrypoint: {kernel_spec.entrypoint}\n"
-                f"- Kernel type: {kernel_spec.kernel_type.value}"
-            ),
-        ]
+        sections: list[str] = []
+
+        if prior_failures:
+            intro = (
+                "Previous baseline-generation attempts for this same PyTorch "
+                "reference hit the following tool errors. Each \"Attempt N\" "
+                "block lists the errors in the order they fired during that "
+                "attempt. The same error class recurring across attempts "
+                "indicates a persistent issue — try a structurally different "
+                "solution rather than re-applying the same approach."
+            )
+            attempt_blocks: list[str] = []
+            for af in prior_failures:
+                if af.tool_errors:
+                    bullets = "\n".join(f"- {e}" for e in af.tool_errors)
+                else:
+                    bullets = (
+                        "- (no tool errors recorded — agent terminated without "
+                        "invoking compile / correctness / submit; likely a "
+                        "reasoning-content budget issue)"
+                    )
+                attempt_blocks.append(f"### Attempt {af.attempt_no}\n{bullets}")
+            sections.append(
+                "## Prior attempt failures\n\n"
+                + intro
+                + "\n\n"
+                + "\n\n".join(attempt_blocks)
+            )
+
+        sections.append("## PyTorch reference\n```python\n" + safe_reference + "\n```")
+        sections.append(
+            "## Target kernel\n"
+            f"- Name: {kernel_spec.name}\n"
+            f"- Entrypoint: {kernel_spec.entrypoint}\n"
+            f"- Kernel type: {kernel_spec.kernel_type.value}"
+        )
         return "\n\n".join(sections)
 
     async def translate(
@@ -453,6 +584,7 @@ class CoderAgent:
         input_generators: list[Callable[[int], tuple]],
         definition: Any | None = None,
         workloads: list[Any] | None = None,
+        prior_failures: Sequence[AttemptFailure] = (),
     ) -> KernelCodeOutput:
         """Port a PyTorch reference into a Triton kernel in one agent run.
 
@@ -466,6 +598,14 @@ class CoderAgent:
         responsibility. Raises ``ImplementationError`` when no model is
         configured, when the LLM call exhausts its retries, or when the
         turn budget is exhausted with no captured submission.
+
+        *prior_failures* — when non-empty, ``build_translate_prompt``
+        prepends a "## Prior attempt failures" section so the model can
+        see what didn't work in earlier baseline-generation attempts for
+        this same reference. Threaded by
+        ``baseline_generator.generate_triton_baseline`` after each
+        ``ImplementationError`` catch. Default empty tuple = no section
+        rendered.
         """
         if self._model is None:
             raise ImplementationError(
@@ -479,6 +619,7 @@ class CoderAgent:
             prompt=self.build_translate_prompt(
                 reference_source=reference_source,
                 kernel_spec=kernel_spec,
+                prior_failures=prior_failures,
             ),
             kernel_spec=kernel_spec,
             reference_fn=reference_fn,

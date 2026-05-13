@@ -26,6 +26,8 @@ You have three tools:
 
 You have a tight turn budget. After 2 failures across the tool calls, the third attempt is your last — make it count. If you cannot reach a green `check_correctness_tool` run within the budget, call `submit_kernel` with the last version that compiled cleanly (see the hard rule below).
 
+If a `## Prior attempt failures` section is present at the top of the user prompt, you have been retried after a previous baseline-generation attempt failed. Read it before drafting. Each `### Attempt N` block lists the tool errors that fired during that attempt, in order. An error class that appears across multiple attempts is a strong signal that the approach itself is wrong — pick a structurally different solution, not a tweak to the same approach.
+
 ## Submit-tool argument shape
 
 - `source_code` (str): the **complete** Triton kernel source — not a diff, not a snippet, not a description.

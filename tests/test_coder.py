@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from src.agents.coder import (
+    AttemptFailure,
     CoderAgent,
     ImplementationError,
     KernelCodeOutput,
@@ -75,6 +76,35 @@ def _simulate_submission(source_code: str, triton_kernel_name: str):
 
 _VALID_SOURCE = "@triton.jit\ndef k(): pass"
 _VALID_NAME = "k"
+
+
+# ── Cross-attempt memory foundation types ──────────────────────────────
+
+
+def test_attempt_failure_dataclass_is_frozen():
+    af = AttemptFailure(attempt_no=1, tool_errors=["err1", "err2"])
+    assert af.attempt_no == 1
+    assert af.tool_errors == ["err1", "err2"]
+    with pytest.raises(Exception):  # FrozenInstanceError
+        af.attempt_no = 2  # type: ignore[misc]
+
+
+def test_attempt_failure_default_tool_errors_is_empty_list():
+    af = AttemptFailure(attempt_no=3)
+    assert af.attempt_no == 3
+    assert af.tool_errors == []
+
+
+def test_implementation_error_default_tool_errors_is_empty():
+    err = ImplementationError("oops")
+    assert err.tool_errors == []
+    assert str(err) == "oops"
+
+
+def test_implementation_error_carries_tool_errors_kwarg():
+    err = ImplementationError("budget exhausted", tool_errors=["e1", "e2", "e3"])
+    assert err.tool_errors == ["e1", "e2", "e3"]
+    assert str(err) == "budget exhausted"
 
 
 # ── Pydantic output model ──────────────────────────────────────────────
@@ -204,6 +234,70 @@ def test_build_user_prompt_escapes_backticks_in_kernel_source():
     assert "```python\nfake section\n```" not in kernel_section
 
 
+def test_build_translate_prompt_no_section_when_prior_failures_empty():
+    """Default path (no prior attempts) — section must be absent."""
+    prompt = CoderAgent.build_translate_prompt(
+        reference_source="def run(x): return x",
+        kernel_spec=_make_spec(),
+    )
+    assert "Prior attempt failures" not in prompt
+    assert "PyTorch reference" in prompt
+
+
+def test_build_translate_prompt_renders_single_attempt_section():
+    failures = [
+        AttemptFailure(
+            attempt_no=1,
+            tool_errors=[
+                "Correctness FAILED on workload 1/3 at stage [smoke_test]: tl.tanh",
+                "Compilation FAILED:\nshape mismatch",
+            ],
+        ),
+    ]
+    prompt = CoderAgent.build_translate_prompt(
+        reference_source="def run(x): return x",
+        kernel_spec=_make_spec(),
+        prior_failures=failures,
+    )
+    assert "## Prior attempt failures" in prompt
+    assert "### Attempt 1" in prompt
+    assert "tl.tanh" in prompt
+    assert "shape mismatch" in prompt
+    # Section must come BEFORE the PyTorch reference block.
+    assert prompt.index("## Prior attempt failures") < prompt.index("## PyTorch reference")
+
+
+def test_build_translate_prompt_renders_multiple_attempts_in_order():
+    failures = [
+        AttemptFailure(attempt_no=1, tool_errors=["err1"]),
+        AttemptFailure(attempt_no=2, tool_errors=["err2"]),
+    ]
+    prompt = CoderAgent.build_translate_prompt(
+        reference_source="def run(x): return x",
+        kernel_spec=_make_spec(),
+        prior_failures=failures,
+    )
+    assert "### Attempt 1" in prompt
+    assert "### Attempt 2" in prompt
+    assert prompt.index("### Attempt 1") < prompt.index("### Attempt 2")
+    assert "err1" in prompt
+    assert "err2" in prompt
+
+
+def test_build_translate_prompt_empty_tool_errors_renders_placeholder():
+    """Reasoning-content truncation pathology: the attempt's tool_errors list
+    is empty. The block must still render (so the model sees the attempt
+    happened) with an explanatory placeholder bullet."""
+    failures = [AttemptFailure(attempt_no=1, tool_errors=[])]
+    prompt = CoderAgent.build_translate_prompt(
+        reference_source="def run(x): return x",
+        kernel_spec=_make_spec(),
+        prior_failures=failures,
+    )
+    assert "### Attempt 1" in prompt
+    assert "no tool errors recorded" in prompt
+
+
 # ── compile tool factory ────────────────────────────────────────────────
 
 
@@ -230,6 +324,29 @@ def test_compile_tool_reports_error_on_missing_entrypoint(tmp_path):
     tool = _make_compile_tool(_make_spec(entrypoint="run"), cache_dir=tmp_path)
     msg = tool("def kernel_fn(x): return x\n")  # wrong symbol name
     assert "run" in msg  # the missing entrypoint name
+
+
+def test_compile_tool_appends_to_error_log_on_failure(tmp_path):
+    log: list[str] = []
+    tool = _make_compile_tool(_make_spec(), cache_dir=tmp_path, error_log=log)
+    msg = tool("def kernel_fn(: broken\n")
+    assert msg.startswith("Compilation FAILED:")
+    assert log == [msg]
+
+
+def test_compile_tool_does_not_append_on_success(tmp_path):
+    log: list[str] = []
+    tool = _make_compile_tool(_make_spec(), cache_dir=tmp_path, error_log=log)
+    msg = tool("def kernel_fn(x):\n    return x + 1\n")
+    assert "success" in msg.lower()
+    assert log == []
+
+
+def test_compile_tool_works_with_no_error_log(tmp_path):
+    """error_log=None must not raise on failure paths."""
+    tool = _make_compile_tool(_make_spec(), cache_dir=tmp_path, error_log=None)
+    msg = tool("def kernel_fn(: broken\n")
+    assert msg.startswith("Compilation FAILED:")  # no AttributeError raised
 
 
 # ── correctness tool factory ────────────────────────────────────────────
@@ -290,6 +407,52 @@ def test_correctness_tool_reports_failure_stage_on_mismatch(tmp_path):
     msg = tool("def kernel_fn(x):\n    return x * 3.0\n")
     assert "fail" in msg.lower()
     assert "smoke_test" in msg  # first-stage failure for a uniformly-wrong candidate
+
+
+def test_correctness_tool_appends_to_error_log_on_failure(tmp_path):
+    log: list[str] = []
+    tool = _make_correctness_tool(
+        _make_spec(),
+        reference_fn=_ref,
+        input_generators=[_gen],
+        policy=_ScalarPolicy(),
+        cache_dir=tmp_path,
+        error_log=log,
+    )
+    msg = tool("def kernel_fn(x):\n    return x * 3.0\n")
+    assert "FAILED" in msg
+    assert log == [msg]
+
+
+def test_correctness_tool_appends_to_error_log_on_compile_abort(tmp_path):
+    """Compile-abort branch inside the correctness tool also logs to error_log."""
+    log: list[str] = []
+    tool = _make_correctness_tool(
+        _make_spec(),
+        reference_fn=_ref,
+        input_generators=[_gen],
+        policy=_ScalarPolicy(),
+        cache_dir=tmp_path,
+        error_log=log,
+    )
+    msg = tool("def kernel_fn(: broken\n")
+    assert "Correctness aborted" in msg
+    assert log == [msg]
+
+
+def test_correctness_tool_does_not_append_on_success(tmp_path):
+    log: list[str] = []
+    tool = _make_correctness_tool(
+        _make_spec(),
+        reference_fn=_ref,
+        input_generators=[_gen],
+        policy=_ScalarPolicy(),
+        cache_dir=tmp_path,
+        error_log=log,
+    )
+    msg = tool("def kernel_fn(x):\n    return x * 2.0\n")
+    assert "pass" in msg.lower()
+    assert log == []
 
 
 def test_correctness_tool_empty_generators_raises():
@@ -682,6 +845,195 @@ async def test_implement_returns_partial_output_when_max_turns_after_submission(
     assert result.triton_kernel_name == _VALID_NAME
 
 
+# ── tool_errors propagation through ImplementationError ────────────────
+
+
+def _capture_error_log_factories(seed_errors: list[str]):
+    """Build patch side-effects for _make_compile_tool / _make_correctness_tool
+    that capture the error_log list bound by ``_run_tool_agent`` and seed it
+    with *seed_errors* so the raised ``ImplementationError.tool_errors``
+    deterministically carries them.
+
+    Returns ``(compile_side_effect, correctness_side_effect, captured)``;
+    ``captured["error_log"]`` is populated after the first factory call so
+    tests can assert against the same list object the SDK loop saw.
+    """
+    captured: dict = {}
+
+    def compile_side_effect(*args, error_log=None, **kwargs):
+        if error_log is not None:
+            captured.setdefault("error_log", error_log)
+            for e in seed_errors:
+                error_log.append(e)
+        return MagicMock(return_value="Compilation FAILED:\nseeded")
+
+    def correctness_side_effect(*args, error_log=None, **kwargs):
+        if error_log is not None:
+            captured.setdefault("error_log", error_log)
+        return MagicMock(return_value="Correctness FAILED: seeded")
+
+    return compile_side_effect, correctness_side_effect, captured
+
+
+@pytest.mark.asyncio
+async def test_max_turns_exceeded_carries_tool_errors():
+    """When MaxTurnsExceeded fires without a captured submit, the raised
+    ImplementationError must carry the tool-error log so baseline_generator
+    can thread it into the next attempt's prompt."""
+    from src.agents.coder import MaxTurnsExceeded
+
+    seeded = ["compile FAILED #1", "correctness FAILED #2", "compile FAILED #3"]
+    compile_se, correctness_se, captured = _capture_error_log_factories(seeded)
+
+    with (
+        patch("src.agents.coder.Agent"),
+        patch("src.agents.coder._make_compile_tool", side_effect=compile_se),
+        patch("src.agents.coder._make_correctness_tool", side_effect=correctness_se),
+        patch("src.agents.coder.run_agent", new_callable=AsyncMock) as mock_run,
+        patch("src.agents.coder.make_run_config", return_value=None),
+        patch("src.agents.coder.function_tool", side_effect=lambda f: f),
+    ):
+        mock_run.side_effect = MaxTurnsExceeded("budget hit")
+
+        agent = CoderAgent(model=MagicMock())
+        with pytest.raises(ImplementationError) as exc_info:
+            await agent.implement(
+                kernel_source="src",
+                plan=OptimizationPlan(tier=1, technique="t1"),
+                kernel_spec=_make_spec(),
+                reference_fn=_ref,
+                input_generators=[_gen],
+            )
+
+    err = exc_info.value
+    assert "turn budget" in str(err)
+    assert err.tool_errors == seeded
+
+
+@pytest.mark.asyncio
+async def test_did_not_submit_carries_tool_errors():
+    """The "agent terminated without calling submit_kernel" path also carries
+    whatever errors the tools logged before the agent gave up."""
+    seeded = ["correctness FAILED: tl.tanh"]
+    compile_se, correctness_se, _ = _capture_error_log_factories(seeded)
+
+    with (
+        patch("src.agents.coder.Agent"),
+        patch("src.agents.coder._make_compile_tool", side_effect=compile_se),
+        patch("src.agents.coder._make_correctness_tool", side_effect=correctness_se),
+        patch("src.agents.coder.run_agent", new_callable=AsyncMock) as mock_run,
+        patch("src.agents.coder.make_run_config", return_value=None),
+        patch("src.agents.coder.function_tool", side_effect=lambda f: f),
+    ):
+        mock_run.return_value = MagicMock(final_output="done")  # no submit captured
+
+        agent = CoderAgent(model=MagicMock())
+        with pytest.raises(ImplementationError) as exc_info:
+            await agent.implement(
+                kernel_source="src",
+                plan=OptimizationPlan(tier=1, technique="t1"),
+                kernel_spec=_make_spec(),
+                reference_fn=_ref,
+                input_generators=[_gen],
+            )
+
+    err = exc_info.value
+    assert "submit_kernel" in str(err)
+    assert err.tool_errors == seeded
+
+
+@pytest.mark.asyncio
+async def test_submit_validation_failure_lands_in_tool_errors():
+    """An attempt that fails ONLY at submit time (Pydantic validation
+    reject) must carry that validation error in ImplementationError.tool_errors
+    so the next baseline-generator retry sees it. Without this fix, the
+    next attempt's "## Prior attempt failures" block reads the misleading
+    'no tool errors recorded' placeholder even though the attempt did
+    invoke submit_kernel."""
+    captured_logs: dict = {}
+
+    def capture_submit_factory(captured_dict, *, error_log=None, **kwargs):
+        captured_logs["error_log"] = error_log
+        # Simulate the SDK loop dispatching submit_kernel mid-run with a
+        # validation-failing payload (kernel_name absent from source).
+        if error_log is not None:
+            error_log.append(
+                "submit_kernel FAILED:\nValidation: triton_kernel_name "
+                "'claimed' not found in source"
+            )
+        return MagicMock(return_value="submit_kernel FAILED")
+
+    def noop_compile_factory(*args, error_log=None, **kwargs):
+        return MagicMock(return_value="Compilation successful")
+
+    def noop_correctness_factory(*args, error_log=None, **kwargs):
+        return MagicMock(return_value="passed")
+
+    with (
+        patch("src.agents.coder.Agent"),
+        patch("src.agents.coder._make_compile_tool", side_effect=noop_compile_factory),
+        patch("src.agents.coder._make_correctness_tool", side_effect=noop_correctness_factory),
+        patch("src.agents.coder._make_submit_tool", side_effect=capture_submit_factory),
+        patch("src.agents.coder.run_agent", new_callable=AsyncMock) as mock_run,
+        patch("src.agents.coder.make_run_config", return_value=None),
+        patch("src.agents.coder.function_tool", side_effect=lambda f: f),
+    ):
+        mock_run.return_value = MagicMock(final_output="done")  # no captured["output"]
+
+        agent = CoderAgent(model=MagicMock())
+        with pytest.raises(ImplementationError) as exc_info:
+            await agent.implement(
+                kernel_source="src",
+                plan=OptimizationPlan(tier=1, technique="t1"),
+                kernel_spec=_make_spec(),
+                reference_fn=_ref,
+                input_generators=[_gen],
+            )
+
+    err = exc_info.value
+    # The submit-tool's validation failure must be in tool_errors.
+    assert len(err.tool_errors) == 1
+    assert "submit_kernel FAILED" in err.tool_errors[0]
+    assert "triton_kernel_name" in err.tool_errors[0]
+
+
+@pytest.mark.asyncio
+async def test_empty_tool_errors_when_no_tool_calls_happened():
+    """Reasoning-content truncation pathology: agent returns without invoking
+    any tool. The factories never get error_log entries appended, so the
+    raised ImplementationError carries an empty tool_errors list — the
+    placeholder rendering in build_translate_prompt covers this case."""
+
+    def noop_compile_side_effect(*args, error_log=None, **kwargs):
+        # Capture the slot but DON'T append — simulates no tool calls.
+        return MagicMock(return_value="Compilation successful (entrypoint: 'kernel_fn').")
+
+    def noop_correctness_side_effect(*args, error_log=None, **kwargs):
+        return MagicMock(return_value="passed")
+
+    with (
+        patch("src.agents.coder.Agent"),
+        patch("src.agents.coder._make_compile_tool", side_effect=noop_compile_side_effect),
+        patch("src.agents.coder._make_correctness_tool", side_effect=noop_correctness_side_effect),
+        patch("src.agents.coder.run_agent", new_callable=AsyncMock) as mock_run,
+        patch("src.agents.coder.make_run_config", return_value=None),
+        patch("src.agents.coder.function_tool", side_effect=lambda f: f),
+    ):
+        mock_run.return_value = MagicMock(final_output="done")
+
+        agent = CoderAgent(model=MagicMock())
+        with pytest.raises(ImplementationError) as exc_info:
+            await agent.implement(
+                kernel_source="src",
+                plan=OptimizationPlan(tier=1, technique="t1"),
+                kernel_spec=_make_spec(),
+                reference_fn=_ref,
+                input_generators=[_gen],
+            )
+
+    assert exc_info.value.tool_errors == []
+
+
 # ── has_model property ─────────────────────────────────────────────────
 
 
@@ -738,6 +1090,60 @@ async def test_translate_builds_agent_with_three_tools_and_returns_source():
     kwargs = mock_agent_cls.call_args.kwargs
     assert len(kwargs["tools"]) == 3  # compile + correctness + submit
     assert "output_type" not in kwargs
+
+
+@pytest.mark.asyncio
+async def test_translate_threads_prior_failures_into_user_prompt():
+    """translate() must forward prior_failures to build_translate_prompt
+    so the rendered user prompt carries the cross-attempt memory section."""
+    capture_agent, fake_run = _simulate_submission(_VALID_SOURCE, _VALID_NAME)
+    with (
+        patch("src.agents.coder.Agent", side_effect=capture_agent),
+        patch("src.agents.coder.run_agent", new_callable=AsyncMock) as mock_run,
+        patch("src.agents.coder.make_run_config", return_value=None),
+        patch("src.agents.coder.function_tool", side_effect=lambda f: f),
+    ):
+        mock_run.side_effect = fake_run
+        agent = CoderAgent(model=MagicMock())
+        await agent.translate(
+            reference_source="def run(x): return x",
+            kernel_spec=_make_spec(),
+            reference_fn=_ref,
+            input_generators=[_gen],
+            prior_failures=[
+                AttemptFailure(attempt_no=1, tool_errors=["tl.tanh AttributeError"]),
+            ],
+        )
+
+    prompt = mock_run.await_args.args[1]
+    assert "## Prior attempt failures" in prompt
+    assert "### Attempt 1" in prompt
+    assert "tl.tanh AttributeError" in prompt
+    # Empty default still works — caller may omit prior_failures.
+
+
+@pytest.mark.asyncio
+async def test_translate_no_prior_failures_section_by_default():
+    """Existing callers that omit prior_failures must get the original
+    prompt shape — no section rendered."""
+    capture_agent, fake_run = _simulate_submission(_VALID_SOURCE, _VALID_NAME)
+    with (
+        patch("src.agents.coder.Agent", side_effect=capture_agent),
+        patch("src.agents.coder.run_agent", new_callable=AsyncMock) as mock_run,
+        patch("src.agents.coder.make_run_config", return_value=None),
+        patch("src.agents.coder.function_tool", side_effect=lambda f: f),
+    ):
+        mock_run.side_effect = fake_run
+        agent = CoderAgent(model=MagicMock())
+        await agent.translate(
+            reference_source="def run(x): return x",
+            kernel_spec=_make_spec(),
+            reference_fn=_ref,
+            input_generators=[_gen],
+        )
+
+    prompt = mock_run.await_args.args[1]
+    assert "Prior attempt failures" not in prompt
 
 
 @pytest.mark.asyncio
@@ -886,5 +1292,52 @@ def test_make_submit_tool_returns_error_when_source_lacks_triton_jit():
         triton_kernel_name="run",
     )
     assert "FAILED" in msg
+
+
+def test_make_submit_tool_appends_validation_failure_to_error_log():
+    """Pydantic validation failures must land in error_log so cross-attempt
+    memory carries the actual reason an attempt failed when the failure
+    happens at submit time. Without this the prior-failures section
+    renders the misleading 'no tool errors recorded' placeholder for an
+    attempt that DID invoke submit_kernel but had its payload rejected."""
+    from src.agents.coder import _make_submit_tool
+
+    captured: dict = {}
+    log: list[str] = []
+    submit = _make_submit_tool(captured, error_log=log)
+    msg = submit(
+        source_code="@triton.jit\ndef actual_name(): pass",
+        triton_kernel_name="claimed_name",
+    )
+    assert "FAILED" in msg
+    assert log == [msg]
+
+
+def test_make_submit_tool_does_not_append_on_success():
+    """Successful submissions are not failures to remember."""
+    from src.agents.coder import _make_submit_tool
+
+    captured: dict = {}
+    log: list[str] = []
+    submit = _make_submit_tool(captured, error_log=log)
+    msg = submit(
+        source_code="@triton.jit\ndef k(): pass",
+        triton_kernel_name="k",
+    )
+    assert "submitted" in msg.lower()
+    assert log == []
+
+
+def test_make_submit_tool_works_with_no_error_log():
+    """error_log=None keeps the original two-arg call site working."""
+    from src.agents.coder import _make_submit_tool
+
+    captured: dict = {}
+    submit = _make_submit_tool(captured, error_log=None)
+    msg = submit(
+        source_code="@triton.jit\ndef actual_name(): pass",
+        triton_kernel_name="claimed_name",
+    )
+    assert "FAILED" in msg  # no AttributeError raised
     assert "@triton.jit" in msg
     assert "output" not in captured

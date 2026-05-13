@@ -339,6 +339,157 @@ async def test_implementation_error_triggers_retry(patched_io):
 
 
 @pytest.mark.asyncio
+async def test_translate_receives_accumulated_prior_failures(patched_io):
+    """Each failed attempt's tool_errors must be carried into the next
+    attempt's prior_failures kwarg, in order, cumulative across attempts.
+    """
+    from src.agents.coder import AttemptFailure
+
+    workloads = _make_workloads(n=1)
+    coder = CoderAgent(model=MagicMock())
+
+    captured_calls: list[list[AttemptFailure]] = []
+
+    async def fake_translate(*args, prior_failures=(), **kwargs):
+        # Copy so later mutations of the caller's accumulator don't bleed in.
+        captured_calls.append(list(prior_failures))
+        if len(captured_calls) == 1:
+            raise ImplementationError(
+                "attempt 1 failed",
+                tool_errors=["err1a", "err1b"],
+            )
+        if len(captured_calls) == 2:
+            raise ImplementationError(
+                "attempt 2 failed",
+                tool_errors=["err2a"],
+            )
+        return _coder_output("good source")
+
+    coder.translate = fake_translate
+
+    with (
+        patch(
+            "src.benchmark.baseline_generator.compile_kernel",
+            return_value=_compile_ok(),
+        ),
+        patch(
+            "src.benchmark.baseline_generator.verify_correctness",
+            return_value=_pass(),
+        ),
+    ):
+        result = await generate_triton_baseline(
+            _make_definition(), _make_spec(),
+            coder=coder, workloads=workloads, max_retries=3,
+        )
+
+    assert result is not None
+    assert len(captured_calls) == 3
+    # Attempt 1: empty (no prior failures).
+    assert captured_calls[0] == []
+    # Attempt 2: one prior failure carrying attempt-1 tool_errors.
+    assert len(captured_calls[1]) == 1
+    assert captured_calls[1][0].attempt_no == 1
+    assert captured_calls[1][0].tool_errors == ["err1a", "err1b"]
+    # Attempt 3: cumulative — both attempts 1 and 2.
+    assert len(captured_calls[2]) == 2
+    assert captured_calls[2][0].attempt_no == 1
+    assert captured_calls[2][1].attempt_no == 2
+    assert captured_calls[2][1].tool_errors == ["err2a"]
+
+
+@pytest.mark.asyncio
+async def test_post_verify_compile_failure_synthesizes_prior_failure(patched_io):
+    """When translate() succeeds but post-verify compile fails, the next
+    attempt's prior_failures should carry a synthetic 'Post-verify Compile
+    FAILED' entry so the model sees the failure mode."""
+    from src.agents.coder import AttemptFailure
+
+    workloads = _make_workloads(n=1)
+    coder = CoderAgent(model=MagicMock())
+
+    captured_calls: list[list[AttemptFailure]] = []
+
+    async def fake_translate(*args, prior_failures=(), **kwargs):
+        captured_calls.append(list(prior_failures))
+        return _coder_output("src")
+
+    coder.translate = fake_translate
+
+    # First compile fails; second succeeds.
+    compile_outcomes = iter([_compile_fail(), _compile_ok()])
+
+    with (
+        patch(
+            "src.benchmark.baseline_generator.compile_kernel",
+            side_effect=lambda *a, **k: next(compile_outcomes),
+        ),
+        patch(
+            "src.benchmark.baseline_generator.verify_correctness",
+            return_value=_pass(),
+        ),
+    ):
+        result = await generate_triton_baseline(
+            _make_definition(), _make_spec(),
+            coder=coder, workloads=workloads, max_retries=3,
+        )
+
+    assert result is not None
+    assert len(captured_calls) == 2
+    assert len(captured_calls[1]) == 1
+    failure = captured_calls[1][0]
+    assert failure.attempt_no == 1
+    assert len(failure.tool_errors) == 1
+    assert "Post-verify Compile FAILED" in failure.tool_errors[0]
+    assert "SyntaxError: bad" in failure.tool_errors[0]
+
+
+@pytest.mark.asyncio
+async def test_post_verify_correctness_failure_synthesizes_prior_failure(patched_io):
+    """When translate() + compile succeed but correctness fails on any
+    workload, synthesize a 'Post-verify Correctness FAILED' entry into
+    the next attempt's prior_failures."""
+    from src.agents.coder import AttemptFailure
+
+    workloads = _make_workloads(n=2)
+    coder = CoderAgent(model=MagicMock())
+
+    captured_calls: list[list[AttemptFailure]] = []
+
+    async def fake_translate(*args, prior_failures=(), **kwargs):
+        captured_calls.append(list(prior_failures))
+        return _coder_output("src")
+
+    coder.translate = fake_translate
+
+    # Attempt 1: wl 0 passes, wl 1 fails.
+    # Attempt 2: both pass.
+    correctness_outcomes = iter([_pass(), _fail(), _pass(), _pass()])
+
+    with (
+        patch(
+            "src.benchmark.baseline_generator.compile_kernel",
+            return_value=_compile_ok(),
+        ),
+        patch(
+            "src.benchmark.baseline_generator.verify_correctness",
+            side_effect=lambda **kw: next(correctness_outcomes),
+        ),
+    ):
+        result = await generate_triton_baseline(
+            _make_definition(), _make_spec(),
+            coder=coder, workloads=workloads, max_retries=3,
+        )
+
+    assert result is not None
+    assert len(captured_calls) == 2
+    assert len(captured_calls[1]) == 1
+    failure = captured_calls[1][0]
+    assert failure.attempt_no == 1
+    assert len(failure.tool_errors) == 1
+    assert "Post-verify Correctness FAILED" in failure.tool_errors[0]
+
+
+@pytest.mark.asyncio
 async def test_compile_failure_in_post_verify_is_treated_as_attempt_failure(patched_io):
     """If the translated source won't compile, skip verify and retry."""
     workloads = _make_workloads(n=1)

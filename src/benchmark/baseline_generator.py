@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from src.agents.coder import CoderAgent, ImplementationError
+from src.agents.coder import AttemptFailure, CoderAgent, ImplementationError
 from src.eval.correctness import verify_correctness
 from src.eval.inputs import build_input_generator, build_reference_fn
 from src.kernels.compiler import compile_kernel
@@ -29,6 +29,10 @@ if TYPE_CHECKING:
 
     from src.eval.correctness import ComparisonPolicy
     from src.kernels.kernel import KernelSpec
+
+
+_POST_VERIFY_COMPILE_FAILED = "Post-verify Compile FAILED"
+_POST_VERIFY_CORRECTNESS_FAILED = "Post-verify Correctness FAILED"
 
 
 class BaselineGenerationError(Exception):
@@ -75,6 +79,12 @@ async def generate_triton_baseline(
         build_input_generator(definition, w, blob_roots=blob_roots) for w in workloads
     ]
 
+    # Accumulator threaded into each attempt's translate() call. Grows by one
+    # AttemptFailure per failed attempt (ImplementationError, post-verify
+    # compile, post-verify correctness) so the next attempt's user prompt
+    # carries a "## Prior attempt failures" section listing what didn't work
+    # in earlier sessions. See doc/specs/2026-05-13-cross-attempt-memory-design.md.
+    prior_failures: list[AttemptFailure] = []
     for attempt in range(max_retries):
         emit("baseline_attempt", attempt=attempt + 1, max_attempts=max_retries)
         try:
@@ -85,8 +95,15 @@ async def generate_triton_baseline(
                 input_generators=input_generators,
                 definition=definition,
                 workloads=workloads,
+                prior_failures=prior_failures,
             )
         except ImplementationError as exc:
+            prior_failures.append(
+                AttemptFailure(
+                    attempt_no=attempt + 1,
+                    tool_errors=list(exc.tool_errors),
+                )
+            )
             emit(
                 "baseline_failure",
                 attempt=attempt + 1,
@@ -102,6 +119,14 @@ async def generate_triton_baseline(
         )
         compiled = compile_kernel(candidate, cache_dir=cache_dir)
         if not compiled.success:
+            prior_failures.append(
+                AttemptFailure(
+                    attempt_no=attempt + 1,
+                    tool_errors=[
+                        f"{_POST_VERIFY_COMPILE_FAILED}:\n{compiled.error_message}"
+                    ],
+                )
+            )
             emit(
                 "baseline_failure",
                 attempt=attempt + 1,
@@ -109,8 +134,11 @@ async def generate_triton_baseline(
             )
             continue
 
-        if all(
-            verify_correctness(
+        # Walk explicitly so the first failure can be captured for prior_failures.
+        first_failure: "CorrectnessResult | None" = None
+        first_failure_idx: int = -1
+        for idx, (gen, wl) in enumerate(zip(input_generators, workloads)):
+            result = verify_correctness(
                 candidate_fn=compiled.compiled_fn,
                 reference_fn=reference_fn,
                 input_generator=gen,
@@ -118,9 +146,13 @@ async def generate_triton_baseline(
                 kernel=candidate,
                 workload=wl,
                 policy=policy,
-            ).passed
-            for gen, wl in zip(input_generators, workloads)
-        ):
+            )
+            if not result.passed:
+                first_failure = result
+                first_failure_idx = idx
+                break
+
+        if first_failure is None:
             emit(
                 "baseline_success",
                 source_bytes=len(output.source_code),
@@ -128,6 +160,16 @@ async def generate_triton_baseline(
             )
             return candidate
 
+        prior_failures.append(
+            AttemptFailure(
+                attempt_no=attempt + 1,
+                tool_errors=[
+                    f"{_POST_VERIFY_CORRECTNESS_FAILED} on workload "
+                    f"{first_failure_idx + 1}/{len(workloads)}:\n"
+                    f"{first_failure.error_message}"
+                ],
+            )
+        )
         emit(
             "baseline_failure",
             attempt=attempt + 1,
