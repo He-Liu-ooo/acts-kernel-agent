@@ -30,6 +30,13 @@ class TreeNode:
     score: ScoreResult | None = None
     branch_quality: BranchQuality | None = None
     action_applied: str = ""
+    # Plan parameters that produced this node (e.g., ``{"BLOCK_N": 32}``).
+    # Populated at add_child time from ``OptimizationPlan.params``. Read by
+    # ``SearchTree.render_siblings`` so the sibling line carries the param
+    # set alongside the technique ID — a sibling that tried ``BLOCK_N=32``
+    # and one that tried ``BLOCK_N=16`` are not interchangeable evidence.
+    # ``None`` on the root and on legacy checkpoints predating this field.
+    action_params: dict | None = None
     depth: int = 0
     # Populated after each iteration's profile_kernel call. None for the
     # root (no profile run at baseline construction) and for children
@@ -104,6 +111,7 @@ class SearchTree:
         action_applied: str,
         *,
         iter_no: int = -1,
+        action_params: dict | None = None,
     ) -> TreeNode:
         """Add a child node resulting from an optimization action."""
         parent = self._nodes[parent_id]
@@ -112,6 +120,7 @@ class SearchTree:
             kernel=kernel,
             parent_id=parent_id,
             action_applied=action_applied,
+            action_params=action_params,
             depth=parent.depth + 1,
             iter_no=iter_no,
         )
@@ -228,6 +237,104 @@ class SearchTree:
             lines.append(f"  [{i}] {action}{quality} — SOL {sol}{cursor}")
         return "\n".join(lines)
 
+    def render_siblings(
+        self,
+        parent_id: int,
+        exclude_id: int | None = None,
+    ) -> str:
+        """Render children of *parent_id* (other than *exclude_id*) as one-liners.
+
+        Returns ``""`` when the parent has no qualifying children — callers
+        gate the prompt section on truthiness, mirroring the existing
+        ``tree_context`` / ``reviewer_feedback`` omission pattern.
+
+        Line format::
+
+            - <action_applied> {<params>}: SOL <score> (Δ <delta vs parent>),
+              <reviewer outcome>, <branch_quality>
+
+        Sentinels for missing fields:
+          * score missing → ``"SOL n/a"`` / ``"Δ n/a"``
+          * last_review missing → ``"(no review yet)"``
+          * branch_quality missing → ``"(unscored)"``
+
+        A still-scoring sibling appears with sentinels rather than being
+        skipped — the Planner / Reviewer benefit from knowing the action
+        was attempted, even before scoring lands.
+        """
+        parent = self._nodes[parent_id]
+        parent_score = parent.score.sol_score if parent.score is not None else None
+        lines: list[str] = []
+        for child_id in parent.children_ids:
+            if exclude_id is not None and child_id == exclude_id:
+                continue
+            child = self._nodes[child_id]
+            if child.action_params:
+                params_str = "{" + ", ".join(
+                    f"{k}:{v}" for k, v in child.action_params.items()
+                ) + "}"
+                action_label = f"{child.action_applied} {params_str}"
+            else:
+                action_label = child.action_applied or "(no action)"
+            if child.score is not None:
+                sol = f"SOL {child.score.sol_score:.3f}"
+                if parent_score is not None:
+                    delta_str = f"Δ {child.score.sol_score - parent_score:+.3f}"
+                else:
+                    delta_str = "Δ n/a"
+            else:
+                sol = "SOL n/a"
+                delta_str = "Δ n/a"
+            outcome = (
+                child.last_review.outcome
+                if child.last_review is not None
+                else "(no review yet)"
+            )
+            bq = (
+                child.branch_quality.value
+                if child.branch_quality is not None
+                else "(unscored)"
+            )
+            lines.append(f"- {action_label}: {sol} ({delta_str}), {outcome}, {bq}")
+        return "\n".join(lines)
+
+    def regressed_sibling_actions(
+        self,
+        parent_id: int,
+        exclude_id: int | None = None,
+    ) -> list[tuple[str, int]]:
+        """Return ``[(action_applied, iter_no), ...]`` for siblings of
+        *parent_id* whose score is strictly more than ``_SOL_DELTA_EPSILON``
+        below the parent's score.
+
+        The strict-inequality boundary matches the Reviewer contract
+        (reviewer/system.md branch-quality table: neutral band
+        ``[−eps, +eps]`` is closed; regression is ``Δ < −eps``), so a
+        sibling at exactly Δ = −eps is neutral here, not regressed. The
+        ``+ 1e-9`` tolerance matches the project's float-boundary
+        convention (see ``detect_plateau``). Siblings without scores
+        (still-running / errored) are not counted.
+
+        Shares the ``_SOL_DELTA_EPSILON`` constant with the Reviewer's
+        rule-based fallback so the two consumers of the −0.02 threshold
+        cannot drift.
+        """
+        from src.agents.reviewer import _SOL_DELTA_EPSILON
+
+        parent = self._nodes[parent_id]
+        if parent.score is None:
+            return []
+        out: list[tuple[str, int]] = []
+        for child_id in parent.children_ids:
+            if exclude_id is not None and child_id == exclude_id:
+                continue
+            child = self._nodes[child_id]
+            if child.score is None:
+                continue
+            if (parent.score.sol_score - child.score.sol_score) > _SOL_DELTA_EPSILON + 1e-9:
+                out.append((child.action_applied, child.iter_no))
+        return out
+
     # ── checkpointing ────────────────────────────────────────────────────
 
     def save(self, path: Path) -> None:
@@ -293,6 +400,7 @@ def _serialize_node(node: TreeNode) -> dict:
         "parent_id": node.parent_id,
         "children_ids": node.children_ids,
         "action_applied": node.action_applied,
+        "action_params": node.action_params,
         "depth": node.depth,
         "branch_quality": node.branch_quality.value if isinstance(node.branch_quality, BranchQuality) else None,
         "dead_reason": node.dead_reason.value if isinstance(node.dead_reason, DeadReason) else None,
@@ -501,6 +609,10 @@ def _deserialize_node(data: dict) -> TreeNode:
         score=score,
         branch_quality=bq,
         action_applied=data["action_applied"],
+        # ``.get(..., None)`` keeps pre-action_params checkpoints loadable —
+        # legacy nodes have no recorded plan params; sibling rendering will
+        # fall back to bare action_applied.
+        action_params=data.get("action_params"),
         depth=data["depth"],
         profiling=_deserialize_profiling(data.get("profiling")),
         per_workload_latency_us=_deserialize_per_workload_latency(
