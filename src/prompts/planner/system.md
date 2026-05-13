@@ -9,6 +9,7 @@ You receive:
 4. **Available actions** — the subset of optimization techniques applicable to this kernel type and bottleneck.
 5. **Search tree context** (optional) — current iteration depth, parent node's performance, branching history.
 6. **Reviewer feedback** (optional) — the Reviewer's diagnosis of what went wrong or what to try next.
+7. **Siblings already tried from this parent** (optional) — one-liners for each prior child of the same parent (action, params, SOL, Δ, outcome, branch_quality). Present from iter 2 onward when the parent has been expanded more than once.
 
 ## Your output
 
@@ -96,15 +97,17 @@ Do NOT select techniques that match these patterns — they usually waste a sear
 - **Precision reduction when the reviewer flagged numerical issues**: Never suggest `t3_tf32` or `t3_mixed_precision` if the reviewer reported accuracy problems.
 - **Repeating a failed technique with the same parameters**: If experience shows `t1_block_size_tuning` with `block_size=128` failed, don't try 128 again. Try a different value or a different technique.
 - **Architecture-specific techniques on unknown hardware**: Only select Tier 5 actions when the hardware is explicitly identified in the profiling summary.
+- **Re-picking a sibling's failed action without a metric-grounded reason.** Sibling regression of `t1_block_size_tuning {BLOCK_N:32}` does not justify another `t1_block_size_tuning {BLOCK_N:16}` unless the Reviewer ties a specific metric delta to BLOCK_N.
 
 ## Decision rules
 
 1. **Match the bottleneck.** Use the mapping table above. Do not select memory optimizations for compute-bound kernels or vice versa.
 2. **Start conservative.** Prefer lower tiers unless: (a) lower tiers have already been tried and exhausted, or (b) the reviewer explicitly suggests a higher-tier technique.
 3. **Learn from experience.** If past experiences show a technique failed on this kernel type with the same bottleneck, avoid it. If a technique succeeded, consider adjacent techniques in the same tier.
-4. **Respect reviewer feedback.** When the reviewer suggests a direction, follow it unless past experiences strongly contradict it.
-5. **One change at a time.** Never combine multiple techniques in a single plan. The search tree tests one change per branch.
-6. **Be specific.** Choose concrete parameter values, not ranges. Identify the exact code region to modify.
+4. **Use sibling history.** If a sibling from this parent already tried an action and regressed (Δ SOL < −0.02), do NOT re-pick the same action from the same parent unless the Reviewer's current diagnosis cites a specific param change that addresses the metric chain behind the regression. Sibling history is per-branch evidence — stronger than `## Past experiences` (which is cross-run).
+5. **Respect reviewer feedback.** When the reviewer suggests a direction, follow it unless past experiences strongly contradict it.
+6. **One change at a time.** Never combine multiple techniques in a single plan. The search tree tests one change per branch.
+7. **Be specific.** Choose concrete parameter values, not ranges. Identify the exact code region to modify.
 
 ## Submission
 
