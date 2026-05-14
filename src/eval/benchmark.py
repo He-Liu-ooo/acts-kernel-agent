@@ -34,7 +34,7 @@ import logging
 import math
 import statistics
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Callable, Protocol
+from typing import TYPE_CHECKING, Any, Callable, Protocol
 
 if TYPE_CHECKING:
     from sol_execbench.core.data import Definition, Workload
@@ -48,60 +48,6 @@ _log = logging.getLogger(__name__)
 # Reserved seed for the per-workload autotune burn-in call. Negative so it
 # can't collide with warmup or timed iter seeds (which range over 0..N).
 _BURN_IN_SEED = -1
-
-
-def _key_tuple_for(
-    workload: "Workload",
-    autotune_keys: list[str],
-    definition: "Definition | None" = None,
-) -> tuple | None:
-    """Resolve autotune key arg-names against a workload's resolved axes.
-
-    Looks up each key string with two-stage resolution:
-      1. ``workload.axes`` first (SOL's per-workload axis-name → integer
-         map; e.g. ``{"B": 2}`` for a batch axis that varies per
-         workload). Workload bindings always win — they're the immediate
-         runtime context.
-      2. If *definition* is provided AND the axis is declared as
-         ``AxisConst`` on ``definition.axes``, use the const value. This
-         covers the common SOL shape where ``key=["B", "M", "N"]`` spans
-         a var axis (``B`` on workload) and const axes (``M``/``N`` on
-         the Definition). Codex review 2026-05-14 finding #2.
-
-    If any key fails to resolve via either stage, returns ``None`` — the
-    orchestrator treats that as "autotune_winner unavailable for this
-    workload" and continues. Empty ``autotune_keys`` returns ``()``
-    (valid Triton cache lookup for kernels with ``key=[]``, though the
-    Coder validator forbids that for emitted kernels).
-
-    Non-const axis types (``AxisVar`` without a workload binding,
-    ``AxisExpr``) degrade to None — they can't be statically resolved.
-    """
-    axes = getattr(workload, "axes", None) or {}
-    def_axes = getattr(definition, "axes", None) or {} if definition is not None else {}
-    values: list = []
-    for k in autotune_keys:
-        if k in axes:
-            values.append(axes[k])
-            continue
-        def_axis = def_axes.get(k) if def_axes else None
-        # Class-name check is the safest cross-Tier path: importing
-        # ``AxisConst`` at module top would pull in ``sol_execbench``,
-        # and the alternative ``getattr(def_axis, "type") == "const"``
-        # is silently typo-prone.
-        if def_axis is not None and type(def_axis).__name__ == "AxisConst":
-            const_value = getattr(def_axis, "value", None)
-            if const_value is not None:
-                values.append(const_value)
-                continue
-        _log.warning(
-            "autotune key %r not resolvable from workload %s axes or "
-            "definition const axes; autotune_winner will be None for "
-            "this workload.",
-            k, getattr(workload, "uuid", "?"),
-        )
-        return None
-    return tuple(values)
 
 
 class BenchmarkTimer(Protocol):
@@ -149,6 +95,7 @@ class BenchmarkResult:
     per_workload_latency_us: dict[str, float] = field(default_factory=dict)
     workload_errors: dict[str, str] = field(default_factory=dict)
     last_outputs: list = field(default_factory=list)
+    autotune_winner_per_workload: dict[str, dict] = field(default_factory=dict)
 
     @property
     def is_fully_successful(self) -> bool:
@@ -168,6 +115,7 @@ def benchmark_kernel(
     timer_factory: Callable[[], BenchmarkTimer] | None = None,
     kernel_fn: Callable | None = None,
     definition: Definition | None = None,
+    autotuner: Any = None,
     discard_first: int = 1,
 ) -> BenchmarkResult:
     """Benchmark kernel latency via the injected timer.
@@ -214,6 +162,25 @@ def benchmark_kernel(
     per_wl: dict[str, float] = {}
     errors: dict[str, str] = {}
     last_outputs: list = []
+    winners: dict[str, dict] = {}
+    autotuner_usable = autotuner is not None
+
+    if autotuner_usable:
+        # The Coder's correctness pass (`check_correctness_tool`) compiles
+        # and launches the same kernel before this function runs. Triton's
+        # @triton.autotune caches the winning config per key on first call,
+        # so the cache may already contain entries for our workload shapes
+        # when we get here. Without this clear, the per-workload
+        # ``set(cache) - before`` delta is empty and every winner is
+        # silently dropped — even though autotune actually selected a config.
+        try:
+            autotuner.cache.clear()
+        except AttributeError:
+            _log.warning(
+                "autotuner provided but .cache.clear() unavailable; "
+                "autotune_winner_per_workload may be empty for this run.",
+            )
+            autotuner_usable = False
 
     for wl, gen in zip(workloads, input_generators):
         # Fresh timer per workload: a CUDA launch/event fault can leave
@@ -227,6 +194,16 @@ def benchmark_kernel(
         # as the workload's outputs — so allocator pauses don't leak into
         # the latency measurement.
         wl_gen = _wrap_dps_generator(gen, kernel=kernel, workload=wl, definition=definition)
+        before: set | None = None
+        if autotuner_usable:
+            try:
+                before = set(autotuner.cache)
+            except AttributeError:
+                _log.warning(
+                    "autotuner provided but lacks .cache attribute; "
+                    "autotune_winner_per_workload will be empty for this run.",
+                )
+                autotuner_usable = False
         median_ms, error, captured = _time_workload(
             fn=fn,
             input_generator=wl_gen,
@@ -240,6 +217,20 @@ def benchmark_kernel(
             errors[wl.uuid] = error
         else:
             per_wl[wl.uuid] = median_ms * 1000.0
+            if autotuner_usable and before is not None:
+                try:
+                    added = set(autotuner.cache) - before
+                except AttributeError:
+                    autotuner_usable = False
+                    added = set()
+                if len(added) == 1:
+                    cache_key = next(iter(added))
+                    winners[wl.uuid] = _extract_winner_cfg(autotuner.cache[cache_key])
+                elif len(added) > 1:
+                    _log.warning(
+                        "unexpected autotune cache delta: %d entries for workload %s",
+                        len(added), wl.uuid,
+                    )
         # Overwrite each workload so we end up with the *last* workload's
         # last-iter outputs — matches the BenchmarkResult.last_outputs
         # contract (used for check_lazy_outputs_after_bench).
@@ -263,7 +254,16 @@ def benchmark_kernel(
         per_workload_latency_us=per_wl,
         workload_errors=errors,
         last_outputs=last_outputs,
+        autotune_winner_per_workload=winners,
     )
+
+
+def _extract_winner_cfg(cfg: Any) -> dict:
+    return {
+        "kwargs": dict(getattr(cfg, "kwargs", {})),
+        "num_warps": int(getattr(cfg, "num_warps", 0)),
+        "num_stages": int(getattr(cfg, "num_stages", 0)),
+    }
 
 
 def _wrap_dps_generator(

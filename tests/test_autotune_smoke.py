@@ -81,10 +81,10 @@ def test_autotune_burn_in_populates_cache(autotune_matmul_source):
     compiled = compile_kernel(k)
     assert compiled.success, compiled.error_message
     # A1 PR 1: compile_kernel now surfaces the Triton Autotuner instance
-    # alongside the host entrypoint, so the orchestrator's
-    # _record_autotune_winner can introspect the cache. The host wrapper
-    # (compiled.compiled_fn) doesn't carry the cache; the Autotuner
-    # (compiled.triton_autotuner) does.
+    # alongside the host entrypoint, so benchmark_kernel can diff the
+    # cache around each workload. The host wrapper (compiled.compiled_fn)
+    # doesn't carry the cache; the Autotuner (compiled.triton_autotuner)
+    # does.
     assert compiled.triton_autotuner is not None, (
         "triton_autotuner not resolved — compile_kernel did not find "
         "module.matmul_kernel or the wrapper has no .cache attribute"

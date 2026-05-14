@@ -1083,6 +1083,44 @@ def test_build_user_prompt_menu_when_flag_on_and_raw_metrics_present():
     assert section.index("- sm__a") < section.index("- sm__b")
 
 
+def test_build_user_prompt_lists_metric_groups_when_available():
+    """Flag on + metric_groups: prompt shows grouped inventory so Reviewer
+    can query high-signal groups instead of guessing exact NCU names."""
+    from src.eval.profiler import AnalyticalMetrics, ProfilingResult
+
+    profiling = ProfilingResult(
+        analytical=AnalyticalMetrics(
+            achieved_tflops=5.0,
+            achieved_bandwidth_gb_s=200.0,
+            pct_peak_compute=0.4,
+            pct_peak_bandwidth=0.5,
+        ),
+        raw_metrics={"foo": 1.0},
+        metric_groups={
+            "tensor_core": {
+                "tc.present": {"status": "present", "value": 1.0},
+                "tc.missing": {"status": "missing"},
+            },
+            "memory": {
+                "mem.present": {"status": "present", "value": 2.0},
+            },
+        },
+    )
+    agent = ReviewerAgent(model=None)
+    prompt = agent.build_user_prompt(
+        kernel_source="def k(): pass",
+        profiling_summary="",
+        sol_score=0.5,
+        headroom_pct=50.0,
+        bottleneck=BottleneckType.MEMORY_BOUND,
+        reviewer_metric_queries=True,
+        profiling=profiling,
+    )
+    assert "## Available metric groups (queryable)" in prompt
+    assert "- tensor_core: 1 present, 1 missing" in prompt
+    assert "- memory: 1 present, 0 missing" in prompt
+
+
 def test_build_user_prompt_menu_degraded_notice_when_raw_metrics_empty():
     """Flag on + empty raw_metrics: degraded-state notice replaces the list."""
     agent = ReviewerAgent(model=None)
@@ -1197,6 +1235,30 @@ def test_make_query_metric_tool_all_known_names():
     assert out == {
         "sm__warps_active.avg.pct": "0.62",
         "smsp__cycles_active.sum": "1234.5",
+    }
+
+
+def test_make_query_metric_tool_group_query_returns_status_values():
+    from src.agents.reviewer import _make_query_metric_tool
+
+    raw = {"foo": 1.0}
+    groups = {
+        "tensor_core": {
+            "tc.present": {"status": "present", "value": 12.5},
+            "tc.missing": {"status": "missing"},
+        }
+    }
+    tool = _make_query_metric_tool(
+        raw_metrics=raw,
+        iter_idx=0,
+        metric_groups=groups,
+    )
+
+    out = tool(names=["group:tensor_core"])
+
+    assert out == {
+        "group:tensor_core.tc.present": "present: 12.5",
+        "group:tensor_core.tc.missing": "missing",
     }
 
 

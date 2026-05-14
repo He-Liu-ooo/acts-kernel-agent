@@ -808,3 +808,61 @@ async def test_orchestrator_threads_dps_onto_child_kernel(tmp_path, harness):
         await orch.run(harness.baseline, workloads=None, roofline=harness.roofline)
 
     assert captured["dps"] is True
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_threads_workloads_and_definition_into_coder(
+    tmp_path, harness,
+):
+    """The orchestrator's per-iteration Coder dispatch must forward
+    ``workloads`` and ``definition`` so the correctness tool's
+    ``verify_correctness`` call sees a non-None workload — that's what
+    activates the workload-tolerance override (atol/rtol from
+    ``Workload.tolerance``) for stages 1-4 and anti-cheat. Without these
+    kwargs, anti-cheat falls back to its hardcoded strict defaults
+    (1e-5 / 1e-4) and rejects mathematically correct kernels whose
+    workload spec carries looser bounds (e.g. bf16 matmul, atol≈9e-5).
+    """
+    from sol_execbench.core.data import Definition, Workload
+    from src.search.orchestrator import Orchestrator
+
+    definition = Definition.model_validate({
+        "name": "noop",
+        "axes": {"N": {"type": "var"}},
+        "inputs": {"x": {"shape": ["N"], "dtype": "float32"}},
+        "outputs": {"y": {"shape": ["N"], "dtype": "float32"}},
+        "reference": "def run(x): return x\n",
+    })
+    workload = Workload.model_validate(
+        {"uuid": "wl0", "axes": {"N": 256}, "inputs": {}}
+    )
+    # ``total_flops`` / ``total_fused_bytes`` populated so
+    # ``compute_roofline_inputs`` early-returns those values without
+    # touching shape-formula resolution.
+    roofline_with_counts = RooflineResult(
+        t_sol_us=harness.roofline.t_sol_us,
+        bottleneck=harness.roofline.bottleneck,
+        source="solar",
+        total_flops=1_000_000,
+        total_fused_bytes=100_000,
+    )
+
+    with (
+        patch("src.eval.benchmark.benchmark_kernel", return_value=harness.bench),
+        patch("src.eval.profiler.profile_kernel", return_value=_make_profile()),
+    ):
+        orch = Orchestrator(
+            harness.config, harness.planner, harness.coder, harness.reviewer,
+            harness.retriever,
+        )
+        await orch.run(
+            harness.baseline,
+            workloads=[workload],
+            roofline=roofline_with_counts,
+            definition=definition,
+        )
+
+    harness.coder.implement.assert_called()
+    kwargs = harness.coder.implement.call_args.kwargs
+    assert kwargs.get("workloads") == [workload]
+    assert kwargs.get("definition") is definition

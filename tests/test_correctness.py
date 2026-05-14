@@ -337,6 +337,58 @@ def test_workload_tolerance_override_is_opt_in():
     assert r.passed is True
 
 
+# ── tol_bound@max_abs telemetry ────────────────────────────────────────────
+
+
+@pytest.mark.gpu
+def test_torch_policy_reports_tol_bound_at_max_abs_position():
+    """When ``TorchComparisonPolicy.compare`` rejects on tolerance, the
+    failure reason must include ``tol_bound@max_abs`` computed as
+    ``atol + rtol * |reference_at_max_abs_idx|``. This is the per-element
+    bound SOL actually compared against at the worst-error position — it
+    makes ``max_abs`` interpretable (over by 2× vs over by 500× look the
+    same in ``max_abs`` alone, but differ wildly in the ratio to
+    ``tol_bound``).
+    """
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("sol_execbench")
+
+    from src.eval.correctness import TorchComparisonPolicy
+
+    # Worst-error element is at index 1 with |reference|=100, error=1.0.
+    # Other elements satisfy the bound. Expected:
+    #   tol_bound@max_abs = 1e-5 + 1e-4 * 100 = 1.001e-2
+    expected = torch.tensor([1.0, 100.0, 0.5], dtype=torch.float32)
+    output = torch.tensor([1.00005, 99.0, 0.5], dtype=torch.float32)
+
+    result = TorchComparisonPolicy().compare(
+        output, expected, atol=1e-5, rtol=1e-4,
+    )
+    assert result.match is False
+    assert "tol_bound@max_abs=" in result.reason
+    assert "tol_bound@max_abs=1.001e-02" in result.reason, result.reason
+
+
+@pytest.mark.gpu
+def test_tol_bound_at_max_abs_helper_matches_sol_per_element_formula():
+    """Direct test of the helper. The per-element bound at the worst-abs
+    position must equal SOL's ``atol + rtol * |reference|`` evaluated at
+    that index — same formula SOL applies element-wise inside
+    ``compute_error_stats``.
+    """
+    torch = pytest.importorskip("torch")
+
+    from src.eval.correctness import _tol_bound_at_max_abs
+
+    # Worst-error position is index 2 (error 0.5, |ref|=10.0).
+    expected = torch.tensor([1.0, 5.0, 10.0, 2.0], dtype=torch.float32)
+    output = torch.tensor([1.0, 5.0, 10.5, 2.0], dtype=torch.float32)
+
+    bound = _tol_bound_at_max_abs(output, expected, atol=1e-3, rtol=0.05)
+    # 1e-3 + 0.05 * 10.0 = 0.501
+    assert bound == pytest.approx(0.501, rel=1e-6)
+
+
 # ── Multi-output normalization (SOL ``normalize_outputs`` integration) ───
 
 

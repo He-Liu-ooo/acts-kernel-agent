@@ -193,12 +193,16 @@ def render_profiling_summary(
 
     ncu = profiling.ncu
     if ncu is not None:
+        tc = (
+            "n/a" if ncu.tensor_core_util_pct is None
+            else f"{ncu.tensor_core_util_pct:.1f}%"
+        )
         lines.extend([
             "",
             "### NCU (curated)",
             f"- sm_occupancy: {ncu.sm_occupancy_pct:.1f}%",
             f"- l2_hit_rate: {ncu.l2_hit_rate_pct:.1f}%",
-            f"- tensor_core_util: {ncu.tensor_core_util_pct:.1f}%",
+            f"- tensor_core_util: {tc}",
             (
                 f"- top stalls: {ncu.warp_stall_dominant} "
                 f"({ncu.warp_stall_dominant_pct:.1f}%), "
@@ -342,6 +346,7 @@ def _make_submit_review_tool(captured: dict) -> Callable[..., str]:
 def _make_query_metric_tool(
     raw_metrics: dict[str, float] | None,
     iter_idx: int,
+    metric_groups: dict[str, dict[str, dict[str, str | float]]] | None = None,
 ) -> Callable[[list[str]], dict[str, str]]:
     """Closure-captures this iteration's raw_metrics + iter index.
 
@@ -373,12 +378,33 @@ def _make_query_metric_tool(
             count=len(coerced),
             names=coerced[:8],
         )
-        if not raw_metrics:
-            return {n: "[no data]" for n in coerced}
-        return {
-            n: (f"{raw_metrics[n]}" if n in raw_metrics else "[unknown]")
-            for n in coerced
-        }
+        out: dict[str, str] = {}
+        groups = metric_groups or {}
+        for name in coerced:
+            group_name = name.removeprefix("group:")
+            if name.startswith("group:") or (
+                name in groups and name not in (raw_metrics or {})
+            ):
+                group = groups.get(group_name)
+                if group is None:
+                    out[name] = "[unknown group]"
+                    continue
+                for metric_name, status in group.items():
+                    state = str(status.get("status", "missing"))
+                    if state == "present" and "value" in status:
+                        out[f"group:{group_name}.{metric_name}"] = (
+                            f"present: {status['value']}"
+                        )
+                    else:
+                        out[f"group:{group_name}.{metric_name}"] = state
+                continue
+            if not raw_metrics:
+                out[name] = "[no data]"
+            else:
+                out[name] = (
+                    f"{raw_metrics[name]}" if name in raw_metrics else "[unknown]"
+                )
+        return out
 
     return query_metric
 
@@ -491,7 +517,27 @@ class ReviewerAgent:
 
         if reviewer_metric_queries:
             raw_metrics = profiling.raw_metrics if profiling is not None else None
+            metric_groups = (
+                profiling.metric_groups if profiling is not None else None
+            )
             if raw_metrics:
+                if metric_groups:
+                    group_lines = ["## Available metric groups (queryable)"]
+                    for group_name in sorted(metric_groups):
+                        group = metric_groups[group_name]
+                        present = sum(
+                            1
+                            for status in group.values()
+                            if status.get("status") == "present"
+                        )
+                        missing = len(group) - present
+                        group_lines.append(
+                            f"- {group_name}: {present} present, {missing} missing"
+                        )
+                    group_lines.append(
+                        'Query a full group with query_metric(["group:<name>"]).'
+                    )
+                    sections.append("\n".join(group_lines))
                 menu_lines = ["## Available raw metrics (queryable)"]
                 menu_lines.extend(f"- {k}" for k in sorted(raw_metrics))
                 sections.append("\n".join(menu_lines))
@@ -583,8 +629,13 @@ class ReviewerAgent:
         instructions = self._instructions_base
         if reviewer_metric_queries:
             raw_metrics = profiling.raw_metrics if profiling is not None else None
+            metric_groups = profiling.metric_groups if profiling is not None else None
             query_tool = function_tool(
-                _make_query_metric_tool(raw_metrics=raw_metrics, iter_idx=iter_idx),
+                _make_query_metric_tool(
+                    raw_metrics=raw_metrics,
+                    iter_idx=iter_idx,
+                    metric_groups=metric_groups,
+                ),
                 strict_mode=False,
             )
             tools.append(query_tool)

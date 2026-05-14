@@ -102,6 +102,13 @@ def _run(
     return result, timer
 
 
+@dataclass
+class FakeAutotuneConfig:
+    kwargs: dict
+    num_warps: int
+    num_stages: int
+
+
 # ── Dataclass / placeholder path ───────────────────────────────────────────
 
 
@@ -114,6 +121,7 @@ def test_benchmark_result_defaults_are_zero():
     assert r.timed_runs == 0
     assert r.per_workload_latency_us == {}
     assert r.workload_errors == {}
+    assert r.autotune_winner_per_workload == {}
 
 
 def test_empty_workloads_returns_sentinel_latency_without_calling_timer():
@@ -642,7 +650,7 @@ def test_non_dps_single_tensor_return_wraps_in_list():
     check_lazy_outputs_after_bench(result.last_outputs)
 
 
-# ── A1 PR 1: autotune burn-in + _key_tuple_for helper ──────────────────
+# ── A1 PR 1/B: autotune burn-in + cache-delta winner capture ───────────
 
 
 def test_burn_in_fires_before_warmup_with_reserved_seed():
@@ -696,121 +704,146 @@ def test_burn_in_failure_surfaces_as_workload_error():
         )
 
 
-def test_key_tuple_for_resolves_axes():
-    from src.eval.benchmark import _key_tuple_for
+def test_benchmark_kernel_records_winner_via_cache_delta():
+    """A single cache insertion during a workload's burn-in is attributed
+    to that workload without resolving Triton key names against SOL axes."""
+    cache = {}
+    autotuner = type("Autotuner", (), {"cache": cache})()
+    configs = {
+        "shape-a": FakeAutotuneConfig({"BLOCK_M": 64}, 4, 3),
+        "shape-b": FakeAutotuneConfig({"BLOCK_M": 128}, 8, 4),
+    }
 
-    wl = Workload.model_validate({
-        "uuid": "wl-1",
-        "axes": {"M": 4096, "N": 4096, "K": 4096},
-        "inputs": {},
-    })
-    assert _key_tuple_for(wl, ["M", "N", "K"]) == (4096, 4096, 4096)
+    def kernel_fn(shape):
+        cache.setdefault(("triton-key", shape), configs[shape])
+
+    def gen_a(seed: int) -> tuple:
+        return ("shape-a",)
+
+    def gen_b(seed: int) -> tuple:
+        return ("shape-b",)
+
+    config = ACTSConfig()
+    config.warmup_runs = 1
+    config.timed_runs = 1
+    result = benchmark_kernel(
+        _make_kernel(),
+        config,
+        workloads=[_wl("wl-a"), _wl("wl-b")],
+        input_generators=[gen_a, gen_b],
+        timer_factory=lambda: RecordingTimer([0.010] * 10),
+        kernel_fn=kernel_fn,
+        autotuner=autotuner,
+        discard_first=1,
+    )
+
+    assert result.autotune_winner_per_workload == {
+        "wl-a": {"kwargs": {"BLOCK_M": 64}, "num_warps": 4, "num_stages": 3},
+        "wl-b": {"kwargs": {"BLOCK_M": 128}, "num_warps": 8, "num_stages": 4},
+    }
 
 
-def test_key_tuple_for_unresolved_key_returns_none():
-    """When a key isn't in workload.axes, the helper degrades to None.
-    The orchestrator treats that as 'autotune_winner unavailable for this
-    workload' and continues."""
-    from src.eval.benchmark import _key_tuple_for
+def test_benchmark_kernel_skips_winner_on_identical_shape_collision(caplog):
+    """When workload 2 hits workload 1's existing autotune cache entry,
+    no winner is guessed for workload 2."""
+    cache = {}
+    autotuner = type("Autotuner", (), {"cache": cache})()
+    cfg = FakeAutotuneConfig({"BLOCK": 64}, 4, 2)
 
-    wl = Workload.model_validate({
-        "uuid": "wl-1",
-        "axes": {"M": 4096},
-        "inputs": {},
-    })
-    assert _key_tuple_for(wl, ["M", "X"]) is None
+    def kernel_fn(shape):
+        cache.setdefault(("same-shape", shape), cfg)
+
+    def gen(seed: int) -> tuple:
+        return ("same",)
+
+    config = ACTSConfig()
+    config.warmup_runs = 1
+    config.timed_runs = 1
+    result = benchmark_kernel(
+        _make_kernel(),
+        config,
+        workloads=[_wl("first"), _wl("second")],
+        input_generators=[gen, gen],
+        timer_factory=lambda: RecordingTimer([0.010] * 10),
+        kernel_fn=kernel_fn,
+        autotuner=autotuner,
+        discard_first=1,
+    )
+
+    assert result.autotune_winner_per_workload == {
+        "first": {"kwargs": {"BLOCK": 64}, "num_warps": 4, "num_stages": 2}
+    }
+    assert "unexpected autotune cache delta" not in caplog.text
 
 
-def test_key_tuple_for_empty_keys_returns_empty_tuple():
-    """Edge case: kernel with no autotune_keys (e.g. legacy single-config
-    starter) → empty tuple, not None. Cache lookup with () is a valid
-    Triton autotune key when key=[] is supplied (which we forbid for
-    Coder kernels, but starters can have it)."""
-    from src.eval.benchmark import _key_tuple_for
+def test_benchmark_kernel_skips_winner_on_ambiguous_delta(caplog):
+    """Multiple cache insertions during one workload are ambiguous, so the
+    workload gets no winner and the anomaly is logged."""
+    cache = {}
+    autotuner = type("Autotuner", (), {"cache": cache})()
 
-    wl = Workload.model_validate({
-        "uuid": "wl-1",
-        "axes": {},
-        "inputs": {},
-    })
-    assert _key_tuple_for(wl, []) == ()
+    def kernel_fn(shape):
+        cache.setdefault(("key-a", shape), FakeAutotuneConfig({"A": 1}, 4, 2))
+        cache.setdefault(("key-b", shape), FakeAutotuneConfig({"B": 2}, 8, 3))
+
+    def gen(seed: int) -> tuple:
+        return ("shape",)
+
+    config = ACTSConfig()
+    config.warmup_runs = 1
+    config.timed_runs = 1
+    with caplog.at_level("WARNING", logger="src.eval.benchmark"):
+        result = benchmark_kernel(
+            _make_kernel(),
+            config,
+            workloads=[_wl("wl-ambiguous")],
+            input_generators=[gen],
+            timer_factory=lambda: RecordingTimer([0.010] * 10),
+            kernel_fn=kernel_fn,
+            autotuner=autotuner,
+            discard_first=1,
+        )
+
+    assert result.autotune_winner_per_workload == {}
+    assert "unexpected autotune cache delta: 2 entries for workload wl-ambiguous" in caplog.text
 
 
-def test_key_tuple_for_resolves_against_definition_const_axes():
-    """Codex review 2026-05-14 finding #2: SOL problems split axes into
-    const_axes (carried on Definition, invariant across workloads) and
-    var_axes (carried on each Workload). The Coder's autotune key= list
-    legitimately spans both — e.g. ``key=["B","M","N"]`` where B is var
-    and M/N are const. Without consulting Definition, _key_tuple_for
-    returns None for M/N and the winner never records.
+def test_benchmark_kernel_records_winner_when_correctness_warmed_cache():
+    """Coder's correctness pass compiles + launches the kernel before
+    ``benchmark_kernel`` runs, so the autotuner cache may already contain
+    the workload's entry by the time benchmarking starts. Without clearing,
+    ``set(cache) - before`` is empty and the winner is dropped — even
+    though autotune ran.
+
+    Contract: ``benchmark_kernel`` clears any prior autotuner cache state
+    at entry so per-workload winner attribution is meaningful.
     """
-    from sol_execbench.core.data import Definition
-    from src.eval.benchmark import _key_tuple_for
+    cfg = FakeAutotuneConfig({"BLOCK_M": 64}, 4, 3)
+    # Simulate the correctness pass having warmed the cache with the
+    # workload's autotune key.
+    cache = {("triton-key", "shape-a"): cfg}
+    autotuner = type("Autotuner", (), {"cache": cache})()
 
-    definition = Definition.model_validate({
-        "name": "matmul-fixed",
-        "op_type": "matmul",
-        "axes": {
-            "M": {"type": "const", "value": 4096},
-            "N": {"type": "const", "value": 4096},
-        },
-        "inputs": {},
-        "outputs": {},
-        "reference": "def run(): return 0",
-    })
-    # Workload only carries the var axis (B).
-    wl = Workload.model_validate({
-        "uuid": "wl-batch-2",
-        "axes": {"B": 2},
-        "inputs": {},
-    })
-    # Key list spans var + const. Should resolve all three using
-    # workload.axes first then Definition.axes consts.
-    assert _key_tuple_for(wl, ["B", "M", "N"], definition=definition) == (2, 4096, 4096)
+    def kernel_fn(shape):
+        cache.setdefault(("triton-key", shape), cfg)
 
+    def gen_a(seed: int) -> tuple:
+        return ("shape-a",)
 
-def test_key_tuple_for_workload_axes_take_precedence_over_definition_consts():
-    """If a workload re-binds an axis declared as const on the Definition,
-    the workload value wins (workload is the immediate axis-resolution
-    context per SOL's runtime contract)."""
-    from sol_execbench.core.data import Definition
-    from src.eval.benchmark import _key_tuple_for
+    config = ACTSConfig()
+    config.warmup_runs = 1
+    config.timed_runs = 1
+    result = benchmark_kernel(
+        _make_kernel(),
+        config,
+        workloads=[_wl("wl-a")],
+        input_generators=[gen_a],
+        timer_factory=lambda: RecordingTimer([0.010] * 10),
+        kernel_fn=kernel_fn,
+        autotuner=autotuner,
+        discard_first=1,
+    )
 
-    definition = Definition.model_validate({
-        "name": "fake",
-        "op_type": "matmul",
-        "axes": {"M": {"type": "const", "value": 4096}},
-        "inputs": {},
-        "outputs": {},
-        "reference": "def run(): return 0",
-    })
-    wl = Workload.model_validate({
-        "uuid": "wl-override",
-        "axes": {"M": 8192},
-        "inputs": {},
-    })
-    assert _key_tuple_for(wl, ["M"], definition=definition) == (8192,)
-
-
-def test_key_tuple_for_unresolved_after_definition_lookup_returns_none():
-    """If a key is in neither workload.axes nor Definition.const_axes
-    (e.g. it's a var axis the workload forgot to bind, or an AxisExpr),
-    return None to degrade autotune_winner cleanly."""
-    from sol_execbench.core.data import Definition
-    from src.eval.benchmark import _key_tuple_for
-
-    definition = Definition.model_validate({
-        "name": "fake",
-        "op_type": "matmul",
-        "axes": {"M": {"type": "const", "value": 4096}},
-        "inputs": {},
-        "outputs": {},
-        "reference": "def run(): return 0",
-    })
-    wl = Workload.model_validate({
-        "uuid": "wl-missing-N",
-        "axes": {},
-        "inputs": {},
-    })
-    # N is neither in workload nor in definition.axes — degrade.
-    assert _key_tuple_for(wl, ["M", "N"], definition=definition) is None
+    assert result.autotune_winner_per_workload == {
+        "wl-a": {"kwargs": {"BLOCK_M": 64}, "num_warps": 4, "num_stages": 3},
+    }

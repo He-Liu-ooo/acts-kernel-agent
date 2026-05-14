@@ -84,7 +84,8 @@ def test_dump_node_writes_kernel_and_meta(tmp_path):
         assert meta["score"]["sol_score"] == 0.5
         assert meta["analytical"]["pct_peak_compute"] == 0.3
         ncu_json = json.loads((node_dir / "ncu.json").read_text())
-        assert ncu_json["sm__cycles_active.avg"] == 12345.0
+        assert ncu_json["raw"]["sm__cycles_active.avg"] == 12345.0
+        assert "groups" in ncu_json
         assert not (node_dir / "ncu.ncu-rep").exists()
     finally:
         tree_dump.unbind()
@@ -189,7 +190,8 @@ def test_dump_node_handles_analytical_none(tmp_path):
         assert meta["analytical"] is None
         # NCU still serialized via ncu.json so the Reviewer keeps its signal.
         ncu_json = json.loads((tmp_path / "tree" / "node_1" / "ncu.json").read_text())
-        assert ncu_json["foo"] == 1.0
+        assert ncu_json["raw"]["foo"] == 1.0
+        assert "groups" in ncu_json
     finally:
         tree_dump.unbind()
 

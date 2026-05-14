@@ -198,6 +198,67 @@ async def test_happy_path_event_sequence(tmp_path, harness):
 
 
 @pytest.mark.asyncio
+async def test_autotune_burn_in_done_payload_uses_winner_count(tmp_path, harness):
+    """Autotune observability reports how many workload winners were captured."""
+    from sol_execbench.core.data import Workload
+    from src.kernels.compiler import CompilationResult
+    from src.search.orchestrator import Orchestrator
+
+    harness.config.max_depth = 0
+    bench = BenchmarkResult(
+        median_latency_us=100.0,
+        timed_runs=1,
+        autotune_winner_per_workload={
+            "wl-a": {"kwargs": {"BLOCK": 64}, "num_warps": 4, "num_stages": 2},
+        },
+    )
+    workload = Workload.model_validate({
+        "uuid": "wl-a",
+        "axes": {"M": 128},
+        "inputs": {},
+    })
+    compile_result = CompilationResult(
+        success=True,
+        compiled_fn=lambda: None,
+        triton_autotuner=object(),
+    )
+
+    fh = (tmp_path / "events.jsonl").open("w", buffering=1)
+    events.bind(fh)
+    try:
+        with (
+            patch("src.kernels.compiler.compile_kernel", return_value=compile_result),
+            patch("src.eval.benchmark.benchmark_kernel", return_value=bench),
+        ):
+            orch = Orchestrator(
+                harness.config,
+                harness.planner,
+                harness.coder,
+                harness.reviewer,
+                harness.retriever,
+            )
+            await orch.run(
+                harness.baseline,
+                workloads=[workload],
+                input_generators=[lambda seed: ()],
+                roofline=harness.roofline,
+            )
+    finally:
+        events.unbind()
+        fh.close()
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "events.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    event = next(r for r in records if r["kind"] == "autotune_burn_in_done")
+    assert event["workload_count"] == 1
+    assert event["winner_count"] == 1
+    assert "winner_recorded" not in event
+
+
+@pytest.mark.asyncio
 async def test_coder_failure_emits_skipped_not_dead_end(tmp_path, harness):
     """ImplementationError → coder_failed + iter_end(skipped). The branch
     is NOT marked dead (orchestrator soft-skips the iteration without a
@@ -1008,108 +1069,43 @@ async def test_repeated_pathway_dead_end_does_not_fire_without_sibling_match(
     assert repeated == []
 
 
-# ── A1 PR 1: _record_autotune_winner ────────────────────────────────────
+# ── A1 PR 1/B: _record_autotune_winner ─────────────────────────────────
 
 
 def test_record_autotune_winner_populates_per_workload():
-    """The orchestrator queries the Triton Autotuner's cache and stores
-    per-workload winning configs under kernel.autotune_winner[wl.uuid].
-    Cache keys are PREFIX-matched: Triton appends dtype tags after the
-    user-declared key= values, so the helper matches the first N values
-    of each tuple."""
-    from unittest.mock import MagicMock
-
-    from sol_execbench.core.data import Workload
-
+    """The orchestrator copies benchmark-captured winners onto the kernel."""
     from src.kernels.kernel import Kernel, KernelSpec, KernelType
     from src.search.orchestrator import _record_autotune_winner
 
     spec = KernelSpec(name="t", kernel_type=KernelType.MATMUL)
-    kernel = Kernel(
-        spec=spec, source_code="# placeholder",
-        autotune_configs=[{"kwargs": {"BLOCK_N": 256}, "num_warps": 2, "num_stages": 2}],
-        autotune_keys=["N"],
-    )
+    kernel = Kernel(spec=spec, source_code="# placeholder")
+    bench = BenchmarkResult(autotune_winner_per_workload={
+        "wl-1": {"kwargs": {"BLOCK_N": 1024}, "num_warps": 4, "num_stages": 3}
+    })
 
-    fake_config = MagicMock()
-    fake_config.kwargs = {"BLOCK_N": 1024}
-    fake_config.num_warps = 4
-    fake_config.num_stages = 3
-
-    # Real Triton cache shape: key=(N_value, dtype_X, dtype_Y, dtype_Z).
-    autotuner = MagicMock()
-    autotuner.cache = {(4096, "torch.float32", "torch.float32"): fake_config}
-
-    wl = Workload.model_validate({"uuid": "wl-1", "axes": {"N": 4096}, "inputs": {}})
-
-    _record_autotune_winner(kernel, autotuner, [wl])
+    _record_autotune_winner(kernel, bench)
 
     assert kernel.autotune_winner == {
         "wl-1": {"kwargs": {"BLOCK_N": 1024}, "num_warps": 4, "num_stages": 3}
     }
 
 
-def test_record_autotune_winner_degrades_on_missing_cache_attribute():
-    """If Triton renames .cache, recording degrades to None silently."""
-    from sol_execbench.core.data import Workload
-
+def test_record_autotune_winner_skips_empty_benchmark_winners():
+    """No benchmark winners means no mutation to the kernel."""
     from src.kernels.kernel import Kernel, KernelSpec, KernelType
     from src.search.orchestrator import _record_autotune_winner
 
     spec = KernelSpec(name="t", kernel_type=KernelType.CUSTOM)
     kernel = Kernel(
         spec=spec, source_code="# placeholder",
-        autotune_configs=[{"kwargs": {}, "num_warps": 4, "num_stages": 2}],
-        autotune_keys=["M"],
+        autotune_winner={"existing": {"kwargs": {}, "num_warps": 1, "num_stages": 1}},
     )
-    autotuner = object()  # no .cache attribute
-    wl = Workload.model_validate({"uuid": "wl-1", "axes": {"M": 4096}, "inputs": {}})
+    bench = BenchmarkResult()
 
-    _record_autotune_winner(kernel, autotuner, [wl])
-    assert kernel.autotune_winner == {}
-
-
-def test_record_autotune_winner_skips_when_no_autotune_keys():
-    """A kernel with autotune_keys=[] doesn't get a winner — there's no
-    per-workload identity to attribute via cache prefix-match."""
-    from unittest.mock import MagicMock
-    from sol_execbench.core.data import Workload
-
-    from src.kernels.kernel import Kernel, KernelSpec, KernelType
-    from src.search.orchestrator import _record_autotune_winner
-
-    spec = KernelSpec(name="t", kernel_type=KernelType.CUSTOM)
-    kernel = Kernel(
-        spec=spec, source_code="# placeholder",
-        autotune_configs=[{"kwargs": {"BLOCK": 64}, "num_warps": 4, "num_stages": 2}],
-        autotune_keys=[],  # empty
-    )
-    autotuner = MagicMock()
-    autotuner.cache = {(): MagicMock(kwargs={}, num_warps=4, num_stages=2)}
-    wl = Workload.model_validate({"uuid": "wl-1", "axes": {}, "inputs": {}})
-
-    _record_autotune_winner(kernel, autotuner, [wl])
-    assert kernel.autotune_winner == {}
-
-
-def test_record_autotune_winner_skips_when_autotuner_is_none():
-    """Kernels without an @triton.autotune decorator surface autotuner=None
-    from compile_kernel.triton_autotuner; recording must skip cleanly."""
-    from sol_execbench.core.data import Workload
-
-    from src.kernels.kernel import Kernel, KernelSpec, KernelType
-    from src.search.orchestrator import _record_autotune_winner
-
-    spec = KernelSpec(name="t", kernel_type=KernelType.CUSTOM)
-    kernel = Kernel(
-        spec=spec, source_code="# placeholder",
-        autotune_configs=[{"kwargs": {"BLOCK": 64}, "num_warps": 4, "num_stages": 2}],
-        autotune_keys=["M"],
-    )
-    wl = Workload.model_validate({"uuid": "wl-1", "axes": {"M": 4096}, "inputs": {}})
-
-    _record_autotune_winner(kernel, None, [wl])
-    assert kernel.autotune_winner == {}
+    _record_autotune_winner(kernel, bench)
+    assert kernel.autotune_winner == {
+        "existing": {"kwargs": {}, "num_warps": 1, "num_stages": 1}
+    }
 
 
 # ── A3: orchestrator passes condensed source to Planner / Reviewer ─────

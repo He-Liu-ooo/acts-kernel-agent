@@ -343,6 +343,60 @@ def test_argv_enumerates_all_18_stall_metrics(fake_ncu_path, sample_kernel, samp
         assert name in metric_values, f"stall metric {name} not in --metrics"
 
 
+def test_argv_explicitly_requests_tensor_core_metric(
+    fake_ncu_path, sample_kernel, sample_workload
+):
+    install, argv_log = fake_ncu_path
+    _install_argv_echo(install, argv_log)
+
+    _run_ncu(
+        sample_kernel,
+        sample_workload,
+        _identity_input_generator,
+        timeout_s=10.0,
+        mode="curated",
+    )
+    args = argv_log.read_text().splitlines()
+
+    metric_values: list[str] = []
+    for i, a in enumerate(args):
+        if a == "--metrics" and i + 1 < len(args):
+            metric_values.extend(args[i + 1].split(","))
+
+    assert (
+        "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active"
+        in metric_values
+    )
+
+
+def test_argv_explicitly_requests_grouped_debug_metrics(
+    fake_ncu_path, sample_kernel, sample_workload
+):
+    install, argv_log = fake_ncu_path
+    _install_argv_echo(install, argv_log)
+
+    _run_ncu(
+        sample_kernel,
+        sample_workload,
+        _identity_input_generator,
+        timeout_s=10.0,
+        mode="curated",
+    )
+    args = argv_log.read_text().splitlines()
+
+    metric_values: list[str] = []
+    for i, a in enumerate(args):
+        if a == "--metrics" and i + 1 < len(args):
+            metric_values.extend(args[i + 1].split(","))
+
+    for name in (
+        "l1tex__t_sector_hit_rate.pct",
+        "sm__instruction_throughput.avg.pct_of_peak_sustained_active",
+        "launch__occupancy_limit_registers",
+    ):
+        assert name in metric_values
+
+
 def test_argv_includes_kernel_regex_for_entrypoint(fake_ncu_path, sample_kernel, sample_workload):
     install, argv_log = fake_ncu_path
     _install_argv_echo(install, argv_log)

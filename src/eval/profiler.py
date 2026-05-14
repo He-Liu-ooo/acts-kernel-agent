@@ -37,12 +37,10 @@ if TYPE_CHECKING:
 # Cache-bust token. Bump when the curated metric map, stall reasons,
 # parser contract, or *cache-key shape* changes. Embedded in every
 # cache key so stale entries are unreachable from the new version and
-# naturally evicted. ``v2`` includes ``kernel_name`` in the key blob so
-# two Kernels with identical source but different declared
-# ``triton_kernel_name`` values cannot alias to one entry (otherwise the
-# helper-kernel metrics would be returned when the run requested the
-# dominant-kernel filter).
-_METRIC_SET_VERSION: str = "v2"
+# naturally evicted. ``v3`` adds grouped metric provenance + a wider
+# explicit metric request list; ``v2`` added ``kernel_name`` to prevent
+# helper-kernel / dominant-kernel aliasing.
+_METRIC_SET_VERSION: str = "v3"
 
 # ``_UNSET`` sentinel distinguishes "not yet probed" from "probed → missing".
 _UNSET: Any = object()
@@ -156,19 +154,25 @@ def _stderr_fingerprint(stderr: str, max_len: int = 60) -> str:
         return ""
     return slug[:max_len]
 
-# Required metrics must appear in the CSV (parse degrades otherwise);
-# optional metrics default to 0.0 when absent. Names are raw
-# (``--print-metric-name=name``) since ``label`` varies across NCU releases.
+_STALL_PREFIX = "smsp__average_warp_latency_issue_stalled_"
+_STALL_SUFFIX = ".pct"
+
+_TENSOR_CORE_METRIC = (
+    "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active"
+)
+
+# Required metrics must appear in the CSV (parse degrades otherwise). Names
+# are raw (``--print-metric-name=name``) since ``label`` varies across NCU
+# releases. The tensor-core counter is OPTIONAL — not every NCU/GPU/kernel
+# combination emits it (e.g. Ada elementwise kernels), and its absence
+# shouldn't discard the rest of the curated profile (occupancy + L2 + stalls).
 _CURATED_REQUIRED = {
     "sm__warps_active.avg.pct_of_peak_sustained_active": "sm_occupancy_pct",
     "lts__t_sector_hit_rate.pct": "l2_hit_rate_pct",
 }
 _CURATED_OPTIONAL = {
-    "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active": "tensor_core_util_pct",
+    _TENSOR_CORE_METRIC: "tensor_core_util_pct",
 }
-
-_STALL_PREFIX = "smsp__average_warp_latency_issue_stalled_"
-_STALL_SUFFIX = ".pct"
 
 # Wildcards (``_*.pct``) do NOT expand on ``ncu --metrics`` — every
 # stall reason must be enumerated explicitly.
@@ -191,6 +195,75 @@ _STALL_REASONS = (
     "sleeping",
     "tex_throttle",
     "wait",
+)
+
+MetricStatus = dict[str, str | float]
+MetricGroups = dict[str, dict[str, MetricStatus]]
+
+# Grouped diagnostic inventory. Some instruction-mix counters are not
+# emitted by every NCU/GPU/version combination; they are still listed so the
+# Reviewer sees "missing" explicitly instead of inferring from silence.
+_METRIC_GROUPS: dict[str, tuple[str, ...]] = {
+    "tensor_core": (
+        _TENSOR_CORE_METRIC,
+        "smsp__sass_thread_inst_executed_op_hmma_pred_on.sum",
+        "smsp__sass_thread_inst_executed_op_mma_pred_on.sum",
+        "smsp__sass_thread_inst_executed_op_wgmma_pred_on.sum",
+    ),
+    "math_pipe": (
+        "smsp__average_warp_latency_issue_stalled_math_pipe_throttle.pct",
+        "sm__inst_executed.avg.per_cycle_active",
+        "sm__inst_issued.avg.per_cycle_active",
+        "sm__inst_issued.avg.pct_of_peak_sustained_active",
+        "sm__instruction_throughput.avg.pct_of_peak_sustained_active",
+    ),
+    "memory": (
+        "dram__bytes.sum.per_second",
+        "gpu__compute_memory_access_throughput.avg.pct_of_peak_sustained_elapsed",
+        "gpu__compute_memory_request_throughput.avg.pct_of_peak_sustained_elapsed",
+        "l1tex__t_sector_hit_rate.pct",
+        "lts__t_sector_hit_rate.pct",
+        "sm__memory_throughput.avg.pct_of_peak_sustained_elapsed",
+    ),
+    "occupancy": (
+        "sm__warps_active.avg.pct_of_peak_sustained_active",
+        "sm__warps_active.avg.per_cycle_active",
+        "sm__maximum_warps_avg_per_active_cycle",
+        "sm__maximum_warps_per_active_cycle_pct",
+        "launch__occupancy_limit_blocks",
+        "launch__occupancy_limit_registers",
+        "launch__occupancy_limit_shared_mem",
+        "launch__occupancy_limit_warps",
+    ),
+    "scheduler": (
+        "smsp__average_warp_latency_issue_stalled_not_selected.pct",
+        "smsp__average_warp_latency_issue_stalled_selected.pct",
+        "smsp__average_warp_latency_per_inst_issued.ratio",
+        "smsp__average_warps_active_per_inst_executed.ratio",
+    ),
+    "launch": (
+        "launch__occupancy_limit_blocks",
+        "launch__occupancy_limit_registers",
+        "launch__occupancy_limit_shared_mem",
+        "launch__occupancy_limit_warps",
+    ),
+    "stalls": tuple(
+        f"{_STALL_PREFIX}{reason}{_STALL_SUFFIX}" for reason in _STALL_REASONS
+    ),
+}
+
+_EXPLICIT_CURATED_METRICS: tuple[str, ...] = tuple(
+    dict.fromkeys(
+        [
+            _TENSOR_CORE_METRIC,
+            *(
+                metric
+                for group_name, metric_names in _METRIC_GROUPS.items()
+                if group_name != "tensor_core"
+                for metric in metric_names
+            ),
+        ]
+    )
 )
 
 # The four curated NCU sections (spec §4). Stall metrics are NOT in any
@@ -269,7 +342,7 @@ class NCUMetrics:
 
     sm_occupancy_pct: float
     l2_hit_rate_pct: float
-    tensor_core_util_pct: float
+    tensor_core_util_pct: float | None
     warp_stall_dominant: str
     warp_stall_dominant_pct: float
     warp_stall_runner_up: str
@@ -288,6 +361,7 @@ class ProfilingResult:
     analytical: AnalyticalMetrics | None
     ncu: NCUMetrics | None = None
     raw_metrics: dict[str, float] = field(default_factory=dict)
+    metric_groups: MetricGroups = field(default_factory=dict)
     degraded_reason: str | None = None
     # Path to the binary NCU report (.ncu-rep) when ncu produced one.
     # ``None`` on degraded runs (binary not found, permission denied, etc.)
@@ -325,6 +399,7 @@ class ProfilingResult:
             analytical=analytical,
             ncu=None,
             raw_metrics={},
+            metric_groups={},
             degraded_reason=reason,
         )
 
@@ -441,13 +516,13 @@ def _parse_ncu_csv(
     if not raw:
         return None, {}, True, "no_matching_kernel"
 
-    curated_fields: dict[str, float] = {}
+    curated_fields: dict[str, float | None] = {}
     for raw_name, field_name in _CURATED_REQUIRED.items():
         if raw_name not in raw:
             return None, raw, True, f"missing_metric:{raw_name}"
         curated_fields[field_name] = raw[raw_name]
     for raw_name, field_name in _CURATED_OPTIONAL.items():
-        curated_fields[field_name] = raw.get(raw_name, 0.0)
+        curated_fields[field_name] = raw.get(raw_name)
 
     stalls = sorted(
         (
@@ -471,6 +546,30 @@ def _parse_ncu_csv(
         warp_stall_runner_up_pct=stalls[1][1],
     )
     return ncu, raw, False, None
+
+
+def _build_metric_groups(raw_metrics: dict[str, float] | None) -> MetricGroups:
+    """Render the diagnostic metric inventory as present/missing groups.
+
+    This is derived from ``raw_metrics`` so every consumer sees the same
+    provenance: a metric was present with a numeric value, or it was missing
+    from the captured NCU export. Missing is intentionally distinct from
+    present-with-zero.
+    """
+    raw = raw_metrics or {}
+    groups: MetricGroups = {}
+    for group_name, metric_names in _METRIC_GROUPS.items():
+        group: dict[str, MetricStatus] = {}
+        for metric_name in metric_names:
+            if metric_name in raw:
+                group[metric_name] = {
+                    "status": "present",
+                    "value": raw[metric_name],
+                }
+            else:
+                group[metric_name] = {"status": "missing"}
+        groups[group_name] = group
+    return groups
 
 
 def _ncu_tmpdir() -> str:
@@ -610,11 +709,12 @@ def _build_ncu_argv(
     else:
         for section in _CURATED_SECTIONS:
             argv += ["--section", section]
-        # Stalls live outside every section — enumerate them explicitly.
-        stall_metrics = ",".join(
-            f"{_STALL_PREFIX}{reason}{_STALL_SUFFIX}" for reason in _STALL_REASONS
-        )
-        argv += ["--metrics", stall_metrics]
+        # Some high-signal diagnostics live outside the curated sections or
+        # are omitted from section exports on some NCU versions. Enumerate
+        # them explicitly so ``raw_metrics`` has the broadest stable debug
+        # surface we can request without switching to ``--set full``.
+        explicit_metrics = ",".join(_EXPLICIT_CURATED_METRICS)
+        argv += ["--metrics", explicit_metrics]
 
     argv += [
         "--",
@@ -874,8 +974,8 @@ def _cache_path(cache_dir: Path, key: str) -> Path:
 
 def _load_ncu_cache(
     cache_dir: Path, key: str
-) -> tuple[NCUMetrics, dict[str, float]] | None:
-    """Read and rehydrate a cached ``(NCUMetrics, raw_metrics)`` pair.
+) -> tuple[NCUMetrics, dict[str, float], MetricGroups] | None:
+    """Read and rehydrate cached ``(NCUMetrics, raw_metrics, metric_groups)``.
     Returns ``None`` on any error (missing file, corrupt JSON, missing
     ``ncu`` field, unknown ``ncu`` field) — a corrupt cache entry is
     treated as a silent miss, not a crash.
@@ -894,11 +994,18 @@ def _load_ncu_cache(
     # has it as a list/scalar, treat as missing.
     if not isinstance(raw, dict):
         raw = {}
-    return ncu, raw
+    groups = payload.get("groups")
+    if not isinstance(groups, dict):
+        groups = _build_metric_groups(raw)
+    return ncu, raw, groups
 
 
 def _save_ncu_cache(
-    cache_dir: Path, key: str, ncu: NCUMetrics, raw: dict[str, float]
+    cache_dir: Path,
+    key: str,
+    ncu: NCUMetrics,
+    raw: dict[str, float],
+    groups: MetricGroups,
 ) -> None:
     """Persist ``ncu`` + ``raw`` atomically: write to a unique temp file
     in ``cache_dir``, then ``os.replace`` onto the final path. The temp
@@ -907,7 +1014,11 @@ def _save_ncu_cache(
     best-effort, never branch-killing."""
     cache_dir.mkdir(parents=True, exist_ok=True)
     final = _cache_path(cache_dir, key)
-    payload = {"ncu": dict(ncu.__dict__), "raw": dict(raw)}
+    payload = {
+        "ncu": dict(ncu.__dict__),
+        "raw": dict(raw),
+        "groups": groups,
+    }
 
     tmp_fd, tmp_name = tempfile.mkstemp(
         prefix=f".{key}.", suffix=".json.tmp", dir=str(cache_dir)
@@ -1017,11 +1128,12 @@ def profile_kernel(
             # previously-written ``.ncu-rep`` when it's still on disk;
             # if a sibling run pruned it, fall back to ``None`` (callers
             # treat that as "no report to copy").
-            cached_ncu, cached_raw = cached
+            cached_ncu, cached_raw, cached_groups = cached
             return ProfilingResult(
                 analytical=analytical,
                 ncu=cached_ncu,
                 raw_metrics=cached_raw,
+                metric_groups=cached_groups,
                 ncu_rep_path=ncu_rep_out if ncu_rep_out.exists() else None,
             )
 
@@ -1077,11 +1189,15 @@ def profile_kernel(
             analytical=analytical,
             ncu=None,
             raw_metrics=raw,
+            metric_groups=_build_metric_groups(raw),
             degraded_reason=reason,
         )
 
     if cache_dir is not None:
-        _save_ncu_cache(cache_dir, key, ncu, raw)
+        groups = _build_metric_groups(raw)
+        _save_ncu_cache(cache_dir, key, ncu, raw, groups)
+    else:
+        groups = _build_metric_groups(raw)
 
     # Only surface the report path when ncu actually wrote it — the
     # subprocess could exit zero with the CSV stream intact but no
@@ -1094,5 +1210,6 @@ def profile_kernel(
         analytical=analytical,
         ncu=ncu,
         raw_metrics=raw,
+        metric_groups=groups,
         ncu_rep_path=final_rep_path,
     )

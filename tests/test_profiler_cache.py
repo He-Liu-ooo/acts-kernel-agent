@@ -91,7 +91,7 @@ def _canned_csv() -> str:
     def row(metric: str, value: str) -> str:
         return f'"0","elementwise_add_kernel","{metric}","%","{value}"\n'
 
-    # Curated required + optional.
+    # Curated required metrics.
     rows.append(row("sm__warps_active.avg.pct_of_peak_sustained_active", "55.0"))
     rows.append(row("lts__t_sector_hit_rate.pct", "72.5"))
     rows.append(row("sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active", "0"))
@@ -806,6 +806,22 @@ def test_cache_hit_rehydrates_raw_metrics(
     assert second.raw_metrics == first.raw_metrics
 
 
+def test_cache_hit_rehydrates_metric_groups(
+    tmp_path, fake_ncu, sample_kernel, sample_workload
+):
+    """Cache entries persist grouped present/missing status so Reviewer group
+    queries behave identically on fresh and cached profiles."""
+    cache_dir = tmp_path / "cache"
+    first = _call_profile(sample_kernel, sample_workload, cache_dir=cache_dir)
+    second = _call_profile(sample_kernel, sample_workload, cache_dir=cache_dir)
+
+    assert first.metric_groups
+    assert second.metric_groups == first.metric_groups
+    assert second.metric_groups["tensor_core"][
+        "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active"
+    ]["status"] == "present"
+
+
 def test_cache_hit_legacy_payload_missing_raw_field_loads_empty(
     tmp_path, sample_kernel, sample_workload
 ):
@@ -833,6 +849,9 @@ def test_cache_hit_legacy_payload_missing_raw_field_loads_empty(
 
     loaded = _load_ncu_cache(cache_dir, key)
     assert loaded is not None
-    ncu, raw = loaded
+    ncu, raw, groups = loaded
     assert ncu.sm_occupancy_pct == 42.0
     assert raw == {}
+    assert groups["tensor_core"][
+        "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active"
+    ]["status"] == "missing"

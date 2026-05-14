@@ -60,6 +60,7 @@ if TYPE_CHECKING:
     from src.agents.reviewer import ReviewerAgent
     from src.agents.planner import PlannerAgent
     from src.config import ACTSConfig
+    from src.eval.benchmark import BenchmarkResult
     from src.eval.roofline import RooflineResult
     from src.eval.types import BottleneckType
     from src.kernels.kernel import Kernel
@@ -112,65 +113,11 @@ def _safe_precompile(
 
 def _record_autotune_winner(
     kernel: "Kernel",
-    autotuner: Any,
-    workloads: list["Workload"],
-    definition: "Definition | None" = None,
+    bench_result: "BenchmarkResult",
 ) -> None:
-    """Populate ``kernel.autotune_winner`` from Triton's autotune cache (A1 PR 1).
-
-    *autotuner* is the Triton ``Autotuner`` instance — i.e.
-    ``module.<kernel.triton_kernel_name>`` — surfaced by
-    ``compile_kernel(..).triton_autotuner``. The host wrapper (the
-    entrypoint) doesn't carry the cache; the autotune decorator binds
-    it to the wrapped ``@triton.jit`` function.
-
-    Cache-key matching: Triton stores entries keyed on tuples that
-    PREFIX with the user-declared ``key=`` values then append the
-    pointer-arg dtypes (e.g. ``(M, N, K, "torch.float32", "torch.float32", "torch.float32")``).
-    We compute the expected prefix from ``workload.axes`` plus any
-    ``AxisConst`` values on *definition.axes* (Codex review finding #2,
-    2026-05-14 — SOL problems with const definition axes were silently
-    failing key lookup before the Definition was threaded through), then
-    search the cache for the entry whose tuple starts with it.
-
-    Best-effort: failures degrade to ``autotune_winner = None`` with a
-    WARNING and never raise. Skipped when ``kernel.autotune_keys`` is
-    empty (no per-workload identity to attribute) or when *autotuner*
-    is ``None`` (no autotune wrapper present, e.g. legacy starters).
-    """
-    from src.eval.benchmark import _key_tuple_for
-
-    if autotuner is None or not kernel.autotune_keys:
-        return
-    try:
-        cache = getattr(autotuner, "cache", None)
-        if not cache:
-            return
-        winners: dict[str, dict] = {}
-        for wl in workloads:
-            expected = _key_tuple_for(wl, kernel.autotune_keys, definition=definition)
-            if expected is None:
-                continue
-            n = len(expected)
-            matched_cfg = None
-            for cache_key, cfg in cache.items():
-                if isinstance(cache_key, tuple) and cache_key[:n] == expected:
-                    matched_cfg = cfg
-                    break
-            if matched_cfg is None:
-                continue
-            winners[wl.uuid] = {
-                "kwargs": dict(getattr(matched_cfg, "kwargs", {})),
-                "num_warps": int(getattr(matched_cfg, "num_warps", 0)),
-                "num_stages": int(getattr(matched_cfg, "num_stages", 0)),
-            }
-        if winners:
-            kernel.autotune_winner = winners
-    except Exception as exc:
-        logger.warning(
-            "autotune_winner unavailable: %s: %s",
-            type(exc).__name__, exc,
-        )
+    """Copy per-workload autotune winners from BenchmarkResult onto kernel."""
+    if bench_result.autotune_winner_per_workload:
+        kernel.autotune_winner = bench_result.autotune_winner_per_workload
 
 
 class TerminationReason(str, Enum):
@@ -407,11 +354,14 @@ class Orchestrator:
         reviewer: ReviewerAgent,
         retriever: MemoryRetriever,
     ) -> None:
+        from src.actions.registry import build_default_registry
+
         self._config = config
         self._planner = planner
         self._coder = coder
         self._reviewer = reviewer
         self._retriever = retriever
+        self._action_registry = build_default_registry()
         self._tree: SearchTree | None = None
         # Cached SOL ``Environment`` for ``trace_emitted``. Built lazily
         # on first use so test paths that mock CUDA don't pay the
@@ -567,6 +517,7 @@ class Orchestrator:
             input_generators=input_generators,
             definition=definition,
             kernel_fn=_baseline_fn,
+            autotuner=_baseline_autotuner,
         )
         if not baseline_bench.is_fully_successful:
             raise BenchmarkError(
@@ -575,20 +526,17 @@ class Orchestrator:
                 f"SOL scoring requires a complete baseline measurement"
             )
 
-        # A1 PR 1: record per-workload autotune winners for the baseline
-        # when we have an Autotuner reference. Skipped on the lazy-compile
-        # fallback path, on placeholder baselines without an autotune
-        # decorator, and on legacy starters — autotune_winner stays None
-        # in those cases (no observability, run continues).
+        # A1 PR 1/B: benchmark_kernel captures per-workload autotune
+        # winners by diffing Triton's cache around each workload burn-in.
+        # Skipped on the lazy-compile fallback path, on placeholder
+        # baselines without an autotune decorator, and on legacy starters.
         if _baseline_autotuner is not None:
-            _record_autotune_winner(
-                baseline, _baseline_autotuner, workloads, definition=definition,
-            )
+            _record_autotune_winner(baseline, baseline_bench)
             emit(
                 "autotune_burn_in_done",
                 iter=root.iter_no,
-                workload_count=len(workloads),
-                winner_recorded=bool(baseline.autotune_winner),
+                workload_count=len(workloads or []),
+                winner_count=len(baseline.autotune_winner),
             )
 
         emit(
@@ -624,6 +572,14 @@ class Orchestrator:
             roofline=roofline,
             baseline_spec=baseline.spec,
         )
+
+        available_actions = [
+            a.id
+            for a in self._action_registry.list_applicable(
+                baseline.spec.kernel_type.value,
+                hardware=self._config.hardware,
+            )
+        ]
 
         root.score = compute_sol_score(
             baseline_bench.median_latency_us,
@@ -806,7 +762,7 @@ class Orchestrator:
                         ),
                         profiling_summary=parent_profiling_summary,
                         past_experiences=experiences,
-                        available_actions=[],
+                        available_actions=available_actions,
                         tree_context=tree.render_path(parent.id),
                         reviewer_feedback=_render_review_for_planner(parent.last_review),
                         bottleneck=run_bottleneck,
@@ -852,6 +808,8 @@ class Orchestrator:
                         kernel_spec=baseline.spec,
                         reference_fn=reference_fn,
                         input_generators=input_generators,
+                        definition=definition,
+                        workloads=workloads,
                     )
             except ImplementationError as exc:
                 logger.warning(
@@ -925,6 +883,7 @@ class Orchestrator:
                         input_generators=input_generators,
                         definition=definition,
                         kernel_fn=_compiled_fn,
+                        autotuner=_child_autotuner,
                     )
                 check_lazy_outputs_after_bench(bench.last_outputs)
                 # Drop GPU tensor refs as soon as the lazy-output check
@@ -932,23 +891,17 @@ class Orchestrator:
                 # are hundreds of MB pinned through the LLM round-trip
                 # ahead (profile + score + reviewer).
                 bench.last_outputs.clear()
-                # A1 PR 1: query Triton's autotune cache for the per-workload
-                # winning config. Skipped on the lazy-compile fallback (no
-                # autotuner captured) and on kernels without an autotune
-                # decorator (autotuner is None). Event fires only when the
-                # Autotuner reference is real, so post-run analysis can
-                # distinguish "autotune ran" from "pre-compile fallback
-                # path taken / no autotune."
+                # A1 PR 1/B: copy benchmark-captured autotune winners onto
+                # the kernel. Event fires only when the Autotuner reference
+                # is real, so post-run analysis can distinguish "autotune
+                # ran" from "pre-compile fallback path taken / no autotune."
                 if bench.is_fully_successful and _child_autotuner is not None:
-                    _record_autotune_winner(
-                        child_kernel, _child_autotuner, workloads,
-                        definition=definition,
-                    )
+                    _record_autotune_winner(child_kernel, bench)
                     emit(
                         "autotune_burn_in_done",
                         iter=iter_no,
-                        workload_count=len(workloads),
-                        winner_recorded=bool(child_kernel.autotune_winner),
+                        workload_count=len(workloads or []),
+                        winner_count=len(child_kernel.autotune_winner),
                     )
                 # Bench succeeded without any reward-hack signal — clear
                 # the CUDA error counter so a single transient blip earlier
@@ -1104,7 +1057,7 @@ class Orchestrator:
             if profiling is not None:
                 ncu = profiling.ncu
                 top_stalls: list[str] = []
-                tc_util = 0.0
+                tc_util: float | None = None
                 if ncu is not None:
                     if ncu.warp_stall_dominant:
                         top_stalls.append(ncu.warp_stall_dominant)
@@ -1478,6 +1431,7 @@ class Orchestrator:
                 correctness=Correctness(),
                 performance=Performance(
                     latency_ms=bench.median_latency_us / 1000.0,
+                    # SOL schema = PyTorch-reference latency; ACTS uses absolute SOL Score, not PyTorch-relative comparison, so unused.
                     reference_latency_ms=0.0,
                     speedup_factor=child.score.sol_score if child.score else 0.0,
                 ),
