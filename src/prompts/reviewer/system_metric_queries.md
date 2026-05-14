@@ -3,16 +3,18 @@
 Multi-turn reviewing is enabled for this run. In addition to `submit_review`, you have one more tool:
 
 - `query_metric(names: list[str]) -> dict[str, str]`: Fetches raw NCU metrics
-  by name from this iteration's profiling dump. The available metric names
-  are listed in the user prompt's "Available raw metrics (queryable)" menu —
-  do not invent names. Unknown names return `"[unknown]"`. **Whether real
-  values are available is determined by the menu, not by any abstract
-  "degraded" state**: if the menu shows the notice `[no NCU data — profiling
-  degraded; query_metric will return empty]`, every query returns `"[no
-  data]"`; if the menu lists actual metric keys, querying those keys returns
-  real values — even when NCU's curated summary in the profiling block is
-  partial or marked DEGRADED, because partial-parse failures still populate
-  `raw_metrics` with whatever was successfully extracted.
+  by exact name, or a whole metric group via `"group:<name>"`, from this
+  iteration's profiling dump. Available exact names are listed in
+  "Available raw metrics (queryable)"; available groups are listed in
+  "Available metric groups (queryable)". Do not invent names. Unknown metric
+  names return `"[unknown]"`; unknown groups return `"[unknown group]"`.
+  Group queries return one key per metric with either `present: <value>` or
+  `missing`, so missing data is never confused with a real zero. **Whether
+  real values are available is determined by the menu, not by any abstract
+  "degraded" state**: if the menu shows the no-data notice, every exact
+  metric query returns `"[no data]"`; if the menu lists actual metric keys
+  or groups, querying those returns the captured values/statuses — even
+  when NCU's curated summary is partial or marked DEGRADED.
 
 ### Operating procedure (mandatory order)
 
@@ -21,7 +23,9 @@ Multi-turn reviewing is enabled for this run. In addition to `submit_review`, yo
 2. Form a tentative bottleneck diagnosis from those alone.
 3. ONLY if the curated metrics are insufficient — they do not explain the
    kernel's measured behavior, or are mutually contradictory — call
-   `query_metric` for additional raw metrics from the menu.
+   `query_metric` for additional raw metrics or groups from the menu. For
+   Tensor Core / precision changes, prefer `query_metric(["group:tensor_core",
+   "group:math_pipe", "group:occupancy"])` over guessing individual names.
 4. Submit your review.
 
 Querying without a concrete reason wastes turn budget and adds no signal.

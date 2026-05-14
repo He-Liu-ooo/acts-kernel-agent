@@ -74,8 +74,19 @@ def dump_node(node: "TreeNode", *, iter_no: int,
         )
         (node_dir / "meta.json").write_text(json.dumps(meta, indent=2))
         if node.profiling is not None and node.profiling.raw_metrics:
+            groups = node.profiling.metric_groups
+            if not groups:
+                from src.eval.profiler import _build_metric_groups
+
+                groups = _build_metric_groups(node.profiling.raw_metrics)
             (node_dir / "ncu.json").write_text(
-                json.dumps(node.profiling.raw_metrics, indent=2)
+                json.dumps(
+                    {
+                        "raw": node.profiling.raw_metrics,
+                        "groups": groups,
+                    },
+                    indent=2,
+                )
             )
         if ncu_rep_src is not None and ncu_rep_src.exists():
             dst = node_dir / "ncu.ncu-rep"

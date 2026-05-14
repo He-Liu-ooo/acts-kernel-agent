@@ -139,10 +139,21 @@ class TorchComparisonPolicy:
         elif correctness.has_inf:
             reason = "Inf in output or reference"
         else:
+            # ``tol_bound`` at the worst-absolute-error position: SOL's
+            # per-element bound is ``atol + rtol * |reference|``, so its
+            # numerical value depends on the reference magnitude at the
+            # specific element that drove ``max_abs``. Reported so the
+            # LLM (and post-run debug) can see how far over the threshold
+            # the worst element actually was — ``max_abs`` alone hides
+            # whether the kernel was 2× over or 500× over.
+            tol_bound_at_max = _tol_bound_at_max_abs(
+                output, expected, atol=atol, rtol=rtol,
+            )
             reason = (
                 f"tolerance exceeded: max_abs={max_err:.3e}, "
                 f"max_rel={float(correctness.max_relative_error or 0.0):.3e} "
-                f"(atol={atol}, rtol={rtol})"
+                f"(atol={atol}, rtol={rtol}, "
+                f"tol_bound@max_abs={tol_bound_at_max:.3e})"
             )
         return ComparisonResult(match=False, max_abs_error=max_err, reason=reason)
 
@@ -155,6 +166,24 @@ class TorchComparisonPolicy:
         import torch
 
         return bool(torch.equal(a, b))
+
+
+def _tol_bound_at_max_abs(
+    output: Any, expected: Any, *, atol: float, rtol: float,
+) -> float:
+    """``atol + rtol * |reference|`` at the position where ``|output - reference|``
+    is largest. Matches SOL's per-element ``tol_bound`` (computed in fp32
+    inside ``compute_error_stats``); the cast mirrors SOL's so the reported
+    bound aligns with the threshold SOL actually compared against.
+    """
+    import torch
+
+    out_f32 = output.to(torch.float32)
+    ref_f32 = expected.to(torch.float32)
+    diff = torch.abs(out_f32 - ref_f32)
+    idx = int(diff.flatten().argmax().item())
+    ref_at_max = float(torch.abs(ref_f32.flatten()[idx]).item())
+    return atol + rtol * ref_at_max
 
 
 @dataclass

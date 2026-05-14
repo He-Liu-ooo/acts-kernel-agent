@@ -95,12 +95,13 @@ class Kernel:
         ``src.agents.coder.KernelCodeOutput`` enforces presence for
         Coder-emitted source; Kernel construction itself is lenient.
       - ``autotune_keys``: parsed from the same decorator's ``key=[...]``
-        arg in the same AST pass. List of arg-name strings used by the
-        orchestrator's ``_record_autotune_winner`` to compute the cache
-        lookup tuple per workload.
+        arg in the same AST pass. Retained as metadata and validator
+        surface; winner attribution reads Triton's cache deltas directly
+        instead of resolving these names against SOL axes.
       - ``autotune_winner``: populated post-bench by the orchestrator
-        from Triton's JIT cache, keyed by ``workload.uuid``. Empty dict
-        until the first benchmark with successful winner attribution.
+        from ``BenchmarkResult.autotune_winner_per_workload``, keyed by
+        ``workload.uuid``. Empty dict until the first benchmark with
+        successful winner attribution.
     """
 
     spec: KernelSpec

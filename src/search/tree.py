@@ -456,6 +456,7 @@ def _serialize_profiling(profiling):
         ),
         "ncu": asdict(profiling.ncu) if profiling.ncu is not None else None,
         "raw_metrics": dict(profiling.raw_metrics),
+        "metric_groups": dict(profiling.metric_groups),
         "degraded_reason": profiling.degraded_reason,
     }
 
@@ -665,9 +666,16 @@ def _deserialize_profiling(data):
             warp_stall_runner_up=n["warp_stall_runner_up"],
             warp_stall_runner_up_pct=n["warp_stall_runner_up_pct"],
         )
+    raw_metrics = dict(data.get("raw_metrics") or {})
+    metric_groups = data.get("metric_groups")
+    if not isinstance(metric_groups, dict):
+        from src.eval.profiler import _build_metric_groups
+
+        metric_groups = _build_metric_groups(raw_metrics)
     return ProfilingResult(
         analytical=analytical,
         ncu=ncu,
-        raw_metrics=dict(data.get("raw_metrics") or {}),
+        raw_metrics=raw_metrics,
+        metric_groups=metric_groups,
         degraded_reason=data.get("degraded_reason"),
     )

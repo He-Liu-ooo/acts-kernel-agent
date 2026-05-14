@@ -71,13 +71,13 @@ CORE_EVENT_KINDS: frozenset[str] = frozenset({
     # already regressed on a sibling — the existing system.md L61-62 rule
     # has now actually fired. Payload: ``action``, ``sibling_iter``.
     "repeated_pathway_dead_end",
-    # A1 PR 1 (Triton autotune integration) — fires once per iteration
-    # after the post-bench autotune-winner recording step. Payload:
-    # ``workload_count: int`` (workloads benchmarked this iter),
-    # ``winner_recorded: bool`` (True iff Triton cache yielded a winner
-    # for at least one workload). Per-workload winners themselves are
-    # persisted on the Kernel (``autotune_winner: dict[uuid, cfg]``);
-    # per-workload burn-in elapsed is captured by ``bench_done`` upstream.
+    # A1 PR 1/B (Triton autotune integration) — fires once per iteration
+    # after benchmark-captured autotune winners are copied to the Kernel.
+    # Payload: ``workload_count: int`` (workloads benchmarked this iter),
+    # ``winner_count: int`` (per-workload winners captured from cache
+    # deltas). Per-workload winners themselves are persisted on the Kernel
+    # (``autotune_winner: dict[uuid, cfg]``); per-workload burn-in elapsed
+    # is captured by ``bench_done`` upstream.
     "autotune_burn_in_done",
 })
 

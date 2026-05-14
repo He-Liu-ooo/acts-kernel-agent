@@ -40,10 +40,10 @@ class CompilationResult:
     # A1 PR 1: when the source declares an ``@triton.autotune``-wrapped
     # ``@triton.jit`` kernel, this holds the resolved Autotuner instance
     # (i.e. ``module.<kernel.triton_kernel_name>``). The orchestrator
-    # passes it to ``_record_autotune_winner`` to introspect Triton's
-    # per-config cache post-bench. ``None`` for kernels without an
-    # autotune decorator or when ``triton_kernel_name`` is empty (legacy
-    # starters, hand-written test fixtures).
+    # passes it into ``benchmark_kernel`` so the benchmark loop can diff
+    # Triton's per-config cache around each workload. ``None`` for kernels
+    # without an autotune decorator or when ``triton_kernel_name`` is empty
+    # (legacy starters, hand-written test fixtures).
     triton_autotuner: Callable | None = None
 
 
