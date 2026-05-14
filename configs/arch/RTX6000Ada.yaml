@@ -5,6 +5,7 @@
 # MAC_per_cycle math: peak_FLOPS / (2 * freq_GHz * 1e9)  (matches SOLAR's
 # H100_PCIe.yaml convention — half the peak since each MAC is 2 FLOPs).
 name: "RTX6000Ada"
+compute_capability: 8.9    # sm_89 (Ada Lovelace)
 SRAM_capacity: 100663296   # 96 MiB L2 cache
 SRAM_byte_per_cycle: 2200     # estimated L2 BW: ~5.5 TB/s @ 2.505 GHz
 DRAM_capacity: 51539607552  # 48 GiB GDDR6 ECC

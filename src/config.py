@@ -40,6 +40,10 @@ class HardwareSpec:
 
     name: str = ""
     freq_GHz: float = 0.0
+    # CUDA compute capability (e.g. 8.9 for Ada, 9.0 for Hopper). 0.0 means
+    # unknown — callers gating on hardware features (Tier-5 actions) should
+    # default-deny when this is 0.0 rather than assume a baseline arch.
+    compute_capability: float = 0.0
     # Memory hierarchy
     SRAM_capacity: int = 0          # L2 cache bytes
     SRAM_byte_per_cycle: float = 0.0
@@ -93,6 +97,7 @@ def load_hardware_spec(path: Path) -> HardwareSpec:
     return HardwareSpec(
         name=raw.get("name", ""),
         freq_GHz=raw.get("freq_GHz", 0.0),
+        compute_capability=raw.get("compute_capability", 0.0),
         SRAM_capacity=raw.get("SRAM_capacity", 0),
         SRAM_byte_per_cycle=raw.get("SRAM_byte_per_cycle", 0.0),
         DRAM_capacity=raw.get("DRAM_capacity", 0),
@@ -318,9 +323,18 @@ def detect_hardware() -> HardwareSpec:
     except Exception:
         return HardwareSpec()
 
+    # ``major`` / ``minor`` are present on real ``CUDAProperties`` but absent on
+    # the ``SimpleNamespace`` stubs used by the test fixtures — fall back to
+    # 0.0 (= unknown CC) rather than raising AttributeError.
+    major = getattr(props, "major", None)
+    minor = getattr(props, "minor", None)
+    compute_capability = (
+        float(f"{major}.{minor}") if major is not None and minor is not None else 0.0
+    )
     detected = HardwareSpec(
         name=props.name,
         freq_GHz=props.clock_rate / 1_000_000,  # kHz → GHz
+        compute_capability=compute_capability,
         SRAM_capacity=props.L2_cache_size,
         DRAM_capacity=props.total_memory,
     )
@@ -351,6 +365,7 @@ def detect_hardware() -> HardwareSpec:
         yaml_spec,
         name=detected.name or yaml_spec.name,
         freq_GHz=detected.freq_GHz or yaml_spec.freq_GHz,
+        compute_capability=detected.compute_capability or yaml_spec.compute_capability,
         SRAM_capacity=detected.SRAM_capacity or yaml_spec.SRAM_capacity,
         DRAM_capacity=detected.DRAM_capacity or yaml_spec.DRAM_capacity,
     )

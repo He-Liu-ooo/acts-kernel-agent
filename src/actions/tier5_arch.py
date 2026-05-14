@@ -13,6 +13,7 @@ def h100_tma_loads() -> Action:
         name="H100 TMA Loads",
         description="Use H100 Tensor Memory Accelerator for async global-to-shared loads.",
         preconditions=["compute_capability >= 9.0"],
+        min_compute_capability=9.0,
         guidance=(
             "**When**: H100 (compute capability 9.0+) kernels where the load phase serializes against "
             "compute and you've already exhausted standard prefetching/coalescing.\n"
@@ -41,6 +42,7 @@ def h100_wgmma() -> Action:
         name="H100 WGMMA",
         description="Use H100 warp-group MMA instructions for higher throughput.",
         preconditions=["compute_capability >= 9.0"],
+        min_compute_capability=9.0,
         guidance=(
             "**When**: H100 matmul/conv kernels where the standard `tl.dot` is the binding constraint "
             "and tensor-core utilization can still rise.\n"
@@ -71,6 +73,7 @@ def a100_cp_async() -> Action:
         name="A100 cp.async",
         description="Use A100 cp.async for asynchronous global-to-shared memory copies.",
         preconditions=["compute_capability >= 8.0"],
+        min_compute_capability=8.0,
         guidance=(
             "**When**: A100 (compute capability 8.0+) kernels where the global-to-shared copy phase is "
             "serializing against compute and prefetching alone is insufficient.\n"
@@ -100,6 +103,7 @@ def hopper_cluster_launch() -> Action:
         name="Hopper Cluster Launch",
         description="Use Hopper cluster launch for cross-SM cooperation.",
         preconditions=["compute_capability >= 9.0"],
+        min_compute_capability=9.0,
         guidance=(
             "**When**: H100 kernels where blocks need to cooperate across SMs — sharing data via "
             "distributed shared memory (DSMEM) instead of round-tripping through global memory.\n"
