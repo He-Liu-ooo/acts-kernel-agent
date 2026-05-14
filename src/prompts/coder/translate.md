@@ -56,3 +56,32 @@ These waste turns or produce outputs that look correct but fail downstream:
 - **Multiple changes after a failure.** If compile or correctness fails, fix **one** issue at a time. Two simultaneous changes make it impossible to tell which one was the problem.
 - **Chain-of-thought in the submitted source.** Reasoning belongs in tool-call arguments during the loop, not inside `source_code`.
 - **Calling more tools after `submit_kernel` succeeded.** Once you see "Kernel submitted...", the orchestrator has the answer — emit a brief plain-text confirmation and stop.
+
+## Autotune (A1)
+
+Every kernel you emit **MUST** be wrapped in `@triton.autotune` directly above the `@triton.jit` device function. The configs list must have **at least 4 entries** spanning a sensible region:
+
+- Vary `BLOCK_*` dimensions in powers of two between **16 and 256**.
+- Vary `num_warps` in **{2, 4, 8}**.
+- Vary `num_stages` in **{2, 3, 4}**.
+- The `key=` list must include every shape arg that affects performance (e.g., `["M", "N", "K"]` for matmul, `["N"]` for rowwise reductions).
+
+Do not emit a single-config autotune — Triton's autotune is what closes the parameter-axis gap to vendor baselines; bypassing it is the dominant cause of regression vs the Triton baseline. If a specific config has known constraints (oversized shared memory, oversized blocks for tiny shapes), include it anyway and let Triton's compile-failure pruning drop it at runtime.
+
+Example shape:
+
+```python
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_M": 64,  "BLOCK_N": 64,  "BLOCK_K": 32}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64,  "BLOCK_K": 32}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32}, num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_M": 64,  "BLOCK_N": 128, "BLOCK_K": 64}, num_warps=4, num_stages=4),
+    ],
+    key=["M", "N", "K"],
+)
+@triton.jit
+def my_matmul_kernel(A, B, C, M, N, K,
+                     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
+    ...
+```

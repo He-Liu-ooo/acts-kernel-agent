@@ -23,3 +23,11 @@ def test_sibling_context_and_repeated_pathway_event_kinds_registered():
     from src.runtime.events import CORE_EVENT_KINDS
     assert "sibling_context_rendered" in CORE_EVENT_KINDS
     assert "repeated_pathway_dead_end" in CORE_EVENT_KINDS
+
+
+def test_autotune_burn_in_done_in_core_event_kinds():
+    """A1 PR 1 — fires once per workload per iter after _time_workload's
+    burn-in call so post-run analysis can see which config Triton picked.
+    Missing the registration would downgrade the emit() to log noise via
+    the unknown-kind WARNING path."""
+    assert "autotune_burn_in_done" in events.CORE_EVENT_KINDS
