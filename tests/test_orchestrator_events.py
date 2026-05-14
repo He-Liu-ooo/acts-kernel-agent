@@ -1006,3 +1006,198 @@ async def test_repeated_pathway_dead_end_does_not_fire_without_sibling_match(
     ]
     repeated = [r for r in records if r["kind"] == "repeated_pathway_dead_end"]
     assert repeated == []
+
+
+# ── A1 PR 1: _record_autotune_winner ────────────────────────────────────
+
+
+def test_record_autotune_winner_populates_per_workload():
+    """The orchestrator queries the Triton Autotuner's cache and stores
+    per-workload winning configs under kernel.autotune_winner[wl.uuid].
+    Cache keys are PREFIX-matched: Triton appends dtype tags after the
+    user-declared key= values, so the helper matches the first N values
+    of each tuple."""
+    from unittest.mock import MagicMock
+
+    from sol_execbench.core.data import Workload
+
+    from src.kernels.kernel import Kernel, KernelSpec, KernelType
+    from src.search.orchestrator import _record_autotune_winner
+
+    spec = KernelSpec(name="t", kernel_type=KernelType.MATMUL)
+    kernel = Kernel(
+        spec=spec, source_code="# placeholder",
+        autotune_configs=[{"kwargs": {"BLOCK_N": 256}, "num_warps": 2, "num_stages": 2}],
+        autotune_keys=["N"],
+    )
+
+    fake_config = MagicMock()
+    fake_config.kwargs = {"BLOCK_N": 1024}
+    fake_config.num_warps = 4
+    fake_config.num_stages = 3
+
+    # Real Triton cache shape: key=(N_value, dtype_X, dtype_Y, dtype_Z).
+    autotuner = MagicMock()
+    autotuner.cache = {(4096, "torch.float32", "torch.float32"): fake_config}
+
+    wl = Workload.model_validate({"uuid": "wl-1", "axes": {"N": 4096}, "inputs": {}})
+
+    _record_autotune_winner(kernel, autotuner, [wl])
+
+    assert kernel.autotune_winner == {
+        "wl-1": {"kwargs": {"BLOCK_N": 1024}, "num_warps": 4, "num_stages": 3}
+    }
+
+
+def test_record_autotune_winner_degrades_on_missing_cache_attribute():
+    """If Triton renames .cache, recording degrades to None silently."""
+    from sol_execbench.core.data import Workload
+
+    from src.kernels.kernel import Kernel, KernelSpec, KernelType
+    from src.search.orchestrator import _record_autotune_winner
+
+    spec = KernelSpec(name="t", kernel_type=KernelType.CUSTOM)
+    kernel = Kernel(
+        spec=spec, source_code="# placeholder",
+        autotune_configs=[{"kwargs": {}, "num_warps": 4, "num_stages": 2}],
+        autotune_keys=["M"],
+    )
+    autotuner = object()  # no .cache attribute
+    wl = Workload.model_validate({"uuid": "wl-1", "axes": {"M": 4096}, "inputs": {}})
+
+    _record_autotune_winner(kernel, autotuner, [wl])
+    assert kernel.autotune_winner == {}
+
+
+def test_record_autotune_winner_skips_when_no_autotune_keys():
+    """A kernel with autotune_keys=[] doesn't get a winner — there's no
+    per-workload identity to attribute via cache prefix-match."""
+    from unittest.mock import MagicMock
+    from sol_execbench.core.data import Workload
+
+    from src.kernels.kernel import Kernel, KernelSpec, KernelType
+    from src.search.orchestrator import _record_autotune_winner
+
+    spec = KernelSpec(name="t", kernel_type=KernelType.CUSTOM)
+    kernel = Kernel(
+        spec=spec, source_code="# placeholder",
+        autotune_configs=[{"kwargs": {"BLOCK": 64}, "num_warps": 4, "num_stages": 2}],
+        autotune_keys=[],  # empty
+    )
+    autotuner = MagicMock()
+    autotuner.cache = {(): MagicMock(kwargs={}, num_warps=4, num_stages=2)}
+    wl = Workload.model_validate({"uuid": "wl-1", "axes": {}, "inputs": {}})
+
+    _record_autotune_winner(kernel, autotuner, [wl])
+    assert kernel.autotune_winner == {}
+
+
+def test_record_autotune_winner_skips_when_autotuner_is_none():
+    """Kernels without an @triton.autotune decorator surface autotuner=None
+    from compile_kernel.triton_autotuner; recording must skip cleanly."""
+    from sol_execbench.core.data import Workload
+
+    from src.kernels.kernel import Kernel, KernelSpec, KernelType
+    from src.search.orchestrator import _record_autotune_winner
+
+    spec = KernelSpec(name="t", kernel_type=KernelType.CUSTOM)
+    kernel = Kernel(
+        spec=spec, source_code="# placeholder",
+        autotune_configs=[{"kwargs": {"BLOCK": 64}, "num_warps": 4, "num_stages": 2}],
+        autotune_keys=["M"],
+    )
+    wl = Workload.model_validate({"uuid": "wl-1", "axes": {"M": 4096}, "inputs": {}})
+
+    _record_autotune_winner(kernel, None, [wl])
+    assert kernel.autotune_winner == {}
+
+
+# ── A3: orchestrator passes condensed source to Planner / Reviewer ─────
+
+
+@pytest.mark.asyncio
+async def test_planner_receives_render_condensed_source_call(tmp_path, harness):
+    """Per-iter Planner call site at orchestrator.py:773 should invoke
+    parent.kernel.render_condensed_source(representative_workload_uuid=...)
+    and pass the result to planner.plan(kernel_source=...). Interface
+    test — content correctness is in test_kernel.py."""
+    from sol_execbench.core.data import Workload
+
+    sentinel = "# condensed parent source — from spy\n"
+    harness.baseline.render_condensed_source = MagicMock(return_value=sentinel)
+
+    wl_a = Workload.model_validate({
+        "uuid": "wl-a", "axes": {"M": 4096}, "inputs": {},
+    })
+    workloads = [wl_a]
+
+    # Provide a bench with per_workload_latency_us populated so the
+    # orchestrator's representative-latency gate doesn't skip the iter.
+    bench_with_wl = BenchmarkResult(
+        median_latency_us=100.0,
+        timed_runs=1,
+        per_workload_latency_us={"wl-a": 100.0},
+    )
+
+    with (
+        patch("src.eval.benchmark.benchmark_kernel", return_value=bench_with_wl),
+        patch("src.eval.profiler.profile_kernel", return_value=_make_profile()),
+    ):
+        from src.search.orchestrator import Orchestrator
+        orch = Orchestrator(
+            harness.config, harness.planner, harness.coder,
+            harness.reviewer, harness.retriever,
+        )
+        await orch.run(
+            harness.baseline, workloads=workloads, roofline=harness.roofline,
+        )
+
+    assert harness.planner.plan.await_count >= 1
+    planner_call = harness.planner.plan.await_args_list[0]
+    assert planner_call.kwargs["kernel_source"] == sentinel
+    # render_condensed_source on the baseline was invoked with the
+    # representative uuid (workloads[0].uuid).
+    harness.baseline.render_condensed_source.assert_any_call(
+        representative_workload_uuid="wl-a",
+    )
+
+
+@pytest.mark.asyncio
+async def test_reviewer_receives_render_condensed_source_call(tmp_path, harness):
+    """Both Reviewer call sites (baseline review at orchestrator.py:694 +
+    per-iter Reviewer at :1191) should invoke
+    <kernel>.render_condensed_source(representative_workload_uuid=...)
+    and pass the result to reviewer.review(kernel_source=...)."""
+    from sol_execbench.core.data import Workload
+
+    sentinel = "# condensed child source — from class-level spy\n"
+
+    bench_with_wl = BenchmarkResult(
+        median_latency_us=100.0,
+        timed_runs=1,
+        per_workload_latency_us={"wl-a": 100.0},
+    )
+
+    with (
+        patch("src.eval.benchmark.benchmark_kernel", return_value=bench_with_wl),
+        patch("src.eval.profiler.profile_kernel", return_value=_make_profile()),
+        patch(
+            "src.kernels.kernel.Kernel.render_condensed_source",
+            return_value=sentinel,
+        ),
+    ):
+        from src.search.orchestrator import Orchestrator
+        orch = Orchestrator(
+            harness.config, harness.planner, harness.coder,
+            harness.reviewer, harness.retriever,
+        )
+        wl_a = Workload.model_validate({
+            "uuid": "wl-a", "axes": {"M": 4096}, "inputs": {},
+        })
+        await orch.run(
+            harness.baseline, workloads=[wl_a], roofline=harness.roofline,
+        )
+
+    assert harness.reviewer.review.await_count >= 1
+    for call in harness.reviewer.review.await_args_list:
+        assert call.kwargs["kernel_source"] == sentinel

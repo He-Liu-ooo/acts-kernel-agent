@@ -37,6 +37,14 @@ class CompilationResult:
     error_message: str = ""
     compiled_fn: Callable | None = None
     source_path: Path | None = None
+    # A1 PR 1: when the source declares an ``@triton.autotune``-wrapped
+    # ``@triton.jit`` kernel, this holds the resolved Autotuner instance
+    # (i.e. ``module.<kernel.triton_kernel_name>``). The orchestrator
+    # passes it to ``_record_autotune_winner`` to introspect Triton's
+    # per-config cache post-bench. ``None`` for kernels without an
+    # autotune decorator or when ``triton_kernel_name`` is empty (legacy
+    # starters, hand-written test fixtures).
+    triton_autotuner: Callable | None = None
 
 
 def compile_kernel(
@@ -70,6 +78,7 @@ def compile_kernel(
                 success=True,
                 compiled_fn=fn,
                 source_path=source_path,
+                triton_autotuner=_resolve_triton_autotuner(cached_module, kernel),
             )
 
     source_path.write_text(source)
@@ -119,4 +128,35 @@ def compile_kernel(
         success=True,
         compiled_fn=fn,
         source_path=source_path,
+        triton_autotuner=_resolve_triton_autotuner(module, kernel),
     )
+
+
+def _resolve_triton_autotuner(module, kernel: "Kernel"):
+    """Locate the ``@triton.autotune``-wrapped JIT kernel in *module*.
+
+    Returns ``module.<kernel.triton_kernel_name>`` when that name resolves
+    to an object that looks like a Triton ``Autotuner`` (carries a
+    ``.cache`` attribute, even if empty). Returns ``None`` for:
+      - Legacy starters / test fixtures without ``triton_kernel_name``.
+      - Kernels whose declared name is a bare ``@triton.jit`` def with no
+        autotune wrapper (no ``.cache`` attribute).
+      - Anything that fails attribute resolution.
+
+    Best-effort: failures degrade to ``None`` so ``compile_kernel`` stays
+    success-path even when autotune introspection isn't available.
+    """
+    name = getattr(kernel, "triton_kernel_name", "") or ""
+    if not name:
+        return None
+    try:
+        candidate = getattr(module, name, None)
+        if candidate is None:
+            return None
+        # Duck-type: Triton's Autotuner exposes ``.cache``; the bare
+        # JITFunction does not. We only want the Autotuner.
+        if not hasattr(candidate, "cache"):
+            return None
+        return candidate
+    except Exception:
+        return None

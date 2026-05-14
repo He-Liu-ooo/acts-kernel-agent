@@ -182,6 +182,81 @@ class TestFrontierQuarantine:
         assert rehydrated.profiling.ncu.sm_occupancy_pct == 10.0
         assert rehydrated.profiling.raw_metrics == {"foo": 1.0}
 
+    # ── A1 PR 1: autotune fields in serialization ──────────────────────
+
+    def test_serialize_kernel_writes_autotune_fields(self):
+        """_serialize_kernel writes the new autotune fields and drops the
+        old num_warps/num_stages/block_size triple."""
+        from src.kernels.kernel import Kernel, KernelSpec, KernelType
+        from src.search.tree import _serialize_kernel
+
+        spec = KernelSpec(name="t", kernel_type=KernelType.CUSTOM)
+        k = Kernel(
+            spec=spec,
+            source_code="# placeholder",
+            autotune_configs=[
+                {"kwargs": {"BLOCK_M": 64}, "num_warps": 4, "num_stages": 2},
+            ],
+            autotune_keys=["M"],
+            autotune_winner={
+                "wl-1": {"kwargs": {"BLOCK_M": 64}, "num_warps": 4, "num_stages": 2}
+            },
+        )
+        out = _serialize_kernel(k)
+        assert out["autotune_configs"] == [
+            {"kwargs": {"BLOCK_M": 64}, "num_warps": 4, "num_stages": 2}
+        ]
+        assert out["autotune_keys"] == ["M"]
+        assert out["autotune_winner"] == {
+            "wl-1": {"kwargs": {"BLOCK_M": 64}, "num_warps": 4, "num_stages": 2}
+        }
+        # Old fields must NOT appear in the new serialization.
+        assert "num_warps" not in out
+        assert "num_stages" not in out
+        assert "block_size" not in out
+
+    def test_deserialize_node_handles_legacy_checkpoint(self):
+        """A checkpoint written before A1 must still load — routed through
+        Kernel.from_legacy_dict when the new field is absent."""
+        from src.search.tree import _deserialize_node
+
+        legacy_node = {
+            "id": 0,
+            "parent_id": None,
+            "children_ids": [],
+            "iter_no": 0,
+            "score": None,
+            "branch_quality": None,
+            "dead_reason": None,
+            "consecutive_agent_failures": 0,
+            "last_review": None,
+            "per_workload_latency_us": {},
+            "profiling": None,
+            "action_applied": None,
+            "depth": 0,
+            "kernel": {
+                "spec": {
+                    "name": "old", "kernel_type": "rmsnorm",
+                    "flop_count": 0, "memory_bytes": 0, "input_shapes": [],
+                    "definition_path": None, "pytorch_reference": "", "t_sol_us": None,
+                },
+                "source_code": "# old kernel",
+                "num_warps": 8,
+                "num_stages": 3,
+                "block_size": {"BLOCK_N": 128},
+                "triton_kernel_name": "",
+                "dps": False,
+            },
+        }
+        node = _deserialize_node(legacy_node)
+        assert node.kernel.autotune_configs == [{
+            "kwargs": {"BLOCK_N": 128},
+            "num_warps": 8,
+            "num_stages": 3,
+        }]
+        assert node.kernel.autotune_keys == []
+        assert node.kernel.autotune_winner == {}
+
 
 # ── beam pruning: diversity-aware (B2) ───────────────────────────────────────
 

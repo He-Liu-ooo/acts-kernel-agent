@@ -248,7 +248,12 @@ def test_flush_l2_called_before_record_start_every_iter():
 
 
 def test_iter_call_sequence_is_prepare_flush_start_end_finalize():
-    """Each iter must emit: prepare, flush_l2, record_start, record_end, finalize_ms."""
+    """Each timed iter must emit: prepare, flush_l2, record_start, record_end, finalize_ms.
+
+    A1 PR 1: a single ``prepare`` call from the autotune burn-in step
+    fires before any iter, so the call sequence prefix is one extra
+    ``prepare`` followed by the standard per-iter sequence ``* N``.
+    """
     _result, timer = _run(
         workloads=[_wl("wl1")],
         generators=[_gen],
@@ -257,7 +262,9 @@ def test_iter_call_sequence_is_prepare_flush_start_end_finalize():
         timed=1,
         discard_first=1,
     )
-    expected = ["prepare", "flush_l2", "record_start", "record_end", "finalize_ms"] * 2
+    expected = ["prepare"] + (
+        ["prepare", "flush_l2", "record_start", "record_end", "finalize_ms"] * 2
+    )
     assert timer.calls == expected
 
 
@@ -453,8 +460,8 @@ def test_benchmark_kernel_dps_allocates_outputs():
         discard_first=1,
     )
     assert result.is_fully_successful
-    # warmup (2) + timed+discard (3+1) = 6 kernel invocations
-    assert captured["calls"] == 6
+    # A1 PR 1: burn-in (1) + warmup (2) + timed+discard (3+1) = 7 invocations.
+    assert captured["calls"] == 7
     assert captured["last_out_shape"] == (1024,)
     assert captured["last_out_dtype"] is torch.float32
     assert captured["last_out_device"].type == "cuda"
@@ -633,3 +640,177 @@ def test_non_dps_single_tensor_return_wraps_in_list():
     assert len(result.last_outputs) == 1
     assert isinstance(result.last_outputs[0], torch.Tensor)
     check_lazy_outputs_after_bench(result.last_outputs)
+
+
+# ── A1 PR 1: autotune burn-in + _key_tuple_for helper ──────────────────
+
+
+def test_burn_in_fires_before_warmup_with_reserved_seed():
+    """One extra fn invocation lands BEFORE the warmup loop (seed=-1)
+    so @triton.autotune's compile+pick cost lands outside the timed
+    window. Total fn calls = 1 burn-in + warmup + timed."""
+    calls: list[tuple] = []
+
+    def fn(*args):
+        calls.append(args)
+
+    def gen(seed: int) -> tuple:
+        return (seed,)
+
+    _run(
+        workloads=[_wl("wl-burn")],
+        generators=[gen],
+        timer_sequence=[0.001, 0.002, 0.003, 0.004, 0.005],
+        kernel_fn=fn,
+        warmup=2,
+        timed=3,
+        discard_first=0,
+    )
+    # 1 burn-in + 2 warmup + 3 timed = 6 fn calls.
+    assert len(calls) == 6
+    # First call carries the reserved burn-in seed.
+    assert calls[0] == (-1,)
+
+
+def test_burn_in_failure_surfaces_as_workload_error():
+    """fn raising during burn-in marks the workload latency as inf and
+    records the error — same path as a warmup failure. With only one
+    workload, the half-survivors-or-die gate fires and raises
+    BenchmarkError."""
+
+    def fn(*args):
+        raise RuntimeError("autotune compile blew up")
+
+    def gen(seed: int) -> tuple:
+        return (seed,)
+
+    with pytest.raises(BenchmarkError):
+        _run(
+            workloads=[_wl("wl-burn-fail")],
+            generators=[gen],
+            timer_sequence=[0.001],
+            kernel_fn=fn,
+            warmup=2,
+            timed=2,
+            discard_first=0,
+        )
+
+
+def test_key_tuple_for_resolves_axes():
+    from src.eval.benchmark import _key_tuple_for
+
+    wl = Workload.model_validate({
+        "uuid": "wl-1",
+        "axes": {"M": 4096, "N": 4096, "K": 4096},
+        "inputs": {},
+    })
+    assert _key_tuple_for(wl, ["M", "N", "K"]) == (4096, 4096, 4096)
+
+
+def test_key_tuple_for_unresolved_key_returns_none():
+    """When a key isn't in workload.axes, the helper degrades to None.
+    The orchestrator treats that as 'autotune_winner unavailable for this
+    workload' and continues."""
+    from src.eval.benchmark import _key_tuple_for
+
+    wl = Workload.model_validate({
+        "uuid": "wl-1",
+        "axes": {"M": 4096},
+        "inputs": {},
+    })
+    assert _key_tuple_for(wl, ["M", "X"]) is None
+
+
+def test_key_tuple_for_empty_keys_returns_empty_tuple():
+    """Edge case: kernel with no autotune_keys (e.g. legacy single-config
+    starter) → empty tuple, not None. Cache lookup with () is a valid
+    Triton autotune key when key=[] is supplied (which we forbid for
+    Coder kernels, but starters can have it)."""
+    from src.eval.benchmark import _key_tuple_for
+
+    wl = Workload.model_validate({
+        "uuid": "wl-1",
+        "axes": {},
+        "inputs": {},
+    })
+    assert _key_tuple_for(wl, []) == ()
+
+
+def test_key_tuple_for_resolves_against_definition_const_axes():
+    """Codex review 2026-05-14 finding #2: SOL problems split axes into
+    const_axes (carried on Definition, invariant across workloads) and
+    var_axes (carried on each Workload). The Coder's autotune key= list
+    legitimately spans both — e.g. ``key=["B","M","N"]`` where B is var
+    and M/N are const. Without consulting Definition, _key_tuple_for
+    returns None for M/N and the winner never records.
+    """
+    from sol_execbench.core.data import Definition
+    from src.eval.benchmark import _key_tuple_for
+
+    definition = Definition.model_validate({
+        "name": "matmul-fixed",
+        "op_type": "matmul",
+        "axes": {
+            "M": {"type": "const", "value": 4096},
+            "N": {"type": "const", "value": 4096},
+        },
+        "inputs": {},
+        "outputs": {},
+        "reference": "def run(): return 0",
+    })
+    # Workload only carries the var axis (B).
+    wl = Workload.model_validate({
+        "uuid": "wl-batch-2",
+        "axes": {"B": 2},
+        "inputs": {},
+    })
+    # Key list spans var + const. Should resolve all three using
+    # workload.axes first then Definition.axes consts.
+    assert _key_tuple_for(wl, ["B", "M", "N"], definition=definition) == (2, 4096, 4096)
+
+
+def test_key_tuple_for_workload_axes_take_precedence_over_definition_consts():
+    """If a workload re-binds an axis declared as const on the Definition,
+    the workload value wins (workload is the immediate axis-resolution
+    context per SOL's runtime contract)."""
+    from sol_execbench.core.data import Definition
+    from src.eval.benchmark import _key_tuple_for
+
+    definition = Definition.model_validate({
+        "name": "fake",
+        "op_type": "matmul",
+        "axes": {"M": {"type": "const", "value": 4096}},
+        "inputs": {},
+        "outputs": {},
+        "reference": "def run(): return 0",
+    })
+    wl = Workload.model_validate({
+        "uuid": "wl-override",
+        "axes": {"M": 8192},
+        "inputs": {},
+    })
+    assert _key_tuple_for(wl, ["M"], definition=definition) == (8192,)
+
+
+def test_key_tuple_for_unresolved_after_definition_lookup_returns_none():
+    """If a key is in neither workload.axes nor Definition.const_axes
+    (e.g. it's a var axis the workload forgot to bind, or an AxisExpr),
+    return None to degrade autotune_winner cleanly."""
+    from sol_execbench.core.data import Definition
+    from src.eval.benchmark import _key_tuple_for
+
+    definition = Definition.model_validate({
+        "name": "fake",
+        "op_type": "matmul",
+        "axes": {"M": {"type": "const", "value": 4096}},
+        "inputs": {},
+        "outputs": {},
+        "reference": "def run(): return 0",
+    })
+    wl = Workload.model_validate({
+        "uuid": "wl-missing-N",
+        "axes": {},
+        "inputs": {},
+    })
+    # N is neither in workload nor in definition.axes — degrade.
+    assert _key_tuple_for(wl, ["M", "N"], definition=definition) is None

@@ -104,6 +104,96 @@ class KernelCodeOutput(BaseModel):
             )
         return self
 
+    @model_validator(mode="after")
+    def _autotune_decorator_well_formed(self) -> "KernelCodeOutput":
+        """Enforce the @triton.autotune contract on Coder-emitted source (A1).
+
+        Rules:
+          1. Source must contain a ``@triton.autotune`` decorator directly
+             above the ``@triton.jit def`` matching ``triton_kernel_name``.
+          2. The decorator's ``configs=[...]`` must have >=4 entries, each
+             a ``triton.Config(...)`` call.
+          3. The decorator's ``key=[...]`` must be present and non-empty.
+
+        Stdlib ``ast`` only — no Triton import. The Coder-side tool loop
+        catches the ValidationError and retries within the existing turn
+        budget; the LLM sees the message and produces a corrected source.
+        """
+        import ast as _ast
+
+        try:
+            tree = _ast.parse(self.source_code)
+        except SyntaxError as exc:
+            raise ValueError(f"source_code does not parse: {exc}") from exc
+
+        target_fn: _ast.FunctionDef | None = None
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.FunctionDef) and node.name == self.triton_kernel_name:
+                target_fn = node
+                break
+        if target_fn is None:
+            # Already caught by _triton_kernel_name_matches_source; defensive.
+            return self
+
+        autotune_dec: _ast.Call | None = None
+        for dec in target_fn.decorator_list:
+            if not isinstance(dec, _ast.Call):
+                continue
+            attr = ""
+            if isinstance(dec.func, _ast.Attribute):
+                attr = dec.func.attr
+            elif isinstance(dec.func, _ast.Name):
+                attr = dec.func.id
+            if attr == "autotune":
+                autotune_dec = dec
+                break
+
+        if autotune_dec is None:
+            raise ValueError(
+                "@triton.autotune decorator required directly above "
+                f"@triton.jit def {self.triton_kernel_name}. Every "
+                "Coder-emitted kernel must autotune; see "
+                "prompts/coder/system.md."
+            )
+
+        configs_list: _ast.List | None = None
+        key_list: _ast.List | None = None
+        for kw in autotune_dec.keywords:
+            if kw.arg == "configs" and isinstance(kw.value, _ast.List):
+                configs_list = kw.value
+            elif kw.arg == "key" and isinstance(kw.value, _ast.List):
+                key_list = kw.value
+
+        if configs_list is None:
+            raise ValueError(
+                "@triton.autotune must pass configs= as a list literal of "
+                "triton.Config(...) calls."
+            )
+
+        n_configs = sum(
+            1 for c in configs_list.elts
+            if isinstance(c, _ast.Call) and (
+                (isinstance(c.func, _ast.Attribute) and c.func.attr == "Config")
+                or (isinstance(c.func, _ast.Name) and c.func.id == "Config")
+            )
+        )
+        if n_configs < 4:
+            raise ValueError(
+                f"@triton.autotune.configs must have at least 4 triton.Config "
+                f"entries; got {n_configs}. Closing the parameter-axis gap to "
+                "the autotuned Triton baseline requires a real sweep."
+            )
+
+        if key_list is None or len(key_list.elts) == 0:
+            raise ValueError(
+                "@triton.autotune must pass a non-empty key=[...] list of "
+                "shape-arg names (e.g. key=['M','N','K']). Empty key= means "
+                "Triton autotunes once and reuses across every shape — the "
+                "bug we started with."
+            )
+
+        return self
+
 
 @dataclass(frozen=True)
 class AttemptFailure:

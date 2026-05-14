@@ -74,7 +74,28 @@ def _simulate_submission(source_code: str, triton_kernel_name: str):
     return capture_agent, fake_run_agent
 
 
-_VALID_SOURCE = "@triton.jit\ndef k(): pass"
+# A1 PR 1: every Coder-emitted source must carry @triton.autotune with
+# >=4 configs + non-empty key=. ``_VALID_SOURCE`` is the canonical
+# "accept" shape used by every test that wants the model to validate
+# successfully; the autotune block stays present at module-import time
+# so subsequent test-bodies don't have to repeat it.
+_VALID_SOURCE = """\
+import triton
+import triton.language as tl
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_M": 64}, num_warps=2, num_stages=2),
+        triton.Config({"BLOCK_M": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_M": 64}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 128}, num_warps=4, num_stages=4),
+    ],
+    key=["M"],
+)
+@triton.jit
+def k(X, M, BLOCK_M: tl.constexpr):
+    pass
+"""
 _VALID_NAME = "k"
 
 
@@ -112,10 +133,10 @@ def test_implementation_error_carries_tool_errors_kwarg():
 
 def test_output_model_accepts_valid_data():
     out = KernelCodeOutput(
-        source_code="@triton.jit\ndef k(): pass",
+        source_code=_VALID_SOURCE,
         triton_kernel_name="k",
     )
-    assert out.source_code.startswith("@triton.jit")
+    assert "@triton.autotune" in out.source_code
     assert out.triton_kernel_name == "k"
 
 
@@ -169,25 +190,142 @@ def test_output_model_rejects_source_with_no_triton_jit():
 def test_output_model_accepts_multiple_jit_defs_with_matching_name():
     """Fused kernels can declare ``@triton.jit`` helpers alongside the main
     kernel. The Coder picks the dominant-work kernel; we only verify the
-    declared name is one of the jit'd defs (not necessarily the first)."""
-    src = (
-        "@triton.jit\ndef _epilogue(): pass\n"
-        "@triton.jit\ndef main_kernel(): pass\n"
-    )
+    declared name is one of the jit'd defs (not necessarily the first).
+
+    A1 PR 1: ``@triton.autotune`` is required directly above the named
+    ``@triton.jit def``; helper kernels may carry their own decorator or
+    none. Both the main kernel (autotune-bearing) and the helper (bare
+    ``@triton.jit``) below should be acceptable as ``triton_kernel_name``
+    targets — the autotune validator only fires on whichever one the
+    Coder names as the primary kernel.
+    """
+    src = """\
+import triton
+import triton.language as tl
+
+@triton.jit
+def _epilogue(): pass
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_M": 64}, num_warps=2, num_stages=2),
+        triton.Config({"BLOCK_M": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_M": 64}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 128}, num_warps=4, num_stages=4),
+    ],
+    key=["M"],
+)
+@triton.jit
+def main_kernel(X, M, BLOCK_M: tl.constexpr): pass
+"""
     out = KernelCodeOutput(source_code=src, triton_kernel_name="main_kernel")
     assert out.triton_kernel_name == "main_kernel"
 
-    # The helper is also a valid choice — Coder is the source of truth.
-    out2 = KernelCodeOutput(source_code=src, triton_kernel_name="_epilogue")
-    assert out2.triton_kernel_name == "_epilogue"
+    # Naming the helper instead: the helper has no @triton.autotune above
+    # it, so the autotune validator rejects (Coder must autotune the
+    # benchmarked kernel; if _epilogue is the primary, IT needs autotune).
+    from pydantic import ValidationError
+    with pytest.raises(ValidationError):
+        KernelCodeOutput(source_code=src, triton_kernel_name="_epilogue")
 
 
 def test_output_model_jit_decorator_with_args_recognized():
     """``@triton.jit(do_not_specialize=...)`` should still match — the
     regex tolerates decorator arguments."""
-    src = "@triton.jit(do_not_specialize=['n'])\ndef tuned_kernel(n): pass"
+    src = """\
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK": 64}, num_warps=2, num_stages=2),
+        triton.Config({"BLOCK": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK": 64}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK": 128}, num_warps=4, num_stages=4),
+    ],
+    key=["n"],
+)
+@triton.jit(do_not_specialize=['n'])
+def tuned_kernel(n): pass
+"""
     out = KernelCodeOutput(source_code=src, triton_kernel_name="tuned_kernel")
     assert out.triton_kernel_name == "tuned_kernel"
+
+
+# ── A1 PR 1: KernelCodeOutput @triton.autotune validator ───────────────
+
+
+def test_validator_accepts_valid_autotune():
+    out = KernelCodeOutput(source_code=_VALID_SOURCE, triton_kernel_name="k")
+    assert out.triton_kernel_name == "k"
+
+
+def test_validator_rejects_source_without_autotune():
+    from pydantic import ValidationError
+    src = "@triton.jit\ndef my_kernel(X): pass"
+    with pytest.raises(ValidationError) as exc:
+        KernelCodeOutput(source_code=src, triton_kernel_name="my_kernel")
+    assert "@triton.autotune" in str(exc.value)
+
+
+def test_validator_rejects_fewer_than_four_configs():
+    from pydantic import ValidationError
+    src = """\
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_M": 64}, num_warps=2, num_stages=2),
+        triton.Config({"BLOCK_M": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_M": 64}, num_warps=4, num_stages=3),
+    ],
+    key=["M"],
+)
+@triton.jit
+def my_kernel(X, M, BLOCK_M): pass
+"""
+    with pytest.raises(ValidationError) as exc:
+        KernelCodeOutput(source_code=src, triton_kernel_name="my_kernel")
+    assert "at least 4" in str(exc.value).lower()
+
+
+def test_validator_rejects_empty_key():
+    from pydantic import ValidationError
+    src = """\
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_M": 64}, num_warps=2, num_stages=2),
+        triton.Config({"BLOCK_M": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_M": 64}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 128}, num_warps=4, num_stages=4),
+    ],
+    key=[],
+)
+@triton.jit
+def my_kernel(X, M, BLOCK_M): pass
+"""
+    with pytest.raises(ValidationError) as exc:
+        KernelCodeOutput(source_code=src, triton_kernel_name="my_kernel")
+    assert "non-empty" in str(exc.value).lower() or "key=" in str(exc.value)
+
+
+def test_validator_rejects_autotune_on_unnamed_kernel():
+    """The decorator must be above the @triton.jit def matching triton_kernel_name."""
+    from pydantic import ValidationError
+    src = """\
+@triton.jit
+def my_kernel(X): pass
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_M": 64}, num_warps=2, num_stages=2),
+        triton.Config({"BLOCK_M": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_M": 64}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 128}, num_warps=4, num_stages=4),
+    ],
+    key=["M"],
+)
+@triton.jit
+def other_kernel(X): pass
+"""
+    with pytest.raises(ValidationError) as exc:
+        KernelCodeOutput(source_code=src, triton_kernel_name="my_kernel")
+    assert "my_kernel" in str(exc.value) or "@triton.autotune" in str(exc.value)
 
 
 # ── prompt assembly ─────────────────────────────────────────────────────
@@ -546,8 +684,8 @@ async def test_implement_calls_llm_and_returns_modified_source():
     """With a model, implement() builds the Agent with bound tools and runs it.
     The Coder emits its answer by calling submit_kernel, not via output_type."""
     capture_agent, fake_run = _simulate_submission(
-        source_code="@triton.jit\ndef k(): pass",
-        triton_kernel_name="k",
+        source_code=_VALID_SOURCE,
+        triton_kernel_name=_VALID_NAME,
     )
 
     with (
@@ -575,8 +713,8 @@ async def test_implement_calls_llm_and_returns_modified_source():
         )
 
     assert isinstance(result, KernelCodeOutput)
-    assert result.source_code == "@triton.jit\ndef k(): pass"
-    assert result.triton_kernel_name == "k"
+    assert result.source_code == _VALID_SOURCE
+    assert result.triton_kernel_name == _VALID_NAME
     mock_run.assert_awaited_once()
     # Agent gets compile + correctness + submit_kernel tools (3) and is built
     # without ``output_type=`` so the SDK doesn't request response_format=json_schema.
@@ -1064,8 +1202,8 @@ async def test_translate_builds_agent_with_three_tools_and_returns_source():
     """translate() constructs a fresh Agent with compile + correctness +
     submit tools and returns the captured Coder submission."""
     capture_agent, fake_run = _simulate_submission(
-        source_code="@triton.jit\ndef kernel_fn(x): pass",
-        triton_kernel_name="kernel_fn",
+        source_code=_VALID_SOURCE,
+        triton_kernel_name=_VALID_NAME,
     )
 
     with (
@@ -1084,8 +1222,8 @@ async def test_translate_builds_agent_with_three_tools_and_returns_source():
         )
 
     assert isinstance(result, KernelCodeOutput)
-    assert result.source_code == "@triton.jit\ndef kernel_fn(x): pass"
-    assert result.triton_kernel_name == "kernel_fn"
+    assert result.source_code == _VALID_SOURCE
+    assert result.triton_kernel_name == _VALID_NAME
     mock_run.assert_awaited_once()
     kwargs = mock_agent_cls.call_args.kwargs
     assert len(kwargs["tools"]) == 3  # compile + correctness + submit
@@ -1251,14 +1389,14 @@ def test_make_submit_tool_captures_valid_output():
     captured: dict = {}
     submit = _make_submit_tool(captured)
     msg = submit(
-        source_code="@triton.jit\ndef k(): pass",
-        triton_kernel_name="k",
+        source_code=_VALID_SOURCE,
+        triton_kernel_name=_VALID_NAME,
     )
     assert "submitted" in msg.lower()
     assert "output" in captured
     assert isinstance(captured["output"], KernelCodeOutput)
-    assert captured["output"].source_code == "@triton.jit\ndef k(): pass"
-    assert captured["output"].triton_kernel_name == "k"
+    assert captured["output"].source_code == _VALID_SOURCE
+    assert captured["output"].triton_kernel_name == _VALID_NAME
 
 
 def test_make_submit_tool_returns_validation_error_string_on_mismatch():
@@ -1321,8 +1459,8 @@ def test_make_submit_tool_does_not_append_on_success():
     log: list[str] = []
     submit = _make_submit_tool(captured, error_log=log)
     msg = submit(
-        source_code="@triton.jit\ndef k(): pass",
-        triton_kernel_name="k",
+        source_code=_VALID_SOURCE,
+        triton_kernel_name=_VALID_NAME,
     )
     assert "submitted" in msg.lower()
     assert log == []

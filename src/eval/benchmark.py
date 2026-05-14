@@ -30,6 +30,7 @@ branch dead.
 
 from __future__ import annotations
 
+import logging
 import math
 import statistics
 from dataclasses import dataclass, field
@@ -40,6 +41,67 @@ if TYPE_CHECKING:
 
     from src.config import ACTSConfig
     from src.kernels.kernel import Kernel
+
+
+_log = logging.getLogger(__name__)
+
+# Reserved seed for the per-workload autotune burn-in call. Negative so it
+# can't collide with warmup or timed iter seeds (which range over 0..N).
+_BURN_IN_SEED = -1
+
+
+def _key_tuple_for(
+    workload: "Workload",
+    autotune_keys: list[str],
+    definition: "Definition | None" = None,
+) -> tuple | None:
+    """Resolve autotune key arg-names against a workload's resolved axes.
+
+    Looks up each key string with two-stage resolution:
+      1. ``workload.axes`` first (SOL's per-workload axis-name → integer
+         map; e.g. ``{"B": 2}`` for a batch axis that varies per
+         workload). Workload bindings always win — they're the immediate
+         runtime context.
+      2. If *definition* is provided AND the axis is declared as
+         ``AxisConst`` on ``definition.axes``, use the const value. This
+         covers the common SOL shape where ``key=["B", "M", "N"]`` spans
+         a var axis (``B`` on workload) and const axes (``M``/``N`` on
+         the Definition). Codex review 2026-05-14 finding #2.
+
+    If any key fails to resolve via either stage, returns ``None`` — the
+    orchestrator treats that as "autotune_winner unavailable for this
+    workload" and continues. Empty ``autotune_keys`` returns ``()``
+    (valid Triton cache lookup for kernels with ``key=[]``, though the
+    Coder validator forbids that for emitted kernels).
+
+    Non-const axis types (``AxisVar`` without a workload binding,
+    ``AxisExpr``) degrade to None — they can't be statically resolved.
+    """
+    axes = getattr(workload, "axes", None) or {}
+    def_axes = getattr(definition, "axes", None) or {} if definition is not None else {}
+    values: list = []
+    for k in autotune_keys:
+        if k in axes:
+            values.append(axes[k])
+            continue
+        def_axis = def_axes.get(k) if def_axes else None
+        # Class-name check is the safest cross-Tier path: importing
+        # ``AxisConst`` at module top would pull in ``sol_execbench``,
+        # and the alternative ``getattr(def_axis, "type") == "const"``
+        # is silently typo-prone.
+        if def_axis is not None and type(def_axis).__name__ == "AxisConst":
+            const_value = getattr(def_axis, "value", None)
+            if const_value is not None:
+                values.append(const_value)
+                continue
+        _log.warning(
+            "autotune key %r not resolvable from workload %s axes or "
+            "definition const axes; autotune_winner will be None for "
+            "this workload.",
+            k, getattr(workload, "uuid", "?"),
+        )
+        return None
+    return tuple(values)
 
 
 class BenchmarkTimer(Protocol):
@@ -267,7 +329,19 @@ def _time_workload(
     appends the pre-allocated output buffers to ``args``; for non-DPS
     kernels we capture the return value of ``fn(*args)``. The list is
     ``None`` when the workload errored out.
+
+    A1 PR 1: one **burn-in** call fires before the warmup loop so
+    Triton's ``@triton.autotune`` runs its config sweep + compile +
+    micro-bench OUTSIDE the timed window. Seed ``-1`` is reserved for
+    burn-in so it can't collide with warmup or timed seeds.
     """
+    try:
+        burn_args = input_generator(_BURN_IN_SEED)
+        fn(*burn_args)
+        timer.prepare()
+    except Exception as e:
+        return 0.0, f"autotune burn-in failed: {type(e).__name__}: {e}", None
+
     try:
         for i in range(warmup):
             args = input_generator(i)

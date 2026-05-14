@@ -76,6 +76,103 @@ if TYPE_CHECKING:
 _NO_PROFILE_SUMMARY = "[no profiling data available]"
 
 
+def _safe_precompile(
+    kernel: "Kernel",
+    *,
+    role: str,
+) -> tuple[Any | None, Any | None]:
+    """Best-effort precompile that returns ``(compiled_fn, autotuner)``,
+    degrading to ``(None, None)`` with a WARNING on any failure.
+
+    Used at the orchestrator's baseline (Phase A) and child (Phase B per-
+    iter) call sites to retain the host entrypoint for ``kernel_fn=`` and
+    the Triton Autotuner for cache introspection (A1 PR 1). Codex review
+    2026-05-14 finding #1: ``compile_kernel`` can raise before returning
+    a ``CompilationResult`` (read-only ``.acts_cache``, disk full); this
+    helper routes those into the lazy-compile fallback in
+    ``benchmark_kernel`` rather than aborting ``Orchestrator.run()``.
+
+    *role* labels the warning ("Baseline" / "Child") for postmortem.
+    """
+    from src.kernels.compiler import compile_kernel
+
+    try:
+        result = compile_kernel(kernel)
+    except Exception as exc:
+        logger.warning(
+            "%s pre-compile raised (%s: %s) — falling back to lazy "
+            "compile; autotune_winner will be None.",
+            role, type(exc).__name__, exc,
+        )
+        return None, None
+    if result.success and result.compiled_fn is not None:
+        return result.compiled_fn, result.triton_autotuner
+    return None, None
+
+
+def _record_autotune_winner(
+    kernel: "Kernel",
+    autotuner: Any,
+    workloads: list["Workload"],
+    definition: "Definition | None" = None,
+) -> None:
+    """Populate ``kernel.autotune_winner`` from Triton's autotune cache (A1 PR 1).
+
+    *autotuner* is the Triton ``Autotuner`` instance — i.e.
+    ``module.<kernel.triton_kernel_name>`` — surfaced by
+    ``compile_kernel(..).triton_autotuner``. The host wrapper (the
+    entrypoint) doesn't carry the cache; the autotune decorator binds
+    it to the wrapped ``@triton.jit`` function.
+
+    Cache-key matching: Triton stores entries keyed on tuples that
+    PREFIX with the user-declared ``key=`` values then append the
+    pointer-arg dtypes (e.g. ``(M, N, K, "torch.float32", "torch.float32", "torch.float32")``).
+    We compute the expected prefix from ``workload.axes`` plus any
+    ``AxisConst`` values on *definition.axes* (Codex review finding #2,
+    2026-05-14 — SOL problems with const definition axes were silently
+    failing key lookup before the Definition was threaded through), then
+    search the cache for the entry whose tuple starts with it.
+
+    Best-effort: failures degrade to ``autotune_winner = None`` with a
+    WARNING and never raise. Skipped when ``kernel.autotune_keys`` is
+    empty (no per-workload identity to attribute) or when *autotuner*
+    is ``None`` (no autotune wrapper present, e.g. legacy starters).
+    """
+    from src.eval.benchmark import _key_tuple_for
+
+    if autotuner is None or not kernel.autotune_keys:
+        return
+    try:
+        cache = getattr(autotuner, "cache", None)
+        if not cache:
+            return
+        winners: dict[str, dict] = {}
+        for wl in workloads:
+            expected = _key_tuple_for(wl, kernel.autotune_keys, definition=definition)
+            if expected is None:
+                continue
+            n = len(expected)
+            matched_cfg = None
+            for cache_key, cfg in cache.items():
+                if isinstance(cache_key, tuple) and cache_key[:n] == expected:
+                    matched_cfg = cfg
+                    break
+            if matched_cfg is None:
+                continue
+            winners[wl.uuid] = {
+                "kwargs": dict(getattr(matched_cfg, "kwargs", {})),
+                "num_warps": int(getattr(matched_cfg, "num_warps", 0)),
+                "num_stages": int(getattr(matched_cfg, "num_stages", 0)),
+            }
+        if winners:
+            kernel.autotune_winner = winners
+    except Exception as exc:
+        logger.warning(
+            "autotune_winner unavailable: %s: %s",
+            type(exc).__name__, exc,
+        )
+
+
 class TerminationReason(str, Enum):
     """Why the search loop exited. str-subclass so legacy string comparisons
     still work during the transition (e.g. existing report/doc consumers)."""
@@ -461,18 +558,37 @@ class Orchestrator:
         # downstream child score meaningless — fail closed symmetric
         # with the majority-failure BenchmarkError path.
         root = tree.add_root(baseline)
+        _baseline_fn, _baseline_autotuner = _safe_precompile(baseline, role="Baseline")
+
         baseline_bench = benchmark_kernel(
             baseline,
             self._config,
             workloads=workloads,
             input_generators=input_generators,
             definition=definition,
+            kernel_fn=_baseline_fn,
         )
         if not baseline_bench.is_fully_successful:
             raise BenchmarkError(
                 f"baseline benchmark had partial-workload failures "
                 f"(errors={baseline_bench.workload_errors}); "
                 f"SOL scoring requires a complete baseline measurement"
+            )
+
+        # A1 PR 1: record per-workload autotune winners for the baseline
+        # when we have an Autotuner reference. Skipped on the lazy-compile
+        # fallback path, on placeholder baselines without an autotune
+        # decorator, and on legacy starters — autotune_winner stays None
+        # in those cases (no observability, run continues).
+        if _baseline_autotuner is not None:
+            _record_autotune_winner(
+                baseline, _baseline_autotuner, workloads, definition=definition,
+            )
+            emit(
+                "autotune_burn_in_done",
+                iter=root.iter_no,
+                workload_count=len(workloads),
+                winner_recorded=bool(baseline.autotune_winner),
             )
 
         emit(
@@ -600,7 +716,11 @@ class Orchestrator:
             try:
                 with _iter_trace(0, "reviewer"):
                     baseline_feedback = await self._reviewer.review(
-                        kernel_source=baseline.source_code,
+                        kernel_source=baseline.render_condensed_source(
+                            representative_workload_uuid=(
+                                workloads[0].uuid if workloads else None
+                            ),
+                        ),
                         profiling_summary="",
                         sol_score=root.score.sol_score,
                         headroom_pct=(1.0 - root.score.sol_score) * 100,
@@ -679,7 +799,11 @@ class Orchestrator:
             try:
                 with _iter_trace(iter_no, "planner"):
                     plan = await self._planner.plan(
-                        kernel_source=parent.kernel.source_code,
+                        kernel_source=parent.kernel.render_condensed_source(
+                            representative_workload_uuid=(
+                                workloads[0].uuid if workloads else None
+                            ),
+                        ),
                         profiling_summary=parent_profiling_summary,
                         past_experiences=experiences,
                         available_actions=[],
@@ -782,15 +906,25 @@ class Orchestrator:
             # ``CUDAContextPoisoned`` budget.
             dead_detail: str | None = None
             bench = None
+            _compiled_fn: Any | None = None
+            _child_autotuner: Any | None = None
             try:
-                # Wrap benchmark_kernel(...) with pre- and post-execution anti-cheat checks.
+                # A1 PR 1 + Codex finding #1: precompile MUST run inside
+                # ``per_iter_anti_cheat`` so import-time side effects from
+                # the candidate source (exec_module runs top-level Python)
+                # register as drift against the snapshot rather than
+                # silently becoming the new baseline.
                 with per_iter_anti_cheat(self._config.anti_cheat_critical_names):
+                    _compiled_fn, _child_autotuner = _safe_precompile(
+                        child_kernel, role="Child",
+                    )
                     bench = benchmark_kernel(
                         child_kernel,
                         self._config,
                         workloads=workloads,
                         input_generators=input_generators,
                         definition=definition,
+                        kernel_fn=_compiled_fn,
                     )
                 check_lazy_outputs_after_bench(bench.last_outputs)
                 # Drop GPU tensor refs as soon as the lazy-output check
@@ -798,6 +932,24 @@ class Orchestrator:
                 # are hundreds of MB pinned through the LLM round-trip
                 # ahead (profile + score + reviewer).
                 bench.last_outputs.clear()
+                # A1 PR 1: query Triton's autotune cache for the per-workload
+                # winning config. Skipped on the lazy-compile fallback (no
+                # autotuner captured) and on kernels without an autotune
+                # decorator (autotuner is None). Event fires only when the
+                # Autotuner reference is real, so post-run analysis can
+                # distinguish "autotune ran" from "pre-compile fallback
+                # path taken / no autotune."
+                if bench.is_fully_successful and _child_autotuner is not None:
+                    _record_autotune_winner(
+                        child_kernel, _child_autotuner, workloads,
+                        definition=definition,
+                    )
+                    emit(
+                        "autotune_burn_in_done",
+                        iter=iter_no,
+                        workload_count=len(workloads),
+                        winner_recorded=bool(child_kernel.autotune_winner),
+                    )
                 # Bench succeeded without any reward-hack signal — clear
                 # the CUDA error counter so a single transient blip earlier
                 # in the run doesn't accumulate forever.
@@ -1061,7 +1213,11 @@ class Orchestrator:
                 )
                 with _iter_trace(iter_no, "reviewer"):
                     feedback = await self._reviewer.review(
-                        kernel_source=new_source,
+                        kernel_source=child.kernel.render_condensed_source(
+                            representative_workload_uuid=(
+                                workloads[0].uuid if workloads else None
+                            ),
+                        ),
                         profiling_summary=_NO_PROFILE_SUMMARY,  # superseded by profiling=
                         sol_score=child.score.sol_score,
                         headroom_pct=(1.0 - child.score.sol_score) * 100,

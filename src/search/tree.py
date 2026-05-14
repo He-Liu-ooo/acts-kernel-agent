@@ -536,9 +536,9 @@ def _serialize_kernel(kernel: Kernel) -> dict:
             "t_sol_us": kernel.spec.t_sol_us,
         },
         "source_code": kernel.source_code,
-        "num_warps": kernel.num_warps,
-        "num_stages": kernel.num_stages,
-        "block_size": kernel.block_size,
+        "autotune_configs": kernel.autotune_configs,
+        "autotune_keys": kernel.autotune_keys,
+        "autotune_winner": kernel.autotune_winner,
         "triton_kernel_name": kernel.triton_kernel_name,
         "dps": kernel.dps,
     }
@@ -575,31 +575,27 @@ def _deserialize_node(data: dict) -> TreeNode:
         dr = DeadReason(dr_raw)
 
     k = data["kernel"]
-    ks = k["spec"]
-    def_path = Path(ks["definition_path"]) if ks["definition_path"] else None
-    kernel = Kernel(
-        spec=KernelSpec(
-            name=ks["name"],
-            kernel_type=KernelType(ks["kernel_type"]),
-            flop_count=ks["flop_count"],
-            memory_bytes=ks["memory_bytes"],
-            input_shapes=ks["input_shapes"],
-            definition_path=def_path,
-            pytorch_reference=ks["pytorch_reference"],
-            t_sol_us=ks["t_sol_us"],
-        ),
-        source_code=k["source_code"],
-        num_warps=k["num_warps"],
-        num_stages=k["num_stages"],
-        block_size=k["block_size"],
-        # ``.get`` with empty-string default keeps older checkpoints
-        # loadable; the profiler's regex fallback handles them.
-        triton_kernel_name=k.get("triton_kernel_name", ""),
-        # ``.get`` with False default for older checkpoints written before
-        # the DPS field existed. Losing dps on reload would silently
-        # change correctness/profiling behavior on the resumed run.
-        dps=k.get("dps", False),
-    )
+    # A1 PR 1: detect pre-autotune checkpoints by the absence of the new
+    # ``autotune_configs`` field, route through Kernel.from_legacy_dict so
+    # legacy num_warps/num_stages/block_size triples become single-entry
+    # autotune_configs lists. New-format checkpoints take the explicit path.
+    if "autotune_configs" not in k:
+        kernel = Kernel.from_legacy_dict(k)
+    else:
+        kernel = Kernel(
+            spec=KernelSpec.from_dict(k["spec"]),
+            source_code=k["source_code"],
+            # ``.get`` with empty-string default keeps older checkpoints
+            # loadable; the profiler's regex fallback handles them.
+            triton_kernel_name=k.get("triton_kernel_name", ""),
+            # ``.get`` with False default for older checkpoints written before
+            # the DPS field existed. Losing dps on reload would silently
+            # change correctness/profiling behavior on the resumed run.
+            dps=k.get("dps", False),
+            autotune_configs=k["autotune_configs"],
+            autotune_keys=k.get("autotune_keys", []),
+            autotune_winner=k.get("autotune_winner") or {},
+        )
 
     return TreeNode(
         id=data["id"],
