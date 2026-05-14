@@ -86,7 +86,7 @@ Each action is a structured record: `{id, tier, name, description, applicable_to
 
 | Tier | Actions (examples) | Risk | Precondition |
 |------|-------------------|------|-------------|
-| 1 | block_size_tuning, grid_shape_optimization, occupancy_maximization | Low | None |
+| 1 | block_size_tuning, grid_shape_optimization, occupancy_maximization (post-A1: these shape the `@triton.autotune` config list rather than picking single values; see Backend → Triton coverage) | Low | None |
 | 2 | shared_memory_tiling, global_memory_coalescing, register_caching, prefetching, bank_conflict_resolution | Low-Med | Memory bottleneck |
 | 3 | tf32_accumulation, mixed_precision, fused_operations, vectorized_loads, loop_unrolling | Medium | Compute pattern |
 | 4 | split_k_decomposition, persistent_kernel, warp_specialization, stream_k | High | Kernel structure |
@@ -148,7 +148,7 @@ The orchestrator runs benchmarking and profiling on the Coder's output. These ar
 
 | Metric | Tool | Method |
 |--------|------|--------|
-| **Latency** | CUDA Events | Median of N trials, 20 warmup + 100 timed |
+| **Latency** | CUDA Events | Median of N trials, 20 warmup + 100 timed + 1 burn-in launch (seed -1) so `@triton.autotune` compile + sweep occurs outside the timed window |
 | **Bottleneck classification** | SOLAR / built-in roofline (run-level, Phase A) | `classify_run` computes `memory_bound` / `compute_bound` / `balanced` once per `(problem, representative workload, hardware)` and threads the label through every iteration via `SearchResult.run_bottleneck`. Per-iter analytical diagnostics (arithmetic intensity, achieved TFLOPs, achieved GB·s) refine the picture without re-classifying. |
 | **Hardware profiling** | NCU subprocess, curated sections (`Occupancy`, `WarpStateStats`, `MemoryWorkloadAnalysis`, `ComputeWorkloadAnalysis`) | SM occupancy, L2 hit rate, tensor-core utilization, dominant + runner-up warp stall class. Best-effort — NCU failures degrade the signal; analytical classification remains the floor. `ACTS_PROFILER_MODE=full` swaps to `--set full` for debug. |
 
@@ -260,7 +260,7 @@ The `reward_hack_suspect` flag connects `scorer.py` to `anti_cheat.py` at the pe
 3. **Phase A baseline review** (iter=0, once per run): the orchestrator profiles the root via `profile_kernel(root)` and runs `Reviewer.review(prev_sol_score=None)`, attaching `root.last_review` + `root.branch_quality` + `root.profiling`. This primes the Planner-feedback channel so iter=1 sees a real review of the Triton baseline instead of `None`. A baseline `DEAD_END` verdict is clamped — the root stays expandable — and a `reviewer_feedback` event with `iter=0` is emitted.
 4. **At each eval iteration**: `profiler.py` produces per-iter diagnostic signals — analytical roofline metrics (arithmetic intensity, achieved TFLOPS / GB/s, pct-of-peak) when `(flops, nbytes)` are derivable for the workload, and curated NCU metrics (occupancy, L2 hit rate, tensor-core utilization, top-2 warp stalls). The analytical block is optional: `ProfilingResult.analytical` is `None` for kernels where bytes cannot be derived from shapes / SOLAR, and NCU still runs in that case (renderers guard via `has_analytical`). These refine the Reviewer's action-tier choice but do **not** re-classify the bottleneck. `scorer.py` computes SOL Score using the static `T_SOL` from step 2.
 5. **Reviewer** receives the SOL score, the run-level bottleneck (threaded through from step 2), the per-iter analytical + NCU blocks, and how far `T_k` is from `T_SOL`. Reports remaining headroom.
-6. **Planner** receives the parent node's curated Reviewer prose — the `outcome`, `bottleneck_diagnosis`, `suggestions`, and `conditional_assessment` fields rendered by `reviewer._render_review_for_planner` — not a single distilled scalar. (Phase A's iter-0 baseline review in step 3 primes this channel so iter=1's Planner sees a real `last_review` rather than `None`.)
+6. **Planner** receives the parent node's curated Reviewer prose — the `outcome`, `bottleneck_diagnosis`, `suggestions`, and `conditional_assessment` fields rendered by `reviewer._render_review_for_planner` — not a single distilled scalar. (Phase A's iter-0 baseline review in step 3 primes this channel so iter=1's Planner sees a real `last_review` rather than `None`.) In addition, the orchestrator threads the parent kernel's **condensed source** to the Planner (and Reviewer) via `Kernel.render_condensed_source(representative_workload_uuid=workloads[0].uuid)` — called at three sites in `src/search/orchestrator.py` (baseline review, per-iter Planner, per-iter Reviewer) — so the Planner sees the actual code it is mutating, not just the curated prose.
 7. **Move-on criteria**: SOL score plateau (consecutive iterations with < δ improvement) or SOL score > threshold (e.g., 0.95 — within 5% of hardware limit).
 8. **Cross-kernel comparability**: SOL score of 0.9 on matmul is directly comparable to 0.9 on softmax — both are 90% of the way to their respective hardware limits.
 
@@ -339,7 +339,7 @@ Triton coverage by tier:
 
 | Tier | Coverage |
 |------|----------|
-| 1: Block/grid sizing | Full |
+| 1: Block/grid sizing | Full (value picking for `num_warps` / `num_stages` / `BLOCK_*` delegated to `@triton.autotune`; Tier-1 actions now shape the autotune search space rather than picking values directly) |
 | 2: Memory | Partial (coalescing automatic, num_stages for pipelining, no bank conflict control) |
 | 3: Compute | Mostly full |
 | 4: Advanced | Partial (split-K doable, persistent kernels awkward, warp specialization impossible) |
@@ -347,6 +347,8 @@ Triton coverage by tier:
 | 6: Kernel-specific | Partial |
 
 **Known limitation**: V1 cannot compete with hand-tuned libraries on kernels requiring warp specialization or architecture-specific intrinsics.
+
+**Mandatory autotune (A1 PR 1, 2026-05-14)**: every Coder-emitted Triton kernel MUST carry an `@triton.autotune` decorator with at least 4 `triton.Config` entries and a non-empty `key=` list; a validator on `KernelCodeOutput` rejects submissions that omit the decorator, ship fewer than 4 configs, or leave `key=` empty. The eval harness performs a single burn-in launch before the warmup window so autotune's compile + config-pick cost lands outside the timed measurement. The orchestrator emits `autotune_burn_in_done` once per benched node — payload `{iter, workload_count, winner_recorded}`. Consequence for the action library: Tier-1 actions (`block_size_tuning`, etc.) are no longer manual value-picking levers; their semantics shift to defining the space the autotune sweep should cover. PR 1 is the foundation PR — the action library reshape and per-kernel-type recipe work are deferred and gated on PR 1 live-run evidence.
 
 ---
 

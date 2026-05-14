@@ -54,11 +54,11 @@ Module-level handle registration, guarded by `_lock`. `RunContext.create` calls 
 
 ### Event catalog — `CORE_EVENT_KINDS`
 
-Frozenset of 29 kinds:
+Frozenset of 30 kinds:
 
 **Run scope** — `run_start`, `baseline_attempt`, `baseline_success`, `baseline_failure`, `baseline_ready`, `verify_start`, `verify_done`, `run_end`, `clock_lock_unavailable`, `clock_drift_detected`.
 
-**Per-iteration** — `iter_start`, `planner_selected`, `planner_failed`, `coder_submitted`, `coder_failed`, `bench_done`, `profile_done`, `score_computed`, `reviewer_feedback`, `reviewer_metric_query`, `branch_dead_end`, `iter_end`, `trace_emitted`, `reward_hack_detected`, `reward_hack_confirmed`, `reward_hack_cleared`, `calibration_warning`, `sibling_context_rendered`, `repeated_pathway_dead_end`.
+**Per-iteration** — `iter_start`, `planner_selected`, `planner_failed`, `coder_submitted`, `coder_failed`, `bench_done`, `profile_done`, `score_computed`, `reviewer_feedback`, `reviewer_metric_query`, `branch_dead_end`, `iter_end`, `trace_emitted`, `reward_hack_detected`, `reward_hack_confirmed`, `reward_hack_cleared`, `calibration_warning`, `sibling_context_rendered`, `repeated_pathway_dead_end`, `autotune_burn_in_done`.
 
 **SOL integration sub-grouping** (added 2026-04-27, distributed across the two scopes above):
 
@@ -74,6 +74,9 @@ Frozenset of 29 kinds:
 
 - `sibling_context_rendered` (per-iter) — fires once per Planner call AND once per Reviewer call whenever the parent has been expanded before (`sibling_context != ""`). Payload: `iter`, `parent_node_id`, `sibling_count: int`, `regressed_actions: list[str]`, `consumer: Literal["planner", "reviewer"]`. On iter ≥2 with a sibling, both events fire (one per consumer) for the same parent.
 - `repeated_pathway_dead_end` (per-iter) — fires when Reviewer verdict is DEAD_END AND `child.action_applied` matches a regressed sibling — the existing reviewer/system.md rule ("regression + same pathway on sibling = dead_end") actually fired with sibling evidence. Payload: `iter`, `action: str`, `sibling_iter: int`. Leading-indicator companion to the `branch_dead_end(reason="reviewer_judged")` that follows; lets postmortems count successful sibling-driven prunes without re-walking the tree.
+
+**Triton autotune integration sub-grouping** (added 2026-05-14, A1 PR 1):
+- `autotune_burn_in_done` (per-iter) — fires once per iter after the post-bench autotune-winner recording step. Payload: `iter`, `workload_count: int`, `winner_recorded: bool`. Per-workload winners themselves persist on `Kernel.autotune_winner: dict[workload.uuid, cfg]`.
 
 Notable semantics:
 

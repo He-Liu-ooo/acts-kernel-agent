@@ -28,25 +28,55 @@ Static metadata about the kernel *problem* — stays the same across all optimiz
 
 ### Kernel
 
-A single *version*: source code + Triton tuning parameters. Every search tree node holds one `Kernel`.
+A single *version*: source code + autotune metadata parsed from it. Every search tree node holds one `Kernel`.
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `spec` | KernelSpec | Shared across all versions |
 | `source_code` | str | Triton source code |
-| `num_warps` | int | Triton num_warps parameter |
-| `num_stages` | int | Triton num_stages for pipelining |
-| `block_size` | dict[str,int] | Block dimensions (e.g., BLOCK_M, BLOCK_N) |
 | `triton_kernel_name` | str | Bare name of the `@triton.jit` device function the profiler filters NCU on. Defaults to `""` for hand-written starters / test fixtures — the profiler's priority chain (`Kernel.triton_kernel_name` → source-regex → `spec.entrypoint`) handles the empty case via the fallback. Coder-produced kernels populate it via the `submit_kernel` tool's Pydantic-validated argument. |
 | `dps` | bool | Destination-passing-style flag. `True` means the host wrapper takes pre-allocated outputs after the inputs (`def kernel_fn(x, y, out)`) and the benchmark / correctness loops allocate buffers via `allocate_outputs(definition, workload, device)` and thread them through. `False` (default) means the wrapper returns its outputs as the function's return value. Default preserves back-compat with hand-written starters and pre-`dps` checkpoint round-trips. |
+| `autotune_configs` | list[dict] | Parsed at `__post_init__` from the `@triton.autotune(configs=[...])` decorator in `source_code` via stdlib `ast` (no Triton import — works in Tier-1 torchless venv). Each entry: `{"kwargs": {...}, "num_warps": int, "num_stages": int}`. Empty list when the source has no `@triton.autotune` (hand-written starters, test fixtures, legacy kernels). Parsing is lenient; the validator in `src/agents/coder.py::KernelCodeOutput` is what enforces presence for Coder-emitted source. |
+| `autotune_keys` | list[str] | Arg-name strings parsed from the same decorator's `key=[...]` arg in the same AST pass (e.g., `["M", "N", "K"]` for matmul). Consumed by the orchestrator's `_record_autotune_winner` to compute the cache lookup tuple per workload. |
+| `autotune_winner` | dict[str, dict] | Populated post-bench by the orchestrator from Triton's JIT cache, keyed by `workload.uuid` with values matching the `autotune_configs` schema. Empty dict until the first benchmark with successful winner attribution; stays empty when introspection soft-fails. |
 
 Read `source_code` directly — it's the full Triton source string.
+
+#### Legacy checkpoint migration
+
+`Kernel.from_legacy_dict(data)` reconstructs a `Kernel` from a pre-A1 checkpoint dict by wrapping the old `(num_warps, num_stages, block_size)` triple into a single-entry `autotune_configs` list (`autotune_keys=[]`, `autotune_winner={}`). Used by `TreeNode` deserialization when legacy field keys are detected; new checkpoints never write the legacy schema. Both call sites — and the new-format path in `tree._deserialize_node` — share `KernelSpec.from_dict(data)` for the spec rebuild so the codec lives in one place.
+
+#### `render_condensed_source(representative_workload_uuid=None) -> str`
+
+Used by `src/search/orchestrator.py` to produce condensed parent source for the Planner and Reviewer prompts. The Coder uses `source_code` verbatim because it must edit the decorator block (the reframed `t1_block_size_tuning` action widens the autotune sweep).
+
+Replaces the `@triton.autotune` decorator block with a single-line comment of the form:
+
+```text
+# autotune: BLOCK_M ∈ {64,128,256}, num_warps ∈ {4,8}, num_stages ∈ {2,3,4}, key=[M,N,K]
+```
+
+When `representative_workload_uuid` is supplied and present in `autotune_winner`, a second comment line is appended:
+
+```text
+# winner (representative wl): BLOCK_M=128, num_warps=4, num_stages=3
+```
+
+Falls back to verbatim `source_code` (entire return) when: source has no `@triton.autotune` decorator; AST parse fails; `autotune_configs` is empty; or the decorator's line span can't be located. All fallbacks degrade silently — the LLM still gets the kernel source.
+
+The method is paired with the module-level `_find_autotune_decorator_span(source, triton_kernel_name)` AST helper, which returns the decorator's 1-indexed `(start_lineno, end_lineno)` span or `None`. Two format helpers (`_render_autotune_summary`, `_render_autotune_winner`) produce the comment lines from parsed config + winner data.
+
+`_autotune_span: tuple[int, int] | None` is a private cached span populated in `__post_init__` alongside `autotune_configs`/`autotune_keys` so `render_condensed_source` reads the decorator's source-line range from the cache instead of re-parsing.
 
 ## Compiler — `compiler.py`
 
 Called by the Coder's `compile_kernel_tool` during its turn, by `eval/benchmark.py::_compile_entrypoint` before timing, by `eval/profiler.py::profile_kernel` to materialize the kernel for NCU's subprocess, and by `pipeline/verify.py` post-search.
 
-- `compile_kernel(kernel, cache_dir=None) -> CompilationResult`: Source-hash-keyed file-backed import. Writes source to `<cache_dir>/<name>_<hash>.py` (hash = `sha256(source)[:12]`), loads via `importlib.util.spec_from_file_location` + `exec_module`, resolves `kernel.spec.entrypoint` via `getattr`. Returns `success`, `compiled_fn`, `error_message`, and `source_path` (carries real filenames into tracebacks so the Coder can self-correct). Defaults to `DEFAULT_CACHE_DIR = Path(".acts_cache/compiled")`.
+- `compile_kernel(kernel, cache_dir=None) -> CompilationResult`: Source-hash-keyed file-backed import. Writes source to `<cache_dir>/<name>_<hash>.py` (hash = `sha256(source)[:12]`), loads via `importlib.util.spec_from_file_location` + `exec_module`, resolves `kernel.spec.entrypoint` via `getattr`. Returns `success`, `compiled_fn`, `error_message`, `source_path` (carries real filenames into tracebacks so the Coder can self-correct), and `triton_autotuner`. Defaults to `DEFAULT_CACHE_DIR = Path(".acts_cache/compiled")`.
+
+### `triton_autotuner` resolution
+
+`CompilationResult.triton_autotuner` holds the `@triton.autotune`-wrapped JIT kernel object when the source declares one, so the orchestrator can introspect Triton's per-config cache post-bench to populate `Kernel.autotune_winner`. The `_resolve_triton_autotuner(module, kernel)` helper returns `module.<kernel.triton_kernel_name>` only when that attribute resolves to an object exposing a `.cache` attribute (i.e. is wrapped in `@triton.autotune`); it returns `None` for legacy starters / fixtures with empty `triton_kernel_name`, for bare `@triton.jit` kernels (no `.cache`), and for any attribute-resolution failure. Best-effort: failures degrade to `None` so the success path is unaffected.
 
 ### `sys.modules` short-circuit
 

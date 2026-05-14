@@ -111,6 +111,18 @@ Measures kernel latency using CUDA events. Called by the orchestrator after the 
 
 Each timed iteration runs: `prepare → flush_l2 → record_start → kernel_fn(*args) → record_end → finalize_ms`. L2 is flushed **before** `record_start` so the kernel sees a cold cache and the flush is excluded from the measurement (KernelBench convention). Inputs are regenerated per iter outside the timing window so in-place kernels don't see degenerate inputs on later iterations.
 
+### Burn-in call (autotune warm-up)
+
+Before the warmup loop, `_time_workload` fires one untimed burn-in call using reserved seed `-1` (`_BURN_IN_SEED = -1` constant in `src/eval/benchmark.py`). This forces `@triton.autotune`'s config sweep + compile + per-config microbench to complete **outside** the timed window, so what flows into the median is cached-winner perf rather than first-call autotune overhead. The burn-in invokes one extra `prepare` (regenerating inputs) ahead of the recorded `[prepare, flush_l2, record_start, record_end, finalize_ms]` per timed iter. Failure inside the burn-in surfaces as a workload-level error on the same fail-closed path as warmup failure — latency = inf in `per_workload_latency_us`, reason recorded in `workload_errors`, half-survivors-or-die gate then fires.
+
+### Autotune-key resolution
+
+Module-level helper `_key_tuple_for(workload, autotune_keys, definition=None) -> tuple | None` resolves an autotuned kernel's declared key arg-names via two-stage lookup: `workload.axes` first (per-workload bindings always win), then `definition.axes` entries whose runtime class name is `AxisConst` (resolves SOL problems with const M/N axes on the Definition and var B on each Workload). Returns `None` if any key fails both stages; non-const axis types (`AxisVar` without a binding, `AxisExpr`) degrade to `None`.
+
+### Autotune burn-in event
+
+`autotune_burn_in_done` is registered in `runtime/events.py::CORE_EVENT_KINDS` and fired **once per iter** by the orchestrator after a successful bench loop. Payload: `{iter, workload_count, winner_recorded}` — `workload_count` summarizes the iter's bench loop; `winner_recorded` is True iff Triton's cache yielded a winner for at least one workload.
+
 ### `BenchmarkTimer` Protocol
 
 The timer is an injectable `Protocol` (`prepare` / `flush_l2` / `record_start` / `record_end` / `finalize_ms`). Production uses `_TorchCudaTimer` — `torch.cuda.Event` pairs plus a 256MB int64 L2-thrash tensor. Tests inject a `RecordingTimer` that returns a scripted elapsed sequence so dispatch / aggregation / call-order can be verified without torch.
