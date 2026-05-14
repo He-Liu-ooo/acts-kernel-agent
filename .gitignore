@@ -41,6 +41,7 @@ doc/plans/
 others/
 meeting-log.md
 configs/models/
+presentation/
 
 # CUDA / profiling artifacts
 *.ncu-rep

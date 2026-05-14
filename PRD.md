@@ -82,7 +82,7 @@ On compilation or correctness failure, the Coder's tool loop handles retries int
 
 ## Structured Action Library — 6-Tier System, Triton-First
 
-Each action is a structured record: `{id, tier, name, description, applicable_to, preconditions, parameters, guidance, anti_patterns, expected_impact}`. Actions use high-level recipes (step-by-step guidance), not code templates — the Coder adapts the recipe to each kernel.
+Each action is a structured record: `{id, tier, name, description, applicable_to, preconditions, min_compute_capability, parameters, guidance, anti_patterns, expected_impact}`. Actions use high-level recipes (step-by-step guidance), not code templates — the Coder adapts the recipe to each kernel. The `preconditions: list[str]` field is LLM-visible documentation rendered into the Planner's system prompt (advisory free-text like `"memory_bound"` or `"compute_bound"`), whereas `min_compute_capability` is a structured enforcement gate consulted by `list_applicable` to deny actions whose hardware requirements the target GPU does not meet.
 
 | Tier | Actions (examples) | Risk | Precondition |
 |------|-------------------|------|-------------|
@@ -92,6 +92,8 @@ Each action is a structured record: `{id, tier, name, description, applicable_to
 | 4 | split_k_decomposition, persistent_kernel, warp_specialization, stream_k | High | Kernel structure |
 | 5 | h100_tma_loads, h100_wgmma, a100_cp_async, hopper_cluster_launch | High | GPU arch |
 | 6 | welford_online_stats, online_softmax, causal_mask_skip, flash_attention_tiling | High | Kernel type |
+
+The "Precondition" column above captures LLM-visible documentation strings surfaced to the Planner, not structurally enforced filters. The only structurally enforced hardware gate today is `min_compute_capability` on Tier-5 actions — `t5_h100_tma=9.0`, `t5_h100_wgmma=9.0`, `t5_hopper_cluster=9.0`, and `t5_a100_cp_async=8.0` — which `list_applicable` consults against `HardwareSpec.compute_capability` to drop unsupported actions before they reach the Planner.
 
 Tiers are not strictly sequential — Planner can pick any tier, but ordering encodes risk/reward.
 
@@ -348,7 +350,7 @@ Triton coverage by tier:
 
 **Known limitation**: V1 cannot compete with hand-tuned libraries on kernels requiring warp specialization or architecture-specific intrinsics.
 
-**Mandatory autotune (A1 PR 1, 2026-05-14)**: every Coder-emitted Triton kernel MUST carry an `@triton.autotune` decorator with at least 4 `triton.Config` entries and a non-empty `key=` list; a validator on `KernelCodeOutput` rejects submissions that omit the decorator, ship fewer than 4 configs, or leave `key=` empty. The eval harness performs a single burn-in launch before the warmup window so autotune's compile + config-pick cost lands outside the timed measurement. The orchestrator emits `autotune_burn_in_done` once per benched node — payload `{iter, workload_count, winner_recorded}`. Consequence for the action library: Tier-1 actions (`block_size_tuning`, etc.) are no longer manual value-picking levers; their semantics shift to defining the space the autotune sweep should cover. PR 1 is the foundation PR — the action library reshape and per-kernel-type recipe work are deferred and gated on PR 1 live-run evidence.
+**Mandatory autotune (A1 PR 1/B, 2026-05-14)**: every Coder-emitted Triton kernel MUST carry an `@triton.autotune` decorator with at least 4 `triton.Config` entries and a non-empty `key=` list; a validator on `KernelCodeOutput` rejects submissions that omit the decorator, ship fewer than 4 configs, or leave `key=` empty. The eval harness performs a single burn-in launch before the warmup window so autotune's compile + config-pick cost lands outside the timed measurement, then attributes winners by diffing Triton's `autotuner.cache` around each workload. The orchestrator emits `autotune_burn_in_done` once per benched node — payload `{iter, workload_count, winner_count}`. Consequence for the action library: Tier-1 actions (`block_size_tuning`, etc.) are no longer manual value-picking levers; their semantics shift to defining the space the autotune sweep should cover. PR 1 is the foundation PR — the action library reshape and per-kernel-type recipe work are deferred and gated on PR 1 live-run evidence.
 
 ---
 

@@ -57,6 +57,7 @@ Frozen dataclass using the SOLAR arch YAML schema. Load from YAML via `load_hard
 | `MAC_per_cycle_fp8_tc` | float | FP8 MACs/cycle (Tensor Cores) |
 | `MAC_per_cycle_int8_tc` | float | INT8 MACs/cycle (Tensor Cores) |
 | `MAC_per_cycle_nvfp4_tc` | float | NVFP4 MACs/cycle (Blackwell only) |
+| `compute_capability` | float | Compute capability (e.g. 8.9 for Ada, 9.0 for Hopper); `0.0` = unknown — callers default-deny on `min_compute_capability`-gated actions. Populated from YAML or `props.major + props.minor / 10` by `detect_hardware()`. |
 
 ### Derived properties
 
@@ -112,6 +113,7 @@ Mutable dataclass. All parameters for a single optimization run.
      - `freq_GHz` — boost clock from `clock_rate / 1_000_000` (kHz → GHz)
      - `SRAM_capacity` — `L2_cache_size`
      - `DRAM_capacity` — `total_memory`
+     - `compute_capability` — derived as `props.major + props.minor / 10` (defensive `getattr` for test stubs missing the attrs).
   2. Look up the device name in `_ACTS_ARCH_YAMLS` via `_lookup_arch_yaml(detected.name)`.
   3. If a YAML is registered AND on disk, load it via `load_hardware_spec` and merge with the runtime spec via `dataclasses.replace`. **Runtime ground-truth wins** for `name` / `freq_GHz` / `SRAM_capacity` / `DRAM_capacity`; the YAML supplies `MAC_per_cycle_*` + `*_byte_per_cycle` + tier ratios.
   4. Run `validate_hardware_spec(yaml_spec, runtime_spec)` and log `WARNING` on any mismatch (DRAM/SRAM/freq, 10% tolerance) — never raises.

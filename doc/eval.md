@@ -115,13 +115,15 @@ Each timed iteration runs: `prepare → flush_l2 → record_start → kernel_fn(
 
 Before the warmup loop, `_time_workload` fires one untimed burn-in call using reserved seed `-1` (`_BURN_IN_SEED = -1` constant in `src/eval/benchmark.py`). This forces `@triton.autotune`'s config sweep + compile + per-config microbench to complete **outside** the timed window, so what flows into the median is cached-winner perf rather than first-call autotune overhead. The burn-in invokes one extra `prepare` (regenerating inputs) ahead of the recorded `[prepare, flush_l2, record_start, record_end, finalize_ms]` per timed iter. Failure inside the burn-in surfaces as a workload-level error on the same fail-closed path as warmup failure — latency = inf in `per_workload_latency_us`, reason recorded in `workload_errors`, half-survivors-or-die gate then fires.
 
-### Autotune-key resolution
+### Autotune winner capture
 
-Module-level helper `_key_tuple_for(workload, autotune_keys, definition=None) -> tuple | None` resolves an autotuned kernel's declared key arg-names via two-stage lookup: `workload.axes` first (per-workload bindings always win), then `definition.axes` entries whose runtime class name is `AxisConst` (resolves SOL problems with const M/N axes on the Definition and var B on each Workload). Returns `None` if any key fails both stages; non-const axis types (`AxisVar` without a binding, `AxisExpr`) degrade to `None`.
+`benchmark_kernel(..., autotuner=...)` snapshots `autotuner.cache` before each workload and diffs it after `_time_workload` returns. A single new cache entry is attributed to that workload and stored on `BenchmarkResult.autotune_winner_per_workload[workload.uuid]` with the usual `{"kwargs", "num_warps", "num_stages"}` shape. Zero-entry deltas (identical-shape cache hits) are left unattributed; multi-entry deltas log a warning and are skipped.
+
+`benchmark_kernel` calls `autotuner.cache.clear()` once at entry (when an autotuner is supplied and `.cache.clear` is callable; an `AttributeError` flips `autotuner_usable=False` with a WARNING and proceeds without winner attribution). The clear is necessary because the Coder's correctness pass (`check_correctness_tool`) compiles and launches the same kernel before `benchmark_kernel` runs, so Triton's `@triton.autotune` may already have cached entries for our workload shapes — without the clear, the per-workload `set(autotuner.cache) - before` delta would be empty and every winner silently dropped. Tradeoff: correctness-pass autotune work is discarded and re-paid on the first warmup run of each workload, which is acceptable because the warmup loop exists for thermal/clock stabilization anyway.
 
 ### Autotune burn-in event
 
-`autotune_burn_in_done` is registered in `runtime/events.py::CORE_EVENT_KINDS` and fired **once per iter** by the orchestrator after a successful bench loop. Payload: `{iter, workload_count, winner_recorded}` — `workload_count` summarizes the iter's bench loop; `winner_recorded` is True iff Triton's cache yielded a winner for at least one workload.
+`autotune_burn_in_done` is registered in `runtime/events.py::CORE_EVENT_KINDS` and fired **once per iter** by the orchestrator after a successful bench loop with an Autotuner reference. Payload: `{iter, workload_count, winner_count}` — `workload_count` summarizes the iter's bench loop; `winner_count` is the number of workload UUIDs with captured winners.
 
 ### `BenchmarkTimer` Protocol
 
@@ -163,9 +165,9 @@ Bridges SOL `Definition` + `Workload` directly to the pair of callables `verify_
 Per-iteration diagnostic signals for the Reviewer. Two pieces:
 
 - **Analytical (optional)** — `_compute_analytical()` derives `AnalyticalMetrics` from `(flops, nbytes, latency_s, HardwareSpec)`, narrowed to per-iter dynamics only: `achieved_tflops`, `achieved_bandwidth_gb_s`, `pct_peak_compute`, `pct_peak_bandwidth`. Fails closed with `ProfilerError` on zero-latency, non-positive `nbytes`, negative `flops`, or zero-peak hardware (the orchestrator marks the branch DEAD_END). `profile_kernel` skips the analytical computation entirely when `nbytes == 0` (no byte count derivable for this iteration) and the resulting `ProfilingResult.analytical` is `None`; NCU still runs. Run-level invariants `arithmetic_intensity` and `ridge_point` (both in MACs/byte) live on `RooflineResult` (`src/eval/roofline.py`); the Reviewer prompt builder reads AI / ridge from `RooflineResult` and achieved_* / pct_peak_* from `AnalyticalMetrics`.
-- **NCU (best-effort)** — subprocess `ncu --csv --print-metric-name=name --section ...` via a dedicated driver (`_profiler_driver.py`). Extracts curated signals: SM occupancy, L2 hit rate, tensor-core utilization, and the top-2 warp-stall classes with percentages. Failures degrade the result (`ncu=None, degraded=True, degraded_reason=<slug>`) but keep the branch alive — the analytical block (when present) still drives the Reviewer's profiling summary.
+- **NCU (best-effort)** — subprocess `ncu --csv --print-metric-name=name --section ...` via a dedicated driver (`_profiler_driver.py`). Extracts curated signals: SM occupancy, L2 hit rate, tensor-core utilization, and the top-2 warp-stall classes with percentages. The full parsed metric map is retained as `raw_metrics`; `metric_groups` overlays present/missing status for diagnostic groups (`tensor_core`, `math_pipe`, `memory`, `occupancy`, `scheduler`, `launch`, `stalls`). Failures degrade the result (`ncu=None, degraded=True, degraded_reason=<slug>`) but keep the branch alive — the analytical block (when present) still drives the Reviewer's profiling summary.
 
-Returns `ProfilingResult(analytical, ncu, raw_metrics, degraded_reason, ncu_rep_path)`. `analytical: AnalyticalMetrics | None` — `None` when `nbytes == 0` was passed in; consumers gate on `ProfilingResult.has_analytical` (mirrors `has_ncu`) before reading `achieved_*` fields. `ProfilingResult.make_degraded(analytical, reason)` accepts `analytical=None` so the degraded path works regardless of whether analytical ran. Bottleneck classification is **not** on `ProfilingResult` — it lives at the run level (see `classify_run` in `roofline.py`) because it's invariant per `(problem, representative workload, hardware)`.
+Returns `ProfilingResult(analytical, ncu, raw_metrics, metric_groups, degraded_reason, ncu_rep_path)`. `analytical: AnalyticalMetrics | None` — `None` when `nbytes == 0` was passed in; consumers gate on `ProfilingResult.has_analytical` (mirrors `has_ncu`) before reading `achieved_*` fields. `ProfilingResult.make_degraded(analytical, reason)` accepts `analytical=None` so the degraded path works regardless of whether analytical ran. Bottleneck classification is **not** on `ProfilingResult` — it lives at the run level (see `classify_run` in `roofline.py`) because it's invariant per `(problem, representative workload, hardware)`.
 
 ### Curated metric set
 
@@ -176,15 +178,17 @@ Required (a missing one degrades the NCU result with `missing_metric:<name>`):
 | `sm__warps_active.avg.pct_of_peak_sustained_active` | `sm_occupancy_pct` | `Occupancy` |
 | `lts__t_sector_hit_rate.pct` | `l2_hit_rate_pct` | `MemoryWorkloadAnalysis` |
 
-Optional (defaults to 0.0 when absent — tensor-core metric is missing on NCU 2025.1.1.0 for pure-memory kernels, so it's demoted to avoid killing memory-bound runs):
+Optional (absence does NOT degrade — field is typed `float | None` and falls through to renderers as `n/a`):
 
 | Raw NCU metric | Field | Section |
 |---|---|---|
-| `sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active` | `tensor_core_util_pct` | `ComputeWorkloadAnalysis` |
+| `sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active` | `tensor_core_util_pct: float | None` | `ComputeWorkloadAnalysis` |
 
-Warp stalls are explicitly enumerated (18 reasons) under the prefix `smsp__average_warp_latency_issue_stalled_<reason>.pct` because NCU does not expand wildcards; top-2 stalls (by percentage, ties broken by reason name) populate `warp_stall_dominant`/`warp_stall_runner_up`.
+The tensor-core metric is also explicitly requested via `--metrics`, not only via `ComputeWorkloadAnalysis`, because some NCU exports omit it from the section output. The counter is optional because not every NCU/GPU/kernel combination emits it (e.g. Ada elementwise kernels); when absent, `tensor_core_util_pct` is `None` and the rest of the curated NCU block (occupancy, L2, stalls) is preserved. Only REQUIRED metrics gate degradation via `missing_metric:<name>`.
 
-`raw_metrics` preserves the full parsed NCU metric dict so future Reviewer prompts can reference metrics outside the curated set without a code change. The dict is persisted to the per-key JSON cache and rehydrated on cache hits (since 2026-05-11), so `Reviewer.query_metric` works the same on a re-profile as on the originating iteration. Pre-2026-05-11 cache entries without a `raw` field load with `raw_metrics={}` for back-compat.
+The explicit `--metrics` list also requests the stable members of the diagnostic groups above, plus all 18 stall metrics under the prefix `smsp__average_warp_latency_issue_stalled_<reason>.pct` because NCU does not expand wildcards. Top-2 stalls (by percentage, ties broken by reason name) populate `warp_stall_dominant`/`warp_stall_runner_up`.
+
+`raw_metrics` preserves the full parsed NCU metric dict so future Reviewer prompts can reference metrics outside the curated set without a code change. `metric_groups` is generated from that dict with per-metric `{"status": "present", "value": ...}` or `{"status": "missing"}` entries, making missing data distinct from a real zero. Both are persisted to the per-key JSON cache and rehydrated on cache hits, so `Reviewer.query_metric` works the same on a re-profile as on the originating iteration. Legacy cache entries without a `raw` or `groups` field load with `raw_metrics={}` and generated missing-only groups for back-compat.
 
 ### NCU subprocess driver — `_profiler_driver.py`
 
@@ -250,7 +254,7 @@ Source-hash-keyed JSON cache: key = `sha256(source_hash + repr(workload) + mode 
 
 ### Modes
 
-- `curated` (default) — `--section Occupancy WarpStateStats MemoryWorkloadAnalysis ComputeWorkloadAnalysis` plus the enumerated stall `--metrics`.
+- `curated` (default) — `--section Occupancy WarpStateStats MemoryWorkloadAnalysis ComputeWorkloadAnalysis` plus explicit `--metrics` for tensor-core utilization, stable grouped diagnostics, and the enumerated stall metrics.
 - `full` — `--set full` for debug; parser still pulls the curated subset, but `raw_metrics` captures everything NCU emitted.
 
 ## Types — `types.py`
