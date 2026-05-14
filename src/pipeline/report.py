@@ -447,10 +447,14 @@ def _render_profiling_block(
             # stalls; show them as unitless ``cyc/inst×100`` instead.
             # The relative ranking (dominant vs runner-up) is still
             # the actionable signal.
+            tc = (
+                "n/a" if n.tensor_core_util_pct is None
+                else f"{n.tensor_core_util_pct:.1f}%"
+            )
             lines.append(
                 f"      NCU: occ {n.sm_occupancy_pct:.1f}% · "
                 f"L2 {n.l2_hit_rate_pct:.1f}% · "
-                f"TC {n.tensor_core_util_pct:.1f}% · "
+                f"TC {tc} · "
                 f"top stalls {n.warp_stall_dominant} "
                 f"({n.warp_stall_dominant_pct:.1f} cyc/inst×100), "
                 f"{n.warp_stall_runner_up} "

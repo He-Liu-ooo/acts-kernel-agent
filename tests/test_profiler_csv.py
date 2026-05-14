@@ -22,11 +22,19 @@ from pathlib import Path
 
 import pytest
 
-from src.eval.profiler import NCUMetrics, _parse_ncu_csv
+from src.eval.profiler import NCUMetrics, _build_metric_groups, _parse_ncu_csv
 
 _FIXTURE = (
     Path(__file__).parent / "fixtures" / "ncu" / "elementwise_add.csv"
 ).read_text()
+_FIXTURE_WITH_TENSOR_CORE_METRIC = _FIXTURE + (
+    '"0","3968890","python3.10","127.0.0.1",'
+    '"void vectorized_elementwise_kernel<4, FillFunctor<float>, array<char *, 1>>(int, T2, T3)",'
+    '"1","7","(128, 1, 1)","(1, 1, 1)","0","8.9",'
+    '"ComputeWorkloadAnalysis",'
+    '"sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active",'
+    '"%","0.0","","","","",""\n'
+)
 
 # Kernel name fragment that the NCU probe produced — Triton/torch JIT
 # kernel names vary, so the parser does a substring match rather than
@@ -38,14 +46,20 @@ _ELEMENTWISE_ENTRYPOINT = "vectorized_elementwise_kernel"
 
 
 def test_parses_golden_fixture():
-    ncu, raw, degraded, reason = _parse_ncu_csv(_FIXTURE, _ELEMENTWISE_ENTRYPOINT)
+    ncu, raw, degraded, reason = _parse_ncu_csv(
+        _FIXTURE_WITH_TENSOR_CORE_METRIC,
+        _ELEMENTWISE_ENTRYPOINT,
+    )
     assert degraded is False
     assert reason is None
     assert isinstance(ncu, NCUMetrics)
 
 
 def test_raw_metrics_populated_from_golden():
-    _, raw, _, _ = _parse_ncu_csv(_FIXTURE, _ELEMENTWISE_ENTRYPOINT)
+    _, raw, _, _ = _parse_ncu_csv(
+        _FIXTURE_WITH_TENSOR_CORE_METRIC,
+        _ELEMENTWISE_ENTRYPOINT,
+    )
     # Golden run has ≥ 4 sections + 18 stall metrics → well over 20 keys.
     assert len(raw) > 20
     # Spot-check a curated source metric survived parsing.
@@ -53,20 +67,45 @@ def test_raw_metrics_populated_from_golden():
 
 
 def test_curated_metrics_populated_from_golden():
-    ncu, _, _, _ = _parse_ncu_csv(_FIXTURE, _ELEMENTWISE_ENTRYPOINT)
+    ncu, _, _, _ = _parse_ncu_csv(
+        _FIXTURE_WITH_TENSOR_CORE_METRIC,
+        _ELEMENTWISE_ENTRYPOINT,
+    )
     assert ncu is not None
     assert ncu.sm_occupancy_pct > 0
     assert ncu.l2_hit_rate_pct > 0
-    # Elementwise x*2 doesn't use tensor cores — value is 0 but field
-    # must still be set (not None / NaN).
+    # Elementwise x*2 doesn't use tensor cores — when the metric IS present
+    # in NCU output we surface its value (here 0.0).
     assert ncu.tensor_core_util_pct == 0.0
+
+
+def test_parse_ncu_csv_returns_ncu_when_tensor_core_metric_missing():
+    """The tensor-core counter isn't emitted by every NCU/GPU/kernel
+    combination. Treating it as REQUIRED would discard an otherwise-useful
+    NCU profile (occupancy + L2 + stalls) just because one optional
+    diagnostic is absent. The parser must surface ``tensor_core_util_pct=None``
+    and leave the rest of the profile intact.
+    """
+    # The bare _FIXTURE never had the tensor-core row — that's the realistic
+    # absence shape on Ada elementwise kernels.
+    ncu, _, degraded, reason = _parse_ncu_csv(_FIXTURE, _ELEMENTWISE_ENTRYPOINT)
+    assert degraded is False, f"expected success, got degraded={degraded} reason={reason}"
+    assert ncu is not None
+    assert ncu.tensor_core_util_pct is None
+    # The rest of the curated block must still be populated.
+    assert ncu.sm_occupancy_pct > 0
+    assert ncu.l2_hit_rate_pct > 0
+    assert ncu.warp_stall_dominant != ""
 
 
 def test_stall_top_and_runner_up_from_golden():
     """Golden run's two largest stalls, in rank order. Exact pct values
     vary across NCU invocations even on identical hardware (hw counters
     are sampled) — assert relative rank + 1% tolerance on magnitude."""
-    ncu, _, _, _ = _parse_ncu_csv(_FIXTURE, _ELEMENTWISE_ENTRYPOINT)
+    ncu, _, _, _ = _parse_ncu_csv(
+        _FIXTURE_WITH_TENSOR_CORE_METRIC,
+        _ELEMENTWISE_ENTRYPOINT,
+    )
     assert ncu.warp_stall_dominant == "imc_miss"
     assert ncu.warp_stall_dominant_pct > ncu.warp_stall_runner_up_pct
     assert ncu.warp_stall_runner_up == "no_instruction"
@@ -77,7 +116,10 @@ def test_comma_thousands_separator_parsed_as_float():
     strip them before float conversion — verified by asserting the
     imc_miss value is the biggest stall (which required parsing
     '55,800' or similar, not truncating it to '55')."""
-    _, raw, _, _ = _parse_ncu_csv(_FIXTURE, _ELEMENTWISE_ENTRYPOINT)
+    _, raw, _, _ = _parse_ncu_csv(
+        _FIXTURE_WITH_TENSOR_CORE_METRIC,
+        _ELEMENTWISE_ENTRYPOINT,
+    )
     key = "smsp__average_warp_latency_issue_stalled_imc_miss.pct"
     # Value has the thousands separator in the raw CSV; post-parse it
     # must be the numerically largest stall (proof the comma was
@@ -105,6 +147,43 @@ def test_no_matching_kernel():
     assert raw == {}
     assert degraded is True
     assert reason == "no_matching_kernel"
+
+
+def test_missing_required_metric_returns_degraded():
+    """A genuinely-required curated metric (sm_occupancy) still gates the
+    profile. The tensor-core counter is the only curated metric that was
+    moved to OPTIONAL after Codex review — the rest still gate."""
+    # Strip the occupancy row from the fixture (the parser's first
+    # required metric). Other curated metrics + stalls remain present.
+    occupancy_row_marker = "sm__warps_active.avg.pct_of_peak_sustained_active"
+    csv_without_occupancy = "\n".join(
+        ln for ln in _FIXTURE_WITH_TENSOR_CORE_METRIC.splitlines()
+        if occupancy_row_marker not in ln
+    )
+    ncu, raw, degraded, reason = _parse_ncu_csv(
+        csv_without_occupancy, _ELEMENTWISE_ENTRYPOINT,
+    )
+    assert ncu is None
+    assert degraded is True
+    assert reason == f"missing_metric:{occupancy_row_marker}"
+
+
+def test_build_metric_groups_records_present_and_missing_status():
+    groups = _build_metric_groups(
+        {
+            "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active": 12.5,
+            "smsp__average_warp_latency_issue_stalled_wait.pct": 3.0,
+        }
+    )
+    assert groups["tensor_core"][
+        "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active"
+    ] == {"status": "present", "value": 12.5}
+    assert groups["tensor_core"][
+        "smsp__sass_thread_inst_executed_op_hmma_pred_on.sum"
+    ] == {"status": "missing"}
+    assert groups["stalls"][
+        "smsp__average_warp_latency_issue_stalled_wait.pct"
+    ] == {"status": "present", "value": 3.0}
 
 
 # ── synthesized edge cases ────────────────────────────────────────────────
