@@ -2,7 +2,7 @@
 
 Per-run observability substrate: one run directory, three streaming sinks plus a per-node search-tree dump, structured events.
 
-Every ACTS run produces exactly one `runs/run_<UTC>/` directory holding a human-readable log, a structured JSONL event stream, SDK trace records, a per-node dump of the search tree, and a rendered end-of-run report. The runtime module owns setup, file handles, and teardown for all five.
+Every ACTS run produces exactly one `runs/run_<UTC>/` directory holding a human-readable log, a structured JSONL event stream, SDK trace records, a per-node dump of the search tree, a rendered end-of-run report, and a per-run usage-accounting sidecar. The runtime module owns setup, file handles, and teardown for all six.
 
 ## Run directory layout
 
@@ -14,9 +14,10 @@ Every ACTS run produces exactly one `runs/run_<UTC>/` directory holding a human-
 | `events.jsonl` | Structured ACTS-narrative events, one JSON object per line, RFC-8259 valid. | Tooling via `jq`; scoring / progress dashboards. |
 | `traces/acts_trace_<UTC>.jsonl` | SDK-level records per LLM call and per tool call, written by `JSONLTraceProcessor`. | Ground-truth replay of agent conversations. |
 | `report.txt` | Rendered end-of-run `OptimizationReport` plus an `=== ACTSConfig (resolved at run start) ===` JSON block. Written best-effort by `optimize.main()`; `OSError` during write degrades to a WARNING and the run continues. | Human-readable end-of-run summary; post-mortem reproduction of the exact resolved config. |
+| `usage.json` | Per-run LLM token/turn accounting sidecar (schema_version 1). Written best-effort by `optimize.main()` via `_write_usage_sidecar` from the `UsageSnapshot` returned by `RunContext.usage_snapshot()`. Always written when a `RunContext` exists — empty schema-stamped object when no spans were captured. `OSError` degrades to a WARNING and the run continues. | Postmortem token-cost analysis; per-(iter, agent) and per-agent rollups; cross-references back into `traces/*.jsonl` generation spans via the `(iter, agent)` key. |
 | `tree/` | Per-committed-node `node_<id>/{kernel.py, ncu.json, ncu.ncu-rep, meta.json}` (streamed per-iter) + end-of-run `index.json` / `tree.{txt,dot,mmd,preview.md}` (visualizations). Written by `tree_dump`. | Postmortem inspection of every kernel + score + status the search produced; cross-referenced into `traces/*.jsonl` via the SDK `workflow_name="acts_iter"` metadata. |
 
-The five artifact families are independent: `events.jsonl` records the orchestrator's narrative (what the search did); `traces/*.jsonl` records what the SDK actually dispatched; `tree/` records every committed node's full state; `report.txt` carries the rendered end-of-run summary + resolved config. Cross-referencing them is how you verify claims that any single stream cannot make on its own — see the truthfulness note on `coder_submitted` below, and the `tree/` section's trace cross-reference recipe.
+The six artifact families are independent: `events.jsonl` records the orchestrator's narrative (what the search did); `traces/*.jsonl` records what the SDK actually dispatched; `tree/` records every committed node's full state; `report.txt` carries the rendered end-of-run summary + resolved config; `usage.json` carries per-run token/turn accounting rollups derived from the trace stream. Cross-referencing them is how you verify claims that any single stream cannot make on its own — see the truthfulness note on `coder_submitted` below, the `tree/` section's trace cross-reference recipe, and the "Per-run usage accounting" section's `(iter, agent)` keying.
 
 ## `timefmt.py`
 
@@ -175,14 +176,15 @@ search progresses; end-of-run files are written by
 | `tree/node_<id>/meta.json` | Structural + scoring + status fields. |
 | `tree/index.json` | All-nodes summary + edges. |
 | `tree/tree.txt`   | ASCII visualization. |
-| `tree/tree.dot`   | Graphviz source — render: `dot -Tpng tree.dot > tree.png`. |
+| `tree/tree.dot`   | Graphviz source. |
+| `tree/tree.png`   | Auto-rendered from `tree.dot` by `finalize_tree` when Graphviz `dot` is on PATH (best-effort: missing binary or non-zero exit logged + swallowed, `.dot` always ships). Manual fallback for Graphviz-less hosts: `scripts/visualize_tree.sh`. |
 | `tree/tree.mmd`   | Mermaid source — preview in GitHub / VS Code. |
 | `tree/tree.preview.md` | Markdown wrapper around `tree.mmd` — opens directly in VS Code's built-in Markdown preview (`Ctrl+Shift+V`) when the *Markdown Preview Mermaid Support* extension is installed. |
 
 Module surface mirrors `events.py`: `bind(tree_root)` / `unbind()` /
 `is_bound()` manage the single bound root, `dump_node(node, *, iter_no,
 ncu_rep_src, failure_detail=None)` streams one committed node,
-`finalize_tree(tree)` writes the five top-level files. Both write paths
+`finalize_tree(tree)` writes the six top-level files (five source files plus the best-effort PNG). Both write paths
 are no-ops when unbound and swallow `OSError` (logged at `WARNING`) so
 a tree-dump hiccup cannot kill a running search. `RunContext.create`
 calls `bind(run_dir / "tree")` after `events.bind(...)`;
@@ -224,10 +226,27 @@ later iters attached. The rewrite preserves every other key (including
 ### Trace cross-reference
 
 Per-iteration LLM-call detail lives in `traces/acts_trace_<ts>.jsonl`,
-keyed by SDK trace metadata. The orchestrator wraps each agent
-invocation in `with trace(workflow_name="acts_iter", metadata={"iter":
-N, "agent": "planner|coder|reviewer"})`. To pull the planner / coder /
-reviewer records for node 5 (committed on iter 3):
+keyed by SDK trace metadata. Every agent invocation that should appear
+in the trace stream is wrapped via the shared helper
+`src/runtime/sdk_trace.py::trace_span(workflow_name, *, iter_no, agent,
+**extra_metadata)`, which under the hood opens
+`agents.trace(workflow_name=..., metadata={"iter": iter_no, "agent":
+agent.value, **extra_metadata})`. The orchestrator (`src/search/orchestrator.py`)
+uses `workflow_name="acts_iter"` with `iter_no = 1..N` for its four
+per-iter agent calls (Planner, Coder, Reviewer, and CODER_TRANSLATE
+sub-flows); the baseline-translate path
+(`src/benchmark/baseline_generator.py`) uses
+`workflow_name="acts_baseline"` with `iter_no=0` and
+`agent=AgentLabel.CODER_TRANSLATE`, plus an `attempt` field in
+`extra_metadata` for retry visibility.
+
+Tier-1 fallback: when the `openai-agents` SDK is not importable,
+`trace_span(...)` returns `contextlib.nullcontext()` so the call sites
+work uniformly under the torchless Tier-1 venv (no SDK trace is
+recorded, no exception raised).
+
+To pull the planner / coder / reviewer records for node 5 (committed on
+iter 3):
 
 ```bash
 jq 'select(.metadata.iter == 3 and .metadata.agent == "reviewer")' \
@@ -250,7 +269,7 @@ close-order, so children appear in the file **before** their parents.
 |---|---|
 | `span_id` | Unique id for this span. |
 | `trace_id` | Trace this span belongs to; spans of one agent invocation share it. |
-| `parent_id` | Span this one nests under, or `null` for the trace root. Forms the tree `agent ⊃ custom "turn" ⊃ generation` / `function`. |
+| `parent_id` | Span this one nests under, or `null` for the trace root. Forms the tree `agent ⊃ generation` / `function` (the SDK's natural nesting; ACTS does not insert custom turn-marker spans). |
 | `started_at` / `ended_at` | ISO-8601 UTC; subtract for duration. |
 | `span_data` | Polymorphic payload — shape selected by `span_data.type`. |
 | `error` | `null` on success, or `{message, data}` on failure (e.g. agent span carries `{"message": "Max turns exceeded", "data": {"max_turns": 8}}` when the Coder loop hits its cap). |
@@ -287,24 +306,153 @@ close-order, so children appear in the file **before** their parents.
   `mcp_data` (`null` for in-process Python tools; populated when the
   tool came from an MCP server).
 - `type: "custom"` — project-defined marker emitted by ACTS, not the
-  SDK. Fields: `name` (`"turn"` or `"task"`), `data` (free-form dict
-  using `sdk_span_type` as the discriminator; turn markers carry
-  `turn`, `agent_name`, and a per-turn `usage` aggregate of
-  `input_tokens` / `output_tokens` / `cached_input_tokens`). Used by
-  the orchestrator to roll up token usage per agent call without
-  re-walking every child `generation`.
+  SDK. Fields: `name` (free-form marker name), `data` (free-form dict
+  using `sdk_span_type` as the discriminator).
+
+Per-run token accounting does **not** rely on a custom turn-marker span
+shape. `type: "generation"` already carries `usage` natively per the SDK
+contract. The `UsageAccumulator` owned by `JSONLTraceProcessor` taps
+these spans on `on_span_end` (buffered by `trace_id`), then resolves
+the buffered spans against `trace.metadata.{iter, agent}` on
+`on_trace_end`. The per-(iter, agent) `UsageBucket` is exposed via
+`JSONLTraceProcessor.snapshot() → UsageSnapshot` and surfaced to the
+report layer via `RunContext.usage_snapshot()`. Late-arriving
+`generation` spans that close *after* their enclosing `trace_end` are
+credited directly against the stored bucket (via
+`_closed_traces: dict[trace_id, (iter, agent)]`) so worker-thread
+reordering doesn't undercount. See `src/runtime/usage.py` for the
+accumulator types + `_pick_token_count` (prompt/completion fallback for
+legacy Chat-Completions-shape providers).
 
 **Counting turns**: one Agents-SDK turn = one model call + zero-or-more
 tool calls the model requested in that response. A typical Coder turn
-that calls one tool produces three `span_end` lines — the
-`generation`, the `function`, and the enclosing `custom "turn"`. A
-reasoning-only turn produces two (no `function` child).
+that calls one tool produces two `span_end` lines — the `generation`
+and the `function`. A reasoning-only turn produces one (no `function`
+child). Turn counts per (iter, agent) are tracked on `UsageBucket.turns`
+in `usage.json` rather than reconstructed from span topology.
 
 ### `★ best` convention
 
 ASCII / DOT / Mermaid all mark the run's best-scoring node with `★`.
 `index.json` sets `is_best=true` on that node and `best_node_id` at the
 top level.
+
+## Per-run usage accounting
+
+ACTS tracks LLM token + turn usage per `(iter, agent)` for every run and
+ships the rollup as a `<run_dir>/usage.json` sidecar. The accounting
+substrate lives in `src/runtime/usage.py` and `src/runtime/sdk_trace.py`;
+the trace processor in `src/agents/trace_processor.py` is the integration
+point.
+
+### Public API surface
+
+- `RunContext.usage_snapshot() -> UsageSnapshot` — the canonical accessor
+  for downstream consumers (report layer, `optimize.main()` sidecar
+  writer). Always returns a snapshot — `UsageSnapshot.is_empty=True`
+  when the SDK isn't installed, when `capture_traces=False`, or when no
+  generation spans were captured during the run. Never raises.
+- `JSONLTraceProcessor.snapshot() -> UsageSnapshot` — the underlying
+  source called by `RunContext.usage_snapshot()`. Materializes a frozen
+  view from the live `UsageAccumulator` owned by the processor.
+
+### Data types (`src/runtime/usage.py`)
+
+- `UsageBucket(invocations, turns, input_tokens, output_tokens,
+  cached_input_tokens, reasoning_output_tokens)` — frozen dataclass. One
+  bucket per `(iter, agent)`; rollups (`by_iter`, `by_agent`, `total`) are
+  also `UsageBucket` instances built by summing.
+- `UsageSnapshot(by_iter_agent, by_iter, by_agent, total, columns)` —
+  frozen dataclass. `by_iter_agent` is a dict keyed by `(iter, agent.value)`;
+  `by_iter` is keyed by `iter`; `by_agent` is keyed by `agent.value`; `total`
+  is the grand `UsageBucket`; `columns` is the canonical column ordering
+  used in the JSON sidecar (driven by `_CANONICAL_AGENT_ORDER`).
+- `AgentLabel(str, Enum)` — canonical agent labels (`PLANNER`, `CODER`,
+  `CODER_TRANSLATE`, `REVIEWER`). Subclasses `str` so members serialize
+  cleanly as JSON strings and work directly as dict keys.
+  **Python 3.10 quirk**: `str(AgentLabel.PLANNER)` returns the qualified
+  name `"AgentLabel.PLANNER"`, not the raw value. The
+  `_coerce_agent_label` helper in `sdk_trace.py` reads `.value` on enum
+  members instead of calling `str(...)` to avoid this footgun when
+  populating `trace.metadata`.
+- Internal helpers: `_fmt_tokens` (human-readable formatter for
+  report rendering), `_pick_token_count` (prompt/completion fallback for
+  legacy Chat-Completions-shape providers whose `usage` shape differs from
+  the SDK's canonical `input_tokens`/`output_tokens`), `_safe_int`
+  (defensive integer coercion at the tap), `_parse_span_usage` (extracts
+  the canonical bucket fields out of one `generation` span's `usage`
+  payload).
+
+### Accounting flow
+
+`JSONLTraceProcessor` owns one `UsageAccumulator` for the run's lifetime:
+
+1. **Tap** — `on_span_end(span)` calls `_safe_usage_tap(span)`, which
+   filters for `span_data.type == "generation"`, parses the span's
+   `usage` payload via `_parse_span_usage`, and buffers the result by
+   `trace_id`. The tap is wrapped in a try/except guard so a malformed
+   `usage` payload from a provider can never propagate into the trace
+   sink; the offending span is dropped, a WARNING is logged, and the
+   run continues.
+2. **Resolve** — `on_trace_end(trace)` reads `trace.metadata.{iter,
+   agent}` (populated by the `trace_span(...)` helper) and credits the
+   buffered spans into the per-`(iter, agent)` `UsageBucket`. Each
+   resolved trace also bumps `bucket.invocations` by 1 and
+   `bucket.turns` by the number of buffered `generation` spans for that
+   trace.
+3. **Late arrivals** — generation spans whose `on_span_end` arrives
+   *after* their enclosing `on_trace_end` (worker-thread reordering)
+   are credited directly against the stored bucket via the processor's
+   `_closed_traces: dict[trace_id, (iter, agent)]` mapping, so token
+   counts never undercount.
+4. **Snapshot** — `JSONLTraceProcessor.snapshot()` builds the frozen
+   `UsageSnapshot` from the live accumulator on demand.
+
+### `<run_dir>/usage.json` sidecar
+
+Persisted at end-of-run by `src/pipeline/optimize.py::_write_usage_sidecar`,
+which calls `RunContext.usage_snapshot()` and writes the resulting
+`UsageSnapshot` to disk. Best-effort: `OSError` is caught, logged at
+`WARNING`, and the run continues.
+
+Schema (`schema_version: 1`):
+
+```json
+{
+  "schema_version": 1,
+  "columns": ["invocations", "turns", "input_tokens", "output_tokens",
+              "cached_input_tokens", "reasoning_output_tokens"],
+  "by_iter": [
+    {"iter": 0, "agent": "coder_translate", "invocations": 1, "turns": 3, ...},
+    {"iter": 1, "agent": "planner", ...},
+    {"iter": 1, "agent": "coder", ...},
+    {"iter": 1, "agent": "reviewer", ...},
+    ...
+  ],
+  "by_agent": {
+    "planner": {"invocations": 4, "turns": 12, ...},
+    "coder": {"invocations": 4, "turns": 18, ...},
+    "coder_translate": {"invocations": 1, "turns": 3, ...},
+    "reviewer": {"invocations": 4, "turns": 9, ...}
+  },
+  "total": {"invocations": 13, "turns": 42, ...}
+}
+```
+
+The file is always written when a real `RunContext` exists — when the
+snapshot is empty (no SDK, capture disabled, no spans recorded), a
+schema-stamped empty object still ships so downstream tools can rely on
+the file's presence.
+
+### Failure modes
+
+| Failure mode | Behavior |
+|---|---|
+| `capture_traces=False` at `RunContext.create` | `usage_snapshot()` returns empty snapshot; `usage.json` written with `schema_version: 1` and empty rollups. |
+| `openai-agents` SDK not installed | `trace_span(...)` falls back to `nullcontext()`; no spans flow into the processor; empty snapshot + schema-stamped empty sidecar. |
+| Malformed `usage` payload from a provider | `_safe_usage_tap` swallows the exception, drops the span, logs at WARNING; the rest of the run + accounting continues. |
+| `OSError` writing `usage.json` (disk full, perms) | Logged at WARNING by `_write_usage_sidecar`; run continues; other artifacts (report, events, traces, tree) still ship. |
+| Late generation span (post-`trace_end`) | Credited directly via `_closed_traces` mapping; no undercounting from worker-thread reorder. |
 
 ## Live-watch one-liners
 

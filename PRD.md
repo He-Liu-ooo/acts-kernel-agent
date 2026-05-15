@@ -280,6 +280,13 @@ The run-level label is threaded into retriever / planner / reviewer every iterat
 
 `OptimizationReport` also carries `hardware_spec: HardwareSpec | None` — the resolved spec used for the run (populated by `generate_report` from the orchestrator's resolved spec). `render_report` ends with a "Hardware spec" block summarizing the device the SOL bounds were computed against, and the rendered report is persisted to `<run_dir>/report.txt`. This makes the hardware target a first-class part of the artifact rather than an implicit assumption, so a report read months later still tells the reader which GPU the SOL score was anchored to.
 
+`OptimizationReport` additionally carries `usage_stats: UsageSnapshot | None` — per-iter x per-agent LLM token accounting captured by `JSONLTraceProcessor`'s `UsageAccumulator` tap and surfaced via `RunContext.usage_snapshot()` (always returns a snapshot; never `None`). Two artifacts land in `<run_dir>`:
+
+- **`report.txt` — `Resource usage (LLM)` block** sits between the `[AUDIT]` lines and the `Hardware spec` block. It renders a per-iter (rows) x per-agent (columns: Planner / Coder / Reviewer / baseline) grid plus row/column/grand totals, with each cell formatted as `<calls> (<turns>) / <input>-><output>` — call count, agent-loop turns in parentheses, input-to-output token counts. Empty cells render as `-`.
+- **`<run_dir>/usage.json`** — machine-readable sidecar with schema `{schema_version: 1, columns: [...], by_iter: [...], by_agent: {...}, total: {...}}`. Best-effort write; OSError downgrades to a WARNING rather than aborting the run.
+
+See `doc/runtime.md` and `doc/pipeline.md` for the full rendering rules and schema.
+
 See JOURNAL → "Bottleneck classify-once (2026-04-22)" for why a per-iter dynamic reclassification (earlier design) was dropped.
 
 ### Per-Iteration Analytical Inputs — Shape-Based, Not SOLAR-Derived
@@ -482,7 +489,7 @@ acts-kernel-agent/
 |   |   |-- planner.py
 |   |   |-- coder.py
 |   |   |-- reviewer.py
-|   |   |-- trace_processor.py  (SDK trace -> JSONL bridge for run-context tracing)
+|   |   |-- trace_processor.py  (SDK trace -> JSONL bridge + UsageAccumulator tap for token accounting)
 |   |   +-- llm_backend.py
 |   |
 |   |-- search/
@@ -541,6 +548,8 @@ acts-kernel-agent/
 |   |   |-- __init__.py
 |   |   |-- timefmt.py          (shared UTC timestamp helpers: filename_ts, iso_ts)
 |   |   |-- events.py           (emit/bind/unbind event bus + CORE_EVENT_KINDS + iter constants)
+|   |   |-- usage.py            (UsageBucket / UsageSnapshot / UsageAccumulator / AgentLabel — per-iter x per-agent LLM token accounting)
+|   |   |-- sdk_trace.py        (trace_span helper — shared SDK-trace shim with Tier-1 nullcontext fallback)
 |   |   +-- run_context.py      (RunContext dataclass + create/close for trace capture)
 |   |
 |   |-- benchmark/              (kernel-side helpers — not benchmark-source loaders)

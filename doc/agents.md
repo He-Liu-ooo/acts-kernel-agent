@@ -168,6 +168,23 @@ The Reviewer can be promoted from the default submit-only shape into a bounded m
 - **Failure-mode inheritance**: no new degraded `error_reason` tags and no new exception types. The multi-turn shape reuses the existing `max_turns_exceeded` / `missing_submit_review` / `llm_retries_exhausted` triplet — `max_turns_exceeded` now covers both "ran out of turns mid-validation-retry" and "ran out of turns after too many `query_metric` calls" without needing a new tag, and `missing_submit_review` still fires identically when the loop exits cleanly without a submission.
 - **Operating procedure**: the LLM-facing contract — when to read curated metrics versus when to fetch, and the expected single-fetch-before-submit pattern — lives in `src/prompts/reviewer/system.md`. Treat the curated summary as primary; treat `query_metric` as the exception path.
 
+## Trace processor — `trace_processor.py`
+
+**Role**: `JSONLTraceProcessor` is the SDK trace sink bound to each run. It now does two jobs:
+
+1. **JSONL persistence** (existing): writes SDK trace + span events to `<run_dir>/traces/<UTC>.jsonl`. Thread-safe (one shared lock), line-buffered, line drops past `shutdown()`. Lifecycle is unchanged — bound by `RunContext.create` via `enable_local_trace_capture` and unbound at `RunContext.close`.
+2. **In-memory usage accounting** (new): owns a `UsageAccumulator` (from `src/runtime/usage.py`). `on_span_end` taps generation spans via `_safe_usage_tap`, buffering them by `trace_id`; `on_trace_end` resolves the pending spans against `trace.metadata.{iter, agent}` set by `src/runtime/sdk_trace.py::trace_span` (the producer side). The accumulator piggy-backs the processor's existing lock for thread safety.
+
+**`.snapshot() → UsageSnapshot`**: new public accessor returning a frozen rollup keyed by `(iter, agent)`. Consumed by `RunContext.usage_snapshot()` to populate `OptimizationReport.usage_stats` and persist the `<run_dir>/usage.json` sidecar at end-of-run.
+
+**Never-raise discipline**: both accumulator entry points are wrapped via `_safe_usage_tap(self, tap_callable)`. A malformed provider payload logs a WARNING and continues — usage accounting is a diagnostic, never a run-aborter. Matches the processor's existing "never let trace I/O kill a run" stance.
+
+**Cross-references**:
+- `src/runtime/usage.py` — `UsageBucket` / `UsageSnapshot` / `UsageAccumulator` / `_parse_span_usage` (prompt/completion key fallback across provider payload shapes).
+- `src/runtime/sdk_trace.py::trace_span` — producer side that stamps `metadata.{iter, agent}` on the enclosing trace so the accumulator can attribute spans on `on_trace_end`.
+- `doc/runtime.md` — end-to-end usage-accounting design.
+- `doc/pipeline.md` — `usage.json` sidecar emission and `OptimizationReport.usage_stats` rendering.
+
 ## Why Debugger Was Merged Into Coder
 
 With the Coder having compile + correctness tools, a separate Debugger was redundant. A compilation error that previously took 3 LLM calls (Coder → Debugger → Coder) now resolves in one Coder call with an internal tool loop. Failed branches are handled by the tree search (pruning), not by escalating to a separate agent.
