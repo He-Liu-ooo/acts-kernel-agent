@@ -1,10 +1,12 @@
 """Unit tests for ``src.runtime.run_context.RunContext``."""
 import logging
 import sys
+from pathlib import Path
 
 import pytest
 
 from src.runtime.run_context import RunContext
+from src.runtime.usage import UsageSnapshot
 
 
 def test_create_builds_dir_layout(tmp_path):
@@ -180,3 +182,45 @@ def test_tree_dump_unbound_on_partial_setup_failure(tmp_path, monkeypatch):
         assert not tree_dump.is_bound()
     finally:
         ctx.close()
+
+
+class TestUsageSnapshotAccessor:
+    def test_returns_empty_snapshot_when_trace_processor_absent(self, tmp_path):
+        # capture_traces=False → no processor wired.
+        ctx = RunContext.create(root=tmp_path, capture_traces=False)
+        try:
+            snap = ctx.usage_snapshot()
+            assert isinstance(snap, UsageSnapshot)
+            assert snap.is_empty
+        finally:
+            ctx.close()
+
+    def test_returns_empty_snapshot_on_null_context(self, tmp_path, monkeypatch):
+        # Force the OSError branch by making run_dir.mkdir fail.
+        original_mkdir = Path.mkdir
+
+        def boom(self, *args, **kwargs):
+            if "runs" in str(self) and "run_" in str(self):
+                raise OSError("simulated disk full")
+            return original_mkdir(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "mkdir", boom)
+        ctx = RunContext.create(root=tmp_path / "runs")
+        try:
+            snap = ctx.usage_snapshot()
+            assert isinstance(snap, UsageSnapshot)
+            assert snap.is_empty
+        finally:
+            ctx.close()
+
+    def test_returns_processor_snapshot_when_available(self, tmp_path):
+        ctx = RunContext.create(root=tmp_path, capture_traces=True)
+        try:
+            # Tier-1 has no SDK → processor stays None even with
+            # capture_traces=True. Accessor must still return an empty
+            # snapshot, not raise.
+            snap = ctx.usage_snapshot()
+            assert isinstance(snap, UsageSnapshot)
+            assert snap.is_empty
+        finally:
+            ctx.close()

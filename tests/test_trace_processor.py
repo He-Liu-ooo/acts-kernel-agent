@@ -23,39 +23,58 @@ import pytest
 from src.agents.trace_processor import JSONLTraceProcessor
 
 
-def _fake_trace(trace_id: str = "trace_abc", name: str = "Coder") -> SimpleNamespace:
+def _fake_trace(
+    trace_id: str = "trace_abc",
+    name: str = "Coder",
+    metadata: dict | None = None,
+) -> SimpleNamespace:
     """Stand-in for ``agents.tracing.traces.Trace``. The processor only reads
     ``trace_id``, ``name``, ``started_at``, ``ended_at`` (all string-typed)
-    and a ``metadata`` mapping — no abstract-method machinery needed."""
+    and a ``metadata`` mapping — no abstract-method machinery needed.
+
+    ``metadata`` defaults to ``{"workflow": "implement"}``; pass an explicit
+    dict (e.g. ``{"iter": 1, "agent": "coder"}``) to drive the
+    UsageAccumulator's (iter, agent) bucket resolution.
+    """
     return SimpleNamespace(
         trace_id=trace_id,
         name=name,
         started_at="2026-04-22T17:30:00",
         ended_at="2026-04-22T17:30:30",
-        metadata={"workflow": "implement"},
+        metadata={"workflow": "implement"} if metadata is None else metadata,
     )
 
 
 def _fake_generation_span(
     span_id: str = "span_1",
     parent_id: str | None = None,
+    trace_id: str = "trace_abc",
+    usage: object = None,
+    span_type: str = "generation",
 ) -> SimpleNamespace:
     """Stand-in for an LLM generation span with full input/output capture.
     Mirrors the shape ``GenerationSpanData.export()`` returns + the parent
-    ``Span`` envelope fields the processor wraps each export in."""
-    span_data = SimpleNamespace(
-        export=lambda: {
-            "type": "generation",
-            "input": [{"role": "user", "content": "compile this kernel"}],
-            "output": [{"role": "assistant", "content": "tool_call: compile"}],
-            "model": "deepseek-reasoner",
-            "model_config": {"temperature": 0.0},
-            "usage": {"prompt_tokens": 1024, "completion_tokens": 128},
-        },
-    )
+    ``Span`` envelope fields the processor wraps each export in.
+
+    ``usage`` overrides the default ``{"prompt_tokens": 1024,
+    "completion_tokens": 128}`` payload so tests can exercise malformed
+    or Responses-API-shaped usage dicts. ``span_type`` allows
+    non-generation shapes (e.g. ``"function"``).
+    """
+    if usage is None:
+        usage = {"prompt_tokens": 1024, "completion_tokens": 128}
+    exported = {
+        "type": span_type,
+        "input": [{"role": "user", "content": "compile this kernel"}],
+        "output": [{"role": "assistant", "content": "tool_call: compile"}],
+        "model": "deepseek-reasoner",
+        "model_config": {"temperature": 0.0},
+        "usage": usage,
+    }
+    span_data = SimpleNamespace(export=lambda: exported)
     return SimpleNamespace(
         span_id=span_id,
-        trace_id="trace_abc",
+        trace_id=trace_id,
         parent_id=parent_id,
         started_at="2026-04-22T17:30:01",
         ended_at="2026-04-22T17:30:05",
@@ -209,3 +228,123 @@ def test_event_after_shutdown_is_silently_ignored(tmp_path: Path):
     # Should not raise even though the file handle is closed.
     proc.on_span_end(_fake_generation_span())
     proc.on_trace_end(_fake_trace())
+
+
+# ── UsageAccumulator tap (Task 3) ───────────────────────────────────────
+
+
+from src.runtime.usage import UsageSnapshot
+
+
+class TestUsageAccumulatorTap:
+    def test_generation_spans_routed_to_accumulator(self, tmp_path):
+        proc = JSONLTraceProcessor(out_dir=tmp_path)
+        try:
+            usage = {
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "input_tokens_details": {"cached_tokens": 0},
+                "output_tokens_details": {"reasoning_tokens": 0},
+            }
+            span = _fake_generation_span(
+                span_id="s1", trace_id="t1", usage=usage,
+            )
+            proc.on_span_end(span)
+            proc.on_trace_end(_fake_trace(
+                trace_id="t1", metadata={"iter": 1, "agent": "coder"},
+            ))
+            snap = proc.snapshot()
+            assert isinstance(snap, UsageSnapshot)
+            bucket = snap.by_iter_agent[(1, "coder")]
+            assert bucket.invocations == 1
+            assert bucket.turns == 1
+            assert bucket.input_tokens == 100
+            assert bucket.output_tokens == 20
+        finally:
+            proc.shutdown()
+
+    def test_non_generation_spans_ignored_by_accumulator(self, tmp_path):
+        proc = JSONLTraceProcessor(out_dir=tmp_path)
+        try:
+            span = _fake_generation_span(
+                span_id="s1", trace_id="t1", span_type="function",
+            )
+            proc.on_span_end(span)
+            proc.on_trace_end(_fake_trace(
+                trace_id="t1", metadata={"iter": 1, "agent": "coder"},
+            ))
+            snap = proc.snapshot()
+            # No generation spans → trace_close still credits an
+            # invocation? Spec says invocations counts traces; but the
+            # whole point is to count model usage. We DO count the
+            # invocation (the trace was tagged + closed) but `turns` and
+            # token fields stay zero.
+            bucket = snap.by_iter_agent.get((1, "coder"))
+            assert bucket is not None
+            assert bucket.invocations == 1
+            assert bucket.turns == 0
+            assert bucket.input_tokens == 0
+        finally:
+            proc.shutdown()
+
+    def test_snapshot_empty_when_no_traces(self, tmp_path):
+        proc = JSONLTraceProcessor(out_dir=tmp_path)
+        try:
+            snap = proc.snapshot()
+            assert snap.is_empty
+        finally:
+            proc.shutdown()
+
+    def test_shutdown_does_not_lose_already_resolved_buckets(self, tmp_path):
+        proc = JSONLTraceProcessor(out_dir=tmp_path)
+        usage = {"input_tokens": 50, "output_tokens": 5,
+                 "input_tokens_details": {}, "output_tokens_details": {}}
+        proc.on_span_end(_fake_generation_span(
+            span_id="s1", trace_id="t1", usage=usage,
+        ))
+        proc.on_trace_end(_fake_trace(
+            trace_id="t1", metadata={"iter": 1, "agent": "planner"},
+        ))
+        proc.shutdown()
+        # Snapshot still accessible after shutdown.
+        snap = proc.snapshot()
+        assert snap.by_iter_agent[(1, "planner")].input_tokens == 50
+
+
+# ── Fix 1: usage tap must never raise from inside SDK callbacks ────────
+
+
+class TestUsageTapNeverRaises:
+    """Discipline: trace I/O must never kill a run. The accumulator tap in
+    on_span_end / on_trace_end is wrapped to swallow any version-skew or
+    malformed-payload exception from `_parse_span_usage`."""
+
+    def test_malformed_generation_usage_does_not_raise(self, tmp_path):
+        proc = JSONLTraceProcessor(out_dir=tmp_path)
+        try:
+            # `usage` is a string, not a dict — the older parser would have
+            # raised AttributeError on `.get(...)`.
+            span = _fake_generation_span(
+                span_id="s1", trace_id="t1", usage="not a dict",
+            )
+            # Must not raise.
+            proc.on_span_end(span)
+            # File write should also have happened (record on disk).
+            # Sanity: snapshot still accessible.
+            _ = proc.snapshot()
+        finally:
+            proc.shutdown()
+
+    def test_malformed_trace_metadata_does_not_raise(self, tmp_path):
+        proc = JSONLTraceProcessor(out_dir=tmp_path)
+        try:
+            # `iter` is a non-int string; the accumulator's int() cast in
+            # on_trace_close would have raised.
+            trace = _fake_trace(
+                trace_id="t1", metadata={"iter": "not an int", "agent": "coder"},
+            )
+            # Must not raise.
+            proc.on_trace_end(trace)
+            _ = proc.snapshot()
+        finally:
+            proc.shutdown()

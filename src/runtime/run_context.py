@@ -13,6 +13,7 @@ from typing import IO
 
 from src.runtime import events, tree_dump
 from src.runtime.timefmt import filename_ts
+from src.runtime.usage import UsageAccumulator, UsageSnapshot
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +58,22 @@ class RunContext:
         reaching into dataclass internals.
         """
         return self._trace_processor
+
+    def usage_snapshot(self) -> UsageSnapshot:
+        """Return a frozen snapshot of LLM usage accumulated by the
+        trace processor. Always returns a ``UsageSnapshot`` — never
+        ``None``. Empty when no processor is wired (SDK absent,
+        ``capture_traces=False``, or the OSError-fallback null context).
+        """
+        proc = self._trace_processor
+        if proc is None:
+            # Empty snapshot — pre-built locally to avoid importing the
+            # processor module just to get a zero state.
+            return UsageAccumulator().snapshot()
+        try:
+            return proc.snapshot()
+        except Exception:  # noqa: BLE001 — diagnostic must not abort the run
+            return UsageAccumulator().snapshot()
 
     @classmethod
     def create(

@@ -37,11 +37,15 @@ double the file size for no diagnostic value.
 from __future__ import annotations
 
 import json
+import logging
 import threading
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from src.runtime.timefmt import filename_ts
+from src.runtime.usage import UsageAccumulator, UsageSnapshot
+
+logger = logging.getLogger(__name__)
 
 try:
     from agents.tracing.processor_interface import TracingProcessor
@@ -72,6 +76,7 @@ class JSONLTraceProcessor(TracingProcessor):
         self._fh = self.path.open("w", buffering=1)
         self._lock = threading.Lock()
         self._closed = False
+        self._usage = UsageAccumulator()
 
     # ── TracingProcessor interface ─────────────────────────────────────
 
@@ -89,6 +94,15 @@ class JSONLTraceProcessor(TracingProcessor):
             "ended_at": getattr(trace, "ended_at", None),
             "metadata": dict(getattr(trace, "metadata", None) or {}),
         }
+        # Resolve the trace's buffered generation spans into the
+        # (iter, agent) bucket. The accumulator drops spans whose trace
+        # metadata lacks `iter` / `agent` (e.g., untagged SDK traces).
+        trace_id = getattr(trace, "trace_id", None)
+        metadata = dict(getattr(trace, "metadata", None) or {})
+        if trace_id is not None:
+            self._safe_usage_tap(
+                lambda: self._usage.on_trace_close(trace_id, metadata)
+            )
         self._write(record)
 
     def on_span_start(self, span: Any) -> None:
@@ -104,6 +118,19 @@ class JSONLTraceProcessor(TracingProcessor):
                 exported = span_data.export()
             except Exception as exc:  # noqa: BLE001 — capture-best-effort
                 exported = {"export_error": f"{type(exc).__name__}: {exc}"}
+
+        # Tap generation-span usage into the in-memory accumulator. The
+        # span shape is the SDK's `GenerationSpanData.export()`: a dict
+        # with `"type": "generation"` and a `"usage"` payload. We route
+        # under the existing lock so on_trace_end's resolve sees a
+        # consistent buffer.
+        if exported is not None and exported.get("type") == "generation":
+            self._safe_usage_tap(
+                lambda: self._usage.on_generation_span(
+                    getattr(span, "trace_id", None) or "",
+                    exported.get("usage"),
+                )
+            )
 
         record: dict[str, Any] = {
             "event": "span_end",
@@ -136,7 +163,34 @@ class JSONLTraceProcessor(TracingProcessor):
             except Exception:  # noqa: BLE001
                 pass
 
+    # ── usage snapshot ─────────────────────────────────────────────────
+
+    def snapshot(self) -> UsageSnapshot:
+        """Return a frozen `UsageSnapshot` of accumulated usage so far.
+
+        Safe to call before or after `shutdown`. The returned snapshot
+        is immutable; subsequent accumulator activity does not mutate it.
+        """
+        with self._lock:
+            return self._usage.snapshot()
+
     # ── internals ──────────────────────────────────────────────────────
+
+    def _safe_usage_tap(self, tap: Callable[[], None]) -> None:
+        """Run a usage-accumulator call under the lock, dropping any
+        exception so trace I/O never kills a run. Skips when the
+        processor has already shut down.
+        """
+        try:
+            with self._lock:
+                if not self._closed:
+                    tap()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "usage tap failed (%s); usage accounting "
+                "degraded for this span",
+                exc,
+            )
 
     def _write(self, record: dict[str, Any]) -> None:
         with self._lock:
