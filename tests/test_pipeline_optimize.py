@@ -613,10 +613,14 @@ def test_main_trace_dir_defaults_under_run_dir(tmp_path, monkeypatch):
     """When --trace-dir is omitted, SDK trace capture targets
     <run-dir>/traces/ rather than the old ``./traces/`` default."""
     from src.pipeline import optimize as opt_mod
+    from src.runtime.usage import UsageAccumulator
 
     monkeypatch.chdir(tmp_path)
     fake_processor = MagicMock()
     fake_processor.path = tmp_path / "some" / "trace.jsonl"
+    # Sidecar persistence needs a real UsageSnapshot (json.dumps would
+    # choke on the auto-generated MagicMock attrs otherwise).
+    fake_processor.snapshot.return_value = UsageAccumulator().snapshot()
 
     async def fake_optimize(problem_path, config=None):
         return MagicMock(), MagicMock()
@@ -731,11 +735,15 @@ def test_main_explicit_trace_dir_override(tmp_path, monkeypatch):
     """--trace-dir <path> still honors the explicit path (escape hatch for
     users who want traces outside the run-dir)."""
     from src.pipeline import optimize as opt_mod
+    from src.runtime.usage import UsageAccumulator
 
     monkeypatch.chdir(tmp_path)
     external = tmp_path / "external_traces"
     fake_processor = MagicMock()
     fake_processor.path = external / "trace.jsonl"
+    # Sidecar persistence needs a real UsageSnapshot (json.dumps would
+    # choke on the auto-generated MagicMock attrs otherwise).
+    fake_processor.snapshot.return_value = UsageAccumulator().snapshot()
 
     async def fake_optimize(problem_path, config=None):
         return MagicMock(), MagicMock()
@@ -767,10 +775,14 @@ def test_main_enables_trace_capture_when_sdk_available(tmp_path, monkeypatch):
     """Explicit ``--trace-dir <path>`` fires ``enable_local_trace_capture``
     when the SDK is present and shuts the processor down after the run."""
     from src.pipeline import optimize as opt_mod
+    from src.runtime.usage import UsageAccumulator
 
     monkeypatch.chdir(tmp_path)
     fake_processor = MagicMock()
     fake_processor.path = tmp_path / "trace.jsonl"
+    # Sidecar persistence needs a real UsageSnapshot (json.dumps would
+    # choke on the auto-generated MagicMock attrs otherwise).
+    fake_processor.snapshot.return_value = UsageAccumulator().snapshot()
 
     async def fake_optimize(problem_path, config=None):
         return MagicMock(), MagicMock()
@@ -1741,3 +1753,90 @@ def test_main_does_not_call_finalize_tree_on_exception(tmp_path, monkeypatch):
             opt_mod.main(["--run-dir", str(tmp_path / "runs")])
 
     assert calls == []
+
+
+import json as _json
+
+from src.runtime.usage import UsageBucket, UsageSnapshot
+
+
+def _snap_with_one_call() -> UsageSnapshot:
+    b = UsageBucket(invocations=1, turns=1, input_tokens=100, output_tokens=10)
+    return UsageSnapshot(
+        by_iter_agent={(1, "coder"): b},
+        by_iter={1: b},
+        by_agent={"coder": b},
+        total=b,
+        columns=("coder",),
+    )
+
+
+class TestUsageJsonSidecar:
+    def test_usage_json_written_with_schema_version_1(self, tmp_path, monkeypatch):
+        # Wire optimize.py to write the sidecar; assert structure.
+        from src.pipeline import optimize as opt
+
+        snap = _snap_with_one_call()
+        run_dir = tmp_path / "run_x"
+        run_dir.mkdir()
+        opt._write_usage_sidecar(snap, run_dir)  # helper to be introduced
+        data = _json.loads((run_dir / "usage.json").read_text())
+        assert data["schema_version"] == 1
+        assert data["columns"] == ["coder"]
+        assert isinstance(data["by_iter"], list)
+        assert data["by_iter"][0]["iter"] == 1
+        assert data["by_iter"][0]["agents"]["coder"]["input_tokens"] == 100
+        assert data["by_agent"]["coder"]["invocations"] == 1
+        assert data["total"]["turns"] == 1
+
+    def test_usage_json_oserror_logged_not_raised(self, tmp_path, caplog, monkeypatch):
+        from src.pipeline import optimize as opt
+        snap = _snap_with_one_call()
+        run_dir = tmp_path / "run_y"
+        run_dir.mkdir()
+
+        def boom(self, *args, **kwargs):
+            raise OSError("simulated read-only fs")
+
+        monkeypatch.setattr(Path, "write_text", boom)
+        with caplog.at_level("WARNING"):
+            opt._write_usage_sidecar(snap, run_dir)  # must not raise
+        assert any("usage.json" in r.message for r in caplog.records)
+
+    def test_empty_snapshot_still_writes_sidecar(self, tmp_path):
+        from src.pipeline import optimize as opt
+        empty = UsageSnapshot(
+            by_iter_agent={}, by_iter={}, by_agent={},
+            total=UsageBucket(), columns=(),
+        )
+        run_dir = tmp_path / "run_z"
+        run_dir.mkdir()
+        opt._write_usage_sidecar(empty, run_dir)
+        data = _json.loads((run_dir / "usage.json").read_text())
+        assert data["schema_version"] == 1
+        assert data["columns"] == []
+        assert data["by_iter"] == []
+        assert data["by_agent"] == {}
+
+    def test_column_sums_equal_grand_total_in_sidecar(self, tmp_path):
+        # Multi-iter, multi-agent — verify the persisted JSON is internally consistent.
+        from src.pipeline import optimize as opt
+        b1 = UsageBucket(invocations=1, turns=2, input_tokens=100, output_tokens=10)
+        b2 = UsageBucket(invocations=1, turns=3, input_tokens=200, output_tokens=20)
+        b3 = UsageBucket(invocations=1, turns=4, input_tokens=300, output_tokens=30)
+        snap = UsageSnapshot(
+            by_iter_agent={(1, "planner"): b1, (1, "coder"): b2, (2, "coder"): b3},
+            by_iter={1: b1 + b2, 2: b3},
+            by_agent={"planner": b1, "coder": b2 + b3},
+            total=b1 + b2 + b3,
+            columns=("planner", "coder"),
+        )
+        run_dir = tmp_path / "run_q"
+        run_dir.mkdir()
+        opt._write_usage_sidecar(snap, run_dir)
+        data = _json.loads((run_dir / "usage.json").read_text())
+        # Column sum = grand total
+        col_sum_input = sum(
+            data["by_agent"][a]["input_tokens"] for a in data["columns"]
+        )
+        assert col_sum_input == data["total"]["input_tokens"] == 600

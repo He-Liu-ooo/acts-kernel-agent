@@ -589,3 +589,136 @@ class TestHardwareSpecInReport:
         # Values reflect their own MAC/cycle, not a shared one:
         assert "Peak FP16:          80.00 TFLOPS" in text
         assert "Peak BF16:          40.00 TFLOPS" in text
+
+
+from src.runtime.usage import UsageBucket, UsageSnapshot
+
+
+def _snap_three_iters() -> UsageSnapshot:
+    """Build a representative 3-iter snapshot for render assertions."""
+    p1 = UsageBucket(invocations=1, turns=2, input_tokens=1200, output_tokens=42)
+    c0 = UsageBucket(invocations=1, turns=3, input_tokens=1800, output_tokens=28)  # baseline-translate
+    c1 = UsageBucket(invocations=1, turns=5, input_tokens=3400, output_tokens=512)
+    r1 = UsageBucket(invocations=1, turns=4, input_tokens=2100, output_tokens=98)
+    by_iter_agent = {
+        (0, "coder-translate"): c0,
+        (1, "planner"): p1,
+        (1, "coder"): c1,
+        (1, "reviewer"): r1,
+    }
+    by_iter = {
+        0: c0,
+        1: p1 + c1 + r1,
+    }
+    by_agent = {"planner": p1, "coder": c1, "coder-translate": c0, "reviewer": r1}
+    total = c0 + p1 + c1 + r1
+    return UsageSnapshot(
+        by_iter_agent=by_iter_agent,
+        by_iter=by_iter,
+        by_agent=by_agent,
+        total=total,
+        columns=("planner", "coder", "coder-translate", "reviewer"),
+    )
+
+
+class TestUsageBlockRender:
+    def test_populated_snapshot_renders_table(self):
+        from src.pipeline.report import OptimizationReport, render_report
+        rep = OptimizationReport(
+            baseline_latency_us=10.0, best_latency_us=5.0, sol_score=0.5,
+            speedup=2.0, total_iterations=1, termination_reason="sol_target_reached",
+            usage_stats=_snap_three_iters(),
+        )
+        text = render_report(rep)
+        assert "Resource usage (LLM)" in text
+        # Header row mentions every column.
+        assert "planner" in text and "coder" in text
+        assert "coder-translate" in text and "reviewer" in text
+        # Iter rows present.
+        assert "0 |" in text
+        assert "1 |" in text
+        # Em-dash for empty cells (iter 0 has no planner / reviewer).
+        assert "—" in text
+        # Cell format includes the arrow.
+        assert "→" in text
+        # k abbreviation kicks in for 1200, 1800, 2100, 3400.
+        assert "1.2k" in text
+        # Run-total row present.
+        assert "total" in text.lower()
+
+    def test_empty_snapshot_renders_fallback_line(self):
+        from src.pipeline.report import OptimizationReport, render_report
+        empty = UsageSnapshot(
+            by_iter_agent={}, by_iter={}, by_agent={},
+            total=UsageBucket(), columns=(),
+        )
+        rep = OptimizationReport(
+            baseline_latency_us=10.0, best_latency_us=5.0, sol_score=0.5,
+            speedup=2.0, total_iterations=1, termination_reason="budget_exhausted",
+            usage_stats=empty,
+        )
+        text = render_report(rep)
+        assert "Resource usage (LLM)" in text
+        assert "(no LLM usage captured)" in text
+        # No table → no em-dash, no arrow.
+        assert "→" not in text
+
+    def test_none_usage_stats_renders_fallback_line(self):
+        from src.pipeline.report import OptimizationReport, render_report
+        rep = OptimizationReport(
+            baseline_latency_us=10.0, best_latency_us=5.0, sol_score=0.5,
+            speedup=2.0, total_iterations=1, termination_reason="budget_exhausted",
+            usage_stats=None,
+        )
+        text = render_report(rep)
+        # None and empty-snapshot render identically.
+        assert "Resource usage (LLM)" in text
+        assert "(no LLM usage captured)" in text
+
+    def test_cached_and_reasoning_footer_emitted_when_nonzero(self):
+        from src.pipeline.report import OptimizationReport, render_report
+        bucket = UsageBucket(
+            invocations=1, turns=1,
+            input_tokens=1000, output_tokens=500,
+            cached_input_tokens=100, reasoning_output_tokens=300,
+        )
+        snap = UsageSnapshot(
+            by_iter_agent={(1, "coder"): bucket},
+            by_iter={1: bucket},
+            by_agent={"coder": bucket},
+            total=bucket,
+            columns=("coder",),
+        )
+        rep = OptimizationReport(
+            baseline_latency_us=10.0, best_latency_us=5.0, sol_score=0.5,
+            speedup=2.0, total_iterations=1, termination_reason="sol_target_reached",
+            usage_stats=snap,
+        )
+        text = render_report(rep)
+        assert "of which cached input" in text
+        assert "10.0%" in text  # 100 / 1000
+        assert "of which reasoning output" in text
+        assert "60.0%" in text  # 300 / 500
+
+    def test_zero_sub_buckets_suppress_footer_lines(self):
+        from src.pipeline.report import OptimizationReport, render_report
+        bucket = UsageBucket(
+            invocations=1, turns=1,
+            input_tokens=1000, output_tokens=500,
+            # cached and reasoning stay zero
+        )
+        snap = UsageSnapshot(
+            by_iter_agent={(1, "coder"): bucket},
+            by_iter={1: bucket},
+            by_agent={"coder": bucket},
+            total=bucket,
+            columns=("coder",),
+        )
+        rep = OptimizationReport(
+            baseline_latency_us=10.0, best_latency_us=5.0, sol_score=0.5,
+            speedup=2.0, total_iterations=1, termination_reason="sol_target_reached",
+            usage_stats=snap,
+        )
+        text = render_report(rep)
+        assert "of which cached input" not in text
+        assert "of which reasoning output" not in text

@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
+from src.runtime.usage import UsageBucket, UsageSnapshot, _fmt_tokens
+
 if TYPE_CHECKING:
     from sol_execbench.core.data import Definition, Workload
 
@@ -87,6 +89,13 @@ class OptimizationReport:
     SOLAR call that fills ``winner_per_workload_bottlenecks`` so the
     rendered report can surface AI / ridge_point alongside the
     achieved-throughput numbers from the per-workload profile.
+
+    ``usage_stats`` carries the per-iter × per-agent LLM call counts
+    and input/output token consumption. ``None`` and an empty snapshot
+    both render the same ``(no LLM usage captured)`` fallback under the
+    section header. The live pipeline always passes a populated
+    snapshot — ``None`` only fires for legacy / direct-construction
+    callers.
     """
 
     baseline_latency_us: float = 0.0
@@ -104,6 +113,7 @@ class OptimizationReport:
     reward_hack_suspect: bool = False
     calibration_warning: bool = False
     hardware_spec: HardwareSpec | None = None
+    usage_stats: UsageSnapshot | None = None
 
 
 def generate_report(
@@ -314,6 +324,7 @@ def render_report(report: OptimizationReport) -> str:
         lines.append("  [AUDIT] reward_hack_suspect — candidate beats T_SOL (physics violation)")
     if report.calibration_warning:
         lines.append("  [AUDIT] calibration_warning — baseline already at/below T_SOL")
+    lines.extend(_render_usage_block(report.usage_stats))
     if report.hardware_spec is not None:
         lines.extend(_render_hardware_spec_block(report.hardware_spec))
     return "\n".join(lines)
@@ -464,4 +475,91 @@ def _render_profiling_block(
             lines.append(
                 f"      [DEGRADED: {p.degraded_reason or 'unknown'}]"
             )
+    return lines
+
+
+def _render_usage_block(snapshot: UsageSnapshot | None) -> list[str]:
+    """Render the per-iter × per-agent LLM usage table.
+
+    `None` and `snapshot.is_empty` collapse to the same fallback line.
+    Populated snapshots render a wide table with em-dashes for empty
+    cells, followed by conditional cached/reasoning footer lines (only
+    when the sub-bucket is non-zero).
+    """
+    if snapshot is None or snapshot.is_empty:
+        return ["Resource usage (LLM): (no LLM usage captured)"]
+
+    columns = snapshot.columns
+    iters = sorted(snapshot.by_iter.keys())
+
+    def _cell(b: UsageBucket | None) -> str:
+        if b is None or b.is_zero:
+            return "—"
+        return (
+            f"{b.invocations} ({b.turns}) / "
+            f"{_fmt_tokens(b.input_tokens)}→{_fmt_tokens(b.output_tokens)}"
+        )
+
+    # Column widths: header width vs. widest cell in that column.
+    col_widths: dict[str, int] = {}
+    for agent in columns:
+        widest = len(agent)
+        for it in iters:
+            cell = _cell(snapshot.by_iter_agent.get((it, agent)))
+            widest = max(widest, len(cell))
+        # row-total column considered separately below
+        col_widths[agent] = widest
+    total_widest = len("total")
+    for it in iters:
+        row_total = _cell(snapshot.by_iter.get(it))
+        total_widest = max(total_widest, len(row_total))
+    iter_col_width = max(len("Iter"), len(str(iters[-1])))
+
+    header = (
+        f"{'Iter'.rjust(iter_col_width)} | "
+        + " | ".join(a.ljust(col_widths[a]) for a in columns)
+        + f" | {'total'.ljust(total_widest)}"
+    )
+    lines: list[str] = ["Resource usage (LLM)", header]
+
+    for it in iters:
+        row_cells = [
+            _cell(snapshot.by_iter_agent.get((it, agent))).ljust(col_widths[agent])
+            for agent in columns
+        ]
+        # Skip rows where every agent cell is empty.
+        if all(c.strip() == "—" for c in row_cells):
+            continue
+        lines.append(
+            f"{str(it).rjust(iter_col_width)} | "
+            + " | ".join(row_cells)
+            + f" | {_cell(snapshot.by_iter.get(it)).ljust(total_widest)}"
+        )
+
+    # Run-total row.
+    total_cells = [
+        _cell(snapshot.by_agent.get(agent)).ljust(col_widths[agent])
+        for agent in columns
+    ]
+    lines.append(
+        f"{'total'.rjust(iter_col_width)} | "
+        + " | ".join(total_cells)
+        + f" | {_cell(snapshot.total).ljust(total_widest)}"
+    )
+
+    # Conditional sub-bucket footer.
+    total = snapshot.total
+    if total.cached_input_tokens > 0 and total.input_tokens > 0:
+        pct = total.cached_input_tokens / total.input_tokens * 100
+        lines.append(
+            f"  of which cached input: "
+            f"{_fmt_tokens(total.cached_input_tokens)} ({pct:.1f}%)"
+        )
+    if total.reasoning_output_tokens > 0 and total.output_tokens > 0:
+        pct = total.reasoning_output_tokens / total.output_tokens * 100
+        lines.append(
+            f"  of which reasoning output: "
+            f"{_fmt_tokens(total.reasoning_output_tokens)} ({pct:.1f}%)"
+        )
+
     return lines

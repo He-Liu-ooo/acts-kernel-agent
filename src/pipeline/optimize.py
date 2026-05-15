@@ -124,11 +124,12 @@ os.environ["CUDA_VISIBLE_DEVICES"] = _GPU_INDEX
 import sol_execbench  # noqa: F401 — load-bearing side effects (_ELAPSED_TIME_ADDR snapshot)
 
 import asyncio
+import json
 import logging
 import os
 import signal
 import subprocess
-from dataclasses import replace
+from dataclasses import asdict, replace
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -137,6 +138,7 @@ from sol_execbench.core.bench.clock_lock import probe_clock_lock_available
 from sol_execbench.core.bench.config.device_config import ClockPreset, get_clock_preset
 
 from src.config import HardwareSpec
+from src.runtime.usage import UsageBucket, UsageSnapshot
 
 if TYPE_CHECKING:
     from sol_execbench.core.data import Definition
@@ -792,6 +794,42 @@ def _load_model_if_configured():
     return create_model(config)
 
 
+def _write_usage_sidecar(snapshot: UsageSnapshot, run_dir: Path) -> None:
+    """Persist ``<run_dir>/usage.json`` with ``schema_version=1``.
+
+    Best-effort: OSError on write becomes a WARNING log; never raises.
+    Empty snapshots are still persisted (schema-version-stamped empty
+    object) so downstream tooling can rely on the file's presence.
+    """
+    by_iter_list: list[dict] = []
+    for it in sorted(snapshot.by_iter.keys()):
+        agents = {
+            agent: asdict(
+                snapshot.by_iter_agent.get((it, agent), UsageBucket())
+            )
+            for agent in snapshot.columns
+        }
+        by_iter_list.append({
+            "iter": it,
+            "agents": agents,
+            "row_total": asdict(snapshot.by_iter[it]),
+        })
+    payload = {
+        "schema_version": 1,
+        "columns": list(snapshot.columns),
+        "by_iter": by_iter_list,
+        "by_agent": {
+            agent: asdict(snapshot.by_agent.get(agent, UsageBucket()))
+            for agent in snapshot.columns
+        },
+        "total": asdict(snapshot.total),
+    }
+    try:
+        (run_dir / "usage.json").write_text(json.dumps(payload, indent=2))
+    except OSError as exc:
+        logger.warning("usage.json write failed (%s); continuing", exc)
+
+
 def main(argv: list[str] | None = None) -> None:
     """CLI entry point.
 
@@ -802,7 +840,6 @@ def main(argv: list[str] | None = None) -> None:
     import argparse
     import atexit
     import json
-    from dataclasses import asdict
     from datetime import datetime, timezone
 
     from src.config import ACTSConfig, detect_hardware, load_config
@@ -958,6 +995,8 @@ def main(argv: list[str] | None = None) -> None:
         # so the ``tree_dump.bind(...)`` is still live. Never raises
         # (tree_dump.finalize_tree swallows OSError); no-op when unbound.
         tree_dump.finalize_tree(result.tree)
+        usage_snapshot = ctx.usage_snapshot()
+        report.usage_stats = usage_snapshot
         rendered_report = render_report(report)
         # Config dump appended to the persisted report only — keeps the
         # terminal print focused on results. ``default=str`` coerces
@@ -974,6 +1013,8 @@ def main(argv: list[str] | None = None) -> None:
                 )
             except OSError as exc:
                 logger.warning("report.txt write failed: %s", exc)
+        if ctx.run_dir is not None:
+            _write_usage_sidecar(usage_snapshot, ctx.run_dir)
         print(rendered_report)
         if ctx.trace_processor is not None and hasattr(ctx.trace_processor, "path"):
             print(f"\nLLM trace: {ctx.trace_processor.path}")
