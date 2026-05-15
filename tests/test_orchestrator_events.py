@@ -464,22 +464,27 @@ async def test_dead_end_iteration_event_sequence(tmp_path, harness):
 @pytest.mark.asyncio
 async def test_runner_run_wrapped_in_trace_with_iter_metadata(harness, monkeypatch):
     """Each agent invocation in the iteration body is wrapped in
-    ``with _iter_trace(iter_no, agent_name)``. We spy on the helper to
-    confirm planner / coder / reviewer are all wrapped on iter 1."""
+    ``with trace_span("acts_iter", iter_no=..., agent=...)``. We spy on
+    the helper (imported into the orchestrator module) to confirm
+    planner / coder / reviewer are all wrapped on iter 1."""
     from src.search import orchestrator as orch
 
     calls: list[dict] = []
-    real = orch._iter_trace
+    real = orch.trace_span
 
-    def spy(iter_no, agent_name):
-        calls.append({"iter": iter_no, "agent": agent_name})
-        return real(iter_no, agent_name)
+    def spy(workflow_name, *, iter_no, agent, **extra):
+        # AgentLabel is a `str`-subclass enum: comparing the recorded
+        # member against the bare value works directly (no manual
+        # coercion needed). The orchestrator passes AgentLabel.* — the
+        # equality assertions below use the bare strings.
+        calls.append({"workflow_name": workflow_name, "iter": iter_no, "agent": agent})
+        return real(workflow_name, iter_no=iter_no, agent=agent, **extra)
 
-    monkeypatch.setattr(orch, "_iter_trace", spy)
+    monkeypatch.setattr(orch, "trace_span", spy)
     await _run_orch(harness)
-    assert {"iter": 1, "agent": "planner"} in calls
-    assert {"iter": 1, "agent": "coder"} in calls
-    assert {"iter": 1, "agent": "reviewer"} in calls
+    assert {"workflow_name": "acts_iter", "iter": 1, "agent": "planner"} in calls
+    assert {"workflow_name": "acts_iter", "iter": 1, "agent": "coder"} in calls
+    assert {"workflow_name": "acts_iter", "iter": 1, "agent": "reviewer"} in calls
 
 
 @pytest.mark.asyncio

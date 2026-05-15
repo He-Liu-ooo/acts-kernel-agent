@@ -761,3 +761,65 @@ async def test_safetensors_workload_resolves_blob_with_roots(monkeypatch):
                 max_retries=1,
                 blob_roots=[fixture],
             )
+
+
+import contextlib
+
+
+class TestBaselineTraceWrap:
+    """The baseline coder.translate() call must run inside a trace
+    tagged {iter: 0, agent: 'coder-translate'} so the resource
+    accumulator can attribute its usage. Tier-1 mocked — verifies the
+    consolidated ``trace_span`` helper is invoked with the right kwargs.
+    """
+
+    @pytest.mark.asyncio
+    async def test_baseline_translate_wrapped_in_acts_baseline_trace(
+        self, monkeypatch, patched_io
+    ):
+        import src.benchmark.baseline_generator as bg
+        from src.runtime.usage import AgentLabel
+
+        captured: list[dict] = []
+
+        @contextlib.contextmanager
+        def fake_trace_span(workflow_name, **kwargs):
+            captured.append({"workflow_name": workflow_name, **kwargs})
+            yield
+
+        # Monkey-patch the module-level alias imported from
+        # ``src.runtime.sdk_trace``. Patching at the import site rather
+        # than the source module ensures the rebinding takes effect for
+        # the ``bg`` module's lookup.
+        monkeypatch.setattr(bg, "trace_span", fake_trace_span, raising=True)
+
+        workloads = _make_workloads(n=1)
+        coder = CoderAgent(model=MagicMock())
+        coder.translate = AsyncMock(return_value=_coder_output("good source"))
+
+        with (
+            patch(
+                "src.benchmark.baseline_generator.compile_kernel",
+                return_value=_compile_ok(),
+            ),
+            patch(
+                "src.benchmark.baseline_generator.verify_correctness",
+                return_value=_pass(),
+            ),
+        ):
+            await generate_triton_baseline(
+                _make_definition(),
+                _make_spec(),
+                coder=coder,
+                workloads=workloads,
+                max_retries=1,
+            )
+
+        # Exactly one trace wrap — happy path takes one attempt.
+        assert len(captured) == 1
+        assert captured[0] == {
+            "workflow_name": "acts_baseline",
+            "iter_no": 0,
+            "agent": AgentLabel.CODER_TRANSLATE,
+            "attempt": 1,
+        }

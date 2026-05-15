@@ -21,6 +21,8 @@ from src.eval.inputs import build_input_generator, build_reference_fn
 from src.kernels.compiler import compile_kernel
 from src.kernels.kernel import Kernel
 from src.runtime.events import emit
+from src.runtime.sdk_trace import trace_span
+from src.runtime.usage import AgentLabel
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -88,15 +90,21 @@ async def generate_triton_baseline(
     for attempt in range(max_retries):
         emit("baseline_attempt", attempt=attempt + 1, max_attempts=max_retries)
         try:
-            output = await coder.translate(
-                reference_source=definition.reference,
-                kernel_spec=spec,
-                reference_fn=reference_fn,
-                input_generators=input_generators,
-                definition=definition,
-                workloads=workloads,
-                prior_failures=prior_failures,
-            )
+            with trace_span(
+                "acts_baseline",
+                iter_no=0,
+                agent=AgentLabel.CODER_TRANSLATE,
+                attempt=attempt + 1,
+            ):
+                output = await coder.translate(
+                    reference_source=definition.reference,
+                    kernel_spec=spec,
+                    reference_fn=reference_fn,
+                    input_generators=input_generators,
+                    definition=definition,
+                    workloads=workloads,
+                    prior_failures=prior_failures,
+                )
         except ImplementationError as exc:
             prior_failures.append(
                 AttemptFailure(

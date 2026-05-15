@@ -7,7 +7,6 @@ The Coder's compile/correctness tools handle self-correction internally.
 
 from __future__ import annotations
 
-import contextlib
 import logging
 import math
 from dataclasses import dataclass
@@ -25,6 +24,8 @@ from src.runtime.events import (
     emit,
     finite_or_none,
 )
+from src.runtime.sdk_trace import trace_span
+from src.runtime.usage import AgentLabel
 
 logger = logging.getLogger(__name__)
 
@@ -265,26 +266,6 @@ def _emit_dead_end(iter_no: int, reason: DeadReason, *, detail: str | None = Non
         payload["detail"] = detail
     emit("branch_dead_end", iter=iter_no, **payload)
     emit("iter_end", iter=iter_no, outcome=ITER_DEAD_END)
-
-
-try:
-    from agents import trace as _agents_trace
-except ModuleNotFoundError:
-    _agents_trace = None  # SDK not installed (Tier-1 test venv); _iter_trace degrades.
-
-
-def _iter_trace(iter_no: int, agent_name: str):
-    """Return a context manager that wraps an agent invocation in an
-    SDK ``trace`` tagged with the iteration index + agent name. Falls
-    back to ``contextlib.nullcontext`` when the SDK isn't installed
-    (Tier-1 test venv) so orchestration code stays harness-agnostic.
-    """
-    if _agents_trace is None:
-        return contextlib.nullcontext()
-    return _agents_trace(
-        workflow_name="acts_iter",
-        metadata={"iter": iter_no, "agent": agent_name},
-    )
 
 
 def detect_plateau(
@@ -670,7 +651,7 @@ class Orchestrator:
         if root.profiling is not None:
             baseline_feedback = None
             try:
-                with _iter_trace(0, "reviewer"):
+                with trace_span("acts_iter", iter_no=0, agent=AgentLabel.REVIEWER):
                     baseline_feedback = await self._reviewer.review(
                         kernel_source=baseline.render_condensed_source(
                             representative_workload_uuid=(
@@ -753,7 +734,7 @@ class Orchestrator:
                 tree, parent, iter_no=iter_no, consumer="planner",
             )
             try:
-                with _iter_trace(iter_no, "planner"):
+                with trace_span("acts_iter", iter_no=iter_no, agent=AgentLabel.PLANNER):
                     plan = await self._planner.plan(
                         kernel_source=parent.kernel.render_condensed_source(
                             representative_workload_uuid=(
@@ -801,7 +782,7 @@ class Orchestrator:
             # run survives one Coder hiccup the way it survives one
             # branch's benchmark crash.
             try:
-                with _iter_trace(iter_no, "coder"):
+                with trace_span("acts_iter", iter_no=iter_no, agent=AgentLabel.CODER):
                     coder_output = await self._coder.implement(
                         kernel_source=parent.kernel.source_code,
                         plan=plan,
@@ -1164,7 +1145,7 @@ class Orchestrator:
                     tree, parent, iter_no=iter_no,
                     consumer="reviewer", exclude_id=child.id,
                 )
-                with _iter_trace(iter_no, "reviewer"):
+                with trace_span("acts_iter", iter_no=iter_no, agent=AgentLabel.REVIEWER):
                     feedback = await self._reviewer.review(
                         kernel_source=child.kernel.render_condensed_source(
                             representative_workload_uuid=(
