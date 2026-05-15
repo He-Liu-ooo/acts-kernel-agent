@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import shutil
+import subprocess
 from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -208,7 +209,7 @@ def _node_summary(node: "TreeNode", *, is_best: bool) -> dict:
 
 def finalize_tree(tree) -> None:
     """End-of-run write: tree/{index.json, tree.txt, tree.dot, tree.mmd,
-    tree.preview.md}.
+    tree.preview.md, tree.png (best-effort if Graphviz is installed)}.
 
     Also rewrites each per-node meta.json's late-bound fields
     (``branch_quality``, ``dead_reason``, ``score``,
@@ -265,14 +266,50 @@ def finalize_tree(tree) -> None:
         }
         (_root / "index.json").write_text(json.dumps(index, indent=2))
         (_root / "tree.txt").write_text(_render_ascii(tree, best_id))
-        (_root / "tree.dot").write_text(_render_dot(tree, best_id))
+        dot_path = _root / "tree.dot"
+        dot_path.write_text(_render_dot(tree, best_id))
         mermaid_src = _render_mermaid(tree, best_id)
         (_root / "tree.mmd").write_text(mermaid_src)
         (_root / "tree.preview.md").write_text(
             f"```mermaid\n{mermaid_src}```\n"
         )
+        _render_png_best_effort(dot_path, _root / "tree.png")
     except (OSError, KeyError) as exc:
         logger.warning("tree_dump.finalize_tree failed: %s", exc)
+
+
+def _render_png_best_effort(dot_path: Path, png_path: Path) -> None:
+    """Run ``dot -Tpng <dot_path> -o <png_path>`` when Graphviz is on PATH.
+
+    Best-effort — Graphviz absence is logged at DEBUG (operator may just
+    not have it installed on this host) and any subprocess failure is
+    logged at WARNING but never raises. The .dot source already shipped;
+    the PNG is a convenience render.
+    """
+    dot_bin = shutil.which("dot")
+    if dot_bin is None:
+        logger.debug(
+            "tree_dump.finalize_tree: dot binary not on PATH — skipping "
+            "tree.png render (run scripts/visualize_tree.sh manually if "
+            "you want the rendered image).",
+        )
+        return
+    try:
+        result = subprocess.run(
+            [dot_bin, "-Tpng", str(dot_path), "-o", str(png_path)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning("tree_dump.finalize_tree: dot subprocess failed: %s", exc)
+        return
+    if result.returncode != 0:
+        logger.warning(
+            "tree_dump.finalize_tree: dot exited %d (%s)",
+            result.returncode,
+            (result.stderr or "").strip()[:200],
+        )
 
 
 def _render_ascii(tree, best_id: int) -> str:

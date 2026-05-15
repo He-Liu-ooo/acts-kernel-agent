@@ -328,6 +328,82 @@ def test_finalize_tree_writes_five_files(tmp_path):
         tree_dump.unbind()
 
 
+def test_finalize_tree_writes_png_when_dot_available(tmp_path, monkeypatch):
+    """``finalize_tree`` runs ``dot -Tpng tree.dot -o tree.png`` so the
+    rendered PNG ships alongside the source files — no manual
+    ``scripts/visualize_tree.sh`` step needed.
+    """
+    from src.runtime import tree_dump
+
+    monkeypatch.setattr(tree_dump.shutil, "which", lambda name: "/usr/bin/dot")
+
+    invocations: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        invocations.append(list(argv))
+        # Faithful Graphviz behavior: write the requested output path.
+        out_idx = argv.index("-o") + 1
+        Path(argv[out_idx]).write_bytes(b"\x89PNG\r\n\x1a\n")
+        return type("CompletedProcess", (), {"returncode": 0, "stderr": ""})()
+
+    monkeypatch.setattr(tree_dump.subprocess, "run", fake_run)
+
+    tree_dump.bind(tmp_path / "tree")
+    try:
+        tree = _make_tree_two_levels()
+        tree_dump.finalize_tree(tree)
+        png = tmp_path / "tree" / "tree.png"
+        assert png.exists()
+        # dot was called with the right argv shape.
+        assert len(invocations) == 1
+        assert invocations[0][:2] == ["/usr/bin/dot", "-Tpng"]
+        assert "tree.dot" in invocations[0][2]
+        assert "tree.png" in invocations[0][4]
+    finally:
+        tree_dump.unbind()
+
+
+def test_finalize_tree_skips_png_when_dot_missing(tmp_path, monkeypatch, caplog):
+    """No Graphviz installed → no crash, tree.png absent, tree.dot still
+    written. Operator can run ``scripts/visualize_tree.sh`` manually later."""
+    from src.runtime import tree_dump
+
+    monkeypatch.setattr(tree_dump.shutil, "which", lambda name: None)
+
+    tree_dump.bind(tmp_path / "tree")
+    try:
+        with caplog.at_level("DEBUG", logger="src.runtime.tree_dump"):
+            tree = _make_tree_two_levels()
+            tree_dump.finalize_tree(tree)
+        assert (tmp_path / "tree" / "tree.dot").exists()
+        assert not (tmp_path / "tree" / "tree.png").exists()
+    finally:
+        tree_dump.unbind()
+
+
+def test_finalize_tree_png_failure_is_swallowed(tmp_path, monkeypatch):
+    """``dot`` non-zero exit / crash must not kill ``finalize_tree``."""
+    from src.runtime import tree_dump
+
+    monkeypatch.setattr(tree_dump.shutil, "which", lambda name: "/usr/bin/dot")
+
+    def boom(*_a, **_k):
+        raise OSError("dot crashed")
+
+    monkeypatch.setattr(tree_dump.subprocess, "run", boom)
+
+    tree_dump.bind(tmp_path / "tree")
+    try:
+        tree = _make_tree_two_levels()
+        tree_dump.finalize_tree(tree)  # must not raise
+        # Source files still landed even though the PNG step failed.
+        assert (tmp_path / "tree" / "tree.dot").exists()
+        assert (tmp_path / "tree" / "index.json").exists()
+        assert not (tmp_path / "tree" / "tree.png").exists()
+    finally:
+        tree_dump.unbind()
+
+
 def test_finalize_tree_marks_best(tmp_path):
     import json
     from src.runtime import tree_dump
