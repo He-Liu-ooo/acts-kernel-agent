@@ -385,14 +385,21 @@ async def test_repeated_planner_failure_quarantines_parent_after_threshold(
 
 @pytest.mark.asyncio
 async def test_dead_end_iteration_event_sequence(tmp_path, harness):
-    """Partial-workload bench failure → bench_done(is_fully_successful=False)
-    → branch_dead_end → iter_end(dead_end). No score_computed or reviewer
-    on the dead path.
+    """A2 K-way contract: candidate-level partial-workload bench failures
+    are per-candidate failures that emit ``coder_failed`` and skip the
+    candidate. When every K candidate fails, the iter ends as SKIPPED —
+    no tree node is added for failed candidates and no ``score_computed``
+    or ``reviewer_feedback`` runs on the dead path.
+
+    (Before A2, partial-bench failure of the lone Coder output created a
+    tree node, marked it DEAD_END, and emitted ``bench_done`` +
+    ``branch_dead_end`` + ``iter_end(dead_end)``. K-way moved the gate
+    upstream so losers never enter the tree.)
     """
-    # Placeholder mode (workloads=None) feeds the bench result through a
-    # minted-once path; rebuild the bench with workload_errors so
-    # ``is_fully_successful`` flips to False and the orchestrator trips
-    # the dead_end gauntlet for the child.
+    # K=1 keeps the test focused on the single-candidate partial-bench
+    # path; the K-way fan-out is exercised by the test_k_way_* group.
+    harness.config.coder_n_candidates = 1
+
     partial_bench = BenchmarkResult(
         median_latency_us=100.0,
         timed_runs=1,
@@ -403,12 +410,6 @@ async def test_dead_end_iteration_event_sequence(tmp_path, harness):
     fh = (tmp_path / "events.jsonl").open("w", buffering=1)
     events.bind(fh)
     try:
-        # The baseline bench uses the default (fully-successful) ``h.bench``
-        # via the patch below; the child bench reuses the same patch so
-        # every benchmark_kernel call returns the partial-failure result.
-        # Baseline's is_fully_successful path is computed *before* we check,
-        # so we need a branch to differ between baseline and child. Using
-        # patch side_effect = [baseline_ok, child_partial] gives us that.
         call_seq = [harness.bench, partial_bench]
 
         def next_bench(*_args, **_kwargs):
@@ -428,10 +429,9 @@ async def test_dead_end_iteration_event_sequence(tmp_path, harness):
         events.unbind()
         fh.close()
 
-    # Use strict JSON parsing to catch any Infinity/NaN tokens that
-    # would slip into events.jsonl — these break RFC-8259 consumers.
-    # Python's default ``json.loads`` allows Infinity; we force-reject
-    # it here to act as a regression guard.
+    # Strict JSON parser: Infinity/NaN tokens would break RFC-8259
+    # consumers; Python's default ``json.loads`` permits them, so we
+    # force-reject here as a regression guard.
     def _strict_loads(s: str):
         return json.loads(
             s,
@@ -444,21 +444,19 @@ async def test_dead_end_iteration_event_sequence(tmp_path, harness):
     records = [_strict_loads(line) for line in raw_lines]
     kinds = [r["kind"] for r in records]
 
-    # bench_done fires with is_fully_successful=False
-    bench_recs = [r for r in records if r["kind"] == "bench_done"]
-    assert any(r["is_fully_successful"] is False for r in bench_recs)
-    # Failed workload latencies are serialized as null, not ``Infinity``.
-    partial = next(r for r in bench_recs if r["is_fully_successful"] is False)
-    assert None in partial["per_workload_us"], partial["per_workload_us"]
-    # No score_computed or reviewer_feedback on the dead path
+    # Partial-bench failure surfaces as a per-candidate coder_failed event.
+    coder_failed = [r for r in records if r["kind"] == "coder_failed"]
+    assert len(coder_failed) == 1
+    assert coder_failed[0]["candidate_idx"] == 0
+    assert "partial bench failure" in coder_failed[0]["reason"]
+    assert "wl-1" in coder_failed[0]["reason"]
+    # No tree node was created, so no profile / score / reviewer.
     assert "score_computed" not in kinds
     assert "reviewer_feedback" not in kinds
-    # branch_dead_end comes before iter_end(dead_end)
-    dead_idx = kinds.index("branch_dead_end")
+    assert "branch_dead_end" not in kinds
+    # iter_end carries skipped (no winner emerged from the K candidates).
     end_idx = kinds.index("iter_end")
-    assert dead_idx < end_idx
-    assert records[end_idx]["outcome"] == "dead_end"
-    assert "reason" in records[dead_idx]
+    assert records[end_idx]["outcome"] == "skipped"
 
 
 @pytest.mark.asyncio
@@ -524,18 +522,21 @@ async def test_dump_node_called_on_committed_node(harness, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_dump_node_called_on_dead_end_with_dead_reason(harness, monkeypatch):
-    """Dead-end iterations now DO call ``tree_dump.dump_node`` so operators
+    """Dead-end iterations call ``tree_dump.dump_node`` so operators
     inspecting "why did node N die" find a meta.json with the kill reason.
 
-    The original Task-13 invariant (dead-ends do NOT dump) flipped when
-    Codex caught that ``finalize_tree`` indexes the dead-end node in
-    ``index.json`` while the per-node directory was missing — same node,
-    two truths. Dead-end dumps carry the categorical cause via
-    ``node.dead_reason`` (single source of truth across all DEAD_END
-    paths) and the kill-site prose via ``failure_detail``; on the
-    partial-bench path the reason is ``DeadReason.BENCH_FAILURE`` and
-    the detail describes the workload errors.
+    Under A2's K-way contract, candidate-level failures (bench, profile,
+    repr-latency-unavailable) are gated out before ``tree.add_child``,
+    so dead-end dumps now flow only from *winner-side* kills — i.e. the
+    channel-B reward-hack-confirmed path. This test exercises that
+    surviving ``_kill_branch`` site: the winner bench-succeeds and
+    profiles cleanly, but its SOL score trips ``reward_hack_suspect``
+    and the re-eval confirms the hack → ``_kill_branch(REWARD_HACK_CONFIRMED)``
+    → ``dump_node`` carrying ``dead_reason``.
     """
+    from unittest.mock import AsyncMock
+
+    from src.eval.scorer import ScoreResult
     from src.runtime import tree_dump
     from src.runtime.events import DeadReason
     from src.search.orchestrator import Orchestrator
@@ -552,20 +553,25 @@ async def test_dump_node_called_on_dead_end_with_dead_reason(harness, monkeypatc
 
     monkeypatch.setattr(tree_dump, "dump_node", spy)
 
-    partial_bench = BenchmarkResult(
-        median_latency_us=100.0,
-        timed_runs=1,
-        per_workload_latency_us={"wl-0": 100.0, "wl-1": float("inf")},
-        workload_errors={"wl-1": "launch failed"},
+    suspect_score = ScoreResult(
+        sol_score=0.99,
+        baseline_latency_us=100.0,
+        candidate_latency_us=40.0,
+        t_sol_us=50.0,
+        speedup=2.5,
+        reward_hack_suspect=True,
+        calibration_warning=False,
     )
-    call_seq = [harness.bench, partial_bench]
-
-    def next_bench(*_args, **_kwargs):
-        return call_seq.pop(0) if call_seq else partial_bench
 
     with (
-        patch("src.eval.benchmark.benchmark_kernel", side_effect=next_bench),
-        patch("src.eval.profiler.profile_kernel", MagicMock(return_value=_make_profile())),
+        patch("src.eval.benchmark.benchmark_kernel", return_value=harness.bench),
+        patch("src.eval.profiler.profile_kernel", return_value=_make_profile()),
+        patch("src.eval.scorer.compute_sol_score", return_value=suspect_score),
+        patch.object(
+            Orchestrator,
+            "_reward_hack_re_eval",
+            AsyncMock(return_value=False),  # confirmed hack
+        ),
     ):
         orch = Orchestrator(
             harness.config, harness.planner, harness.coder,
@@ -576,20 +582,12 @@ async def test_dump_node_called_on_dead_end_with_dead_reason(harness, monkeypatc
     # Filter to non-root: the orchestrator also dumps the baseline root
     # (id=0); this test asserts on the dead-end child dump.
     child_recs = [c for c in captured if c["id"] != 0]
-    # Exactly one dump_node call captured the dead-end node and carried
-    # the kill reason from _kill_branch through to dump_node.
     assert len(child_recs) == 1, child_recs
     rec = child_recs[0]
     assert rec["id"] == 1
     assert rec["iter_no"] == 1
-    # No profiling on the dead-end path → ncu_rep_src is None.
-    assert rec["ncu_rep_src"] is None
-    # dead_reason is set on the node by _kill_branch (replaces the old
-    # failure_reason kwarg, which duplicated dead_reason.value).
-    assert rec["dead_reason"] == DeadReason.BENCH_FAILURE
-    # detail is non-None (the orchestrator built a workload-errors string).
-    assert rec["failure_detail"] is not None
-    assert "wl-1" in rec["failure_detail"]
+    # dead_reason flows from _kill_branch → node.mark_dead.
+    assert rec["dead_reason"] == DeadReason.REWARD_HACK_CONFIRMED
 
 
 @pytest.mark.asyncio
@@ -874,11 +872,15 @@ async def test_sibling_context_rendered_fires_for_planner_and_reviewer(
 
     # max_depth=2 so a second iteration runs. Force select_next to always
     # return root so both iters spawn siblings off the same parent.
+    # coder_n_candidates=1 keeps the legacy single-Coder per-iter cardinality
+    # so the bench_seq below stays aligned (A2 K-way fan-out is tested
+    # separately in the test_k_way_* group).
     harness.config = ACTSConfig(
         hardware=_rtx6000_ada(),
         max_depth=2,
         beam_width=3,
         sol_plateau_window=99,
+        coder_n_candidates=1,
     )
 
     # Make iter 1's child regress against root so it qualifies as a
@@ -946,11 +948,15 @@ async def test_repeated_pathway_dead_end_fires_when_reviewer_judges_dead(
     Reviewer verdict is DEAD_END, ``repeated_pathway_dead_end`` fires."""
     from src.search import beam as _beam
 
+    # coder_n_candidates=1: A2 K-way fan-out is tested separately; this
+    # test targets the sibling-pathway gating logic and uses a fixed-length
+    # bench sequence.
     harness.config = ACTSConfig(
         hardware=_rtx6000_ada(),
         max_depth=2,
         beam_width=3,
         sol_plateau_window=99,
+        coder_n_candidates=1,
     )
     # Iter 2 reviewer judges DEAD_END.
     review_seq = [
@@ -1015,11 +1021,13 @@ async def test_repeated_pathway_dead_end_does_not_fire_without_sibling_match(
     differs from any regressed sibling (even when verdict == DEAD_END)."""
     from src.search import beam as _beam
 
+    # coder_n_candidates=1: A2 K-way fan-out is tested separately.
     harness.config = ACTSConfig(
         hardware=_rtx6000_ada(),
         max_depth=2,
         beam_width=3,
         sol_plateau_window=99,
+        coder_n_candidates=1,
     )
     # Different action per iter — iter 1 = "tiling", iter 2 = "fusion".
     plan_seq = [
@@ -1202,3 +1210,774 @@ async def test_reviewer_receives_render_condensed_source_call(tmp_path, harness)
     assert harness.reviewer.review.await_count >= 1
     for call in harness.reviewer.review.await_args_list:
         assert call.kwargs["kernel_source"] == sentinel
+
+
+# ── A2: _select_best_candidate (best-of-survivors) ────────────────────
+
+
+def test_select_best_candidate_picks_highest_sol_score():
+    """A2: best-of-survivors ranks by SOL Score, which (with fixed T_b
+    + T_SOL) maps monotonically to lower latency wins."""
+    from src.search.orchestrator import _select_best_candidate
+
+    spec = KernelSpec(name="t", kernel_type=KernelType.MATMUL)
+
+    # T_b = 100us, T_SOL = 50us. Lower T_k → higher SOL Score.
+    cand_a = (0, MagicMock(), Kernel(spec=spec, source_code="# a"),
+              BenchmarkResult(median_latency_us=90.0, timed_runs=1), None)
+    cand_b = (1, MagicMock(), Kernel(spec=spec, source_code="# b"),
+              BenchmarkResult(median_latency_us=70.0, timed_runs=1), None)
+    cand_c = (2, MagicMock(), Kernel(spec=spec, source_code="# c"),
+              BenchmarkResult(median_latency_us=80.0, timed_runs=1), None)
+
+    winner = _select_best_candidate(
+        [cand_a, cand_b, cand_c],
+        t_sol_us=50.0,
+        baseline_latency_us=100.0,
+    )
+    # Candidate B has the lowest latency → highest SOL Score → wins.
+    assert winner[0] == 1  # candidate_idx
+    assert winner[3].median_latency_us == 70.0  # bench result
+
+
+def test_select_best_candidate_tie_break_lowest_candidate_idx():
+    """A2: ties on SOL Score resolve to the lowest candidate_idx —
+    deterministic first-survivor rule independent of list order."""
+    from src.search.orchestrator import _select_best_candidate
+
+    spec = KernelSpec(name="t", kernel_type=KernelType.MATMUL)
+
+    cand_a = (0, MagicMock(), Kernel(spec=spec, source_code="# a"),
+              BenchmarkResult(median_latency_us=80.0, timed_runs=1), None)
+    cand_b = (1, MagicMock(), Kernel(spec=spec, source_code="# b"),
+              BenchmarkResult(median_latency_us=80.0, timed_runs=1), None)
+
+    # Iteration order shouldn't matter for the tie-break.
+    winner = _select_best_candidate(
+        [cand_b, cand_a],
+        t_sol_us=50.0,
+        baseline_latency_us=100.0,
+    )
+    assert winner[0] == 0
+
+
+def test_select_best_candidate_single_survivor_wins_trivially():
+    """A2 Q5a: single survivor (K-1 failed) becomes the winner even if
+    its SOL Score is below the baseline anchor."""
+    from src.search.orchestrator import _select_best_candidate
+
+    spec = KernelSpec(name="t", kernel_type=KernelType.MATMUL)
+    cand = (3, MagicMock(), Kernel(spec=spec, source_code="# only"),
+            BenchmarkResult(median_latency_us=200.0, timed_runs=1), None)
+
+    # T_k=200 > T_b=100 — score < 0.5; still wins as the only survivor.
+    winner = _select_best_candidate(
+        [cand],
+        t_sol_us=50.0,
+        baseline_latency_us=100.0,
+    )
+    assert winner[0] == 3
+
+
+def test_select_best_candidate_below_sol_ranks_by_speed():
+    """Codex review P2-A: when multiple candidates run below T_SOL,
+    the actual scorer returns distinct values > 1.0 for each (monotonic
+    in t_k). ``_select_best_candidate`` must rank by those true scores,
+    not clamp everyone to 1.0 — otherwise the lowest-idx tie-break
+    silently picks the slower below-SOL candidate.
+    """
+    from src.search.orchestrator import _select_best_candidate
+
+    spec = KernelSpec(name="t", kernel_type=KernelType.MATMUL)
+
+    # T_b = 100us, T_SOL = 50us. Both candidates are below T_SOL.
+    # cand_a (idx=0): T_k = 40us — score ≈ 50 / (40-50 + 50) = 1.25
+    # cand_b (idx=1): T_k = 20us — score ≈ 50 / (20-50 + 50) = 2.50
+    # cand_b is genuinely faster (lower latency, higher score).
+    # Under the buggy "below-SOL → 1.0" clamp, both tied at 1.0 and
+    # cand_a (lower idx) would have won.
+    cand_a = (0, MagicMock(), Kernel(spec=spec, source_code="# 40us"),
+              BenchmarkResult(median_latency_us=40.0, timed_runs=1), None)
+    cand_b = (1, MagicMock(), Kernel(spec=spec, source_code="# 20us"),
+              BenchmarkResult(median_latency_us=20.0, timed_runs=1), None)
+
+    winner = _select_best_candidate(
+        [cand_a, cand_b],
+        t_sol_us=50.0,
+        baseline_latency_us=100.0,
+    )
+    assert winner[0] == 1  # cand_b (20us) wins, not cand_a (40us)
+
+
+def test_select_best_candidate_calibration_warning_mirrors_scorer():
+    """Codex review #2: in the calibration-warning regime (T_b <= T_SOL,
+    baseline already at hardware bound), ``compute_sol_score`` returns
+    1.0 only for ``t_k <= t_sol`` and 0.0 otherwise — NOT 1.0 for all
+    survivors. ``_select_best_candidate`` must mirror this exactly so a
+    slow above-SOL candidate cannot tie with a below-SOL one and steal
+    the win via the lowest-idx tie-break.
+    """
+    from src.search.orchestrator import _select_best_candidate
+
+    spec = KernelSpec(name="t", kernel_type=KernelType.MATMUL)
+
+    # Calibration warning: baseline (50us) already at T_SOL (50us).
+    # cand_a (idx=0): T_k = 200us > T_SOL → scorer says 0.0
+    # cand_b (idx=1): T_k = 40us  <= T_SOL → scorer says 1.0
+    # Under the buggy "1.0 for everyone in calibration regime" branch,
+    # cand_a would win on lowest-idx tie-break. With the fix, cand_b
+    # wins because its score is genuinely higher.
+    cand_a = (0, MagicMock(), Kernel(spec=spec, source_code="# slow"),
+              BenchmarkResult(median_latency_us=200.0, timed_runs=1), None)
+    cand_b = (1, MagicMock(), Kernel(spec=spec, source_code="# below-sol"),
+              BenchmarkResult(median_latency_us=40.0, timed_runs=1), None)
+
+    winner = _select_best_candidate(
+        [cand_a, cand_b],
+        t_sol_us=50.0,
+        baseline_latency_us=50.0,  # T_b == T_SOL → calibration warning
+    )
+    assert winner[0] == 1  # cand_b wins (below-SOL, score=1.0)
+
+
+# ── A2: K-way Coder fan-out integration tests ─────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_k_way_gather_dispatches_k_coder_calls(tmp_path, harness):
+    """A2: orchestrator awaits coder.implement exactly K times per iter."""
+    harness.config.coder_n_candidates = 3
+    # K distinct outputs so survivors are distinguishable downstream.
+    outputs = [
+        KernelCodeOutput.model_construct(
+            source_code=f"# candidate {i}", triton_kernel_name="",
+        )
+        for i in range(3)
+    ]
+    harness.coder.implement = AsyncMock(side_effect=outputs)
+
+    await _run_orch(harness)
+
+    # max_depth=1 → exactly one iter → exactly K=3 implement awaits.
+    assert harness.coder.implement.await_count == 3
+
+
+@pytest.mark.asyncio
+async def test_k_way_best_of_survivors_selects_highest_sol_score(tmp_path, harness):
+    """A2: among K successful candidates, the lowest-latency one (highest
+    SOL Score) becomes the tree node."""
+    harness.config.coder_n_candidates = 3
+    outputs = [
+        KernelCodeOutput.model_construct(
+            source_code=f"# candidate {i}", triton_kernel_name="",
+        )
+        for i in range(3)
+    ]
+    harness.coder.implement = AsyncMock(side_effect=outputs)
+
+    # First bench is the baseline (consumed by orchestrator before the
+    # iter loop); the next three are the K candidates. Candidate 1 has
+    # the lowest latency → highest SOL Score → wins.
+    benches = [
+        BenchmarkResult(median_latency_us=200.0, timed_runs=1),  # baseline
+        BenchmarkResult(median_latency_us=90.0, timed_runs=1),
+        BenchmarkResult(median_latency_us=70.0, timed_runs=1),
+        BenchmarkResult(median_latency_us=85.0, timed_runs=1),
+    ]
+
+    from src.search.orchestrator import Orchestrator
+    fh = (tmp_path / "events.jsonl").open("w", buffering=1)
+    events.bind(fh)
+    try:
+        with (
+            patch("src.eval.benchmark.benchmark_kernel", side_effect=benches),
+            patch("src.eval.profiler.profile_kernel", return_value=_make_profile()),
+        ):
+            orch = Orchestrator(
+                harness.config, harness.planner, harness.coder,
+                harness.reviewer, harness.retriever,
+            )
+            result = await orch.run(
+                harness.baseline, workloads=None, roofline=harness.roofline,
+            )
+    finally:
+        events.unbind()
+        fh.close()
+
+    # Winner's source_code is candidate 1's.
+    best = result.tree.best_node()
+    assert best.kernel.source_code == "# candidate 1"
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "events.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    coder_rec = next(r for r in records if r["kind"] == "coder_submitted")
+    assert coder_rec["winner_candidate_idx"] == 1
+    assert coder_rec["n_candidates"] == 3
+    assert coder_rec["n_survivors"] == 3
+    # Happy path: fastest candidate profiled cleanly on the first try.
+    assert coder_rec["n_profile_attempts"] == 1
+
+
+@pytest.mark.asyncio
+async def test_k_way_all_fail_marks_iter_skipped(tmp_path, harness):
+    """A2: all K Coder calls raising ImplementationError → iter SKIPPED;
+    parent's consecutive_agent_failures increments; K coder_failed events
+    fire with distinct candidate_idx values."""
+    from src.agents.coder import ImplementationError
+    from src.search.orchestrator import Orchestrator
+
+    harness.config.coder_n_candidates = 3
+    harness.coder.implement = AsyncMock(side_effect=[
+        ImplementationError("compile failed: candidate 0"),
+        ImplementationError("correctness failed: candidate 1"),
+        ImplementationError("budget exhausted: candidate 2"),
+    ])
+
+    fh = (tmp_path / "events.jsonl").open("w", buffering=1)
+    events.bind(fh)
+    try:
+        with (
+            patch("src.eval.benchmark.benchmark_kernel", return_value=harness.bench),
+            patch("src.eval.profiler.profile_kernel", return_value=_make_profile()),
+        ):
+            orch = Orchestrator(
+                harness.config, harness.planner, harness.coder,
+                harness.reviewer, harness.retriever,
+            )
+            await orch.run(
+                harness.baseline, workloads=None, roofline=harness.roofline,
+            )
+    finally:
+        events.unbind()
+        fh.close()
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "events.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    # K coder_failed events with candidate_idx in {0, 1, 2}.
+    failed = [r for r in records if r["kind"] == "coder_failed"]
+    assert len(failed) == 3
+    assert sorted(r["candidate_idx"] for r in failed) == [0, 1, 2]
+    # iter_end carries skipped outcome.
+    iter_end = next(r for r in records if r["kind"] == "iter_end")
+    assert iter_end["outcome"] == "skipped"
+
+
+@pytest.mark.asyncio
+async def test_k_way_partial_failure_picks_surviving_winner(tmp_path, harness):
+    """A2: K-1 raise, 1 survives → survivor becomes the tree node and
+    K-1 coder_failed events fire with the failing indices."""
+    from src.agents.coder import ImplementationError
+    from src.search.orchestrator import Orchestrator
+
+    harness.config.coder_n_candidates = 3
+    survivor_output = KernelCodeOutput.model_construct(
+        source_code="# the only survivor", triton_kernel_name="",
+    )
+    harness.coder.implement = AsyncMock(side_effect=[
+        ImplementationError("compile failed: candidate 0"),
+        survivor_output,
+        ImplementationError("budget exhausted: candidate 2"),
+    ])
+
+    # Survivor's bench is faster than baseline so best_node prefers it
+    # over the root (root.score = 0.5 at baseline=baseline tie).
+    baseline_bench = BenchmarkResult(median_latency_us=200.0, timed_runs=1)
+    survivor_bench = BenchmarkResult(median_latency_us=80.0, timed_runs=1)
+
+    fh = (tmp_path / "events.jsonl").open("w", buffering=1)
+    events.bind(fh)
+    try:
+        with (
+            patch(
+                "src.eval.benchmark.benchmark_kernel",
+                side_effect=[baseline_bench, survivor_bench],
+            ),
+            patch("src.eval.profiler.profile_kernel", return_value=_make_profile()),
+        ):
+            orch = Orchestrator(
+                harness.config, harness.planner, harness.coder,
+                harness.reviewer, harness.retriever,
+            )
+            result = await orch.run(
+                harness.baseline, workloads=None, roofline=harness.roofline,
+            )
+    finally:
+        events.unbind()
+        fh.close()
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "events.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    failed = [r for r in records if r["kind"] == "coder_failed"]
+    assert len(failed) == 2
+    assert sorted(r["candidate_idx"] for r in failed) == [0, 2]
+    best = result.tree.best_node()
+    assert best.kernel.source_code == "# the only survivor"
+    # The surviving candidate (idx=1) is recorded as winner.
+    coder_rec = next(r for r in records if r["kind"] == "coder_submitted")
+    assert coder_rec["winner_candidate_idx"] == 1
+    assert coder_rec["n_survivors"] == 1
+
+
+@pytest.mark.asyncio
+async def test_k_way_profile_failure_falls_back_to_next_ranked(tmp_path, harness):
+    """Codex review #1: when the fastest candidate is unprofileable
+    (ProfilerError on the rank-1 candidate), the orchestrator falls back
+    to the next-ranked instead of killing the iter. The slower-but-
+    profileable candidate becomes the iter's winner and the iter
+    advances. The failed candidate emits ``coder_failed`` with the
+    profile-error reason for postmortem.
+    """
+    from src.eval.profiler import ProfilerError
+    from src.search.orchestrator import Orchestrator
+
+    harness.config.coder_n_candidates = 2
+    outputs = [
+        KernelCodeOutput.model_construct(
+            source_code=f"# candidate {i}", triton_kernel_name="",
+        )
+        for i in range(2)
+    ]
+    harness.coder.implement = AsyncMock(side_effect=outputs)
+
+    # Candidate 0 is fastest (would normally win the SOL-Score rank);
+    # candidate 1 is slower but profileable.
+    benches = [
+        BenchmarkResult(median_latency_us=200.0, timed_runs=1),  # baseline
+        BenchmarkResult(median_latency_us=60.0, timed_runs=1),   # cand 0
+        BenchmarkResult(median_latency_us=80.0, timed_runs=1),   # cand 1
+    ]
+
+    # profile_kernel raises on candidate 0 (the rank-1 pick) and returns
+    # a valid result for candidate 1 (the fall-back winner).
+    profile_calls = {"n": 0}
+
+    def profile_side_effect(*args, **kwargs):
+        profile_calls["n"] += 1
+        if profile_calls["n"] == 1:
+            raise ProfilerError("zero analytical latency")
+        return _make_profile()
+
+    fh = (tmp_path / "events.jsonl").open("w", buffering=1)
+    events.bind(fh)
+    try:
+        with (
+            patch("src.eval.benchmark.benchmark_kernel", side_effect=benches),
+            patch("src.eval.profiler.profile_kernel", side_effect=profile_side_effect),
+        ):
+            orch = Orchestrator(
+                harness.config, harness.planner, harness.coder,
+                harness.reviewer, harness.retriever,
+            )
+            result = await orch.run(
+                harness.baseline, workloads=None, roofline=harness.roofline,
+            )
+    finally:
+        events.unbind()
+        fh.close()
+
+    # Profile attempted twice — once on cand 0 (fastest, fails), once
+    # on cand 1 (slower, succeeds).
+    assert profile_calls["n"] == 2
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "events.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+
+    # Fall-back path emits per-candidate coder_failed for the rank-1
+    # candidate that profile-killed.
+    coder_failed = [r for r in records if r["kind"] == "coder_failed"]
+    assert len(coder_failed) == 1
+    assert coder_failed[0]["candidate_idx"] == 0
+    assert "profile error" in coder_failed[0]["reason"]
+
+    # Winner is candidate 1 (the slower but profileable survivor).
+    coder_rec = next(r for r in records if r["kind"] == "coder_submitted")
+    assert coder_rec["winner_candidate_idx"] == 1
+    # n_profile_attempts == 2 — cand 0 profile-failed and we fell back
+    # to cand 1, which succeeded.
+    assert coder_rec["n_profile_attempts"] == 2
+    best = result.tree.best_node()
+    assert best.kernel.source_code == "# candidate 1"
+
+
+@pytest.mark.asyncio
+async def test_k_way_all_profile_fail_marks_iter_skipped(tmp_path, harness):
+    """Codex review #1: when every K candidate is unprofileable, the
+    iter SKIPS without bumping ``consecutive_agent_failures`` (profile
+    errors are infra, not agent fault — matches the legacy single-Coder
+    ``_kill_branch(PROFILER_ERROR, bumps_agent_failures=False)``).
+    """
+    from src.eval.profiler import ProfilerError
+    from src.search.orchestrator import Orchestrator
+    from src.search.tree import QUARANTINE_THRESHOLD
+
+    harness.config.coder_n_candidates = 2
+    outputs = [
+        KernelCodeOutput.model_construct(
+            source_code=f"# candidate {i}", triton_kernel_name="",
+        )
+        for i in range(2)
+    ]
+    harness.coder.implement = AsyncMock(side_effect=outputs)
+
+    fh = (tmp_path / "events.jsonl").open("w", buffering=1)
+    events.bind(fh)
+    try:
+        with (
+            patch("src.eval.benchmark.benchmark_kernel", return_value=harness.bench),
+            patch(
+                "src.eval.profiler.profile_kernel",
+                side_effect=ProfilerError("zero analytical latency"),
+            ),
+        ):
+            orch = Orchestrator(
+                harness.config, harness.planner, harness.coder,
+                harness.reviewer, harness.retriever,
+            )
+            result = await orch.run(
+                harness.baseline, workloads=None, roofline=harness.roofline,
+            )
+    finally:
+        events.unbind()
+        fh.close()
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "events.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    # Both candidates emit coder_failed for profile error.
+    coder_failed = [r for r in records if r["kind"] == "coder_failed"]
+    assert len(coder_failed) == 2
+    assert sorted(r["candidate_idx"] for r in coder_failed) == [0, 1]
+    # iter_end SKIPPED.
+    end = next(r for r in records if r["kind"] == "iter_end")
+    assert end["outcome"] == "skipped"
+    # Root's quarantine counter is NOT bumped (infra failures don't
+    # quarantine the parent).
+    assert result.tree.get_node(0).consecutive_agent_failures < QUARANTINE_THRESHOLD
+
+
+@pytest.mark.asyncio
+async def test_k_way_channel_a_reward_hack_aborts_iter_no_sibling_fallback(
+    tmp_path, harness,
+):
+    """Codex review P1: when one of the K candidates raises
+    ``RewardHackDetected`` during its bench, the iter aborts
+    immediately — *no* earlier-benched sibling gets profiled or
+    committed. ``per_iter_anti_cheat`` detects monkey-patching but does
+    not restore the patched primitives, so any further work in the iter
+    runs against a tainted process. The legacy K-way design (continue
+    to next sibling) was unsafe; this test pins the corrected semantic.
+    """
+    from src.search.orchestrator import Orchestrator
+    from sol_execbench.core.bench.reward_hack import RewardHackDetected
+
+    harness.config.coder_n_candidates = 3
+    outputs = [
+        KernelCodeOutput.model_construct(
+            source_code=f"# candidate {i}", triton_kernel_name="",
+        )
+        for i in range(3)
+    ]
+    harness.coder.implement = AsyncMock(side_effect=outputs)
+
+    # Candidate 0 + 1 bench cleanly; candidate 2 raises RewardHackDetected.
+    # Without the abort, candidates 0/1 are still in bench_results and
+    # one of them would be profiled + committed.
+    baseline_bench = BenchmarkResult(median_latency_us=200.0, timed_runs=1)
+    clean_bench_a = BenchmarkResult(median_latency_us=80.0, timed_runs=1)
+    clean_bench_b = BenchmarkResult(median_latency_us=90.0, timed_runs=1)
+
+    def bench_side_effect(*args, **kwargs):
+        return bench_seq.pop(0)
+
+    bench_seq = [baseline_bench, clean_bench_a, clean_bench_b]
+
+    def bench_then_hack(*args, **kwargs):
+        if bench_seq:
+            return bench_seq.pop(0)
+        raise RewardHackDetected(
+            "candidate 2 monkey-patched torch.cuda.Event.elapsed_time",
+        )
+
+    fh = (tmp_path / "events.jsonl").open("w", buffering=1)
+    events.bind(fh)
+    try:
+        with (
+            patch("src.eval.benchmark.benchmark_kernel", side_effect=bench_then_hack),
+            patch("src.eval.profiler.profile_kernel", return_value=_make_profile()),
+        ):
+            orch = Orchestrator(
+                harness.config, harness.planner, harness.coder,
+                harness.reviewer, harness.retriever,
+            )
+            result = await orch.run(
+                harness.baseline, workloads=None, roofline=harness.roofline,
+            )
+    finally:
+        events.unbind()
+        fh.close()
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "events.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    # Dedicated channel-A event fires for the cheating candidate.
+    rh_detected = [r for r in records if r["kind"] == "reward_hack_detected"]
+    assert len(rh_detected) == 1
+    assert rh_detected[0]["candidate_idx"] == 2
+
+    # CRITICAL: no tree node is added for the iter. The earlier clean-
+    # benched siblings (cand 0, 1) are NOT promoted under a tainted
+    # process. ``best_node()`` falls back to root.
+    children = [n for n in result.tree._nodes.values() if n.parent_id is not None]
+    assert children == []
+    assert result.best_node.id == 0  # root
+
+    # iter_end SKIPPED. RewardHackDetected is agent-fault so the
+    # parent's quarantine counter bumps.
+    end = next(r for r in records if r["kind"] == "iter_end")
+    assert end["outcome"] == "skipped"
+    assert result.tree.get_node(0).consecutive_agent_failures >= 1
+
+
+@pytest.mark.asyncio
+async def test_k_way_partial_coder_success_resets_quarantine_counter(tmp_path, harness):
+    """Partial Coder success (some K candidates fail agent-side, at least
+    one succeeds) is "any Coder success" and clears the parent's
+    quarantine counter even when downstream bench fails infra-only.
+    The pre-K-way semantic was "Coder success → reset"; under K-way at
+    T=1.0, partial success is the *expected* case (LLM decoder variance),
+    not the exception. Mirror it.
+
+    Sequence: iter 1 planner fails → counter=1.
+    iter 2: K=2 Coder calls — one ImplementationError, one succeeds; the
+    survivor reaches bench then bench infra-fails → counter must reset
+    to 0 (not stay at 1 or bump to 2).
+    iter 3: planner fails → counter=1 (not 2), parent stays eligible.
+    """
+    from src.agents.coder import ImplementationError
+    from src.agents.planner import PlanningError
+    from src.eval.benchmark import BenchmarkError, BenchmarkResult
+    from src.search.orchestrator import Orchestrator
+    from src.search.tree import QUARANTINE_THRESHOLD
+
+    harness.config.coder_n_candidates = 2
+    harness.config.max_depth = 3
+    # K=2 per iter: 1 agent-fail, 1 succeed. Repeat across iters that
+    # reach the Coder phase.
+    success_output = KernelCodeOutput.model_construct(
+        source_code="# child", triton_kernel_name="",
+    )
+    harness.coder.implement = AsyncMock(side_effect=[
+        # iter 2 (iter 1 fails at planner):
+        ImplementationError("turn budget"), success_output,
+        # iter 3 (planner fails again, no Coder calls)
+    ])
+    plan_seq = [
+        PlanningError("turn budget exhausted"),
+        OptimizationPlan(
+            tier=1, technique="tiling", params={}, target_region="",
+            rationale="r",
+        ),
+        PlanningError("turn budget exhausted"),
+    ]
+    harness.planner.plan = AsyncMock(side_effect=plan_seq)
+
+    baseline_bench = BenchmarkResult(median_latency_us=100.0, timed_runs=1)
+
+    def bench_side_effect(*args, **kwargs):
+        if bench_seq:
+            return bench_seq.pop(0)
+        raise BenchmarkError("0/3 workloads survived")
+
+    bench_seq = [baseline_bench]  # baseline only
+
+    with (
+        patch("src.eval.benchmark.benchmark_kernel", side_effect=bench_side_effect),
+        patch("src.eval.profiler.profile_kernel", return_value=_make_profile()),
+    ):
+        orch = Orchestrator(
+            harness.config, harness.planner, harness.coder,
+            harness.reviewer, harness.retriever,
+        )
+        result = await orch.run(
+            harness.baseline, workloads=None, roofline=harness.roofline,
+        )
+
+    # Counter shouldn't reach QUARANTINE_THRESHOLD: iter 2's partial
+    # Coder success resets to 0 even though one of the 2 K calls failed
+    # agent-side; iter 3's planner failure bumps back to 1, not 2.
+    root_counter = result.tree.get_node(0).consecutive_agent_failures
+    assert root_counter < QUARANTINE_THRESHOLD, (
+        f"partial Coder success must reset quarantine counter even when "
+        f"K-1 candidates failed agent-side; counter={root_counter}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_k_way_infra_only_skip_resets_quarantine_counter(tmp_path, harness):
+    """Codex review P2-B: when an iter SKIPS because every K candidate
+    failed for *infra* reasons (bench/profile), the parent's
+    ``consecutive_agent_failures`` counter resets to 0 — mirroring the
+    pre-K-way single-Coder semantic of clearing the counter the moment
+    valid Coder output is committed to the tree.
+
+    Multi-iter sequence pinned here:
+      iter 1: planner raises → counter = 1 (agent fault)
+      iter 2: Coder produces K valid candidates → all fail bench (infra)
+              → counter resets to 0 (not stuck at 1)
+      iter 3: planner raises again → counter = 1 (NOT 2, so the parent
+              is NOT pre-emptively quarantined)
+    """
+    from src.agents.planner import PlanningError
+    from src.eval.benchmark import BenchmarkError, BenchmarkResult
+    from src.search.orchestrator import Orchestrator
+    from src.search.tree import QUARANTINE_THRESHOLD
+
+    harness.config.coder_n_candidates = 2
+    harness.config.max_depth = 3
+    harness.coder.implement = AsyncMock(
+        return_value=KernelCodeOutput.model_construct(
+            source_code="# child", triton_kernel_name="",
+        )
+    )
+    # iter 1: planner fault. iter 2: planner success. iter 3: planner fault.
+    plan_seq = [
+        PlanningError("turn budget exhausted"),
+        OptimizationPlan(
+            tier=1, technique="tiling", params={}, target_region="",
+            rationale="r",
+        ),
+        PlanningError("turn budget exhausted"),
+    ]
+    harness.planner.plan = AsyncMock(side_effect=plan_seq)
+
+    baseline_bench = BenchmarkResult(median_latency_us=100.0, timed_runs=1)
+
+    def bench_side_effect(*args, **kwargs):
+        if bench_seq:
+            return bench_seq.pop(0)
+        raise BenchmarkError("0/3 workloads survived")
+
+    bench_seq = [baseline_bench]  # baseline only; child benches raise
+
+    with (
+        patch("src.eval.benchmark.benchmark_kernel", side_effect=bench_side_effect),
+        patch("src.eval.profiler.profile_kernel", return_value=_make_profile()),
+    ):
+        orch = Orchestrator(
+            harness.config, harness.planner, harness.coder,
+            harness.reviewer, harness.retriever,
+        )
+        result = await orch.run(
+            harness.baseline, workloads=None, roofline=harness.roofline,
+        )
+
+    # If P2-B is buggy: iter 1 bumps to 1, iter 2 leaves at 1, iter 3
+    # bumps to 2 = QUARANTINE_THRESHOLD → root quarantined → ALL_DEAD_END
+    # and counter ends at 2. With the fix: iter 2's infra-only skip
+    # resets to 0, iter 3 bumps back to 1 → no quarantine.
+    root_counter = result.tree.get_node(0).consecutive_agent_failures
+    assert root_counter < QUARANTINE_THRESHOLD, (
+        f"root quarantine counter must not reach QUARANTINE_THRESHOLD "
+        f"when only one agent failure precedes the final iter; got {root_counter}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_k_way_per_candidate_trace_span_per_call(tmp_path, harness, monkeypatch):
+    """Codex review P3: under K-way fan-out, each ``coder.implement`` call
+    runs inside its own ``trace_span`` so the agents SDK trace closes K
+    times per iter and ``UsageAccumulator.invocations`` ticks K times.
+    A single outer ``trace_span`` would close once and underreport the
+    coder call count by K× in ``usage.json`` and the cost report.
+    """
+    from src.runtime.usage import AgentLabel
+    from src.search import orchestrator as orch
+
+    harness.config.coder_n_candidates = 3
+    outputs = [
+        KernelCodeOutput.model_construct(
+            source_code=f"# candidate {i}", triton_kernel_name="",
+        )
+        for i in range(3)
+    ]
+    harness.coder.implement = AsyncMock(side_effect=outputs)
+
+    coder_trace_calls: list[dict] = []
+    real = orch.trace_span
+
+    def spy(workflow_name, *, iter_no, agent, **extra):
+        # Capture all coder-agent trace_span invocations so we can count
+        # them. The agents-SDK contextvar plumbing is exercised by the
+        # real `trace_span` underneath.
+        if agent == AgentLabel.CODER:
+            coder_trace_calls.append({
+                "workflow": workflow_name, "iter": iter_no,
+                "candidate_idx": extra.get("candidate_idx"),
+            })
+        return real(workflow_name, iter_no=iter_no, agent=agent, **extra)
+
+    monkeypatch.setattr(orch, "trace_span", spy)
+    await _run_orch(harness)
+
+    # K=3 coder.implement calls in iter 1 → 3 trace_span entries, each
+    # carrying a distinct candidate_idx in {0, 1, 2}.
+    assert len(coder_trace_calls) == 3
+    assert sorted(c["candidate_idx"] for c in coder_trace_calls) == [0, 1, 2]
+    assert all(c["iter"] == 1 for c in coder_trace_calls)
+
+
+@pytest.mark.asyncio
+async def test_k_way_per_candidate_anti_cheat_scopes_isolated(tmp_path, harness):
+    """A2 + Codex finding #1: each surviving candidate enters its own
+    per_iter_anti_cheat context (not one shared snapshot for all K)."""
+    from contextlib import contextmanager
+    from src.search.orchestrator import Orchestrator
+
+    harness.config.coder_n_candidates = 3
+    outputs = [
+        KernelCodeOutput.model_construct(
+            source_code=f"# candidate {i}", triton_kernel_name="",
+        )
+        for i in range(3)
+    ]
+    harness.coder.implement = AsyncMock(side_effect=outputs)
+
+    enter_count = {"n": 0}
+
+    @contextmanager
+    def _spy_anti_cheat(critical_names):
+        enter_count["n"] += 1
+        yield MagicMock(snapshot={}, namespace={}, threads_before=0)
+
+    with (
+        patch("src.eval.benchmark.benchmark_kernel", return_value=harness.bench),
+        patch("src.eval.profiler.profile_kernel", return_value=_make_profile()),
+        patch("src.eval.anti_cheat.per_iter_anti_cheat", _spy_anti_cheat),
+    ):
+        orch = Orchestrator(
+            harness.config, harness.planner, harness.coder,
+            harness.reviewer, harness.retriever,
+        )
+        await orch.run(
+            harness.baseline, workloads=None, roofline=harness.roofline,
+        )
+
+    # K=3 candidates → 3 separate per_iter_anti_cheat entries (one per
+    # candidate's per_iter bench, not one shared for all K).
+    assert enter_count["n"] == 3

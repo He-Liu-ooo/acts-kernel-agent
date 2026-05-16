@@ -7,6 +7,7 @@ The Coder's compile/correctness tools handle self-correction internally.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 from dataclasses import dataclass
@@ -119,6 +120,36 @@ def _record_autotune_winner(
     """Copy per-workload autotune winners from BenchmarkResult onto kernel."""
     if bench_result.autotune_winner_per_workload:
         kernel.autotune_winner = bench_result.autotune_winner_per_workload
+
+
+def _select_best_candidate(
+    bench_results: list[tuple[int, Any, "Kernel", "BenchmarkResult", Any]],
+    *,
+    t_sol_us: float,
+    baseline_latency_us: float,
+) -> tuple[int, Any, "Kernel", "BenchmarkResult", Any]:
+    """Pick the highest-SOL-Score entry from *bench_results*.
+
+    Each entry is ``(candidate_idx, coder_output, child_kernel, bench,
+    autotuner)``. Ranks by ``sol_execbench.sol_score.sol_score`` (the
+    same formula ``compute_sol_score`` uses downstream — singularity
+    and below-SOL > 1.0 behavior preserved); tie-break is lowest
+    ``candidate_idx`` for deterministic first-survivor selection.
+    """
+    from sol_execbench.sol_score import sol_score as _sol_score
+
+    def _sort_key(entry):
+        cand_idx, _coder_out, _kernel, bench, _autotuner = entry
+        # µs → ms; the unit factor cancels in both regimes so ranking
+        # is unchanged relative to a µs-native formula.
+        score = _sol_score(
+            t_k=bench.median_latency_us / 1000.0,
+            t_p=baseline_latency_us / 1000.0,
+            t_sol=t_sol_us / 1000.0,
+        )
+        return (-score, cand_idx)
+
+    return min(bench_results, key=_sort_key)
 
 
 class TerminationReason(str, Enum):
@@ -771,19 +802,26 @@ class Orchestrator:
                 rationale_short=plan.rationale[:120],
             )
 
-            # Coder (with tools for self-correction). `kernel_spec` /
-            # `reference_fn` / `input_generators` are threaded into the
-            # compile + correctness tools the Coder binds per call — the
-            # full generator list so cross-workload bugs surface in-turn.
-            # Coder failure (turn-budget exhaustion, transient retry
-            # exhaustion, missing submit_kernel call) is branch-local:
-            # skip this iteration without adding a tree node and let the
-            # next select_next pick a different parent. The full search
-            # run survives one Coder hiccup the way it survives one
-            # branch's benchmark crash.
-            try:
-                with trace_span("acts_iter", iter_no=iter_no, agent=AgentLabel.CODER):
-                    coder_output = await self._coder.implement(
+            # K-way Coder fan-out: K parallel ``coder.implement`` calls
+            # via ``asyncio.gather``. Decoder diversity at the forced
+            # T=1.0 (configs/models/deepseek.json) produces variance —
+            # no prompt perturbation, no per-call temperature schedule.
+            # Per-candidate failures emit ``coder_failed`` with
+            # ``candidate_idx`` and skip to the next candidate; all-K
+            # failure marks the iter SKIPPED. The best-of-survivors
+            # (highest SOL Score; tie-break lowest candidate_idx)
+            # becomes the tree node — losers are not added to the tree.
+            K = self._config.coder_n_candidates
+
+            async def _run_one_coder(_cand_idx: int):
+                # Per-call trace_span so ``UsageAccumulator.invocations``
+                # ticks K times per iter (a single outer span would close
+                # once and underreport call count by K× in usage.json).
+                with trace_span(
+                    "acts_iter", iter_no=iter_no, agent=AgentLabel.CODER,
+                    candidate_idx=_cand_idx,
+                ):
+                    return await self._coder.implement(
                         kernel_source=parent.kernel.source_code,
                         plan=plan,
                         kernel_spec=baseline.spec,
@@ -792,31 +830,292 @@ class Orchestrator:
                         definition=definition,
                         workloads=workloads,
                     )
-            except ImplementationError as exc:
+
+            candidate_results = await asyncio.gather(
+                *[_run_one_coder(i) for i in range(K)],
+                return_exceptions=True,
+            )
+
+            # ``agent_failure_count`` tracks ImplementationError +
+            # RewardHackDetected (agent-fault reasons that should bump
+            # the parent's quarantine counter). Infra failures don't
+            # count — they aren't the parent's fault.
+            survivors: list[tuple[int, Any]] = []
+            agent_failure_count = 0
+            for cand_idx, result in enumerate(candidate_results):
+                if isinstance(result, ImplementationError):
+                    agent_failure_count += 1
+                    emit(
+                        "coder_failed",
+                        iter=iter_no,
+                        candidate_idx=cand_idx,
+                        reason=str(result)[:200],
+                    )
+                elif isinstance(result, BaseException):
+                    # Unexpected exception class — re-raise so the crash
+                    # surfaces. Trade-off: later enumerate entries (both
+                    # ImplementationErrors and successful outputs) are
+                    # lost from this iter's event log; the crash is the
+                    # priority signal.
+                    raise result
+                else:
+                    survivors.append((cand_idx, result))
+
+            if not survivors:
                 logger.warning(
-                    "Iteration %d: Coder failed (%s) — skipping iteration",
-                    iter_no, exc,
+                    "Iteration %d: all %d Coder candidates failed — skipping",
+                    iter_no, K,
                 )
-                # See planner_failed branch above for the quarantine rationale.
-                parent.consecutive_agent_failures += 1
-                emit("coder_failed", iter=iter_no, reason=str(exc)[:200])
+                if agent_failure_count > 0:
+                    parent.consecutive_agent_failures += 1
                 emit("iter_end", iter=iter_no, outcome=ITER_SKIPPED)
                 epsilon = max(self._config.epsilon_end, epsilon - decay)
                 continue
-            emit("coder_submitted", iter=iter_no)
-            new_source = coder_output.source_code
 
-            # Build child kernel — carry the Coder's declared
-            # ``triton_kernel_name`` so the profiler skips the regex
-            # fallback and filters NCU on the symbol the Coder named.
-            # ``dps`` is threaded so DPS kernels see the pre-allocated
-            # output buffers in the benchmark + correctness paths.
-            child_kernel = Kernel(
-                spec=baseline.spec,
-                source_code=new_source,
-                triton_kernel_name=coder_output.triton_kernel_name,
-                dps=getattr(coder_output, "dps", False),
+            # Per-survivor: sequential anti-cheat + precompile + bench.
+            # Anti-cheat scope is per-candidate (Q4) so a monkey-patch by
+            # one sibling can't taint the others. A channel-A
+            # ``RewardHackDetected`` aborts the iter (no sibling
+            # fallback): ``per_iter_anti_cheat`` is a detector, not a
+            # restorer, so the process state may stay tainted and
+            # profiling any later candidate would compound the taint.
+            # (Restoring state explicitly is JOURNAL'd tech-debt.)
+            bench_results: list[tuple[int, Any, Kernel, Any, Any]] = []
+            iter_tainted_by_hack = False
+            for cand_idx, cand_output in survivors:
+                cand_kernel = Kernel(
+                    spec=baseline.spec,
+                    source_code=cand_output.source_code,
+                    triton_kernel_name=cand_output.triton_kernel_name,
+                    dps=getattr(cand_output, "dps", False),
+                )
+                try:
+                    # Precompile must run inside per_iter_anti_cheat so
+                    # candidate-source import-time side effects register
+                    # as drift (not as the new baseline).
+                    with per_iter_anti_cheat(self._config.anti_cheat_critical_names):
+                        cand_compiled_fn, cand_autotuner = _safe_precompile(
+                            cand_kernel, role="Child",
+                        )
+                        cand_bench = benchmark_kernel(
+                            cand_kernel,
+                            self._config,
+                            workloads=workloads,
+                            input_generators=input_generators,
+                            definition=definition,
+                            kernel_fn=cand_compiled_fn,
+                            autotuner=cand_autotuner,
+                        )
+                    check_lazy_outputs_after_bench(cand_bench.last_outputs)
+                    cand_bench.last_outputs.clear()
+                except RewardHackDetected as exc:
+                    # Agent-fault + process tainted: abort the iter
+                    # (no sibling fallback). The dedicated
+                    # ``reward_hack_detected`` event preserves the
+                    # channel-A trust-boundary signal for telemetry
+                    # consumers; ``coder_failed`` runs alongside for
+                    # the all-failures bookkeeping.
+                    agent_failure_count += 1
+                    iter_tainted_by_hack = True
+                    emit(
+                        "reward_hack_detected",
+                        iter=iter_no,
+                        candidate_idx=cand_idx,
+                        reason=str(exc)[:200],
+                    )
+                    emit(
+                        "coder_failed",
+                        iter=iter_no,
+                        candidate_idx=cand_idx,
+                        reason=f"reward-hack: {str(exc)[:180]}",
+                    )
+                    break
+                except BenchmarkError as exc:
+                    emit(
+                        "coder_failed",
+                        iter=iter_no,
+                        candidate_idx=cand_idx,
+                        reason=str(exc)[:200],
+                    )
+                    continue
+                except RuntimeError as exc:
+                    msg = str(exc)
+                    msg_lower = msg.lower()
+                    if not any(p in msg_lower for p in _CUDA_STICKY_PATTERNS):
+                        raise
+                    try:
+                        import torch
+                        torch.cuda.synchronize()
+                        consecutive_cuda_errors = 0
+                    except Exception:
+                        consecutive_cuda_errors += 1
+                        if consecutive_cuda_errors >= 3:
+                            raise CUDAContextPoisoned(
+                                f"3+ consecutive cuda.synchronize() failures: {exc}"
+                            ) from exc
+                    emit(
+                        "coder_failed",
+                        iter=iter_no,
+                        candidate_idx=cand_idx,
+                        reason=f"CUDA sticky-state: {msg[:160]}",
+                    )
+                    continue
+
+                if not cand_bench.is_fully_successful:
+                    # Partial-workload failure: downstream profile/score
+                    # require fully_successful, so the candidate cannot
+                    # become a winner. Treat as per-candidate infra
+                    # failure (no quarantine bump).
+                    emit(
+                        "coder_failed",
+                        iter=iter_no,
+                        candidate_idx=cand_idx,
+                        reason=(
+                            f"partial bench failure: {cand_bench.workload_errors}"
+                        )[:200],
+                    )
+                    continue
+
+                bench_results.append(
+                    (cand_idx, cand_output, cand_kernel, cand_bench, cand_autotuner)
+                )
+                consecutive_cuda_errors = 0
+
+            if iter_tainted_by_hack:
+                # Bench loop broke on the first detection — earlier
+                # siblings' bench_results were collected before the
+                # patch tripped on a later sibling, but they may already
+                # have read patched primitives; profile would compound
+                # the taint.
+                logger.warning(
+                    "Iteration %d: channel-A reward-hack detected — "
+                    "aborting iter (process state may be tainted).",
+                    iter_no,
+                )
+                parent.consecutive_agent_failures += 1
+                emit("iter_end", iter=iter_no, outcome=ITER_SKIPPED)
+                epsilon = max(self._config.epsilon_end, epsilon - decay)
+                continue
+
+            if not bench_results:
+                logger.warning(
+                    "Iteration %d: all %d Coder candidates failed bench — skipping",
+                    iter_no, K,
+                )
+                # ``survivors`` was non-empty (gated above), so at least
+                # one Coder produced output → parent is productive.
+                # Clear quarantine even if K-1 siblings failed agent-side
+                # (stochastic decoder variance at T=1.0, not the
+                # parent's fault).
+                parent.consecutive_agent_failures = 0
+                emit("iter_end", iter=iter_no, outcome=ITER_SKIPPED)
+                epsilon = max(self._config.epsilon_end, epsilon - decay)
+                continue
+
+            # Rank-and-fallback winner selection. The fastest
+            # bench-successful candidate may be unprofileable; if it
+            # entered the tree pre-profile, a single ProfilerError
+            # would kill the whole iter even when K-1 valid siblings
+            # exist — defeating K-way's reliability. Iterate candidates
+            # in SOL-Score order (highest first; tie-break lowest idx),
+            # profile each, commit only the first profile-success.
+            # Channel-B reward-hack on the winner still kills the iter
+            # without fallback (rare; agent-fault).
+            profile_blob_roots = _resolve_blob_roots(
+                self._config.safetensors_blob_roots,
+                problem_definition_path,
             )
+            remaining = list(bench_results)
+            winner_idx = None
+            coder_output = None
+            child_kernel = None
+            bench = None
+            _child_autotuner = None
+            profiling = None
+            repr_workload_latency_s = None
+            # 1-indexed rank of the profile-success winner; surfaced in
+            # ``coder_submitted.n_profile_attempts`` as a companion to
+            # ``n_survivors`` (bench-survivors, not profile-survivors).
+            profile_attempts = 0
+
+            while remaining:
+                entry = _select_best_candidate(
+                    remaining,
+                    t_sol_us=roofline.t_sol_us,
+                    baseline_latency_us=baseline_bench.median_latency_us,
+                )
+                e_idx, e_coder_output, e_kernel, e_bench, e_autotuner = entry
+                remaining = [e for e in remaining if e[0] != e_idx]
+                profile_attempts += 1
+
+                e_repr_lat_s = _representative_latency_s(
+                    e_bench, workloads, repr_idx,
+                )
+                if e_repr_lat_s is None:
+                    logger.warning(
+                        "Iteration %d: candidate %d representative workload "
+                        "latency unavailable — falling back to next-ranked",
+                        iter_no, e_idx,
+                    )
+                    emit(
+                        "coder_failed",
+                        iter=iter_no,
+                        candidate_idx=e_idx,
+                        reason="representative workload latency unavailable",
+                    )
+                    continue
+
+                try:
+                    e_profiling = profile_kernel(
+                        e_kernel,
+                        repr_workload_axes,
+                        repr_input_generator,
+                        hardware_spec=self._config.hardware,
+                        flops=iter_flops,
+                        nbytes=iter_nbytes,
+                        latency_s=e_repr_lat_s,
+                        problem_definition_path=problem_definition_path,
+                        blob_roots=profile_blob_roots,
+                    )
+                except ProfilerError as exc:
+                    logger.warning(
+                        "Iteration %d: candidate %d profile failed (%s) — "
+                        "falling back to next-ranked",
+                        iter_no, e_idx, exc,
+                    )
+                    emit(
+                        "coder_failed",
+                        iter=iter_no,
+                        candidate_idx=e_idx,
+                        reason=f"profile error: {str(exc)[:180]}",
+                    )
+                    continue
+
+                # Winner — this candidate cleared bench AND profile.
+                winner_idx = e_idx
+                coder_output = e_coder_output
+                child_kernel = e_kernel
+                bench = e_bench
+                _child_autotuner = e_autotuner
+                profiling = e_profiling
+                repr_workload_latency_s = e_repr_lat_s
+                break
+
+            if winner_idx is None:
+                logger.warning(
+                    "Iteration %d: all %d Coder candidates failed the "
+                    "profile gauntlet — skipping",
+                    iter_no, len(bench_results),
+                )
+                # bench_results was non-empty → parent produced valid
+                # Coder output AND bench results. Profile failures are
+                # infra; clear quarantine.
+                parent.consecutive_agent_failures = 0
+                emit("iter_end", iter=iter_no, outcome=ITER_SKIPPED)
+                epsilon = max(self._config.epsilon_end, epsilon - decay)
+                continue
+
+            # Winner committed to the tree (only after profile success).
             child = tree.add_child(
                 parent.id,
                 child_kernel,
@@ -828,139 +1127,27 @@ class Orchestrator:
             # one transient blip earlier in the run doesn't permanently
             # quarantine an otherwise-productive node.
             parent.consecutive_agent_failures = 0
+            emit(
+                "coder_submitted",
+                iter=iter_no,
+                winner_candidate_idx=winner_idx,
+                n_candidates=K,
+                n_survivors=len(bench_results),
+                n_profile_attempts=profile_attempts,
+            )
 
-            # Child-benchmark failure is branch-local: BenchmarkError
-            # (majority-failure) and non-empty workload_errors (partial
-            # failure) both mark the child DEAD_END so a kernel that
-            # crashes on a slice of the workload set cannot be scored or
-            # promoted. Baseline failure is not caught — no baseline
-            # means no signal, and the caller is expected to surface it.
-            #
-            # The eval block (benchmark) is wrapped in
-            # ``per_iter_anti_cheat`` so a candidate that monkey-patches
-            # torch.cuda.Event, spawns a background thread, or returns
-            # lazy/proxy outputs trips ``RewardHackDetected`` and lands
-            # on the DEAD_END path. CUDA sticky-state errors get one
-            # ``synchronize()`` retry before counting against the 3-strike
-            # ``CUDAContextPoisoned`` budget.
-            dead_detail: str | None = None
-            bench = None
-            _compiled_fn: Any | None = None
-            _child_autotuner: Any | None = None
-            try:
-                # A1 PR 1 + Codex finding #1: precompile MUST run inside
-                # ``per_iter_anti_cheat`` so import-time side effects from
-                # the candidate source (exec_module runs top-level Python)
-                # register as drift against the snapshot rather than
-                # silently becoming the new baseline.
-                with per_iter_anti_cheat(self._config.anti_cheat_critical_names):
-                    _compiled_fn, _child_autotuner = _safe_precompile(
-                        child_kernel, role="Child",
-                    )
-                    bench = benchmark_kernel(
-                        child_kernel,
-                        self._config,
-                        workloads=workloads,
-                        input_generators=input_generators,
-                        definition=definition,
-                        kernel_fn=_compiled_fn,
-                        autotuner=_child_autotuner,
-                    )
-                check_lazy_outputs_after_bench(bench.last_outputs)
-                # Drop GPU tensor refs as soon as the lazy-output check
-                # accepts them — for large workloads the captured outputs
-                # are hundreds of MB pinned through the LLM round-trip
-                # ahead (profile + score + reviewer).
-                bench.last_outputs.clear()
-                # A1 PR 1/B: copy benchmark-captured autotune winners onto
-                # the kernel. Event fires only when the Autotuner reference
-                # is real, so post-run analysis can distinguish "autotune
-                # ran" from "pre-compile fallback path taken / no autotune."
-                if bench.is_fully_successful and _child_autotuner is not None:
-                    _record_autotune_winner(child_kernel, bench)
-                    emit(
-                        "autotune_burn_in_done",
-                        iter=iter_no,
-                        workload_count=len(workloads or []),
-                        winner_count=len(child_kernel.autotune_winner),
-                    )
-                # Bench succeeded without any reward-hack signal — clear
-                # the CUDA error counter so a single transient blip earlier
-                # in the run doesn't accumulate forever.
-                consecutive_cuda_errors = 0
-            except RewardHackDetected as e:
+            # A1 PR 1/B: copy benchmark-captured autotune winners onto the
+            # winning kernel. Event fires only when the Autotuner reference
+            # is real, so post-run analysis can distinguish "autotune ran"
+            # from "pre-compile fallback path taken / no autotune."
+            if bench.is_fully_successful and _child_autotuner is not None:
+                _record_autotune_winner(child_kernel, bench)
                 emit(
-                    "reward_hack_detected",
+                    "autotune_burn_in_done",
                     iter=iter_no,
-                    reason=str(e)[:200],
-                    child_id=str(child.id),
+                    workload_count=len(workloads or []),
+                    winner_count=len(child_kernel.autotune_winner),
                 )
-                self._kill_branch(
-                    child, parent, iter_no,
-                    reason=DeadReason.REWARD_HACK,
-                    detail=str(e)[:120],
-                    bumps_agent_failures=True,
-                )
-                epsilon = max(self._config.epsilon_end, epsilon - decay)
-                continue
-            except BenchmarkError as e:
-                dead_detail = f"child benchmark failed ({e})"
-            except RuntimeError as e:
-                # CUDA sticky-state recovery. Match against known transient
-                # launch-failure patterns only; a generic RuntimeError that
-                # merely *mentions* "CUDA" (e.g. "operation not implemented
-                # for CUDA") is a real bug and must propagate.
-                msg = str(e)
-                msg_lower = msg.lower()
-                if not any(p in msg_lower for p in _CUDA_STICKY_PATTERNS):
-                    raise
-                try:
-                    import torch
-                    torch.cuda.synchronize()
-                    # sync succeeded — branch-local failure, run continues.
-                    consecutive_cuda_errors = 0
-                except Exception:
-                    consecutive_cuda_errors += 1
-                    if consecutive_cuda_errors >= 3:
-                        raise CUDAContextPoisoned(
-                            f"3+ consecutive cuda.synchronize() failures: {e}"
-                        ) from e
-                logger.warning(
-                    "Iteration %d: transient CUDA error (%s) — branch DEAD_END",
-                    iter_no, msg[:200],
-                )
-                self._kill_branch(
-                    child, parent, iter_no,
-                    reason=DeadReason.CUDA_ERROR,
-                    detail=msg[:120],
-                )
-                epsilon = max(self._config.epsilon_end, epsilon - decay)
-                continue
-            else:
-                if not bench.is_fully_successful:
-                    dead_detail = (
-                        f"child benchmark had partial-workload failures "
-                        f"(errors={bench.workload_errors})"
-                    )
-
-            if dead_detail is not None:
-                logger.warning("Iteration %d: %s — marking branch dead_end", iter_no, dead_detail)
-                # bench_done fires even on partial-workload failure so the
-                # event log has a row for every benchmark attempt.
-                emit(
-                    "bench_done",
-                    iter=iter_no,
-                    median_us=bench.median_latency_us if bench is not None else 0.0,
-                    per_workload_us=_per_workload_us(bench),
-                    is_fully_successful=False,
-                )
-                self._kill_branch(
-                    child, parent, iter_no,
-                    reason=DeadReason.BENCH_FAILURE,
-                    detail=dead_detail,
-                )
-                epsilon = max(self._config.epsilon_end, epsilon - decay)
-                continue
 
             emit(
                 "bench_done",
@@ -970,70 +1157,6 @@ class Orchestrator:
                 is_fully_successful=bench.is_fully_successful,
             )
 
-            # Profile the child on the representative workload. Analytical
-            # failure (ProfilerError: zero latency, missing peaks) is
-            # branch-killing — the latency measurement is meaningless
-            # without a basis for roofline comparison. NCU subprocess
-            # failure degrades the profile (ncu=None) but the analytical
-            # block still drives per-iter metrics and the branch survives.
-            # Score and per-workload latencies are deferred past this
-            # gauntlet so ``best_node()`` (which filters on ``score is not
-            # None``) cannot promote a profile-killed branch.
-            profiling = None
-            repr_workload_latency_s = _representative_latency_s(
-                bench, workloads, repr_idx
-            )
-            if repr_workload_latency_s is None:
-                # Representative workload's measurement is inf (partial
-                # failure on this slice) — we've already caught fully-
-                # dead children above, so this is the "majority survived
-                # but the middle workload didn't" edge. Skip profiling;
-                # the bench_failure path would have kicked in for ≥50%
-                # failure.
-                logger.warning(
-                    "Iteration %d: representative workload latency unavailable "
-                    "— skipping profile (child benchmark: %s)",
-                    iter_no,
-                    bench.per_workload_latency_us,
-                )
-                self._kill_branch(
-                    child, parent, iter_no,
-                    reason=DeadReason.REPR_LATENCY_UNAVAILABLE,
-                )
-                epsilon = max(self._config.epsilon_end, epsilon - decay)
-                continue
-
-            # No gate — profile_kernel accepts flops=0 (pct_peak_compute=0)
-            # and nbytes=0 (analytical=None, NCU still runs).
-            profile_blob_roots = _resolve_blob_roots(
-                self._config.safetensors_blob_roots,
-                problem_definition_path,
-            )
-            try:
-                profiling = profile_kernel(
-                    child_kernel,
-                    repr_workload_axes,
-                    repr_input_generator,
-                    hardware_spec=self._config.hardware,
-                    flops=iter_flops,
-                    nbytes=iter_nbytes,
-                    latency_s=repr_workload_latency_s,
-                    problem_definition_path=problem_definition_path,
-                    blob_roots=profile_blob_roots,
-                )
-            except ProfilerError as e:
-                logger.warning(
-                    "Iteration %d: profile_kernel failed (%s) — marking branch dead_end",
-                    iter_no,
-                    e,
-                )
-                self._kill_branch(
-                    child, parent, iter_no,
-                    reason=DeadReason.PROFILER_ERROR,
-                    detail=str(e)[:120],
-                )
-                epsilon = max(self._config.epsilon_end, epsilon - decay)
-                continue
             child.profiling = profiling
             if profiling is not None:
                 ncu = profiling.ncu

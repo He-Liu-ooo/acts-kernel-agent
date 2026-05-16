@@ -87,11 +87,15 @@ def harness():
     behavior (``side_effect`` or ``return_value``) before calling
     ``run_orch``.
     """
+    # coder_n_candidates=1 preserves legacy single-Coder mock cardinality
+    # for these profiler-threading tests. A2's K-way fan-out is covered
+    # by test_k_way_* in test_orchestrator_events.py.
     config = ACTSConfig(
         hardware=_rtx6000_ada(),
         max_depth=1,
         beam_width=3,
         sol_plateau_window=99,
+        coder_n_candidates=1,
     )
     planner = MagicMock()
     planner.plan = AsyncMock(return_value=OptimizationPlan(
@@ -173,8 +177,11 @@ class TestProfilingAttachedToTree:
 class TestProfilingSkippedOnDeadBranch:
     @pytest.mark.asyncio
     async def test_partial_workload_failure_skips_profile(self, harness):
-        """Benchmark partial-failure marks the child DEAD_END and profile_kernel
-        is NOT called — there's no valid latency to pass it."""
+        """A2: a candidate with partial-bench failure is gated out before
+        ``tree.add_child`` (per-candidate ``coder_failed`` event, iter
+        SKIPPED). ``profile_kernel`` never runs because there is no
+        winning candidate, and the tree has no child node from this iter.
+        """
         from src.search.orchestrator import Orchestrator
 
         baseline_bench = BenchmarkResult(median_latency_us=100.0, timed_runs=1)
@@ -200,36 +207,41 @@ class TestProfilingSkippedOnDeadBranch:
             result = await orch.run(harness.baseline, workloads=None, roofline=harness.roofline)
 
         assert profile_fake.call_count == 0, (
-            "profile_kernel must not run when the child benchmark had partial failures"
+            "profile_kernel must not run when no candidate survived bench"
         )
-        child = [n for n in result.tree._nodes.values() if n.parent_id is not None][0]
-        assert child.branch_quality is BranchQuality.DEAD_END
-        assert child.profiling is None
+        children = [n for n in result.tree._nodes.values() if n.parent_id is not None]
+        assert children == []
 
 
 class TestProfilerErrorMarksDeadEnd:
     @pytest.mark.asyncio
     async def test_analytical_failure_marks_dead_end(self, harness):
-        """ProfilerError raised by profile_kernel (e.g. zero-latency analytical
-        failure) marks the child DEAD_END and the orchestrator continues."""
+        """A2 + Codex review #1: ProfilerError on every K candidate (K=1
+        here per harness pin) → per-candidate ``coder_failed`` events,
+        iter SKIPPED, no tree child. The legacy "ProfilerError marks the
+        single Coder candidate DEAD_END in the tree" path is gated out:
+        failed candidates fall back to the next-ranked (or, if there is
+        no next, the iter skips without a tree node).
+        """
         profile_fake = MagicMock(
             side_effect=ProfilerError("latency_s must be positive, got 0.0")
         )
         result, _ = await _run_orch(harness, profile_fake=profile_fake)
 
-        child = [n for n in result.tree._nodes.values() if n.parent_id is not None][0]
-        assert child.branch_quality is BranchQuality.DEAD_END
-        assert child.profiling is None
-        # Reviewer must be skipped when profile fails — no profile to hand it.
+        children = [n for n in result.tree._nodes.values() if n.parent_id is not None]
+        assert children == []
+        # Reviewer skipped — no surviving candidate, nothing to review.
         assert harness.reviewer.review.await_count == 0
 
     @pytest.mark.asyncio
     async def test_profiler_killed_child_cannot_become_best_node(self, harness):
-        """``SearchTree.best_node()`` filters only on ``score is not None`` —
-        if a ProfilerError-killed child still carried the score its benchmark
-        produced, a branch we declared DEAD_END could be returned as the
-        final winner. Score must only be committed after the profile DEAD_END
-        gauntlet clears."""
+        """A2 + Codex review #1: a profile-killed candidate is never
+        added to the tree, so it cannot be returned by ``best_node()``
+        regardless of how fast its benchmark was. (Before A2, the score
+        was committed only after the profile gauntlet; under the new
+        rank-and-fallback path, the candidate doesn't even reach
+        ``tree.add_child``.)
+        """
         from src.search.orchestrator import Orchestrator
 
         # Child's benchmark is faster than the baseline → its SOL score
@@ -253,11 +265,10 @@ class TestProfilerErrorMarksDeadEnd:
             )
             result = await orch.run(harness.baseline, workloads=None, roofline=harness.roofline)
 
-        child = [n for n in result.tree._nodes.values() if n.parent_id is not None][0]
-        assert child.branch_quality is BranchQuality.DEAD_END
-        # Critical: the profile-killed child must carry no score, so
-        # best_node() cannot promote it over the root.
-        assert child.score is None
+        children = [n for n in result.tree._nodes.values() if n.parent_id is not None]
+        assert children == []
+        # Critical: with no tree child created, ``best_node()`` falls
+        # back to root and cannot promote a profile-killed branch.
         assert result.best_node.id == 0, (
             "best_node must not return a branch killed by profile failure"
         )
@@ -1249,6 +1260,7 @@ class TestFailFastOnZeroHardware:
             max_depth=1,
             beam_width=3,
             sol_plateau_window=99,
+            coder_n_candidates=1,
         )
         orch = Orchestrator(
             harness.config, harness.planner, harness.coder,

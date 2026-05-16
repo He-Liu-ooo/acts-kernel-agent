@@ -68,11 +68,16 @@ def _make_profile() -> ProfilingResult:
 @pytest.fixture
 def harness():
     """Orchestrator harness with mocked agents returning happy-path values."""
+    # coder_n_candidates=1: A2 K-way fan-out is covered by test_k_way_*
+    # in test_orchestrator_events.py; these tests exercise orthogonal
+    # iter-flow paths (reward-hack, CUDA recovery, trace_emitted, etc.)
+    # that benefit from legacy single-Coder mock cardinality.
     config = ACTSConfig(
         hardware=_rtx6000_ada(),
         max_depth=1,
         beam_width=3,
         sol_plateau_window=99,
+        coder_n_candidates=1,
     )
     planner = MagicMock()
     planner.plan = AsyncMock(return_value=OptimizationPlan(
@@ -136,49 +141,63 @@ def _read_events(path) -> list[dict]:
 
 @pytest.mark.asyncio
 async def test_orchestrator_marks_branch_dead_on_reward_hack_detected(tmp_path, harness):
-    """When ``per_iter_anti_cheat`` raises ``RewardHackDetected`` during the
-    benchmark, the orchestrator emits ``reward_hack_detected``, marks the
-    child DEAD_END, and the run continues."""
+    """A2: when ``per_iter_anti_cheat`` raises ``RewardHackDetected`` during
+    a candidate's benchmark, the orchestrator emits ``coder_failed`` with
+    a reward-hack reason (one per failing candidate) and the iter ends
+    SKIPPED. The legacy single-Coder path that emitted ``reward_hack_detected``
+    + ``branch_dead_end`` on a tree node is gated out under K-way — losers
+    don't enter the tree. Channel-B reward-hack (the SOL-scorer's
+    ``reward_hack_suspect`` re-eval) still fires for winning candidates;
+    those tests live in ``test_orchestrator_re_evals_suspect_score_*``.
+    """
     from src.search.orchestrator import Orchestrator
     from sol_execbench.core.bench.reward_hack import RewardHackDetected
 
     events_path, close = _capture_events(tmp_path)
 
-    def fake_bench(*args, **kwargs):
-        raise RewardHackDetected("monkey-patched torch.cuda.Event.elapsed_time")
-
     try:
+        calls = {"n": 0}
+
+        def side_effect(*a, **k):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return harness.bench  # baseline
+            raise RewardHackDetected("monkey-patched torch.cuda.Event.elapsed_time")
+
         with (
-            patch("src.eval.benchmark.benchmark_kernel", side_effect=fake_bench),
+            patch("src.eval.benchmark.benchmark_kernel", side_effect=side_effect),
             patch("src.eval.profiler.profile_kernel", return_value=_make_profile()),
         ):
             orch = Orchestrator(
                 harness.config, harness.planner, harness.coder, harness.reviewer,
                 harness.retriever,
             )
-            # The first benchmark call is the BASELINE. We need that to
-            # succeed. Switch our side_effect so it raises only on the
-            # child eval call.
-            calls = {"n": 0}
-
-            def side_effect(*a, **k):
-                calls["n"] += 1
-                if calls["n"] == 1:
-                    return harness.bench
-                raise RewardHackDetected("monkey-patched torch.cuda.Event.elapsed_time")
-
-            with patch("src.eval.benchmark.benchmark_kernel", side_effect=side_effect):
-                await orch.run(harness.baseline, workloads=None, roofline=harness.roofline)
+            result = await orch.run(harness.baseline, workloads=None, roofline=harness.roofline)
     finally:
         close()
 
     records = _read_events(events_path)
     kinds = [r["kind"] for r in records]
-    assert "reward_hack_detected" in kinds, kinds
-    assert "branch_dead_end" in kinds, kinds
-    # The dead_reason should mention reward_hack.
-    de = next(r for r in records if r["kind"] == "branch_dead_end")
-    assert "reward_hack" in de["reason"]
+    # Codex review #2: per-candidate channel-A reward-hack emits a
+    # dedicated ``reward_hack_detected`` event (with ``candidate_idx``)
+    # so telemetry consumers watching trust-boundary violations don't
+    # have to substring-match a generic ``coder_failed.reason``.
+    rh_detected = [r for r in records if r["kind"] == "reward_hack_detected"]
+    assert len(rh_detected) >= 1
+    assert any("monkey-patched" in r["reason"] for r in rh_detected)
+    assert all("candidate_idx" in r for r in rh_detected)
+    # The matching ``coder_failed`` also fires for the all-failures
+    # bookkeeping (n_candidates / n_survivors aggregation in the iter).
+    coder_failed = [r for r in records if r["kind"] == "coder_failed"]
+    assert len(coder_failed) >= 1
+    assert any("reward-hack" in r["reason"] for r in coder_failed)
+    # No tree child for the failed candidate.
+    children = [n for n in result.tree._nodes.values() if n.parent_id is not None]
+    assert children == []
+    # iter_end SKIPPED — RewardHackDetected is agent-fault so it bumps
+    # ``consecutive_agent_failures``; the run still completes cleanly.
+    end = next(r for r in records if r["kind"] == "iter_end")
+    assert end["outcome"] == "skipped"
 
 
 # ── reward_hack_suspect (channel B): re-eval cleared / confirmed ──────
@@ -325,8 +344,14 @@ async def test_orchestrator_emits_calibration_warning_on_score_flag(tmp_path, ha
 
 @pytest.mark.asyncio
 async def test_orchestrator_recovers_from_transient_cuda_error(tmp_path, harness):
-    """A transient CUDA error during benchmarking + a successful sync →
-    branch DEAD_END, run continues. No CUDAContextPoisoned raised."""
+    """A2: a transient CUDA sticky-state error during a candidate's bench
+    plus a successful ``torch.cuda.synchronize()`` → per-candidate
+    ``coder_failed`` event (with the CUDA-sticky-state reason), iter
+    SKIPPED, run continues without ``CUDAContextPoisoned``. The legacy
+    ``branch_dead_end`` event used to fire from ``_kill_branch(CUDA_ERROR)``;
+    K-way replaces that with the per-candidate ``coder_failed`` path
+    since failed candidates no longer enter the tree.
+    """
     import torch
 
     from src.search.orchestrator import Orchestrator
@@ -357,11 +382,11 @@ async def test_orchestrator_recovers_from_transient_cuda_error(tmp_path, harness
         close()
 
     records = _read_events(events_path)
-    kinds = [r["kind"] for r in records]
-    # Branch was marked dead with cuda_error reason.
-    de = [r for r in records if r["kind"] == "branch_dead_end"]
-    assert de, kinds
-    assert any("cuda_error" in r["reason"] for r in de)
+    coder_failed = [r for r in records if r["kind"] == "coder_failed"]
+    assert coder_failed, [r["kind"] for r in records]
+    assert any("CUDA sticky-state" in r["reason"] for r in coder_failed)
+    end = next(r for r in records if r["kind"] == "iter_end")
+    assert end["outcome"] == "skipped"
 
 
 @pytest.mark.asyncio
@@ -376,12 +401,16 @@ async def test_orchestrator_run_fatal_after_three_consecutive_cuda_errors(
     events_path, close = _capture_events(tmp_path)
 
     # Use a config with enough depth so we can rack up 3 consecutive
-    # CUDA errors before BUDGET kicks in.
+    # CUDA errors before BUDGET kicks in. coder_n_candidates=1 isolates
+    # this test from A2's K-way fan-out (otherwise K=4 sticky-CUDA errors
+    # within iter 1 would hit the 3-strike CUDAContextPoisoned mid-iter,
+    # which would also raise — but the legacy semantic is cross-iter).
     config = ACTSConfig(
         hardware=_rtx6000_ada(),
         max_depth=5,
         beam_width=3,
         sol_plateau_window=99,
+        coder_n_candidates=1,
     )
 
     calls = {"n": 0}

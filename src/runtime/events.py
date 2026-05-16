@@ -28,8 +28,14 @@ CORE_EVENT_KINDS: frozenset[str] = frozenset({
     # ``coder_submitted`` marks ``implement()`` returning a kernel — it
     # does NOT prove the compile/correctness tools ran or passed.
     # Ground-truth per-tool-call records are in ``traces/*.jsonl``.
-    # ``coder_failed`` covers any ``ImplementationError`` cause
-    # (compile, correctness, turn-budget, missing ``submit_kernel``).
+    # K-way fan-out payload: ``{winner_candidate_idx, n_candidates,
+    # n_survivors, n_profile_attempts}`` — ``n_survivors`` counts
+    # bench-survivors, ``n_profile_attempts`` is the winner's 1-indexed
+    # rank (>1 means profile-fallback engaged).
+    # ``coder_failed`` payload: ``{iter, reason}`` (reason truncated to
+    # 200 chars), plus ``candidate_idx: int | None`` (set per K-way
+    # candidate; None for legacy single-candidate paths like baseline
+    # ``translate()``).
     "coder_submitted", "coder_failed",
     "bench_done", "profile_done", "score_computed",
     "reviewer_feedback",
@@ -45,7 +51,10 @@ CORE_EVENT_KINDS: frozenset[str] = frozenset({
     # evaluation with the SOL ``Trace`` payload. The ``reward_hack_*``
     # triplet covers the two-channel detector flow:
     #   channel A — process-level detector raised inside the eval block
-    #     → ``reward_hack_detected`` (branch DEAD_END);
+    #     → ``reward_hack_detected``. K-way payload carries
+    #     ``candidate_idx``; the iter aborts (no sibling fallback —
+    #     process state may be tainted). A matching ``coder_failed``
+    #     fires alongside for the all-failures bookkeeping.
     #   channel B — sol_score flagged ``reward_hack_suspect`` and the
     #     re-eval was either confirmed (``reward_hack_confirmed`` →
     #     DEAD_END) or cleared (``reward_hack_cleared`` → accept score).

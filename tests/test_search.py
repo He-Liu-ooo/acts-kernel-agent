@@ -754,6 +754,10 @@ def _orch_harness():
 
     # Orchestrator.run fail-fasts on zeroed peaks; these tests exercise
     # coder / reviewer / benchmark threading, not the analytical path.
+    # coder_n_candidates=1 keeps the legacy single-Coder per-iter shape
+    # so these threading tests don't need K-way bench sequencing — A2's
+    # K-way fan-out is covered by the test_k_way_* group in
+    # test_orchestrator_events.py.
     config = ACTSConfig(
         hardware=HardwareSpec(
             name="RTX6000Ada",
@@ -764,6 +768,7 @@ def _orch_harness():
         max_depth=1,
         beam_width=3,
         sol_plateau_window=99,  # disable plateau termination
+        coder_n_candidates=1,
     )
 
     planner = MagicMock()
@@ -997,8 +1002,12 @@ class TestOrchestratorBenchmarkFailure:
     async def test_child_benchmark_error_marks_dead_end_and_continues(
         self, _orch_harness, caplog
     ):
-        """BenchmarkError on a child → branch marked DEAD_END, reviewer skipped,
-        run completes normally (no exception unwinds run())."""
+        """A2: BenchmarkError on every K candidate → per-candidate
+        ``coder_failed`` events fire, the iter ends SKIPPED, reviewer is
+        skipped, and the run completes normally. No tree node is added
+        for failed candidates (the legacy "child marked DEAD_END" path
+        is gated out before ``tree.add_child`` under K-way).
+        """
         import logging
 
         from src.eval.benchmark import BenchmarkError, BenchmarkResult
@@ -1018,23 +1027,25 @@ class TestOrchestratorBenchmarkFailure:
             orch = Orchestrator(h.config, h.planner, h.coder, h.reviewer, h.retriever)
             result = await orch.run(h.baseline, workloads=None, roofline=h.roofline)
 
-        # Reviewer must be skipped when the child's benchmark fails — no
-        # score means nothing to review.
+        # Reviewer skipped — no surviving candidate, nothing to review.
         assert h.reviewer.review.await_count == 0
-        # The child must be marked DEAD_END so the frontier excludes it.
+        # No child added to the tree on the all-fail path.
         child_ids = [n for n in result.tree._nodes.values() if n.parent_id is not None]
-        assert len(child_ids) == 1
-        assert child_ids[0].branch_quality == BranchQuality.DEAD_END
-        assert child_ids[0].score is None
+        assert child_ids == []
         warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
-        assert any("benchmark" in w.lower() and "dead" in w.lower() for w in warnings), (
-            f"Expected a dead-end warning; got: {warnings}"
+        # A2 emits the "all N Coder candidates failed bench — skipping"
+        # warning instead of the legacy per-branch dead-end log.
+        assert any("Coder candidates failed bench" in w for w in warnings), (
+            f"Expected a Coder-bench-failure skipping warning; got: {warnings}"
         )
 
     @pytest.mark.asyncio
     async def test_child_partial_workload_failure_marks_dead_end(self, _orch_harness):
-        """If ≥50% of workloads survive but some failed (workload_errors
-        non-empty), the child is still unsafe to promote — treat as dead."""
+        """A2: partial-workload failure on every K candidate → per-candidate
+        ``coder_failed`` events (with the partial-bench reason), iter
+        SKIPPED, no tree child. The legacy "partial-failure child marked
+        DEAD_END" path is gated out before ``tree.add_child``.
+        """
         from src.eval.benchmark import BenchmarkResult
         from src.search.orchestrator import Orchestrator
 
@@ -1058,12 +1069,9 @@ class TestOrchestratorBenchmarkFailure:
             "Partial-failure kernels must not reach the reviewer"
         )
         children = [n for n in result.tree._nodes.values() if n.parent_id is not None]
-        assert len(children) == 1
-        assert children[0].branch_quality == BranchQuality.DEAD_END, (
-            "Child with non-empty workload_errors must be marked DEAD_END "
-            "so it cannot be promoted as the best node"
-        )
-        assert children[0].score is None
+        # No tree node — partial-failure is gated out at the candidate
+        # level so it cannot be promoted as the best node by construction.
+        assert children == []
 
     @pytest.mark.asyncio
     async def test_baseline_partial_workload_failure_fails_closed(self, _orch_harness):
@@ -1141,10 +1149,30 @@ class TestOrchestratorCoderFailure:
         baseline_bench = BenchmarkResult(median_latency_us=100.0, timed_runs=1)
         child_bench = BenchmarkResult(median_latency_us=80.0, timed_runs=1)
 
+        # Patch profile_kernel so iter 2's stub Coder output (which has
+        # no real ``kernel_fn``) doesn't trip the real profiler's compile
+        # gauntlet — this test cares about Coder-failure recovery, not
+        # the profile-fallback path.
+        from src.eval.profiler import (
+            AnalyticalMetrics,
+            ProfilingResult,
+        )
+        stub_profile = ProfilingResult(
+            analytical=AnalyticalMetrics(
+                achieved_tflops=1.0, achieved_bandwidth_gb_s=1.0,
+                pct_peak_compute=0.5, pct_peak_bandwidth=0.5,
+            ),
+            ncu=None,
+            raw_metrics={},
+        )
+
         caplog.set_level(logging.WARNING, logger="src.search.orchestrator")
-        with patch(
-            "src.eval.benchmark.benchmark_kernel",
-            side_effect=[baseline_bench, child_bench],
+        with (
+            patch(
+                "src.eval.benchmark.benchmark_kernel",
+                side_effect=[baseline_bench, child_bench],
+            ),
+            patch("src.eval.profiler.profile_kernel", return_value=stub_profile),
         ):
             orch = Orchestrator(h.config, h.planner, h.coder, h.reviewer, h.retriever)
             h.reviewer.review.return_value = _promising_review_stub()
@@ -1161,7 +1189,9 @@ class TestOrchestratorCoderFailure:
             f"Expected exactly one tree node from the successful retry; got {len(children)}"
         )
         warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
-        assert any("Coder failed" in w for w in warnings), (
+        # A2: the iter-SKIPPED warning names how many K candidates failed.
+        # Phrase is "all N Coder candidates failed" (where N == K).
+        assert any("Coder candidates failed" in w for w in warnings), (
             f"Expected a Coder-failure warning; got: {warnings}"
         )
 
@@ -1261,29 +1291,54 @@ class TestDeadReasonField:
             assert n.dead_reason is None
 
     @pytest.mark.asyncio
-    async def test_bench_failure_records_bench_failure_reason(self, _orch_harness):
-        """An infrastructure-error kill via _kill_branch must propagate
-        the reason onto the node, not just into telemetry."""
+    async def test_bench_failure_records_bench_failure_reason(
+        self, _orch_harness, tmp_path,
+    ):
+        """A2: infrastructure-error kills (BenchmarkError) no longer create
+        a tree node — under K-way, failed candidates are gated out before
+        ``tree.add_child``. The infra-error reason now lives only on the
+        per-candidate ``coder_failed`` event payload (``reason`` string),
+        not on a tree node's ``dead_reason``. ``dead_reason`` continues
+        to flow for *winner-side* kills (profile error, reward-hack
+        channel B, reviewer-judged) — see
+        ``test_reviewer_dead_end_records_reviewer_judged_reason``.
+        """
+        import json
+
         from src.eval.benchmark import BenchmarkError, BenchmarkResult
-        from src.runtime.events import DeadReason
+        from src.runtime import events
         from src.search.orchestrator import Orchestrator
 
         h = _orch_harness
         baseline_bench = BenchmarkResult(median_latency_us=100.0, timed_runs=1)
-        with patch(
-            "src.eval.benchmark.benchmark_kernel",
-            side_effect=[
-                baseline_bench,
-                BenchmarkError("only 0/3 workloads survived"),
-            ],
-        ):
-            orch = Orchestrator(h.config, h.planner, h.coder, h.reviewer, h.retriever)
-            result = await orch.run(h.baseline, workloads=None, roofline=h.roofline)
+
+        fh = (tmp_path / "events.jsonl").open("w", buffering=1)
+        events.bind(fh)
+        try:
+            with patch(
+                "src.eval.benchmark.benchmark_kernel",
+                side_effect=[
+                    baseline_bench,
+                    BenchmarkError("only 0/3 workloads survived"),
+                ],
+            ):
+                orch = Orchestrator(h.config, h.planner, h.coder, h.reviewer, h.retriever)
+                result = await orch.run(h.baseline, workloads=None, roofline=h.roofline)
+        finally:
+            events.unbind()
+            fh.close()
 
         children = [n for n in result.tree._nodes.values() if n.parent_id is not None]
-        assert len(children) == 1
-        assert children[0].branch_quality == BranchQuality.DEAD_END
-        assert children[0].dead_reason == DeadReason.BENCH_FAILURE
+        assert children == []
+
+        records = [
+            json.loads(line)
+            for line in (tmp_path / "events.jsonl").read_text().splitlines()
+            if line.strip()
+        ]
+        coder_failed = [r for r in records if r["kind"] == "coder_failed"]
+        assert len(coder_failed) == 1
+        assert "0/3 workloads survived" in coder_failed[0]["reason"]
 
     @pytest.mark.asyncio
     async def test_reviewer_dead_end_records_reviewer_judged_reason(

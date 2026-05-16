@@ -123,6 +123,11 @@ class ACTSConfig:
     # `submit_review` and runs with `max_turns=6` instead of `4`. Default
     # off — the existing single-call path is the verified default.
     reviewer_metric_queries: bool = True
+    # K-way Coder fan-out per iter; best-of-survivors becomes the tree
+    # node. Diversity comes from LLM decoder stochasticity at the model's
+    # forced temperature, not from per-call prompt or temperature
+    # perturbation. See doc/search.md for the selection algorithm.
+    coder_n_candidates: int = 4
     # Outer-loop iteration budget (Planner→Coder→Reviewer cycles per run),
     # not a cap on tree path length. Also sets the epsilon decay horizon.
     max_depth: int = 20
@@ -194,6 +199,21 @@ class ACTSConfig:
         ]
     )
 
+    def __post_init__(self) -> None:
+        # Reject non-int / <1: K=0 silently skips iters as "all 0
+        # candidates failed"; non-int (e.g. ``1.5``) crashes ``range(K)``
+        # deep in the iter loop. (``bool`` is an int subclass — accepted;
+        # ``False == 0`` is caught by the ``< 1`` check.)
+        if not isinstance(self.coder_n_candidates, int):
+            raise TypeError(
+                f"coder_n_candidates must be int, "
+                f"got {type(self.coder_n_candidates).__name__}",
+            )
+        if self.coder_n_candidates < 1:
+            raise ValueError(
+                f"coder_n_candidates must be >= 1, got {self.coder_n_candidates}",
+            )
+
 
 def load_config(path: Path) -> ACTSConfig:
     """Load ACTSConfig from a libconfig-format ``.cfg`` file via ``libconf``.
@@ -219,6 +239,7 @@ def load_config(path: Path) -> ACTSConfig:
     _section_map = {
         "search": [
             "beam_width", "beam_diversity", "reviewer_metric_queries",
+            "coder_n_candidates",
             "max_depth", "epsilon_start", "epsilon_end",
         ],
         "eval": ["warmup_runs", "timed_runs"],

@@ -251,6 +251,98 @@ def test_load_config_reviewer_metric_queries_omitted_uses_default():
     assert cfg.reviewer_metric_queries is False
 
 
+# ── A2: coder_n_candidates (K-way Coder fan-out) ──────────────────────
+
+
+def test_acts_config_coder_n_candidates_default_4():
+    """A2: default K is 4 — matches AccelOpt num_samples=2 × breadth=2 = 4
+    plan-side cardinality and the canonical best-of-N value in code-gen
+    literature."""
+    from src.config import ACTSConfig
+
+    cfg = ACTSConfig()
+    assert cfg.coder_n_candidates == 4
+
+
+def test_load_config_coder_n_candidates_from_cfg():
+    """A2: ``[search] coder_n_candidates = 8`` overrides the default."""
+    from src.config import load_config
+
+    cfg_text = "search: { coder_n_candidates = 8; };\n"
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".cfg", delete=False) as f:
+        f.write(cfg_text)
+        f.flush()
+        cfg = load_config(Path(f.name))
+
+    assert cfg.coder_n_candidates == 8
+
+
+def test_load_config_coder_n_candidates_omitted_uses_default():
+    """A2: omitted setting → dataclass default (4)."""
+    from src.config import load_config
+
+    cfg_text = "search: { beam_width = 5; };\n"
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".cfg", delete=False) as f:
+        f.write(cfg_text)
+        f.flush()
+        cfg = load_config(Path(f.name))
+
+    assert cfg.coder_n_candidates == 4
+
+
+def test_acts_config_coder_n_candidates_zero_raises():
+    """A2: K=0 would silently skip every iter ("all 0 candidates failed");
+    __post_init__ fails fast instead. Codex review #3."""
+    import pytest
+    from src.config import ACTSConfig
+
+    with pytest.raises(ValueError, match="coder_n_candidates"):
+        ACTSConfig(coder_n_candidates=0)
+
+
+def test_acts_config_coder_n_candidates_negative_raises():
+    """A2: a negative typo would mean ``range(K)`` dispatches no Coder
+    calls — same silent-skip failure mode. Codex review #3."""
+    import pytest
+    from src.config import ACTSConfig
+
+    with pytest.raises(ValueError, match="coder_n_candidates"):
+        ACTSConfig(coder_n_candidates=-1)
+
+
+def test_load_config_coder_n_candidates_zero_raises(tmp_path):
+    """A2: K=0 from the cfg file fails fast at load_config too."""
+    import pytest
+    from src.config import load_config
+
+    cfg_text = "search: { coder_n_candidates = 0; };\n"
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".cfg", delete=False) as f:
+        f.write(cfg_text)
+        f.flush()
+        with pytest.raises(ValueError, match="coder_n_candidates"):
+            load_config(Path(f.name))
+
+
+def test_acts_config_coder_n_candidates_non_int_raises():
+    """A2: a float (e.g. typo'd ``1.5``) would crash ``range(K)`` deep in
+    the iter loop with a confusing TypeError. Reject at config load."""
+    import pytest
+    from src.config import ACTSConfig
+
+    with pytest.raises(TypeError, match="coder_n_candidates"):
+        ACTSConfig(coder_n_candidates=1.5)
+
+
+def test_acts_config_coder_n_candidates_bool_accepted():
+    """A2: ``bool`` is a subclass of ``int`` in Python, so ``True``
+    passes both the isinstance and the ``>= 1`` checks (``True == 1``).
+    Treat this as benign — no need to special-case bool out."""
+    from src.config import ACTSConfig
+
+    cfg = ACTSConfig(coder_n_candidates=True)
+    assert cfg.coder_n_candidates == 1  # noqa: E712 — bool→int coercion intent
+
+
 # ── validate_hardware_spec() ───────────────────────────────────────────
 
 
