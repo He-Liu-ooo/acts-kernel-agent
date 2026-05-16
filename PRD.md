@@ -34,7 +34,7 @@ Best-first tree search with beam constraint.
 | Agent | Runs | Role |
 |-------|------|------|
 | **Planner** | Every iteration | Analyzes profiling data + optimization memory, selects technique from structured action library, produces structured plan `{tier, technique, params, target_region, rationale}` |
-| **Coder** | Every iteration | Implements the plan into kernel code; one focused change per iteration. Has compile and correctness-check tools for self-correction within a retry budget. |
+| **Coder** | K times every iteration (K=4 default) | Implements the plan into kernel code; one focused change per iteration. Has compile and correctness-check tools for self-correction within a retry budget. K parallel calls per iter form a best-of-K fan-out (`ACTSConfig.coder_n_candidates`, opt-out via `=1`); decoder stochasticity at the forced T=1.0 of reasoning-mode models supplies the variance. |
 | **Reviewer** | Every iteration (after eval) | Interprets eval results, produces structured feedback `{outcome, metric_deltas, bottleneck_classification, bottleneck_diagnosis, suggestions, branch_quality, conditional_assessment}`. Optional multi-turn capability via `query_metric` (gated by `ACTSConfig.reviewer_metric_queries`, default off) lets the Reviewer fetch additional `raw_metrics` from the iteration's profiling dump when the curated NCU subset is insufficient. |
 
 Plus a deterministic orchestrator (code, not LLM) that manages tree state, beam selection, and move-on criteria.
@@ -59,24 +59,30 @@ Plus a deterministic orchestrator (code, not LLM) that manages tree state, beam 
 ### Per-Iteration Communication Flow
 
 ```
-Planner --> Coder (with compile/correctness tools) --> [deterministic eval] --> Reviewer --> Planner (next iter)
-                  |                                |
-                  +-- self-correction loop ---------+
-                  (up to max_debug_retries attempts)
+Planner --> Coder x K (asyncio.gather, K=4 default) --> [per-candidate sequential
+            (with compile/correctness tools)             anti-cheat + bench]
+                  |                                |        --> rank-and-profile
+                  +-- self-correction loop ---------+            (first profile-success
+                  (up to max_debug_retries attempts)              wins) --> Reviewer
+                                                                          --> Planner (next iter)
 ```
 
-On compilation or correctness failure, the Coder's tool loop handles retries internally. If the retry budget is exhausted, the branch is marked dead — no separate Debugger agent.
+The Coder axis fans out to K parallel `Coder.implement()` calls per iter (best-of-K, `ACTSConfig.coder_n_candidates=4` default; set `=1` to opt out and recover the pre-A2 1-call shape). Compile + correctness self-correction happens inside each Coder call's own tool loop. The K outputs are then ranked sequentially through anti-cheat + benchmark + profile — the first candidate to clear profiling wins the iter and becomes the tree node. The Planner and Reviewer paths are unchanged; K-way multiplies cost only on the Coder axis. This converts the per-iter comparison from "median LLM draft vs baseline" to "best-of-K vs baseline," closing the failure mode where a regressing median Coder draft makes every iter lose.
+
+On compilation or correctness failure inside a Coder call, that call's tool loop handles retries internally. If the retry budget is exhausted, that candidate is dropped from the survivor set; if all K fail, the iter is marked dead. No separate Debugger agent.
+
+**Operator caveat**: K-way assumes the LLM backend serves the K requests concurrently. Serial backends (locally hosted TGI with one slot, provider-side queues capped below K) turn the `asyncio.gather` into K sequential calls and pay K× wallclock for the same token cost as the parallel case — set `coder_n_candidates=1` in that environment.
 
 ### LLM Cost Estimate Per Iteration
 
 | Agent | Calls/iter | Input tokens (est.) | Output tokens (est.) |
 |-------|-----------|--------------------|--------------------|
 | Planner | 1 | ~4K | ~500 |
-| Coder | 1-3 (with tool-use self-correction) | ~3-6K | ~2-4K |
+| Coder | K × (1-3 with tool-use self-correction); K=4 default | ~12-24K | ~8-16K |
 | Reviewer | 1 | ~2K | ~500 |
-| **Total** | **3-5** | **~9-12K** | **~3-5K** |
+| **Total** | **~6-14** | **~18-30K** | **~9-17K** |
 
-~15K tokens per iteration. At beam width 3 and depth 20, ~900K tokens per kernel.
+~60K tokens per iteration under K=4 (up from ~15K under K=1). At beam width 3 and depth 20, ~3.6M tokens per kernel. Set `coder_n_candidates=1` to recover the ~15K/iter pre-A2 budget at the cost of best-of-K variance reduction.
 
 ---
 
@@ -323,6 +329,8 @@ No `bottleneck_after` — classification is once-per-run (invariant per `(proble
 
 No kernel code stored — only summaries. Both successes and failures stored.
 
+Under K-way Coder fan-out (`coder_n_candidates>1`), MemoryStore growth is unchanged: one `Experience` per advanced iter (the winner), not K. The K-1 losing candidates exist only as `coder_failed` records in `events.jsonl` — persisting them in MemoryStore would dilute its `success=False` retrieval semantics.
+
 ### Storage & Retrieval
 
 - **Backend**: JSON files. Simple, git-friendly, human-readable. No database.
@@ -385,6 +393,7 @@ Run parameters are set through `.cfg` files (INI format, parsed via Python's `co
 beam_width = 3
 beam_diversity = true
 reviewer_metric_queries = false   ; opt-in: registers Reviewer's `query_metric` tool, max_turns=6
+coder_n_candidates = 4            ; A2: K-way Coder fan-out per iter (best-of-K -> one child). Set =1 to opt out.
 max_depth = 20
 epsilon_start = 0.3
 epsilon_end = 0.05
@@ -637,7 +646,9 @@ acts-kernel-agent/
 
 ### Parallel Kernel Candidate Generation
 
-Generate multiple kernel candidates per iteration instead of one. The Coder produces N candidates from the same plan (varying implementation details), and all candidates are evaluated in parallel. The best-scoring candidate becomes the tree node. This trades LLM cost for search breadth — useful when a single Coder call has high variance in output quality.
+**Shipped (A2, default `coder_n_candidates = 4`).** Each iter dispatches K parallel Coder calls via `asyncio.gather`; survivors enter a sequential per-candidate bench loop and the highest-SOL-Score profileable candidate becomes the tree node. Diversity comes from LLM decoder stochasticity at the model's forced temperature, not from per-call prompt or temperature perturbation. See `doc/search.md` and `doc/agents.md` for the per-iter flow and the rank-and-profile-fallback semantics. Trades LLM cost (~K× tokens/iter on the Coder axis) for search breadth — the configured default of K=4 matches AccelOpt's plan-side cardinality and the canonical best-of-N value in code-gen literature.
+
+**Future-work variants** (not shipped): per-call temperature schedule (`[0.3, 0.5, 0.7, 0.9]` style) and prompt-entropy perturbation. Both are decoder-diversity alternatives to A2's identical-call stochasticity; either could compose additively if reasoning-mode temperature constraints loosen.
 
 ### Multi-Technique Planning
 
