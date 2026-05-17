@@ -188,13 +188,12 @@ ACTS uses SOL-ExecBench (NVIDIA, 2026) as its benchmark suite. SOL-ExecBench pro
 
 ### Triton Baseline Generation
 
-SOL-ExecBench provides only PyTorch references. Since ACTS optimizes Triton code, each problem requires a Triton baseline as the root of the search tree. The Coder agent generates a one-shot PyTorch-to-Triton translation at problem load time:
+SOL-ExecBench provides only PyTorch references. Since ACTS optimizes Triton code, each problem requires a Triton baseline as the root of the search tree. The baseline can come from one of two sources, selected via configuration:
 
-1. Coder receives the PyTorch reference and problem definition
-2. Coder produces a functionally equivalent Triton kernel
-3. Correctness is verified against the PyTorch reference (same 5-stage gate)
-4. If correctness fails, Coder retries (up to `max_baseline_retries` attempts)
-5. If all retries fail, the problem is skipped
+- **LLM translation** (default — `generate_triton_baseline`): the Coder agent produces a one-shot PyTorch-to-Triton translation at problem load time. Coder receives the PyTorch reference and problem definition, produces a functionally equivalent Triton kernel, correctness is verified against the PyTorch reference (same 5-stage gate), and Coder retries up to `max_baseline_retries` attempts on failure; if all retries fail, the problem is skipped.
+- **Operator-supplied** (`load_operator_baseline`): when `[runtime] use_operator_baseline=true` in the run config, the file at `[runtime] triton_baseline_path` is loaded as the search-tree root after compile + per-workload correctness, bypassing the LLM Coder entirely. Any gate miss is a hard fail — no retry, no fallback. This is the sibling of investigation item C4 (curated per-op starter library): same idea, operator-supplied vs framework-baked.
+
+See `doc/eval.md` and `doc/config.md` for the gate sequence and configuration details.
 
 ### Correctness Reference
 

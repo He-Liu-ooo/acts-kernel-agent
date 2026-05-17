@@ -1423,6 +1423,44 @@ A kernel can shift its effective bottleneck only by changing its data access pat
 
 **Best-effort write contract**: `main()` writes `report.txt` after `optimize()` returns. The write is wrapped in a try/except on `OSError` (disk full, permissions, read-only mount) that logs a `WARNING` and continues — a failed persistence write does *not* abort the run or mask the successful optimization result. The run's primary artifacts (tree dump, events, traces) have already landed by this point; the report is a derived, secondary artifact, so a write failure here degrades observability rather than correctness.
 
+### Operator-supplied Triton baseline — bypass `CoderAgent.translate()` (2026-05-16)
+
+**Trigger**: the LLM-translation path ("Triton baseline via LLM translation" above) was the only way to seed `T_b`, but operators arriving with a hand-tuned single-config kernel, a `@triton.heuristics`-style kernel, or an external-library port (FlashAttention reference, cuBLAS Triton port) had no way to anchor the run on that vetted artifact. Live runs were re-translating known-good kernels on every invocation, paying LLM tokens + retries to reproduce something the operator already had on disk. The fix is a second baseline strategy — `load_operator_baseline` — that reads a path from cfg, runs the same correctness gate the translator path runs, and skips the Coder entirely.
+
+**Q1 — Autotune validator flag-controlled, default skip.** The autotune contract enforced for Coder-emitted kernels (`KernelCodeOutput._autotune_decorator_well_formed`: ≥4 `triton.Config` entries, non-empty `key=[...]`) is opt-in for operator-supplied baselines, gated on a new `[runtime] triton_baseline_enforce_autotune: bool = False`. *Why*: operators with hand-tuned single-config kernels, heuristics-decorated kernels, or external-library ports should be accepted as-is. *Trade-off*: default-skip means a non-autotuned root competes against A1-mandated autotuning descendants — slightly asymmetric search, but acceptable since operators picking this feature are deliberately anchoring on a vetted artifact.
+
+**Q2 — Auto-detect kernel name + cfg field for dps.** `triton_kernel_name` is auto-resolved via `triton_kernel_names_in()` when the source has exactly one `@triton.jit def`; multi-kernel files require explicit `[runtime] triton_baseline_kernel_name`. `dps` is unknowable from source (host-wrapper runtime contract) and is always cfg-supplied. *Why*: minimal boilerplate for the 95% single-kernel case; explicit when ambiguous.
+
+**Q3 — Hard-fail, no retries, no fallback.** Any post-load gate failure raises `BaselineGenerationError` with the failing stage in the message; no LLM retry loop (there's no Coder to re-prompt); no fallback to `generate_triton_baseline` (would defeat the wallclock trigger and silently mask operator bugs). *Why*: the whole point of this feature is "operator already has a vetted kernel" — if the vetted kernel fails, the operator wants to know, not have the run quietly switch strategies.
+
+**Q4 — Call-site dispatch in `pipeline/optimize.py` (`_dispatch_baseline`).** Each baseline strategy (`generate_triton_baseline`, `load_operator_baseline`) stays a separately-testable single-purpose function. The future curated per-op starter library (PROCESS.md Tier C, investigation item C4) plugs in as another branch at the same seam. *Why*: simpler than an umbrella function with a strategy registry; each baseline path's tests stay focused on one source-of-kernel.
+
+**Q5 — Warn-not-raise on stray cfg keys.** When `triton_baseline_path` is unset but other `triton_baseline_*` keys are set, `ACTSConfig.__post_init__` logs a `WARNING` listing the stray keys. *Why*: operator can comment out `triton_baseline_path` for a quick A/B run without scrubbing the rest of the cfg. Aligns with `validate_hardware_spec`'s warn-not-raise pattern.
+
+**Codex adversarial review finding (HIGH, fixed)**: the original `load_operator_baseline` gate sequence only checked that `triton_baseline_kernel_name` appeared as a `@triton.jit def` somewhere in source. But correctness later executes `spec.entrypoint` (the host wrapper). A source can pass correctness while declaring one JIT kernel and launching a different one — profiler/autotune attribution then silently targets the never-launched function. *Fix*: a new pure-AST helper `find_jit_name_in_entrypoint(source, entrypoint, jit_name) -> tuple[bool, str]` (`src/eval/profiler.py`) verifies the entrypoint actually launches `jit_name` via one of three patterns: subscript launch (`<jit_name>[grid](args)`), `.run` call, or a single-level alias. Direct-launch pass-through handles `jit_name == entrypoint`; missing-entrypoint and unparseable-source defer to the compile gate.
+
+**Symmetric application at three call sites, with intentional failure-handling asymmetry**: every place a Triton kernel becomes either a baseline anchor or a tree node now runs the same launch-binding check:
+
+- `generate_triton_baseline` (LLM baseline, `baseline_generator.py`): append to `prior_failures`, continue retry.
+- `load_operator_baseline` (operator baseline, `baseline_generator.py`): raise `BaselineGenerationError`, hard-fail.
+- Orchestrator per-iter K-way candidate (`src/search/orchestrator.py`): emit `coder_failed` event, drop candidate, K-way fan-out picks another survivor.
+
+The baseline-side hard-fail vs candidate-side drop is intentional: a mis-bound baseline corrupts the run anchor for every subsequent iteration, so the operator needs to see it; a mis-bound candidate is one of K and the K-way reliability layer is designed to absorb single-candidate losses.
+
+**Documented remaining gap**: string-keyed indirection (`getattr(module, "name")[grid](...)`), dynamic kernel selection from dicts/lists, and multi-hop alias chains. The realistic attack surface is covered; exotic cases get a clear error rather than silent mis-attribution.
+
+**Sibling to investigation item C4** (PROCESS.md Framework Enhancement Investigation Tier C — curated per-op starter library): this entry is the operator-runtime version. C4 will reuse `load_operator_baseline` unchanged; the C4 work becomes an `op_type → path` registry sitting in front of the existing loader at the same `_dispatch_baseline` seam.
+
+**Update (2026-05-17): explicit dispatch flag.** Mid-implementation user-review feedback flipped the dispatch shape and tightened Q5. The implicit "truthy `triton_baseline_path` ⇒ load operator baseline" toggle is retired in favor of an explicit `use_operator_baseline: bool = False` field on `ACTSConfig`. `_dispatch_baseline` in `src/pipeline/optimize.py` now branches on the flag alone; the path field becomes a pure data input.
+
+*Why*: with an implicit toggle, operator intent is buried inside the path field — reading the cfg, you can't distinguish "operator wants the loader and forgot to set the path" from "operator wants the LLM translator and left a stale path lying around." The explicit flag makes the cfg self-documenting and gives `_dispatch_baseline` a single source of truth instead of inferring intent from a string's emptiness.
+
+*Q5 revised — asymmetric consistency rules at cfg load*:
+- **flag=True + `triton_baseline_path` empty → raise `ValueError`** in `ACTSConfig.__post_init__`. The operator declared intent to use the loader but didn't supply the file; this is a fail-fast operator error, not a config quirk, and surfacing it at cfg load beats letting the loader entry raise `BaselineGenerationError` mid-run.
+- **flag=False + any stray `triton_baseline_*` field set → `WARNING`**, listing the stray keys. Same Q5 spirit (mid-iteration A/B-toggle tolerance), but the warn-set is wider now — it includes `triton_baseline_path` itself, since the field is no longer the dispatch toggle and a leftover value is just dead config.
+
+*Trade-off*: the asymmetric strictness (raise where the operator clearly stated intent, warn elsewhere) catches typos and forgotten-toggles at cfg load instead of as a later `BaselineGenerationError` from the loader, while still tolerating the "comment out the flag for a quick A/B run without scrubbing every related key" workflow Q5 was designed to support.
+
 ---
 
 ## Backend

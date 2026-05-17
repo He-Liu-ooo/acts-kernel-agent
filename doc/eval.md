@@ -160,12 +160,66 @@ Bridges SOL `Definition` + `Workload` directly to the pair of callables `verify_
 - `build_input_generator(definition, workload, *, device="cuda", blob_roots: list[Path] | None = None) -> Callable[[int], tuple]` — wraps `sol_execbench.core.bench.io.gen_inputs`. Per-seed call resets RNG (`set_seed(seed)`) and generates fresh inputs. `blob_roots` is forwarded to `sol_execbench.core.bench.io.load_safetensors` when the workload declares any `SafetensorsInput` — blobs are resolved against the roots in order (first existing match wins) and loaded **once at build time**, so the on-disk read is excluded from the per-seed (and therefore per-iter) timing path. Torch and sol_execbench are lazy-imported so the module remains importable without the GPU stack.
 - `allocate_dps_outputs(definition, workload, *, device="cuda") -> list` — pre-allocates DPS output buffers for `kernel_fn(*inputs, *outputs)` calls. Resolves the workload's axes against the definition once (`definition.get_resolved_axes_values(workload.axes)`), then delegates to `sol_execbench.core.bench.io.allocate_outputs`. Single source of truth for the DPS allocation shape — used by the correctness gate (`maybe_wrap_dps_candidate`), the benchmark loop, and the `_profiler_driver` NCU subprocess.
 
+## Baseline construction — `src/benchmark/baseline_generator.py`
+
+Two entry points produce the search-tree root `Kernel`. Both run the same compile + per-workload `verify_correctness` gate at the tail; they differ only in how the source is sourced.
+
+- `generate_triton_baseline(...)` — LLM path. Calls `CoderAgent.translate()` inside an `acts_baseline` trace span; retries up to `max_retries` on `ImplementationError`, entrypoint-binding miss, compile failure, or first-workload correctness failure. Each failure is appended to `prior_failures` (carried into the next attempt's prompt) and emits a `baseline_failure` event with the stage in the reason prefix. Success emits `baseline_success`. Budget exhaustion raises `BaselineGenerationError`.
+- `load_operator_baseline(...)` — operator path. Reads a `.py` file supplied via `[runtime] triton_baseline_path` and bypasses the Coder. No retry loop, no fallback to the LLM path — hard-fail by design (the operator chose the file; if it doesn't pass the gate, surface the cause rather than silently re-translate).
+
+### `load_operator_baseline` gate sequence
+
+Each gate raises `BaselineGenerationError` with the stage embedded as `[<stage>]` and fires `operator_baseline_failure` with the same `stage` payload. On entry (after Gate 3b passes) emits `operator_baseline_load`; on Gate 7 pass emits `operator_baseline_success`. The trace span is `acts_operator_baseline` (parallel to the LLM path's `acts_baseline`).
+
+| Gate | Stage slug | Check |
+|------|------------|-------|
+| 1 | `missing_file` / `empty` | `path.exists()` re-check + non-empty source |
+| 2 | `name_resolve` | resolve `triton_kernel_name` — override wins; otherwise auto-detect via `triton_kernel_names_in(source)` (multi-kernel file with no override is a hard fail) |
+| 3 | `name_resolve` | resolved name appears as `@triton.jit def <name>` in source (auto-detect path makes this trivial; override path enforces it) |
+| 3b | `name_resolve` | entrypoint-binding check via `find_jit_name_in_entrypoint` — see below |
+| 4 | `autotune_validate` | only when `enforce_autotune=True`: construct `KernelCodeOutput(...)` to run the `@triton.autotune` AST validator (≥4 configs, non-empty `key=[...]`) |
+| 5 | (no stage slug) | `Kernel(...)` construction (its `__post_init__` parses autotune metadata; lenient when no decorator is present) |
+| 6 | `compile` | `compile_kernel(kernel, cache_dir)` inside the `acts_operator_baseline` trace span |
+| 7 | `correctness wl K/N` | `verify_correctness` per workload; first failure wins and K/N (1-indexed) is embedded in the stage slug |
+
+Gate 4 reuses the Coder's `KernelCodeOutput` Pydantic validator so the autotune contract enforced on LLM-generated kernels (4+ configs, non-empty `key`) applies symmetrically to operator-supplied ones — without duplicating the AST walk.
+
 ## Profiler — `profiler.py`
 
 Per-iteration diagnostic signals for the Reviewer. Two pieces:
 
 - **Analytical (optional)** — `_compute_analytical()` derives `AnalyticalMetrics` from `(flops, nbytes, latency_s, HardwareSpec)`, narrowed to per-iter dynamics only: `achieved_tflops`, `achieved_bandwidth_gb_s`, `pct_peak_compute`, `pct_peak_bandwidth`. Fails closed with `ProfilerError` on zero-latency, non-positive `nbytes`, negative `flops`, or zero-peak hardware (the orchestrator marks the branch DEAD_END). `profile_kernel` skips the analytical computation entirely when `nbytes == 0` (no byte count derivable for this iteration) and the resulting `ProfilingResult.analytical` is `None`; NCU still runs. Run-level invariants `arithmetic_intensity` and `ridge_point` (both in MACs/byte) live on `RooflineResult` (`src/eval/roofline.py`); the Reviewer prompt builder reads AI / ridge from `RooflineResult` and achieved_* / pct_peak_* from `AnalyticalMetrics`.
 - **NCU (best-effort)** — subprocess `ncu --csv --print-metric-name=name --section ...` via a dedicated driver (`_profiler_driver.py`). Extracts curated signals: SM occupancy, L2 hit rate, tensor-core utilization, and the top-2 warp-stall classes with percentages. The full parsed metric map is retained as `raw_metrics`; `metric_groups` overlays present/missing status for diagnostic groups (`tensor_core`, `math_pipe`, `memory`, `occupancy`, `scheduler`, `launch`, `stalls`). Failures degrade the result (`ncu=None, degraded=True, degraded_reason=<slug>`) but keep the branch alive — the analytical block (when present) still drives the Reviewer's profiling summary.
+
+### `find_jit_name_in_entrypoint` — entrypoint-binding helper
+
+Pure-AST helper closing a profiler-attribution footgun: a source can define multiple `@triton.jit def`s, declare one as `triton_kernel_name`, and have the host wrapper (`spec.entrypoint`) launch a *different* one. Correctness passes (the launched kernel produces correct output), but NCU's `--kernel-name regex:<triton_kernel_name>` filter targets the never-launched function — silently mis-attributing every per-iter profile to a helper, and (downstream) attributing autotune-cache deltas to the wrong key.
+
+Signature: `find_jit_name_in_entrypoint(source: str, entrypoint: str, jit_name: str) -> tuple[bool, str]`.
+
+Returns `(True, "")` in four cases — three are deliberate pass-throughs that defer to a clearer downstream error:
+
+1. `jit_name == entrypoint` — direct-launch convention (the `@triton.jit def` IS the entrypoint). The benchmark loop launches the JIT kernel itself; nothing to validate.
+2. `entrypoint` not found in source as a `FunctionDef` — defer to the compile gate's clearer error.
+3. Source does not parse — defer to the compile gate.
+4. `jit_name` appears in launch position inside the entrypoint body via one of three accepted patterns:
+   - `<jit_name>[grid](args)` (subscript launch).
+   - `<jit_name>.run(grid, args)` (explicit `.run` call).
+   - Single-level alias: `<alias> = <jit_name>` (or `a = b = jit_name`, or `alias: T = jit_name`) plus a launch of `<alias>` via either of the above.
+
+Returns `(False, reason)` otherwise. The check validates **launch position only** — a passing reference (`unused = other_kernel`) while a different kernel actually launches is rejected.
+
+Documented remaining gap (not closed): string-keyed indirection (`getattr(module, "name")[grid](...)`), dynamic kernel selection from dicts/lists, multi-hop alias chains (`a = b; b = jit_name`). The realistic-attack surface is covered; exotic cases get a clear `(False, reason)` and the operator restructures the wrapper, or the runtime profiler's `no_matching_kernel` slug is the backstop.
+
+Used at three call sites — the contract is identical at all three; only the failure handling differs:
+
+| Call site | Source | On `(False, reason)` |
+|-----------|--------|----------------------|
+| `generate_triton_baseline` (`src/benchmark/baseline_generator.py:141`) | LLM-translated baseline | Append to `prior_failures` and `continue` — one of N retry attempts |
+| `load_operator_baseline` (`src/benchmark/baseline_generator.py:309`) | Operator-supplied baseline | Raise `BaselineGenerationError` — no retry, no fallback |
+| Orchestrator per-iter K-way candidate (`src/search/orchestrator.py:894`) | Coder-translated child candidate | Emit `coder_failed` and skip the candidate — K-way fan-out picks another |
+
+The helper itself is a pure-AST pass-through-by-default check (no module import, no side effects) so it is safe to call before `compile_kernel` and cheap to call inside hot per-iter loops.
 
 Returns `ProfilingResult(analytical, ncu, raw_metrics, metric_groups, degraded_reason, ncu_rep_path)`. `analytical: AnalyticalMetrics | None` — `None` when `nbytes == 0` was passed in; consumers gate on `ProfilingResult.has_analytical` (mirrors `has_ncu`) before reading `achieved_*` fields. `ProfilingResult.make_degraded(analytical, reason)` accepts `analytical=None` so the degraded path works regardless of whether analytical ran. Bottleneck classification is **not** on `ProfilingResult` — it lives at the run level (see `classify_run` in `roofline.py`) because it's invariant per `(problem, representative workload, hardware)`.
 

@@ -103,6 +103,39 @@ Mutable dataclass. All parameters for a single optimization run.
 - `benchmark_adapter` (None: `str | None`): explicit override for the `_load_problem` dispatcher's adapter choice. Values: `"sol_execbench"` (also auto-selected when `definition.json` is present), `"kernelbench"` (raises `NotImplementedError` until that adapter ships). When `None`, the dispatcher inspects the problem directory and either picks an adapter or raises `UnknownBenchmarkFormat`.
 - `anti_cheat_critical_names` (`list[str]`, default `["elapsed_time", "synchronize", "wait", "record", "query"]`): names of methods on `torch.cuda.Event` whose `id()` is snapshotted on entry to `per_iter_anti_cheat` and re-checked on exit. A monkey-patch substitution between snapshot and check raises `RewardHackDetected` and the orchestrator marks the branch DEAD_END. Default covers the timing primitives a candidate would need to patch to fake faster-than-SOL latencies; operators can extend without code change.
 
+### Operator-supplied Triton baseline
+
+Skip `CoderAgent.translate()` and seat a pre-written Triton kernel as the search-tree root. Read from the `.cfg` `[runtime]` section. See `doc/eval.md` for the loader gate sequence (compile + per-workload `verify_correctness`) and `doc/pipeline.md` for the dispatch seam that branches on `use_operator_baseline`.
+
+| Field | Type | Default | Purpose |
+|-------|------|---------|---------|
+| `use_operator_baseline` | `bool` | `False` | **Dispatch flag.** When True, `_dispatch_baseline` skips `CoderAgent.translate()` and loads the file at `triton_baseline_path` as the search-tree root. When False (default), the LLM-translation path runs and all other `triton_baseline_*` fields are ignored. |
+| `triton_baseline_path` | `str \| None` | `None` | Path to a pre-written Triton `.py` file (file location, no longer the toggle). CWD-relative when not absolute. `load_config` raises `FileNotFoundError` at cfg-load time only when `use_operator_baseline=true` and the file is missing on disk. |
+| `triton_baseline_dps` | `bool` | `False` | Host-wrapper destination-passing-style contract (matches `Kernel.dps`). Cfg-supplied because dps is unknowable from source. |
+| `triton_baseline_kernel_name` | `str \| None` | `None` | Override for multi-`@triton.jit def` files. Auto-detected from source when exactly one JIT def is present. |
+| `triton_baseline_enforce_autotune` | `bool` | `False` | Opt-in to `KernelCodeOutput._autotune_decorator_well_formed` (≥4 `triton.Config` entries, non-empty `key=[...]`). Default skip — operator kernels may legitimately use `@triton.heuristics` or hand-tuned single configs. |
+
+```libconfig
+runtime:
+{
+    use_operator_baseline = true;
+    triton_baseline_path = "kernels/my_op.py";
+    triton_baseline_dps = false;
+    triton_baseline_enforce_autotune = false;
+};
+```
+
+**Asymmetric consistency rules.** `__post_init__` enforces the dispatch flag with deliberately uneven strictness — raise where the misconfig would silently waste a run, warn where it's harmless:
+
+- **`use_operator_baseline=true` + `triton_baseline_path` empty → `ValueError` at cfg load.** The operator declared intent to use a pre-written kernel but didn't supply the file; falling through to the LLM path would silently contradict the declared intent. Raise.
+- **`use_operator_baseline=false` + any of `{triton_baseline_path, triton_baseline_dps, triton_baseline_kernel_name, triton_baseline_enforce_autotune}` set → `logger.warning` "dead config".** The flag is the only thing that gates dispatch; stray fields are inert. Warn so operators can toggle modes by flipping `use_operator_baseline` alone (without scrubbing the rest of the cfg) and so mid-iteration mode-flipping during a debug session is tolerated. Mirrors the `validate_hardware_spec` warn-not-raise pattern.
+
+The `load_config` `FileNotFoundError` guard is correspondingly scoped: it fires only when `use_operator_baseline=true` and `triton_baseline_path` is set but missing on disk. A stray path under `use_operator_baseline=false` is dead config, not a misconfig — `__post_init__` already warns; `load_config` does not re-validate.
+
+**Autotune-enforce trade-off.** Default skip preserves compatibility with operator kernels that intentionally bypass `@triton.autotune` (e.g. `@triton.heuristics`, single hand-tuned config). Set `triton_baseline_enforce_autotune = true` to apply the same well-formedness gate the LLM-translation path uses when the operator wants matching strictness.
+
+`load_config` also extends the `_section_map` `[runtime]` keys to absorb the five fields, with a third coercion branch: when `default_val is None` (Optional fields), libconf's native value is stored directly — the previous `type(default_val)(value)` path tried `NoneType(value)` → `TypeError`.
+
 ## Functions
 
 - `load_config(path) -> ACTSConfig`: Parse `.cfg` file, fall back to defaults. Loads arch YAML if `[hardware] arch_config_path` is set; after load, calls `validate_hardware_spec()` against `detect_hardware()` and logs a `WARNING` per mismatch.
