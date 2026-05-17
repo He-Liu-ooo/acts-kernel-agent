@@ -88,6 +88,20 @@ CORE_EVENT_KINDS: frozenset[str] = frozenset({
     # (``autotune_winner: dict[uuid, cfg]``); per-workload burn-in elapsed
     # is captured by ``bench_done`` upstream.
     "autotune_burn_in_done",
+    # Operator-supplied Triton baseline (bypass CoderAgent.translate()).
+    # See doc/specs/2026-05-16-operator-supplied-triton-baseline-design.md.
+    # ``operator_baseline_load`` payload: path (str), kernel_name (str),
+    # dps (bool), enforce_autotune (bool). Fired once at loader entry
+    # after kernel-name resolution.
+    # ``operator_baseline_success`` payload: source_bytes (int),
+    # triton_kernel_name (str). Fired after gate 7 (correctness) passes.
+    # ``operator_baseline_failure`` payload: stage (one of "empty",
+    # "missing_file", "name_resolve", "autotune_validate", "compile",
+    # "correctness wl K/N"), reason (str, truncated to 200 chars). Fired
+    # immediately before BaselineGenerationError is raised.
+    "operator_baseline_load",
+    "operator_baseline_success",
+    "operator_baseline_failure",
 })
 
 # ``iter_end.outcome`` values. Kept as string constants (not an enum) so

@@ -199,6 +199,27 @@ class ACTSConfig:
         ]
     )
 
+    # Operator-supplied Triton baseline (bypass CoderAgent.translate()).
+    # ``use_operator_baseline`` is the explicit dispatch flag: when True,
+    # the .py file at ``triton_baseline_path`` is loaded as the search-tree
+    # root after passing compile + per-workload verify_correctness. When
+    # False (default), the LLM-translation path runs.
+    #
+    # Consistency rules (enforced in ``__post_init__``):
+    #   - flag True + path empty  -> raise ValueError (operator declared
+    #     intent but didn't provide the file).
+    #   - flag False + any of {path, dps, kernel_name, enforce_autotune}
+    #     set -> warn (dead config; mid-iteration toggling tolerated).
+    # ``load_config`` additionally raises FileNotFoundError when
+    # flag=True + path set + file missing on disk.
+    #
+    # See doc/specs/2026-05-16-operator-supplied-triton-baseline-design.md.
+    use_operator_baseline: bool = False
+    triton_baseline_path: str | None = None
+    triton_baseline_dps: bool = False
+    triton_baseline_kernel_name: str | None = None
+    triton_baseline_enforce_autotune: bool = False
+
     def __post_init__(self) -> None:
         # Reject non-int / <1: K=0 silently skips iters as "all 0
         # candidates failed"; non-int (e.g. ``1.5``) crashes ``range(K)``
@@ -213,6 +234,28 @@ class ACTSConfig:
             raise ValueError(
                 f"coder_n_candidates must be >= 1, got {self.coder_n_candidates}",
             )
+        if self.use_operator_baseline:
+            if not self.triton_baseline_path:
+                raise ValueError(
+                    "use_operator_baseline=true requires triton_baseline_path "
+                    "to be set; got empty/None.",
+                )
+        else:
+            stray = []
+            if self.triton_baseline_path:
+                stray.append("triton_baseline_path")
+            if self.triton_baseline_dps:
+                stray.append("triton_baseline_dps")
+            if self.triton_baseline_kernel_name:
+                stray.append("triton_baseline_kernel_name")
+            if self.triton_baseline_enforce_autotune:
+                stray.append("triton_baseline_enforce_autotune")
+            if stray:
+                logger.warning(
+                    "use_operator_baseline=false but %s set — these are "
+                    "dead config; LLM translation path will run.",
+                    ", ".join(stray),
+                )
 
 
 def load_config(path: Path) -> ACTSConfig:
@@ -249,7 +292,14 @@ def load_config(path: Path) -> ACTSConfig:
         "benchmark": ["benchmark_workload_count"],
         # Invocation-scoped fields absorbed from argparse (2026-05-11).
         "hardware": ["gpu_index"],
-        "runtime": ["problem_path", "reset_clocks"],
+        "runtime": [
+            "problem_path", "reset_clocks",
+            "use_operator_baseline",
+            "triton_baseline_path",
+            "triton_baseline_dps",
+            "triton_baseline_kernel_name",
+            "triton_baseline_enforce_autotune",
+        ],
     }
     defaults = ACTSConfig()
     for section, keys in _section_map.items():
@@ -265,8 +315,30 @@ def load_config(path: Path) -> ACTSConfig:
                 value = group[key]
                 if isinstance(default_val, bool):
                     kwargs[key] = bool(value)
+                elif default_val is None:
+                    # Optional fields (e.g. triton_baseline_path: str | None) —
+                    # libconf returns the right native type (str/int/float).
+                    # Store as-is; the annotation is the contract, not the
+                    # default's runtime type.
+                    kwargs[key] = value
                 else:
                     kwargs[key] = type(default_val)(value)
+    # Operator baseline: when use_operator_baseline=true AND path is set,
+    # verify the file exists at cfg-load time so misconfigured runs fail
+    # before pipeline startup. The "flag=True + empty path" case is caught
+    # in ACTSConfig.__post_init__ (ValueError). When the flag is False,
+    # any stray path is dead config — warned in __post_init__, not
+    # validated here.
+    use_op = bool(kwargs.get("use_operator_baseline", False))
+    baseline_path = kwargs.get("triton_baseline_path") or ""
+    if use_op and baseline_path:
+        resolved = Path(baseline_path).resolve()
+        if not resolved.exists():
+            raise FileNotFoundError(
+                f"use_operator_baseline=true requires triton_baseline_path "
+                f"to exist on disk; got {baseline_path!r} "
+                f"(resolved to {resolved})",
+            )
     # Hardware: load from SOLAR arch YAML if specified, else detect at runtime
     arch_path_str = (cfg.get("hardware") or {}).get("arch_config_path", "")
     if arch_path_str:
