@@ -484,7 +484,11 @@ class Orchestrator:
             per_iter_anti_cheat,
         )
         from src.eval.benchmark import BenchmarkError, benchmark_kernel
-        from src.eval.profiler import ProfilerError, profile_kernel
+        from src.eval.profiler import (
+            ProfilerError,
+            find_jit_name_in_entrypoint,
+            profile_kernel,
+        )
         from src.eval.roofline import classify_run, compute_roofline
         from src.eval.scorer import compute_sol_score
         from src.kernels.kernel import Kernel, KernelSpec
@@ -883,6 +887,23 @@ class Orchestrator:
             bench_results: list[tuple[int, Any, Kernel, Any, Any]] = []
             iter_tainted_by_hack = False
             for cand_idx, cand_output in survivors:
+                # Entrypoint-binding check: drop with coder_failed so
+                # the K-way fan-out picks another survivor — different
+                # from the baseline path (which raises) because here a
+                # mis-bound candidate is one of K, not the run's anchor.
+                ok, reason = find_jit_name_in_entrypoint(
+                    cand_output.source_code,
+                    baseline.spec.entrypoint,
+                    cand_output.triton_kernel_name,
+                )
+                if not ok:
+                    emit(
+                        "coder_failed",
+                        iter=iter_no,
+                        candidate_idx=cand_idx,
+                        reason=f"EntrypointBinding: {reason[:160]}",
+                    )
+                    continue
                 cand_kernel = Kernel(
                     spec=baseline.spec,
                     source_code=cand_output.source_code,

@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING
 from src.agents.coder import AttemptFailure, CoderAgent, ImplementationError
 from src.eval.correctness import verify_correctness
 from src.eval.inputs import build_input_generator, build_reference_fn
+from src.eval.profiler import find_jit_name_in_entrypoint
 from src.kernels.compiler import compile_kernel
 from src.kernels.kernel import Kernel
 from src.runtime.events import emit
@@ -116,6 +117,30 @@ async def generate_triton_baseline(
                 "baseline_failure",
                 attempt=attempt + 1,
                 reason=f"ImplementationError: {str(exc)[:200]}",
+            )
+            continue
+
+        # The KernelCodeOutput validator only checks that the declared
+        # triton_kernel_name appears as an @triton.jit def somewhere in
+        # source — a multi-kernel source can still declare one JIT def
+        # while spec.entrypoint launches a different one, skewing
+        # profiler/autotune attribution. Bind-check here before the
+        # Kernel is constructed so the retry loop carries the diagnostic
+        # in prior_failures.
+        ok, reason = find_jit_name_in_entrypoint(
+            output.source_code, spec.entrypoint, output.triton_kernel_name,
+        )
+        if not ok:
+            prior_failures.append(
+                AttemptFailure(
+                    attempt_no=attempt + 1,
+                    tool_errors=[f"Entrypoint-binding FAILED:\n{reason}"],
+                )
+            )
+            emit(
+                "baseline_failure",
+                attempt=attempt + 1,
+                reason=f"EntrypointBinding: {reason[:160]}",
             )
             continue
 

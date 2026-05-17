@@ -310,6 +310,61 @@ async def test_correctness_failure_on_any_workload_triggers_retry(patched_io):
 
 
 @pytest.mark.asyncio
+async def test_entrypoint_binding_mismatch_triggers_retry(patched_io):
+    """Codex 2026-05-16: LLM declares triton_kernel_name=`other` but the
+    host wrapper launches `my_kernel`. Without the binding gate this
+    would pass bench+correctness while NCU filters on a never-launched
+    kernel. Treated as a post-verify failure: one attempt consumed, the
+    retry sees a clean source and succeeds.
+    """
+    workloads = _make_workloads(n=1)
+    misleading_source = (
+        "@triton.jit\n"
+        "def my_kernel(x): pass\n"
+        "\n"
+        "@triton.jit\n"
+        "def other(x): pass\n"
+        "\n"
+        "def kernel_fn(x):\n"
+        "    my_kernel[(1,)](x)\n"
+    )
+    good_source = "@triton.jit\ndef kernel_fn(x): pass\n"
+    coder = CoderAgent(model=MagicMock())
+    coder.translate = AsyncMock(
+        side_effect=[
+            _coder_output(misleading_source, triton_kernel_name="other"),
+            _coder_output(good_source, triton_kernel_name="kernel_fn"),
+        ]
+    )
+
+    with (
+        patch(
+            "src.benchmark.baseline_generator.compile_kernel",
+            return_value=_compile_ok(),
+        ),
+        patch(
+            "src.benchmark.baseline_generator.verify_correctness",
+            return_value=_pass(),
+        ),
+    ):
+        result = await generate_triton_baseline(
+            _make_definition(), _make_spec(),
+            coder=coder, workloads=workloads, max_retries=3,
+        )
+
+    assert result.source_code == good_source
+    assert coder.translate.await_count == 2
+    # Attempt-2 prompt must surface the entrypoint-binding diagnostic so
+    # the LLM knows what to fix.
+    second_call_kwargs = coder.translate.await_args_list[1].kwargs
+    prior_failures = second_call_kwargs["prior_failures"]
+    assert len(prior_failures) == 1
+    assert any(
+        "Entrypoint-binding FAILED" in err for err in prior_failures[0].tool_errors
+    )
+
+
+@pytest.mark.asyncio
 async def test_implementation_error_triggers_retry(patched_io):
     """Transient ImplementationError consumes one attempt; then a retry is taken."""
     workloads = _make_workloads(n=2)

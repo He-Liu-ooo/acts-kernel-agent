@@ -309,6 +309,124 @@ def triton_kernel_names_in(source: str) -> list[str]:
     return _TRITON_JIT_DEF_RE.findall(source)
 
 
+def find_jit_name_in_entrypoint(
+    source: str,
+    entrypoint: str,
+    jit_name: str,
+) -> tuple[bool, str]:
+    """Verify the host wrapper ``entrypoint`` actually launches ``jit_name``.
+
+    Closes the "declared one kernel, launched another" footgun: when a
+    source defines multiple ``@triton.jit`` defs but the host wrapper
+    only launches one of them, the declared ``triton_kernel_name`` must
+    match what's actually launched — otherwise NCU filters on a
+    never-launched kernel and the profiler/autotune attribution silently
+    targets the wrong function. Validates "launch position only" — a
+    passing reference (``unused = other_kernel``) while a different
+    kernel actually launches is rejected.
+
+    Returns ``(True, "")`` when one of the following holds:
+
+      1. *jit_name == entrypoint* — direct-launch convention where the
+         ``@triton.jit def`` IS the entrypoint (the benchmark loop calls
+         ``entrypoint[grid](...)`` against the JIT kernel itself).
+      2. *entrypoint* is not found in source as a ``FunctionDef`` — the
+         compile gate will raise on that path; don't double-fail.
+      3. Source does not parse — defer to the compile gate's clearer
+         error.
+      4. *jit_name* appears in launch position inside the entrypoint
+         body via one of three accepted patterns:
+
+           - ``<jit_name>[grid](args)`` (subscript launch).
+           - ``<jit_name>.run(grid, args)`` (explicit ``.run`` call).
+           - Single-level alias: ``<alias> = <jit_name>`` plus a launch
+             of ``<alias>`` via either of the above. ``a = b = jit_name``
+             (multi-target assignment) and ``alias: T = jit_name``
+             (annotated assignment) are both accepted.
+
+    Returns ``(False, reason)`` otherwise.
+
+    Remaining gap (documented, not closed): string-keyed indirection
+    (``getattr(module, "name")[grid](...)``), dynamic kernel selection
+    from dicts/lists, and multi-hop alias chains (``a = b; b = jit_name``)
+    are outside static analysis. The realistic-attack surface is
+    well-covered; the exotic cases get a clear error message and the
+    operator can either restructure the wrapper or rely on the runtime
+    profiler's ``no_matching_kernel`` signal as the backstop.
+
+    Pure AST analysis; no module import or side effects.
+    """
+    import ast as _ast
+
+    # Pass-through #1: the entrypoint IS the JIT kernel. The benchmark
+    # loop calls ``entrypoint[grid](...)`` against the same function the
+    # profiler filters NCU on; nothing to validate.
+    if jit_name == entrypoint:
+        return (True, "")
+
+    try:
+        tree = _ast.parse(source)
+    except SyntaxError as exc:
+        # Pass-through #3: defer to the compile gate's clearer error.
+        return (True, f"(source does not parse: {exc}; defer to compile gate)")
+
+    entrypoint_fn: _ast.FunctionDef | None = None
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.FunctionDef) and node.name == entrypoint:
+            entrypoint_fn = node
+            break
+
+    if entrypoint_fn is None:
+        # Pass-through #2: compile_kernel will surface the missing
+        # entrypoint; don't mask it here.
+        return (True, "")
+
+    # Collect (a) names that appear in launch position and (b) one-level
+    # aliases of jit_name from the entrypoint body. A "launch" is a Call
+    # whose func is either ``<name>[grid]`` (Subscript on Name) or
+    # ``<name>.run`` (Attribute on Name). An "alias of jit_name" is the
+    # target of an Assign/AnnAssign whose RHS is exactly Name(jit_name).
+    launched_names: set[str] = set()
+    aliases_of_jit_name: set[str] = set()
+    for sub in _ast.walk(entrypoint_fn):
+        if isinstance(sub, _ast.Call):
+            func = sub.func
+            if isinstance(func, _ast.Subscript) and isinstance(func.value, _ast.Name):
+                launched_names.add(func.value.id)
+            elif (
+                isinstance(func, _ast.Attribute)
+                and func.attr == "run"
+                and isinstance(func.value, _ast.Name)
+            ):
+                launched_names.add(func.value.id)
+        elif isinstance(sub, _ast.Assign):
+            if isinstance(sub.value, _ast.Name) and sub.value.id == jit_name:
+                for tgt in sub.targets:
+                    if isinstance(tgt, _ast.Name):
+                        aliases_of_jit_name.add(tgt.id)
+        elif isinstance(sub, _ast.AnnAssign):
+            if (
+                isinstance(sub.value, _ast.Name)
+                and sub.value.id == jit_name
+                and isinstance(sub.target, _ast.Name)
+            ):
+                aliases_of_jit_name.add(sub.target.id)
+
+    if jit_name in launched_names:
+        return (True, "")
+    if launched_names & aliases_of_jit_name:
+        return (True, "")
+
+    return (
+        False,
+        f"entrypoint {entrypoint!r} does not launch @triton.jit def "
+        f"{jit_name!r} via subscript syntax ({jit_name}[grid](...)), "
+        f"explicit .run ({jit_name}.run(...)), or single-level alias "
+        f"(<x> = {jit_name}; <x>[grid](...)); profiler/autotune "
+        f"attribution will target a kernel the host wrapper never launches",
+    )
+
+
 class ProfilerError(Exception):
     """Raised when the analytical path cannot produce a classification.
 
