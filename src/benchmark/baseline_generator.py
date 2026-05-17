@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING
 from src.agents.coder import AttemptFailure, CoderAgent, ImplementationError
 from src.eval.correctness import verify_correctness
 from src.eval.inputs import build_input_generator, build_reference_fn
-from src.eval.profiler import find_jit_name_in_entrypoint
+from src.eval.profiler import find_jit_name_in_entrypoint, triton_kernel_names_in
 from src.kernels.compiler import compile_kernel
 from src.kernels.kernel import Kernel
 from src.runtime.events import emit
@@ -36,6 +36,17 @@ if TYPE_CHECKING:
 
 _POST_VERIFY_COMPILE_FAILED = "Post-verify Compile FAILED"
 _POST_VERIFY_CORRECTNESS_FAILED = "Post-verify Correctness FAILED"
+
+# Stage tags for ``load_operator_baseline`` failures. Each tag appears
+# both in the BaselineGenerationError message (as ``[<stage>]``) and in
+# the ``operator_baseline_failure`` event payload's ``stage`` field, so
+# postmortem grep on either surface lands on the same vocabulary.
+_OPERATOR_STAGE_EMPTY = "empty"
+_OPERATOR_STAGE_MISSING_FILE = "missing_file"
+_OPERATOR_STAGE_NAME_RESOLVE = "name_resolve"
+_OPERATOR_STAGE_AUTOTUNE = "autotune_validate"
+_OPERATOR_STAGE_COMPILE = "compile"
+_OPERATOR_STAGE_CORRECTNESS = "correctness"
 
 
 class BaselineGenerationError(Exception):
@@ -213,3 +224,171 @@ async def generate_triton_baseline(
         f"Baseline translation for '{definition.name}' failed after "
         f"{max_retries} attempts.",
     )
+
+
+def _fail_operator(stage: str, message: str) -> "BaselineGenerationError":
+    """Emit the failure event and build the BaselineGenerationError.
+
+    Caller raises the returned exception; emission happens inside this
+    helper so every failure path keeps the event-and-raise pair in sync.
+    """
+    reason = message[:200]
+    emit("operator_baseline_failure", stage=stage, reason=reason)
+    return BaselineGenerationError(f"[{stage}] {message}")
+
+
+async def load_operator_baseline(
+    definition: "Definition",
+    spec: "KernelSpec",
+    *,
+    path: "Path",
+    dps: bool,
+    kernel_name_override: str | None,
+    enforce_autotune: bool,
+    workloads: list["Workload"],
+    cache_dir: "Path | None" = None,
+    policy: "ComparisonPolicy | None" = None,
+    blob_roots: list["Path"] | None = None,
+) -> Kernel:
+    """Load an operator-supplied Triton kernel as the search-tree root.
+
+    Bypasses ``CoderAgent.translate()``. Source is read from *path* and
+    verified via the same compile + per-workload ``verify_correctness``
+    gate the LLM path runs after ``translate()``. Raises
+    ``BaselineGenerationError`` on any gate failure — no retry loop, no
+    fallback to the LLM path. See
+    ``doc/specs/2026-05-16-operator-supplied-triton-baseline-design.md``.
+    """
+    if not workloads:
+        raise ValueError(
+            "load_operator_baseline requires at least one workload.",
+        )
+
+    # Gate 1: read source + missing-file / empty guard.
+    if not path.exists():
+        raise _fail_operator(
+            _OPERATOR_STAGE_MISSING_FILE,
+            f"Operator baseline file missing: {path}",
+        )
+    source = path.read_text()
+    if not source.strip():
+        raise _fail_operator(
+            _OPERATOR_STAGE_EMPTY,
+            f"Operator baseline file empty: {path}",
+        )
+
+    # Gate 2 + 3: resolve triton_kernel_name (override -> auto-detect)
+    # and verify the resolved name actually appears in source.
+    names = triton_kernel_names_in(source)
+    if kernel_name_override:
+        if kernel_name_override not in names:
+            raise _fail_operator(
+                _OPERATOR_STAGE_NAME_RESOLVE,
+                f"triton_baseline_kernel_name={kernel_name_override!r} not "
+                f"found in source; @triton.jit defs present: {names}",
+            )
+        resolved_name = kernel_name_override
+    else:
+        if not names:
+            raise _fail_operator(
+                _OPERATOR_STAGE_NAME_RESOLVE,
+                f"Operator baseline has no @triton.jit def in {path}",
+            )
+        if len(names) > 1:
+            raise _fail_operator(
+                _OPERATOR_STAGE_NAME_RESOLVE,
+                f"Operator baseline has {len(names)} @triton.jit defs "
+                f"({names}); set [runtime] triton_baseline_kernel_name "
+                f"to disambiguate",
+            )
+        resolved_name = names[0]
+
+    # Gate 3b: entrypoint-binding check. Symmetric with the
+    # ``generate_triton_baseline`` and ``Orchestrator`` per-iter gates;
+    # see ``find_jit_name_in_entrypoint`` for the contract.
+    ok, reason = find_jit_name_in_entrypoint(
+        source, spec.entrypoint, resolved_name,
+    )
+    if not ok:
+        raise _fail_operator(_OPERATOR_STAGE_NAME_RESOLVE, reason)
+
+    emit(
+        "operator_baseline_load",
+        path=str(path),
+        kernel_name=resolved_name,
+        dps=dps,
+        enforce_autotune=enforce_autotune,
+    )
+
+    # Gate 4: autotune validator — opt-in. When enforced, reuse the
+    # KernelCodeOutput validator's logic by constructing the Pydantic
+    # model (its model_validator chain runs both name-match — already
+    # passed — and autotune well-formedness). On ValidationError, wrap
+    # as BaselineGenerationError.
+    if enforce_autotune:
+        from pydantic import ValidationError
+
+        from src.agents.coder import KernelCodeOutput
+        try:
+            KernelCodeOutput(
+                source_code=source,
+                triton_kernel_name=resolved_name,
+                dps=dps,
+            )
+        except ValidationError as exc:
+            raise _fail_operator(
+                _OPERATOR_STAGE_AUTOTUNE,
+                f"Autotune validator failed: {exc}",
+            ) from exc
+
+    # Gate 5: construct Kernel (its __post_init__ parses autotune
+    # metadata from source; lenient when no decorator is present).
+    kernel = Kernel(
+        spec=spec,
+        source_code=source,
+        triton_kernel_name=resolved_name,
+        dps=dps,
+    )
+
+    # Gate 6: compile.
+    with trace_span(
+        "acts_operator_baseline",
+        iter_no=0,
+        agent=AgentLabel.CODER_TRANSLATE,
+    ):
+        compiled = compile_kernel(kernel, cache_dir=cache_dir)
+    if not compiled.success:
+        raise _fail_operator(
+            _OPERATOR_STAGE_COMPILE,
+            f"Operator baseline compile FAILED: {compiled.error_message}",
+        )
+
+    # Gate 7: per-workload correctness (first failure wins).
+    reference_fn = build_reference_fn(definition.reference)
+    input_generators = [
+        build_input_generator(definition, w, blob_roots=blob_roots)
+        for w in workloads
+    ]
+    for idx, (gen, wl) in enumerate(zip(input_generators, workloads)):
+        result = verify_correctness(
+            candidate_fn=compiled.compiled_fn,
+            reference_fn=reference_fn,
+            input_generator=gen,
+            definition=definition,
+            kernel=kernel,
+            workload=wl,
+            policy=policy,
+        )
+        if not result.passed:
+            raise _fail_operator(
+                f"{_OPERATOR_STAGE_CORRECTNESS} wl {idx + 1}/{len(workloads)}",
+                f"Operator baseline correctness FAILED on workload "
+                f"{idx + 1}/{len(workloads)}: {result.error_message}",
+            )
+
+    emit(
+        "operator_baseline_success",
+        source_bytes=len(source),
+        triton_kernel_name=resolved_name,
+    )
+    return kernel

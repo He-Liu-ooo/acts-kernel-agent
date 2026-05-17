@@ -571,6 +571,54 @@ async def optimize(
     return result, report
 
 
+async def _dispatch_baseline(
+    config: ACTSConfig,
+    definition: "Definition",
+    spec: "KernelSpec",
+    *,
+    coder: "CoderAgent | None",
+    workloads: list["Workload"],
+    blob_roots: list[Path],
+) -> "Kernel":
+    """Pick the operator-supplied or LLM-translated baseline strategy.
+
+    When ``config.use_operator_baseline`` is True, route to
+    ``load_operator_baseline`` (reads the file at
+    ``config.triton_baseline_path``); otherwise fall through to the
+    existing LLM-translation path. Both return a verified ``Kernel`` of
+    identical shape. See
+    ``doc/specs/2026-05-16-operator-supplied-triton-baseline-design.md``.
+
+    Function-local import so tests that patch
+    ``src.benchmark.baseline_generator.{generate_triton_baseline,
+    load_operator_baseline}`` see the mock at call time (the canonical
+    patch target both pre-A1 pipeline tests and this feature's dispatch
+    tests use).
+    """
+    from src.benchmark.baseline_generator import (
+        generate_triton_baseline,
+        load_operator_baseline,
+    )
+
+    if config.use_operator_baseline:
+        return await load_operator_baseline(
+            definition, spec,
+            path=Path(config.triton_baseline_path).resolve(),
+            dps=config.triton_baseline_dps,
+            kernel_name_override=config.triton_baseline_kernel_name or None,
+            enforce_autotune=config.triton_baseline_enforce_autotune,
+            workloads=workloads,
+            blob_roots=blob_roots,
+        )
+    return await generate_triton_baseline(
+        definition, spec,
+        coder=coder,
+        workloads=workloads,
+        max_retries=config.max_baseline_retries,
+        blob_roots=blob_roots,
+    )
+
+
 async def _load_problem(
     problem_dir: Path,
     config: ACTSConfig,
@@ -632,7 +680,6 @@ async def _load_sol_problem(
     ``definition.json`` the profiler subprocess driver reloads to
     reconstruct the (unpicklable) input generator.
     """
-    from src.benchmark.baseline_generator import generate_triton_baseline
     from src.benchmark.solar_adapter import is_solar_available
     from src.benchmark.workload_selector import select_workloads
     # ``load`` is re-exported as a function from
@@ -688,11 +735,10 @@ async def _load_sol_problem(
         spec.t_sol_us = roofline.t_sol_us
 
     blob_roots = config.safetensors_blob_roots or [problem_dir]
-    baseline = await generate_triton_baseline(
-        definition, spec,
+    baseline = await _dispatch_baseline(
+        config, definition, spec,
         coder=coder,
         workloads=workloads,
-        max_retries=config.max_baseline_retries,
         blob_roots=blob_roots,
     )
 
