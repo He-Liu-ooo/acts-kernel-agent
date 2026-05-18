@@ -396,12 +396,21 @@ def _render_autotune_summary(
     return "# autotune: " + ", ".join(parts)
 
 
+def _flatten_autotune_config(cfg: dict) -> dict:
+    """Lift the parser's nested ``{"kwargs": {...}, "num_warps": int,
+    "num_stages": int}`` shape to a flat dict with ``num_warps`` /
+    ``num_stages`` alongside the kwargs. Shared by ``_render_autotune_winner``
+    and the Coder's ``autotune_exclude`` validator so both agree on what
+    "flat" means."""
+    return {
+        **cfg.get("kwargs", {}),
+        "num_warps": cfg.get("num_warps", 0),
+        "num_stages": cfg.get("num_stages", 0),
+    }
+
+
 def _render_autotune_winner(winner: dict) -> str:
     """Build the ``# winner (representative wl): ...`` line from a single
     winner-config dict (kwargs + num_warps + num_stages)."""
-    parts: list[str] = []
-    for k, v in winner.get("kwargs", {}).items():
-        parts.append(f"{k}={v}")
-    parts.append(f"num_warps={winner.get('num_warps', 0)}")
-    parts.append(f"num_stages={winner.get('num_stages', 0)}")
+    parts = [f"{k}={v}" for k, v in _flatten_autotune_config(winner).items()]
     return "# winner (representative wl): " + ", ".join(parts)

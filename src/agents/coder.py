@@ -24,6 +24,7 @@ still runs — invoked by the submit tool body — preserving the
 
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -370,10 +371,34 @@ def _make_correctness_tool(
     return check_correctness_tool
 
 
+def _format_exclude_violation(
+    patterns: list[dict[str, int]],
+    violations: list[tuple[int, dict]],
+) -> str:
+    """Build the ``submit_kernel FAILED:`` string for autotune_exclude
+    violations. Names both the Planner-supplied patterns and the matching
+    configs so the Coder doesn't have to diff its own list."""
+    pattern_lines = "\n".join(f"  - exclude pattern: {p}" for p in patterns)
+    violation_lines = "\n".join(
+        f"  config[{i}] {cfg} matches autotune_exclude"
+        for i, cfg in violations
+    )
+    return (
+        "submit_kernel FAILED: autotune_exclude violation. The Planner "
+        "specified these configs must NOT appear in @triton.autotune:\n"
+        + pattern_lines
+        + "\nYour submitted configs that violate:\n"
+        + violation_lines
+        + "\nRemove the offending configs and resubmit. "
+        "The ≥4-config minimum still applies."
+    )
+
+
 def _make_submit_tool(
     captured: dict,
     *,
     error_log: list[str] | None = None,
+    plan: "OptimizationPlan | None" = None,
 ) -> Callable[[str, str], str]:
     """Build a submit tool that captures the LLM's final ``KernelCodeOutput``.
 
@@ -395,7 +420,17 @@ def _make_submit_tool(
     prior-failures section would render the misleading
     "no tool errors recorded" placeholder for an attempt that DID
     invoke ``submit_kernel`` but had its payload rejected.
+
+    *plan* — when supplied with a non-empty ``plan.autotune_exclude``,
+    the closure parses the submitted ``@triton.autotune`` block and
+    rejects any Config matching an exclude pattern. ``plan=None`` (the
+    default) is used by the ``translate`` baseline path which has no
+    Planner plan; the exclude check is a no-op there.
     """
+    from src.kernels.kernel import (
+        _flatten_autotune_config,
+        _parse_autotune_from_source,
+    )
 
     def submit_kernel(
         source_code: str,
@@ -403,7 +438,7 @@ def _make_submit_tool(
         dps: bool = False,
     ) -> str:
         try:
-            captured["output"] = KernelCodeOutput(
+            output = KernelCodeOutput(
                 source_code=source_code,
                 triton_kernel_name=triton_kernel_name,
                 dps=dps,
@@ -413,6 +448,25 @@ def _make_submit_tool(
                 error_log,
                 format_submit_validation_error("submit_kernel", exc),
             )
+
+        if plan is not None and plan.autotune_exclude:
+            configs, _ = _parse_autotune_from_source(
+                source_code, triton_kernel_name,
+            )
+            violations: list[tuple[int, dict]] = []
+            for i, cfg in enumerate(configs):
+                flat = _flatten_autotune_config(cfg)
+                for exclude in plan.autotune_exclude:
+                    if all(flat.get(k) == v for k, v in exclude.items()):
+                        violations.append((i, flat))
+                        break
+            if violations:
+                return _record_failure(
+                    error_log,
+                    _format_exclude_violation(plan.autotune_exclude, violations),
+                )
+
+        captured["output"] = output
         return SUBMIT_OK_SENTINEL
 
     return submit_kernel
@@ -480,6 +534,12 @@ class CoderAgent:
             plan_lines.append(f"- Params: {params_str}")
         plan_lines.append(f"- Target region: {plan.target_region}")
         plan_lines.append(f"- Rationale: {plan.rationale}")
+        if plan.autotune_exclude:
+            exclude_json = json.dumps(plan.autotune_exclude)
+            plan_lines.append(
+                "- Autotune exclude (submit_kernel rejects any "
+                f"@triton.autotune Config matching any pattern): {exclude_json}"
+            )
         sections.append("## Optimization plan\n" + "\n".join(plan_lines))
 
         return "\n\n".join(sections)
@@ -495,6 +555,7 @@ class CoderAgent:
         input_generators: list[Callable[[int], tuple]],
         definition: Any | None = None,
         workloads: list[Any] | None = None,
+        plan: "OptimizationPlan | None" = None,
     ) -> KernelCodeOutput:
         # Shared across all three tool factories so every FAILED return
         # rides out via ``ImplementationError.tool_errors`` for the
@@ -515,7 +576,7 @@ class CoderAgent:
         )
         captured: dict = {}
         submit_tool = function_tool(
-            _make_submit_tool(captured, error_log=tool_errors)
+            _make_submit_tool(captured, error_log=tool_errors, plan=plan)
         )
         agent = Agent(
             name=agent_name,
@@ -606,6 +667,7 @@ class CoderAgent:
             input_generators=input_generators,
             definition=definition,
             workloads=workloads,
+            plan=plan,
         )
 
     @staticmethod

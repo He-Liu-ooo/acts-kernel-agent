@@ -56,6 +56,11 @@ class OptimizationPlanOutput(BaseModel):
     params: dict[str, str] = {}
     target_region: str = ""
     rationale: str = ""
+    # Each dict is a partial-match pattern; the Coder validator rejects
+    # any submitted @triton.autotune Config whose listed keys all match.
+    # Top-level field (not inside ``params``) so the existing strict-mode
+    # str-only ``params`` workaround stays intact.
+    autotune_exclude: list[dict[str, int]] = []
 
 
 # ── Plain dataclass used internally ────────────────────────────────────
@@ -70,6 +75,7 @@ class OptimizationPlan:
     params: dict[str, str] = field(default_factory=dict)
     target_region: str = ""
     rationale: str = ""
+    autotune_exclude: list[dict[str, int]] = field(default_factory=list)
 
 
 def _output_to_plan(out: OptimizationPlanOutput) -> OptimizationPlan:
@@ -80,6 +86,7 @@ def _output_to_plan(out: OptimizationPlanOutput) -> OptimizationPlan:
         params=dict(out.params),
         target_region=out.target_region,
         rationale=out.rationale,
+        autotune_exclude=list(out.autotune_exclude),
     )
 
 
@@ -115,6 +122,7 @@ def _make_submit_plan_tool(captured: dict) -> Callable[..., str]:
         params: dict[str, str] | None = None,
         target_region: str = "",
         rationale: str = "",
+        autotune_exclude: list[dict[str, int]] | None = None,
     ) -> str:
         try:
             captured["output"] = OptimizationPlanOutput(
@@ -123,6 +131,7 @@ def _make_submit_plan_tool(captured: dict) -> Callable[..., str]:
                 params=params or {},
                 target_region=target_region,
                 rationale=rationale,
+                autotune_exclude=autotune_exclude or [],
             )
         except ValidationError as exc:
             return format_submit_validation_error("submit_plan", exc)
