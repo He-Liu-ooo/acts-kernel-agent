@@ -151,7 +151,7 @@ When `report.hardware_spec is not None`, `render_report` appends a trailing **"H
 Every CLI invocation creates a fresh `<run-dir>/run_<YYYYMMDDTHHMMSS_ffffffZ>/` directory (default `./runs/run_<UTC>/`) holding:
 
 - `run.log` — human-readable text log of the invocation.
-- `events.jsonl` — structured event stream (27 kinds in `CORE_EVENT_KINDS`) emitted by the orchestrator and `RunContext`.
+- `events.jsonl` — structured event stream (kinds enumerated in `runtime/events.CORE_EVENT_KINDS`) emitted by the orchestrator and `RunContext`.
 - `traces/acts_trace_<UTC>.jsonl` — SDK per-call records (LLM inputs/outputs, tool calls, spans) written by `JSONLTraceProcessor`. Relocated when `--trace-dir <path>` is passed; absent when `--trace-dir=` disables capture.
 - `report.txt` — final `render_report(report)` text persisted alongside the stdout print, plus an appended `=== ACTSConfig (resolved at run start) ===` block (JSON dump of the dataclass `main()` constructed for this invocation). Best-effort write; an `OSError` is logged at `WARNING` and skipped. The terminal print stays focused on results — only the persisted file carries the config dump.
 - `usage.json` — machine-readable sidecar with per-iter × per-agent LLM usage. Schema: `{schema_version: 1, columns: [...], by_iter: [...], by_agent: {...}, total: {...}}`, serialized via `dataclasses.asdict` over the snapshot's buckets (no custom dict-builder). Persisted by `pipeline/optimize.py::_write_usage_sidecar(snapshot, run_dir)`, built from `ctx.usage_snapshot()` (see `doc/runtime.md` for the accumulator's design). Best-effort write; an `OSError` is logged at `WARNING` and skipped.

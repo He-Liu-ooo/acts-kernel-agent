@@ -22,7 +22,7 @@ Best-first tree search with beam constraint.
 - **Structure**: Tree nodes = kernel versions, edges = optimization actions. Root = baseline kernel.
 - **Selection**: Epsilon-greedy over frontier. With probability (1−ε) expand highest-scoring node; with probability ε expand a random node. Epsilon decays over iterations.
 - **Parent retention**: Parent stays in frontier after expansion, enabling backtracking.
-- **Child retention**: Children worse than their parent are kept by default. Regressed children are handled by: (1) score-based deprioritization, (2) beam constraint pruning, (3) Reviewer `branch_quality` override (`"promising"`, `"blocked_potential"`, `"plateau"`, `"dead_end"`).
+- **Child retention**: Children worse than their parent are kept by default. Regressed children are handled by: (1) score-based deprioritization, (2) beam constraint pruning, (3) Reviewer `branch_quality` override (`"promising"`, `"blocked_potential"`, `"plateau"`, `"dead_end"`). K-way Coder/bench-layer failures attach as non-expandable failure nodes (no score, `dead_reason=CODER_FAILED`) so the Planner sees prior failed attempts on the same parent; failure siblings are deduped on `(action, params, failure_reason)` and capped at `failure_sibling_cap` (default 8) when rendered.
 - **Scoring**: SOL Score (see Roofline Model & Optimization Headroom section).
 - **Termination**: All frontier nodes marked dead_end, iteration budget exhausted, SOL score ≥ `sol_target`, or global plateau (best score stalled for `sol_plateau_window` iterations).
 - **Single strategy**: Tree search with beam pruning only. No evolutionary fallback — keeps the search layer simple and debuggable.
@@ -67,9 +67,9 @@ Planner --> Coder x K (asyncio.gather, K=4 default) --> [per-candidate sequentia
                                                                           --> Planner (next iter)
 ```
 
-The Coder axis fans out to K parallel `Coder.implement()` calls per iter (best-of-K, `ACTSConfig.coder_n_candidates=4` default; set `=1` to opt out and recover the pre-A2 1-call shape). Compile + correctness self-correction happens inside each Coder call's own tool loop. The K outputs are then ranked sequentially through anti-cheat + benchmark + profile — the first candidate to clear profiling wins the iter and becomes the tree node. The Planner and Reviewer paths are unchanged; K-way multiplies cost only on the Coder axis. This converts the per-iter comparison from "median LLM draft vs baseline" to "best-of-K vs baseline," closing the failure mode where a regressing median Coder draft makes every iter lose.
+The Coder axis fans out to K parallel `Coder.implement()` calls per iter (best-of-K, `ACTSConfig.coder_n_candidates=4` default; set `=1` to opt out and recover the pre-A2 1-call shape). Compile + correctness self-correction happens inside each Coder call's own tool loop. The K outputs are then ranked sequentially through anti-cheat + benchmark + profile — the first candidate to clear profiling wins the iter and becomes the tree node. The Planner and Reviewer paths are unchanged; K-way multiplies cost only on the Coder axis. This converts the per-iter comparison from "median LLM draft vs baseline" to "best-of-K vs baseline," closing the failure mode where a regressing median Coder draft makes every iter lose. Failed Coder candidates (compile / correctness / entrypoint-binding / partial-bench / sticky-CUDA) attach to the parent as non-expandable failure nodes carrying the raw error string; profile-layer failures stay as `coder_failed` events only.
 
-On compilation or correctness failure inside a Coder call, that call's tool loop handles retries internally. If the retry budget is exhausted, that candidate is dropped from the survivor set; if all K fail, the iter is marked dead. No separate Debugger agent.
+On compilation or correctness failure inside a Coder call, that call's tool loop handles retries internally. If the retry budget is exhausted, that candidate is dropped from the survivor set. If all K fail, the iter is marked SKIPPED; Coder-layer and bench-layer failures persist as non-expandable failure nodes under the parent for Planner visibility, while profile-layer failures emit `coder_failed` events only without tree mutation. No separate Debugger agent.
 
 **Operator caveat**: K-way assumes the LLM backend serves the K requests concurrently. Serial backends (locally hosted TGI with one slot, provider-side queues capped below K) turn the `asyncio.gather` into K sequential calls and pay K× wallclock for the same token cost as the parallel case — set `coder_n_candidates=1` in that environment.
 
@@ -328,7 +328,7 @@ No `bottleneck_after` — classification is once-per-run (invariant per `(proble
 
 No kernel code stored — only summaries. Both successes and failures stored.
 
-Under K-way Coder fan-out (`coder_n_candidates>1`), MemoryStore growth is unchanged: one `Experience` per advanced iter (the winner), not K. The K-1 losing candidates exist only as `coder_failed` records in `events.jsonl` — persisting them in MemoryStore would dilute its `success=False` retrieval semantics.
+Under K-way Coder fan-out (`coder_n_candidates>1`), MemoryStore growth is unchanged: one `Experience` per advanced iter (the winner), not K. The K-1 losing candidates exist as `coder_failed` (+ `failure_node_added` when persisted) records in `events.jsonl`, plus non-expandable `DeadReason.CODER_FAILED` failure nodes under the parent (capped per parent by `failure_sibling_cap`, default 8); MemoryStore still records only the winner — persisting losers in MemoryStore would dilute its `success=False` retrieval semantics.
 
 ### Storage & Retrieval
 
@@ -393,6 +393,7 @@ beam_width = 3
 beam_diversity = true
 reviewer_metric_queries = false   ; opt-in: registers Reviewer's `query_metric` tool, max_turns=6
 coder_n_candidates = 4            ; A2: K-way Coder fan-out per iter (best-of-K -> one child). Set =1 to opt out.
+failure_sibling_cap = 8           ; per-parent cap on rendered DeadReason.CODER_FAILED failure siblings (deduped on (action, params, failure_reason))
 max_depth = 20
 epsilon_start = 0.3
 epsilon_end = 0.05

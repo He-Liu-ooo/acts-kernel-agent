@@ -24,6 +24,7 @@ search:
     beam_width = 3;
     beam_diversity = true;
     reviewer_metric_queries = false;
+    failure_sibling_cap = 8;
     max_depth = 20;
     epsilon_start = 0.3;
     epsilon_end = 0.05;
@@ -79,6 +80,7 @@ Mutable dataclass. All parameters for a single optimization run.
 - `beam_width` (3): max active frontier nodes after beam pruning.
 - `beam_diversity` (True): enable the diversity-aware rescue pass (B2) in `beam_prune`. Disable for ablation or pure-exploitation runs.
 - `reviewer_metric_queries` (False): If True, Reviewer can fetch additional NCU metrics via the `query_metric` tool (multi-turn agent loop, `max_turns=6`). Default off; the default submit-only path is the verified default. When True, `ReviewerAgent` also appends the `system_metric_queries.md` addendum to its system prompt; when False, the base `system.md` is used alone (mirrors tool-registration to prevent prompt-leak regressions).
+- `failure_sibling_cap` (8): max number of failure-sibling entries rendered into Planner prompts via `SearchTree.render_siblings(consumer='planner', failure_cap=...)`. Above the cap, failure siblings are deduped on `(action, params, failure_reason)` and the most-recent groups (by `(iter_no, child_id)`) survive. Reviewer consumer omits failure siblings regardless of cap. `0` = uncapped.
 - `max_depth` (20): max tree depth (longest root-to-leaf path).
 - `epsilon_start` (0.3): initial exploration rate for epsilon-greedy selection.
 - `epsilon_end` (0.05): final exploration rate after decay.

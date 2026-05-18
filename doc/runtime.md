@@ -40,7 +40,7 @@ Fans out each call to two sinks:
 Contract:
 
 - `kind` must be in `CORE_EVENT_KINDS`; other kinds log a warning and are still written (schema drift stays visible, never silent).
-- `iter` is an explicit keyword. It appears on per-iteration events (`iter_start`, `planner_selected`, `planner_failed`, `coder_submitted`, `coder_failed`, `bench_done`, `profile_done`, `score_computed`, `reviewer_feedback`, `reviewer_metric_query`, `branch_dead_end`, `iter_end`, `trace_emitted`, `reward_hack_detected`, `reward_hack_confirmed`, `reward_hack_cleared`, `calibration_warning`, `sibling_context_rendered`, `repeated_pathway_dead_end`) and is `None` on run-scope events (`run_start`, `baseline_*`, `verify_*`, `run_end`, `clock_lock_unavailable`, `clock_drift_detected`).
+- `iter` is an explicit keyword. It appears on per-iteration events (`iter_start`, `planner_selected`, `planner_failed`, `coder_submitted`, `coder_failed`, `bench_done`, `profile_done`, `score_computed`, `reviewer_feedback`, `reviewer_metric_query`, `branch_dead_end`, `iter_end`, `trace_emitted`, `reward_hack_detected`, `reward_hack_confirmed`, `reward_hack_cleared`, `calibration_warning`, `sibling_context_rendered`, `failure_node_added`, `repeated_pathway_dead_end`) and is `None` on run-scope events (`run_start`, `baseline_*`, `verify_*`, `run_end`, `clock_lock_unavailable`, `clock_drift_detected`).
 - **Never raises.** Serialization failures are caught and logged; file-handle errors during write do not propagate.
 - Skips serialization entirely when `logger.isEnabledFor(INFO)` is false — cheap to leave in hot paths.
 - All additional `**fields` are merged flat into the JSON object. Use `finite_or_none(x)` on any float that could be `inf`/`nan` (e.g. latency after a failed bench) so JSON stays valid.
@@ -55,11 +55,11 @@ Module-level handle registration, guarded by `_lock`. `RunContext.create` calls 
 
 ### Event catalog — `CORE_EVENT_KINDS`
 
-Frozenset of 30 kinds:
+Frozenset of 34 kinds:
 
 **Run scope** — `run_start`, `baseline_attempt`, `baseline_success`, `baseline_failure`, `baseline_ready`, `verify_start`, `verify_done`, `run_end`, `clock_lock_unavailable`, `clock_drift_detected`.
 
-**Per-iteration** — `iter_start`, `planner_selected`, `planner_failed`, `coder_submitted`, `coder_failed`, `bench_done`, `profile_done`, `score_computed`, `reviewer_feedback`, `reviewer_metric_query`, `branch_dead_end`, `iter_end`, `trace_emitted`, `reward_hack_detected`, `reward_hack_confirmed`, `reward_hack_cleared`, `calibration_warning`, `sibling_context_rendered`, `repeated_pathway_dead_end`, `autotune_burn_in_done`.
+**Per-iteration** — `iter_start`, `planner_selected`, `planner_failed`, `coder_submitted`, `coder_failed`, `bench_done`, `profile_done`, `score_computed`, `reviewer_feedback`, `reviewer_metric_query`, `branch_dead_end`, `iter_end`, `trace_emitted`, `reward_hack_detected`, `reward_hack_confirmed`, `reward_hack_cleared`, `calibration_warning`, `sibling_context_rendered`, `failure_node_added`, `repeated_pathway_dead_end`, `autotune_burn_in_done`.
 
 **SOL integration sub-grouping** (added 2026-04-27, distributed across the two scopes above):
 
@@ -76,17 +76,21 @@ Frozenset of 30 kinds:
 - `sibling_context_rendered` (per-iter) — fires once per Planner call AND once per Reviewer call whenever the parent has been expanded before (`sibling_context != ""`). Payload: `iter`, `parent_node_id`, `sibling_count: int`, `regressed_actions: list[str]`, `consumer: Literal["planner", "reviewer"]`. On iter ≥2 with a sibling, both events fire (one per consumer) for the same parent.
 - `repeated_pathway_dead_end` (per-iter) — fires when Reviewer verdict is DEAD_END AND `child.action_applied` matches a regressed sibling — the existing reviewer/system.md rule ("regression + same pathway on sibling = dead_end") actually fired with sibling evidence. Payload: `iter`, `action: str`, `sibling_iter: int`. Leading-indicator companion to the `branch_dead_end(reason="reviewer_judged")` that follows; lets postmortems count successful sibling-driven prunes without re-walking the tree.
 
+**Failure-node retention sub-grouping** (per-iter):
+
+- `failure_node_added` (per-iter) — fires alongside `coder_failed` only when the failure is persisted as a non-expandable failure node on the search tree (Coder-layer + bench-layer firings). Profile-layer `coder_failed` firings emit no `failure_node_added` (no tree artifact). Payload: `iter`, `candidate_idx: int`, `node_id: int`, `parent_id: int`, `action: str`, `params: dict`, `reason: str`.
+
 **Triton autotune integration sub-grouping** (added 2026-05-14, A1 PR 1):
 - `autotune_burn_in_done` (per-iter) — fires once per iter after benchmark-captured autotune winners are copied onto the kernel. Payload: `iter`, `workload_count: int`, `winner_count: int`. Per-workload winners themselves persist on `Kernel.autotune_winner: dict[workload.uuid, cfg]`.
 
 Notable semantics:
 
 - `coder_submitted` carries **no pass/fail claim**. The orchestrator cannot verify compile or correctness gates from `CoderAgent.implement()`'s return value alone. Ground-truth per-tool-call records live in `traces/*.jsonl`; cross-reference both streams when auditing.
-- `coder_failed` covers any `ImplementationError` (compile failure, correctness failure, exhausted retries).
+- `coder_failed` covers Coder-side errors (`ImplementationError`: compile / correctness / exhausted retries, plus `EntrypointBinding` rejection), bench-layer failures (`BenchmarkError`, partial bench, recoverable CUDA sticky-state), and profile-layer failures (representative-workload latency unavailable, `ProfilerError`). Coder-layer and bench-layer firings are paired with a `failure_node_added` event (a failure node is attached to the parent); profile-layer firings are not (no tree artifact).
 - `score_computed` carries `iter`, `score` (sol_score), `is_new_best`, `reward_hack_suspect`, `calibration_warning`, `t_k_us` (kernel median latency), `t_b_us` (baseline median latency), `t_sol_us` (T_SOL used in scoring), and `t_sol_source` — `"solar"` when SOLAR's pipeline produced T_SOL successfully, `"builtin"` when the in-process `compute_roofline()` fallback was used. The source field lets downstream consumers (telemetry, analysis, future memory retrieval) distinguish SOLAR-grounded sol_score numbers from fallback-grounded ones when auditing across runs that may have used different T_SOL backends.
 - `planner_failed`: any `PlanningError` cause — turn-budget exhaustion, missing `submit_plan` call, transient retry exhaustion, or the available-actions guard rejecting an unknown technique. Carries `iter` and `reason` (truncated exception string ≤ 200 chars). Always followed by `iter_end(outcome="skipped")`; no tree mutation occurs on this path.
 - `reviewer_metric_query`: emitted by the Reviewer's `query_metric` tool body each time the LLM invokes it during a multi-turn review. Carries `iter` (orchestrator iteration index), `count` (number of names in the query), and `names` (list of the first 8 names from the query, capped to keep `events.jsonl` lines bounded). Emission is gated on `ACTSConfig.reviewer_metric_queries=True`. Records what the Reviewer LLM asked for via the `query_metric` tool — useful post-run for analyzing whether the multi-turn capability is being exercised and on what metrics.
-- `iter_end.outcome` is exactly one of three constants: `ITER_ADVANCED` (`"advanced"`), `ITER_DEAD_END` (`"dead_end"`), `ITER_SKIPPED` (`"skipped"`). `skipped` fires only after either `coder_failed` or `planner_failed` and implies no tree mutation.
+- `iter_end.outcome` is exactly one of three constants: `ITER_ADVANCED` (`"advanced"`), `ITER_DEAD_END` (`"dead_end"`), `ITER_SKIPPED` (`"skipped"`). `skipped` fires only after either `coder_failed` or `planner_failed`; it can still mutate the tree (K-way Coder/bench-layer failures attach non-expandable failure nodes via `_persist_failure_node`). Profile-layer-only SKIPs produce no tree mutation.
 
 ### Dead-end reasons
 
@@ -105,6 +109,7 @@ Members:
 - `AGENT_FAILURE` (`"agent_failure"`) — agent-side error not covered by the more specific buckets above.
 - `BEAM_PRUNED` (`"beam_pruned"`) — node lost the beam competition. On-tree only; not emitted as `branch_dead_end`.
 - `REVIEWER_JUDGED` (`"reviewer_judged"`) — Reviewer's verdict for the iter was `DEAD_END`. On-tree only; the verdict flows through `reviewer_feedback` for telemetry.
+- `CODER_FAILED` (`"coder_failed"`) — K-way Coder/bench-layer candidate failure persisted as a non-expandable failure node via `add_failure_child` (`kernel=None` allowed for turn-exhaust). Set on failure nodes (no score), so excluded from `best_node()` like other infra-error reasons. Not emitted as `branch_dead_end`; the failure surfaces via the paired `coder_failed` + `failure_node_added` events.
 
 `DEAD_REASONS` is now `frozenset(DeadReason)`. The orchestrator's `_emit_dead_end` helper takes a typed `DeadReason` argument; the type system enforces validity, so the legacy `if reason not in DEAD_REASONS` warning has been removed.
 
@@ -205,6 +210,13 @@ DEAD_END cause schema in `meta.json`:
 The previous nested `failure: {reason, detail}` block was retired
 because `failure.reason` always duplicated `dead_reason`; only
 `failure.detail` carried unique information.
+
+Failure nodes (Coder-layer / bench-layer K-way failures attached via
+`add_failure_child`) serialize through the same `dump_node` path: their
+top-level `dead_reason` is `"coder_failed"`, `failure_detail` carries
+the kill-site reason string, and `kernel.py` is absent when the
+underlying node carries `kernel=None` (e.g. turn-exhaust before any
+draft was produced).
 
 `finalize_tree` also rewrites each per-node `meta.json`'s late-bound
 fields — `branch_quality`, `dead_reason`, `score`,

@@ -186,6 +186,41 @@ practice and the framework response it argues for.
    compute-vs-memory plane and is that the right direction," not "is
    metric X higher than before."
 
+2. **Failure patterns as a first-class search signal, not telemetry exhaust.**
+   In the standard search-tree contract, an iteration is a unit that
+   either produces a scored child (signal: SOL delta, bottleneck
+   classification, Reviewer prose) or is dropped (signal: a line in
+   `events.jsonl`). Failed candidates carry no weight in the Planner's
+   next decision. This is empirically wrong: a postmortem on
+   `run_20260517T044132_970459Z` (JOURNAL → Search → "Failure-node
+   retention") found 4 consecutive Coder candidates at the same parent
+   failing with the same `cudaErrorInvalidAddressSpace` during autotune
+   burn-in — the same systematic failure class, repeated four times,
+   because each new Planner call saw zero evidence the prior 4 had
+   failed. The information content of "this branch is uncodable in this
+   way" was generated and discarded four times. The framework response
+   it argues for: **failed candidates persist as tree artifacts carrying
+   a typed failure class**, and the Planner consumes them on equal
+   footing with successful siblings. The methodology claim this surfaces
+   is sharper than it looks — failure patterns are the *cheapest*
+   high-signal observation an agent system produces (no profile run, no
+   Reviewer LLM call, no correctness pass) and discarding them is
+   wasting the most cost-efficient evidence the system generates.
+   Concretely: (a) failed candidates produce non-expandable tree nodes
+   carrying `(action, params, failure_class, turns_used)`; (b) the
+   sibling-context render that A2 introduced is extended to include them
+   in a parallel format to successful siblings; (c) "dead branch" detection
+   becomes a property of the sibling list (N consecutive same-class
+   failures at one parent), not a separate orchestrator counter; (d) the
+   Planner→Coder contract widens so that Planner-level decisions
+   informed by failure history (e.g., narrowing an autotune config grid
+   after repeated `autotune_launch_fault`) flow into the next Coder
+   plan's `params`. The general methodology lesson: in any search-shaped
+   agent system, the *failure-signal-to-cost ratio* is a budget-allocation
+   primitive comparable to per-agent context tokens or retrieval depth —
+   surfacing failures cheaply and routing them into the next decision is
+   a lever, not housekeeping.
+
 ## Status
 
 Brainstorming in progress. Next step: pick the experiment shape, then write
