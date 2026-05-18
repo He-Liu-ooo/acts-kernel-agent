@@ -133,6 +133,8 @@ class ACTSConfig:
     max_depth: int = 20
     epsilon_start: float = 0.3
     epsilon_end: float = 0.05
+    # Cap on Planner-rendered FAILED-line count (post-dedup). 0 = uncapped.
+    failure_sibling_cap: int = 8
 
     # Evaluation parameters
     warmup_runs: int = 20
@@ -284,6 +286,7 @@ def load_config(path: Path) -> ACTSConfig:
             "beam_width", "beam_diversity", "reviewer_metric_queries",
             "coder_n_candidates",
             "max_depth", "epsilon_start", "epsilon_end",
+            "failure_sibling_cap",
         ],
         "eval": ["warmup_runs", "timed_runs"],
         "move_on": ["sol_plateau_window", "sol_plateau_delta", "sol_target"],

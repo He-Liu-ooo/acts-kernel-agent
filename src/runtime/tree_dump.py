@@ -67,7 +67,9 @@ def dump_node(node: "TreeNode", *, iter_no: int,
     try:
         node_dir = _root / f"node_{node.id}"
         node_dir.mkdir(parents=True, exist_ok=True)
-        (node_dir / "kernel.py").write_text(node.kernel.source_code)
+        # Turn-exhaust failure nodes have ``kernel=None`` → skip kernel.py.
+        if node.kernel is not None:
+            (node_dir / "kernel.py").write_text(node.kernel.source_code)
         meta = _build_meta(
             node,
             iter_no=iter_no,

@@ -24,7 +24,9 @@ class TreeNode:
     """A node in the search tree representing one kernel version."""
 
     id: int
-    kernel: Kernel
+    # ``None`` only on turn-exhaust failure nodes (Coder never reached
+    # submit_kernel); all other nodes carry the submitted source.
+    kernel: "Kernel | None"
     parent_id: int | None = None
     children_ids: list[int] = field(default_factory=list)
     score: ScoreResult | None = None
@@ -69,6 +71,10 @@ class TreeNode:
     # on live nodes and legacy checkpoints; paired with
     # ``branch_quality = DEAD_END`` at every kill site via ``mark_dead``.
     dead_reason: "DeadReason | None" = None
+    # Raw error string from ``coder_failed.reason``; non-None only on
+    # failure nodes added via ``add_failure_child``. Truncated upstream
+    # (~200 chars) and read verbatim by ``render_siblings``.
+    failure_reason: str | None = None
 
     def mark_dead(self, reason: "DeadReason") -> None:
         """Mark this node DEAD_END and record the cause atomically.
@@ -88,6 +94,14 @@ class TreeNode:
 # is quarantined from ``frontier()``. Two tolerates one transient API
 # blip; raising it loosens the guarantee against deterministic failures.
 QUARANTINE_THRESHOLD: int = 2
+
+
+def _format_action_label(action: str, params: dict | None) -> str:
+    """Shared formatter for success + failure sibling render lines."""
+    if params:
+        params_str = "{" + ", ".join(f"{k}:{v}" for k, v in params.items()) + "}"
+        return f"{action} {params_str}"
+    return action or "(no action)"
 
 
 class SearchTree:
@@ -124,6 +138,42 @@ class SearchTree:
             depth=parent.depth + 1,
             iter_no=iter_no,
         )
+        parent.children_ids.append(node.id)
+        self._nodes[node.id] = node
+        self._next_id += 1
+        return node
+
+    def add_failure_child(
+        self,
+        parent_id: int,
+        kernel: "Kernel | None",
+        action_applied: str,
+        *,
+        action_params: dict | None,
+        failure_reason: str,
+        iter_no: int,
+    ) -> TreeNode:
+        """Add a non-expandable failure node under ``parent_id``.
+
+        ``kernel = None`` for turn-exhaust paths (Coder never reached
+        ``submit_kernel``); otherwise the submitted-but-crashed source
+        rides through for postmortem inspection. Marked DEAD_END +
+        CODER_FAILED via ``mark_dead`` so ``frontier()``/``best_node()``
+        exclude it (no trustworthy score). ``consecutive_agent_failures``
+        stays an iter-level orchestrator counter — not bumped here.
+        """
+        parent = self._nodes[parent_id]
+        node = TreeNode(
+            id=self._next_id,
+            kernel=kernel,
+            parent_id=parent_id,
+            action_applied=action_applied,
+            action_params=action_params,
+            depth=parent.depth + 1,
+            iter_no=iter_no,
+            failure_reason=failure_reason,
+        )
+        node.mark_dead(DeadReason.CODER_FAILED)
         parent.children_ids.append(node.id)
         self._nodes[node.id] = node
         self._next_id += 1
@@ -241,6 +291,9 @@ class SearchTree:
         self,
         parent_id: int,
         exclude_id: int | None = None,
+        *,
+        consumer: str = "planner",
+        failure_cap: int = 8,
     ) -> str:
         """Render children of *parent_id* (other than *exclude_id*) as one-liners.
 
@@ -248,34 +301,54 @@ class SearchTree:
         gate the prompt section on truthiness, mirroring the existing
         ``tree_context`` / ``reviewer_feedback`` omission pattern.
 
-        Line format::
+        Two consumer modes:
 
-            - <action_applied> {<params>}: SOL <score> (Δ <delta vs parent>),
-              <reviewer outcome>, <branch_quality>
+        - ``consumer="planner"`` (default) — success siblings first, then
+          failure siblings (FAILED format), deduped on
+          ``(action, params, failure_reason)`` with ``×N`` for N≥2.
+        - ``consumer="reviewer"`` — success siblings only.
 
-        Sentinels for missing fields:
-          * score missing → ``"SOL n/a"`` / ``"Δ n/a"``
-          * last_review missing → ``"(no review yet)"``
-          * branch_quality missing → ``"(unscored)"``
+        Success-line format::
 
-        A still-scoring sibling appears with sentinels rather than being
-        skipped — the Planner / Reviewer benefit from knowing the action
-        was attempted, even before scoring lands.
+            - <action> {<params>}: SOL <score> (Δ <delta>), <outcome>, <branch_quality>
+
+        Failure-line format::
+
+            - <action> {<params>}: FAILED [×N — ]<raw failure_reason>
+
+        ``failure_cap`` (>0) caps the rendered failure lines to the
+        most-recent ``cap`` entries by ``(iter_no, candidate_idx)``
+        ascending (tail-N). Over-cap renders prepend ``... (M earlier
+        failures omitted)``. ``cap = 0`` means uncapped. Success
+        siblings are never capped.
+
+        A still-scoring success sibling appears with sentinels rather
+        than being skipped — the Planner benefits from knowing the
+        action was attempted, even before scoring lands.
         """
         parent = self._nodes[parent_id]
         parent_score = parent.score.sol_score if parent.score is not None else None
-        lines: list[str] = []
+        success_lines: list[str] = []
+        # Entry: (iter_no, child_id, action, params, reason). child_id is
+        # the within-iter tie-breaker since candidate_idx isn't a node field.
+        failure_entries: list[tuple[int, int, str, dict | None, str]] = []
+
         for child_id in parent.children_ids:
             if exclude_id is not None and child_id == exclude_id:
                 continue
             child = self._nodes[child_id]
-            if child.action_params:
-                params_str = "{" + ", ".join(
-                    f"{k}:{v}" for k, v in child.action_params.items()
-                ) + "}"
-                action_label = f"{child.action_applied} {params_str}"
-            else:
-                action_label = child.action_applied or "(no action)"
+            if child.failure_reason is not None:
+                failure_entries.append((
+                    child.iter_no,
+                    child.id,
+                    child.action_applied,
+                    child.action_params,
+                    child.failure_reason,
+                ))
+                continue
+            action_label = _format_action_label(
+                child.action_applied, child.action_params,
+            )
             if child.score is not None:
                 sol = f"SOL {child.score.sol_score:.3f}"
                 if parent_score is not None:
@@ -295,8 +368,57 @@ class SearchTree:
                 if child.branch_quality is not None
                 else "(unscored)"
             )
-            lines.append(f"- {action_label}: {sol} ({delta_str}), {outcome}, {bq}")
-        return "\n".join(lines)
+            success_lines.append(
+                f"- {action_label}: {sol} ({delta_str}), {outcome}, {bq}"
+            )
+
+        # Reviewer consumer: success only, early return.
+        if consumer == "reviewer":
+            return "\n".join(success_lines)
+
+        # Planner consumer: dedup failures, apply cap, render.
+        def _params_key(p: dict | None) -> tuple:
+            # Canonicalize so dicts with different insertion order dedup.
+            return () if p is None else tuple(sorted(p.items()))
+
+        # Dedup on (action, params, reason). Each group's ``latest``
+        # tracks its newest occurrence so cap-tail keeps recurring
+        # signatures the Planner most needs to see; first-occurrence
+        # ordering would silently evict them.
+        failure_entries.sort(key=lambda e: (e[0], e[1]))
+        groups: dict[tuple, dict] = {}
+        for iter_no, child_id, action, params, reason in failure_entries:
+            key = (action, _params_key(params), reason)
+            if key not in groups:
+                groups[key] = {
+                    "count": 0, "action": action, "params": params,
+                    "reason": reason, "latest": (iter_no, child_id),
+                }
+            groups[key]["count"] += 1
+            groups[key]["latest"] = (iter_no, child_id)
+
+        order: list[tuple] = sorted(
+            groups.keys(), key=lambda k: groups[k]["latest"],
+        )
+
+        # Apply cap (counts rendered lines = unique dedup groups).
+        omitted = 0
+        if failure_cap and len(order) > failure_cap:
+            omitted = len(order) - failure_cap
+            order = order[-failure_cap:]
+
+        failure_lines: list[str] = []
+        if omitted:
+            failure_lines.append(f"... ({omitted} earlier failures omitted)")
+        for key in order:
+            g = groups[key]
+            action_label = _format_action_label(g["action"], g["params"])
+            count_suffix = f" ×{g['count']}" if g["count"] >= 2 else ""
+            failure_lines.append(
+                f"- {action_label}: FAILED{count_suffix} — {g['reason']}"
+            )
+
+        return "\n".join(success_lines + failure_lines)
 
     def regressed_sibling_actions(
         self,
@@ -411,6 +533,7 @@ def _serialize_node(node: TreeNode) -> dict:
         "consecutive_agent_failures": node.consecutive_agent_failures,
         "iter_no": node.iter_no,
         "last_review": _serialize_review_feedback(node.last_review),
+        "failure_reason": node.failure_reason,
     }
 
 
@@ -524,7 +647,10 @@ def _serialize_score(score: ScoreResult | None) -> dict | None:
     }
 
 
-def _serialize_kernel(kernel: Kernel) -> dict:
+def _serialize_kernel(kernel: "Kernel | None") -> dict | None:
+    # ``kernel=None`` on turn-exhaust failure nodes; round-trip the sentinel.
+    if kernel is None:
+        return None
     return {
         "spec": {
             "name": kernel.spec.name,
@@ -576,11 +702,14 @@ def _deserialize_node(data: dict) -> TreeNode:
         dr = DeadReason(dr_raw)
 
     k = data["kernel"]
+    # Turn-exhaust failure nodes serialize with ``kernel=null``.
+    if k is None:
+        kernel = None
     # A1 PR 1: detect pre-autotune checkpoints by the absence of the new
     # ``autotune_configs`` field, route through Kernel.from_legacy_dict so
     # legacy num_warps/num_stages/block_size triples become single-entry
     # autotune_configs lists. New-format checkpoints take the explicit path.
-    if "autotune_configs" not in k:
+    elif "autotune_configs" not in k:
         kernel = Kernel.from_legacy_dict(k)
     else:
         kernel = Kernel(
@@ -625,6 +754,7 @@ def _deserialize_node(data: dict) -> TreeNode:
         # legacy nodes have no Reviewer feedback recorded.
         last_review=_deserialize_review_feedback(data.get("last_review")),
         dead_reason=dr,
+        failure_reason=data.get("failure_reason"),
     )
 
 

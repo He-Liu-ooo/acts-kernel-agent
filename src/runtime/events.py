@@ -76,6 +76,10 @@ CORE_EVENT_KINDS: frozenset[str] = frozenset({
     # ``sibling_count``, ``regressed_actions``, ``consumer``
     # (``"planner"`` | ``"reviewer"``).
     "sibling_context_rendered",
+    # Fires alongside ``coder_failed`` when a Coder/bench-layer failure
+    # produces a persisted tree node. Profile-layer failures emit only
+    # ``coder_failed`` (no tree artifact) and do not fire this.
+    "failure_node_added",
     # Fires when Reviewer verdict is dead_end AND child.action_applied
     # already regressed on a sibling — the existing system.md L61-62 rule
     # has now actually fired. Payload: ``action``, ``sibling_iter``.
@@ -145,6 +149,9 @@ class DeadReason(str, Enum):
     AGENT_FAILURE = "agent_failure"
     BEAM_PRUNED = "beam_pruned"
     REVIEWER_JUDGED = "reviewer_judged"
+    # K-way candidate that failed at the Coder or bench layer. No score,
+    # so excluded from ``best_node`` like other infra-error reasons.
+    CODER_FAILED = "coder_failed"
 
 
 _events_fh: IO[str] | None = None

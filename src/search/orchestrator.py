@@ -312,6 +312,57 @@ def detect_plateau(
     return max(recent) - min(recent) <= delta + 1e-9
 
 
+def _persist_failure_node(
+    tree: "SearchTree",
+    parent: "TreeNode",
+    *,
+    plan,
+    kernel,
+    failure_reason: str,
+    iter_no: int,
+    candidate_idx: int,
+) -> None:
+    """Emit ``coder_failed``, attach a failure node, emit
+    ``failure_node_added``, stream the on-disk artifacts. Shared by the
+    5 K-way fan-out failure sites (ImplementationError, EntrypointBinding,
+    BenchmarkError, CUDA sticky-state, partial bench).
+
+    Reward-hack and profile-layer paths emit ``coder_failed`` standalone
+    instead — they intentionally drop the candidate without producing a
+    tree artifact, so they aren't routed through this helper.
+    """
+    from src.runtime.tree_dump import dump_node
+
+    emit(
+        "coder_failed",
+        iter=iter_no,
+        candidate_idx=candidate_idx,
+        reason=failure_reason,
+    )
+    fn = tree.add_failure_child(
+        parent_id=parent.id,
+        kernel=kernel,
+        action_applied=plan.technique,
+        action_params=plan.params,
+        failure_reason=failure_reason,
+        iter_no=iter_no,
+    )
+    emit(
+        "failure_node_added",
+        iter=iter_no,
+        candidate_idx=candidate_idx,
+        node_id=str(fn.id),
+        parent_id=str(parent.id),
+        action=plan.technique,
+        params=plan.params,
+        reason=failure_reason,
+    )
+    # Failure-node artifacts mirror success nodes: meta.json always,
+    # kernel.py only when the Coder reached submit_kernel. Raw error
+    # rides via tree_dump's existing ``failure_detail`` channel.
+    dump_node(fn, iter_no=iter_no, ncu_rep_src=None, failure_detail=failure_reason)
+
+
 def _render_and_emit_sibling_context(
     tree: "SearchTree",
     parent: "TreeNode",
@@ -319,14 +370,24 @@ def _render_and_emit_sibling_context(
     iter_no: int,
     consumer: str,
     exclude_id: int | None = None,
+    failure_cap: int = 8,
 ) -> tuple[str, list[tuple[str, int]]]:
     """Render the sibling section and emit ``sibling_context_rendered``.
 
     Returns ``(sibling_context, regressed)``. ``regressed`` is returned
     so the Reviewer-side caller can reuse it for the
     ``repeated_pathway_dead_end`` check without a second tree walk.
+
+    ``consumer`` is forwarded to ``tree.render_siblings`` so the
+    Planner sees FAILED lines for prior failed children (per
+    doc/specs/2026-05-17-failure-node-retention-design.md) while the
+    Reviewer keeps the success-only render. ``failure_cap`` (defaults
+    to 8) limits the Planner-side FAILED-line count.
     """
-    sibling_context = tree.render_siblings(parent.id, exclude_id=exclude_id)
+    sibling_context = tree.render_siblings(
+        parent.id, exclude_id=exclude_id,
+        consumer=consumer, failure_cap=failure_cap,
+    )
     regressed = tree.regressed_sibling_actions(parent.id, exclude_id=exclude_id)
     if sibling_context:
         sibling_count = len(parent.children_ids) - (1 if exclude_id is not None else 0)
@@ -767,6 +828,7 @@ class Orchestrator:
             # doc/specs/2026-05-13-sibling-aware-agent-contracts-design.md.
             sibling_context, _ = _render_and_emit_sibling_context(
                 tree, parent, iter_no=iter_no, consumer="planner",
+                failure_cap=self._config.failure_sibling_cap,
             )
             try:
                 with trace_span("acts_iter", iter_no=iter_no, agent=AgentLabel.PLANNER):
@@ -849,11 +911,11 @@ class Orchestrator:
             for cand_idx, result in enumerate(candidate_results):
                 if isinstance(result, ImplementationError):
                     agent_failure_count += 1
-                    emit(
-                        "coder_failed",
-                        iter=iter_no,
-                        candidate_idx=cand_idx,
-                        reason=str(result)[:200],
+                    # Turn-exhaust path: no kernel was submitted.
+                    _persist_failure_node(
+                        tree, parent, plan=plan, kernel=None,
+                        failure_reason=str(result)[:200],
+                        iter_no=iter_no, candidate_idx=cand_idx,
                     )
                 elif isinstance(result, BaseException):
                     # Unexpected exception class — re-raise so the crash
@@ -887,9 +949,19 @@ class Orchestrator:
             bench_results: list[tuple[int, Any, Kernel, Any, Any]] = []
             iter_tainted_by_hack = False
             for cand_idx, cand_output in survivors:
-                # Entrypoint-binding check: drop with coder_failed so
-                # the K-way fan-out picks another survivor — different
-                # from the baseline path (which raises) because here a
+                # Build the candidate Kernel once — used by every path
+                # below (entrypoint failure, bench failure, success).
+                # Mis-bound kernels persist with the submitted source so
+                # postmortems can inspect what the Coder produced.
+                cand_kernel = Kernel(
+                    spec=baseline.spec,
+                    source_code=cand_output.source_code,
+                    triton_kernel_name=cand_output.triton_kernel_name,
+                    dps=getattr(cand_output, "dps", False),
+                )
+                # Entrypoint-binding check drops the candidate so the
+                # K-way fan-out picks another survivor — different from
+                # the baseline path (which raises) because here a
                 # mis-bound candidate is one of K, not the run's anchor.
                 ok, reason = find_jit_name_in_entrypoint(
                     cand_output.source_code,
@@ -897,19 +969,12 @@ class Orchestrator:
                     cand_output.triton_kernel_name,
                 )
                 if not ok:
-                    emit(
-                        "coder_failed",
-                        iter=iter_no,
-                        candidate_idx=cand_idx,
-                        reason=f"EntrypointBinding: {reason[:160]}",
+                    _persist_failure_node(
+                        tree, parent, plan=plan, kernel=cand_kernel,
+                        failure_reason=f"EntrypointBinding: {reason[:160]}",
+                        iter_no=iter_no, candidate_idx=cand_idx,
                     )
                     continue
-                cand_kernel = Kernel(
-                    spec=baseline.spec,
-                    source_code=cand_output.source_code,
-                    triton_kernel_name=cand_output.triton_kernel_name,
-                    dps=getattr(cand_output, "dps", False),
-                )
                 try:
                     # Precompile must run inside per_iter_anti_cheat so
                     # candidate-source import-time side effects register
@@ -952,11 +1017,10 @@ class Orchestrator:
                     )
                     break
                 except BenchmarkError as exc:
-                    emit(
-                        "coder_failed",
-                        iter=iter_no,
-                        candidate_idx=cand_idx,
-                        reason=str(exc)[:200],
+                    _persist_failure_node(
+                        tree, parent, plan=plan, kernel=cand_kernel,
+                        failure_reason=str(exc)[:200],
+                        iter_no=iter_no, candidate_idx=cand_idx,
                     )
                     continue
                 except RuntimeError as exc:
@@ -974,11 +1038,10 @@ class Orchestrator:
                             raise CUDAContextPoisoned(
                                 f"3+ consecutive cuda.synchronize() failures: {exc}"
                             ) from exc
-                    emit(
-                        "coder_failed",
-                        iter=iter_no,
-                        candidate_idx=cand_idx,
-                        reason=f"CUDA sticky-state: {msg[:160]}",
+                    _persist_failure_node(
+                        tree, parent, plan=plan, kernel=cand_kernel,
+                        failure_reason=f"CUDA sticky-state: {msg[:160]}",
+                        iter_no=iter_no, candidate_idx=cand_idx,
                     )
                     continue
 
@@ -987,13 +1050,12 @@ class Orchestrator:
                     # require fully_successful, so the candidate cannot
                     # become a winner. Treat as per-candidate infra
                     # failure (no quarantine bump).
-                    emit(
-                        "coder_failed",
-                        iter=iter_no,
-                        candidate_idx=cand_idx,
-                        reason=(
+                    _persist_failure_node(
+                        tree, parent, plan=plan, kernel=cand_kernel,
+                        failure_reason=(
                             f"partial bench failure: {cand_bench.workload_errors}"
                         )[:200],
+                        iter_no=iter_no, candidate_idx=cand_idx,
                     )
                     continue
 
@@ -1288,6 +1350,7 @@ class Orchestrator:
                 reviewer_sibling_context, regressed = _render_and_emit_sibling_context(
                     tree, parent, iter_no=iter_no,
                     consumer="reviewer", exclude_id=child.id,
+                    failure_cap=self._config.failure_sibling_cap,
                 )
                 with trace_span("acts_iter", iter_no=iter_no, agent=AgentLabel.REVIEWER):
                     feedback = await self._reviewer.review(
