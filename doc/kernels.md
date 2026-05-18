@@ -64,7 +64,7 @@ When `representative_workload_uuid` is supplied and present in `autotune_winner`
 
 Falls back to verbatim `source_code` (entire return) when: source has no `@triton.autotune` decorator; AST parse fails; `autotune_configs` is empty; or the decorator's line span can't be located. All fallbacks degrade silently — the LLM still gets the kernel source.
 
-The method is paired with the module-level `_find_autotune_decorator_span(source, triton_kernel_name)` AST helper, which returns the decorator's 1-indexed `(start_lineno, end_lineno)` span or `None`. Two format helpers (`_render_autotune_summary`, `_render_autotune_winner`) produce the comment lines from parsed config + winner data.
+The method is paired with the module-level `_find_autotune_decorator_span(source, triton_kernel_name)` AST helper, which returns the decorator's 1-indexed `(start_lineno, end_lineno)` span or `None`. Two format helpers (`_render_autotune_summary`, `_render_autotune_winner`) produce the comment lines from parsed config + winner data. A third helper `_flatten_autotune_config(cfg) -> dict` lifts the parser's nested `{"kwargs": {...}, "num_warps": int, "num_stages": int}` shape into a flat dict so `_render_autotune_winner` and the Coder's `autotune_exclude` validator (in `src/agents/coder.py`, see doc/agents.md) agree on what "flat" means.
 
 `_autotune_span: tuple[int, int] | None` is a private cached span populated in `__post_init__` alongside `autotune_configs`/`autotune_keys` so `render_condensed_source` reads the decorator's source-line range from the cache instead of re-parsing.
 

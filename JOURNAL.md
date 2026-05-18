@@ -175,6 +175,20 @@ Persist on `TreeNode.dead_reason` (None on live nodes and legacy checkpoints). T
 
 **Pointer.** Postmortem run: `runs/run_20260517T044132_970459Z`. Surviving accepted nodes: `tree/node_{0..5}`. Identical autotune block visible at `tree/node_1/kernel.py:6-17` (success) and trace `trace_7c95c4feeef340e1b34e544382a4d392` (iter 6 cand 0 submission, fault). Coder loop pathology in trace `trace_4bce81c8dc5049fdaff5ee8e5529ee02` (iter 7 cand 0, 8 turns of compile→correctness with no `submit_kernel`). A2's tech-debt note (3) — "`coder_failed.reason` should land as an enum on the next event-schema sweep" — is the natural pickup point for the failure-class taxonomy.
 
+### Autotune-exclude structured bounds — escalation from failure-node retention's soft prompt rule (2026-05-18)
+
+**Predecessor and why it wasn't enough.** Failure-node retention (2026-05-17, above) landed as a *soft* contract: failure siblings render into the Planner's parent-context, the Planner's rationale text names the autotune configs to avoid, and the Coder is expected to read that prose and steer clear. Run `run_20260518T035408_454910Z` showed the soft contract failing in the obvious way. Four+ successive iters crashed with `cudaErrorInvalidAddressSpace` despite the Planner picking different techniques each time (`t2_register_caching`, `t3_tf32`, `t1_occupancy`, `t1_block_size_tuning`) — the Planner *was* learning from the failure siblings and varying its action. The Coder ignored the channel and copy-pasted the parent's overcommitted autotune block `{BLOCK_M:128, BLOCK_N:128, BLOCK_K:32, num_warps:8, num_stages:4}` into every draft. The Planner held up its end; the Coder dropped the rationale text on the floor.
+
+**Escalation.** Surface the bound as a structured field — `autotune_exclude: list[dict[str, int]]` on the Planner's structured output — and have Coder's `submit_kernel` validator hard-reject any `@triton.autotune` Config whose flattened keys partial-match an exclude pattern. The validator emits `submit_kernel FAILED: autotune_exclude violation. ...` so the Coder's next turn sees a mechanically-enforced rejection rather than a prose hint it can ignore. The same field is also rendered into Coder's *user prompt* at generation time, not just on submit-rejection: the prompt is the information channel, the validator is the backstop. Prompt-only would leave the soft-contract failure mode in place; validator-only would burn turn budget teaching the Coder a constraint the prompt could have stated upfront.
+
+**Partial-match semantics.** A pattern dict's listed keys must all equal the corresponding Config keys; missing keys are wildcards. Narrow patterns (the full flat dict of a known-bad config) target one entry; broad patterns (`{"num_stages": 4}`) sweep an entire axis. Planner defaults to narrow — exclude exactly the failing config — and only widens after 3+ failed siblings at the same parent share an axis. This keeps the bound informative without collapsing the autotune search prematurely.
+
+**Hard-reject, not strip-and-accept.** Strip-and-accept (filter the bad Config out of the submitted list and keep the rest) would let the Coder keep producing the bad block iter after iter; the negative signal *is* the feature. A submit that violates the bound is a submit the Coder needs to re-draft.
+
+**Implementation note.** `_flatten_autotune_config(cfg)` was extracted to `src/kernels/kernel.py` so both the validator and the existing `_render_autotune_winner` agree on what "flat" means (kwargs ∪ {`num_warps`, `num_stages`}); inline duplication across the two consumers would have been a silent drift surface.
+
+**Cross-ref.** A2 K-way Coder fan-out (2026-05-15) — the K-way iteration is what generates the failure-sibling cohort the Planner now learns from; without K-way, a parent rarely accumulates enough failure siblings for the exclude list to be informative.
+
 ---
 
 ## Agents
