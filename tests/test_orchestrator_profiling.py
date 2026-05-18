@@ -177,10 +177,12 @@ class TestProfilingAttachedToTree:
 class TestProfilingSkippedOnDeadBranch:
     @pytest.mark.asyncio
     async def test_partial_workload_failure_skips_profile(self, harness):
-        """A2: a candidate with partial-bench failure is gated out before
-        ``tree.add_child`` (per-candidate ``coder_failed`` event, iter
-        SKIPPED). ``profile_kernel`` never runs because there is no
-        winning candidate, and the tree has no child node from this iter.
+        """A2 + failure-node retention (2026-05-17): a candidate with
+        partial-bench failure produces a non-expandable failure node
+        (DEAD_END / CODER_FAILED). ``profile_kernel`` never runs because
+        there is no winning candidate. The failure node is added by the
+        bench-layer persistence site so the next iter's Planner sees it
+        as a FAILED sibling.
         """
         from src.search.orchestrator import Orchestrator
 
@@ -210,7 +212,10 @@ class TestProfilingSkippedOnDeadBranch:
             "profile_kernel must not run when no candidate survived bench"
         )
         children = [n for n in result.tree._nodes.values() if n.parent_id is not None]
-        assert children == []
+        # One failure node (K=1 in this harness) carrying the partial-bench reason.
+        assert len(children) == 1
+        assert children[0].failure_reason is not None
+        assert "partial bench failure" in children[0].failure_reason
 
 
 class TestProfilerErrorMarksDeadEnd:

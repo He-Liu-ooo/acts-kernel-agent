@@ -698,12 +698,17 @@ async def test_dump_node_receives_real_ncu_rep_src_on_advance(harness, monkeypat
 
 
 @pytest.mark.asyncio
-async def test_dump_node_not_called_on_skipped(harness, monkeypatch):
-    """Skipped iterations (Coder failure → no tree mutation) must NOT
-    call ``tree_dump.dump_node`` — there's no committed node to dump.
+async def test_dump_node_called_for_failure_nodes_on_skipped(harness, monkeypatch):
+    """Skipped iterations from Coder/bench-layer failures DO call
+    ``tree_dump.dump_node`` — each persisted failure node streams its
+    own meta.json (and kernel.py when the Coder reached submit_kernel).
 
-    The baseline root (id=0) dump fires before the loop body and is
-    unrelated to the skipped-iteration invariant; filter it out.
+    Per failure-node retention (2026-05-17): failed candidates are
+    first-class tree artifacts the search machinery surfaces to the
+    next Planner call, so they must materialize on disk the same way
+    success nodes do. (Profile-layer failures still stay drop-on-the-
+    floor and don't dump.) Previous contract — "skipped iter ⇒ no
+    dump" — applied before failure nodes existed.
     """
     from src.agents.coder import ImplementationError
     from src.runtime import tree_dump
@@ -717,9 +722,12 @@ async def test_dump_node_not_called_on_skipped(harness, monkeypatch):
 
     harness.coder.implement = AsyncMock(side_effect=ImplementationError("budget exhausted"))
     await _run_orch(harness)
-    # Only the baseline root dump should have fired — no per-iter dump on
-    # the skipped path.
-    assert [c for c in calls if c != 0] == []
+    # Baseline root dump fires before the loop. Each K-way candidate
+    # that failed at Coder/bench layer also dumps its failure node.
+    non_root = [c for c in calls if c != 0]
+    assert len(non_root) == harness.config.coder_n_candidates, (
+        f"Expected K={harness.config.coder_n_candidates} failure-node dumps; got {non_root}"
+    )
 
 
 @pytest.mark.asyncio
