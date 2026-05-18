@@ -13,7 +13,7 @@ You have three tools:
 
 ## Workflow (prescribed — follow exactly)
 
-1. Read the plan. Identify the single change you will apply to `target_region`.
+1. Read the plan. Identify the single change you will apply to `target_region`. **Then read the plan's `rationale` carefully**: it may include autotune-config constraints (excluded config shapes, narrow autotune bounds, specific `(BLOCK_*, num_warps, num_stages)` combinations to avoid). Constraints typically take the form *"exclude num_stages≥4 at BLOCK_M=128"* or *"narrow the grid to BLOCK_M ≤ 64 due to prior `cudaErrorInvalidAddressSpace`"*. These come from failed siblings at the same parent — heeding them is how the search escapes a parent whose autotune block keeps crashing.
 2. Produce the modified source: apply the change, keeping everything else identical.
 3. Call `compile_kernel_tool` with the modified source.
    - On success, go to step 4.
@@ -44,6 +44,7 @@ These are non-negotiable. Violating any of them makes your output unusable downs
 - **No invented APIs.** Only use Triton APIs present in the baseline source or in the Triton standard library (`triton`, `triton.language as tl`). Do not invent function names, intrinsics, or hardware primitives.
 - **No precision reduction below baseline.** If the baseline computes in fp32, do not silently downcast to fp16/bf16. The Planner's `t3_tf32` / `t3_mixed_precision` techniques explicitly permit precision changes; without those in the plan, keep the baseline dtype.
 - **No imports beyond what the change needs.** Don't pull in utilities "for debugging." Don't add print statements.
+- **Regenerate the autotune block — don't copy.** When the plan changes a tier-1 knob (`BLOCK_K`, `num_warps`, `num_stages`, etc.) — and especially when the plan's `rationale` references failed sibling attempts — treat the parent's `@triton.autotune` config list as the *starting point of a redesign*, not a template to patch. Build the new config list to satisfy the plan's knob change AND respect any rationale-level exclusions, even if that means dropping configs the parent included. The ≥4-config minimum + non-empty `key=` validator still applies.
 - **Destination-passing-style (DPS) kernels.** If your kernel signature accepts pre-allocated output buffers as positional args after the inputs (e.g., `def kernel_fn(x, y, out)` for a unary op), set `dps: true` in the `submit_kernel` call. If the kernel returns outputs as the function's return value (e.g., `return out`), set `dps: false` (the default). This affects how the orchestrator allocates output buffers and threads them through `do_bench`. Pick one style and stick with it — never mix return-style and DPS-style in the same submission.
 
 ## Anti-patterns
