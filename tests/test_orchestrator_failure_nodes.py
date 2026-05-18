@@ -320,3 +320,50 @@ async def test_profile_layer_failure_does_not_persist_failure_node(tmp_path, har
     failure_nodes = [n for n in result.tree.nodes() if n.failure_reason is not None]
     assert len(failure_nodes) == 0
     assert "failure_node_added" not in [r["kind"] for r in records]
+
+
+# ── autotune_exclude end-to-end plumbing ──────────────────────────────────────
+
+
+async def test_planner_autotune_exclude_reaches_coder_submit_validator(tmp_path, harness):
+    """End-to-end: Planner returns a plan with ``autotune_exclude``;
+    orchestrator forwards it through ``coder.implement(plan=...)``;
+    Coder exhausts turns; failure node added with the existing
+    ``Coder exhausted turn budget`` reason (no new failure class needed
+    per doc/specs/2026-05-18-autotune-exclude-structured-bounds-design.md).
+
+    The validator behavior is unit-tested in ``tests/test_coder.py``;
+    this test verifies the new field reaches the Coder closure unchanged
+    without an orchestrator-side modification.
+    """
+    from src.agents.coder import ImplementationError
+    from src.agents.planner import OptimizationPlan
+
+    harness.config.coder_n_candidates = 1
+    harness.planner.plan = AsyncMock(return_value=OptimizationPlan(
+        tier=1,
+        technique="t1_block_size_tuning",
+        params={"BLOCK_K": "32"},
+        rationale="exclude the overcommitted config that crashed prior siblings",
+        autotune_exclude=[{"BLOCK_M": 128, "BLOCK_N": 128, "num_stages": 4}],
+    ))
+    # Simulate Coder exhausting its turn budget — the natural outcome of
+    # repeated validator rejection in a real run.
+    harness.coder.implement = AsyncMock(side_effect=ImplementationError(
+        "Coder exhausted turn budget (8) without calling submit_kernel."
+    ))
+
+    result, records = await _run_and_collect(harness, tmp_path)
+
+    # Orchestrator forwarded the plan with autotune_exclude populated.
+    call_args = harness.coder.implement.call_args
+    assert call_args is not None
+    plan_arg = call_args.kwargs.get("plan")
+    assert plan_arg is not None
+    assert plan_arg.autotune_exclude == [
+        {"BLOCK_M": 128, "BLOCK_N": 128, "num_stages": 4}
+    ]
+    # Failure node added via the existing K-way Coder-failure flow.
+    failure_nodes = [n for n in result.tree.nodes() if n.failure_reason is not None]
+    assert len(failure_nodes) == 1
+    assert "turn budget" in failure_nodes[0].failure_reason

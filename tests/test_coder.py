@@ -372,6 +372,43 @@ def test_build_user_prompt_escapes_backticks_in_kernel_source():
     assert "```python\nfake section\n```" not in kernel_section
 
 
+def test_build_user_prompt_renders_autotune_exclude_when_populated():
+    """Non-empty ``autotune_exclude`` must appear in the rendered plan
+    section so the Coder sees the structured constraint at generation
+    time, not only at submit-rejection time. Without this line the
+    structured-bounds contract (per
+    doc/specs/2026-05-18-autotune-exclude-structured-bounds-design.md)
+    is half-built: validator enforces, but Coder never receives the
+    information.
+    """
+    plan = OptimizationPlan(
+        tier=1, technique="t1_block_size_tuning",
+        rationale="exclude the overcommitted config",
+        autotune_exclude=[
+            {"BLOCK_M": 128, "BLOCK_N": 128, "num_stages": 4},
+            {"BLOCK_M": 64, "num_stages": 4},
+        ],
+    )
+    prompt = CoderAgent.build_user_prompt(kernel_source="def k(): pass", plan=plan)
+    assert "Autotune exclude" in prompt
+    # Each pattern appears verbatim as JSON so the Coder can copy keys.
+    assert '"BLOCK_M": 128' in prompt
+    assert '"BLOCK_N": 128' in prompt
+    assert '"num_stages": 4' in prompt
+    assert '"BLOCK_M": 64' in prompt
+
+
+def test_build_user_prompt_omits_autotune_exclude_when_empty():
+    """Empty ``autotune_exclude`` (the default) → no rendered line. Keeps
+    the prompt clean for plans that don't carry the field."""
+    plan = OptimizationPlan(
+        tier=1, technique="t1", rationale="x",
+        # autotune_exclude defaults to []
+    )
+    prompt = CoderAgent.build_user_prompt(kernel_source="def k(): pass", plan=plan)
+    assert "Autotune exclude" not in prompt
+
+
 def test_build_translate_prompt_no_section_when_prior_failures_empty():
     """Default path (no prior attempts) — section must be absent."""
     prompt = CoderAgent.build_translate_prompt(
@@ -1479,3 +1516,172 @@ def test_make_submit_tool_works_with_no_error_log():
     assert "FAILED" in msg  # no AttributeError raised
     assert "@triton.jit" in msg
     assert "output" not in captured
+
+
+# ── autotune_exclude validator tests ──────────────────────────────────────────
+
+
+def _kernel_source_with_configs(configs_block: str) -> str:
+    """Build a minimal Coder-valid kernel source with a custom autotune
+    configs list. Inserts the literal text into a ≥4-config-valid template.
+    """
+    return (
+        "import triton\n"
+        "import triton.language as tl\n"
+        "\n"
+        "@triton.autotune(\n"
+        "    configs=[\n"
+        f"{configs_block}\n"
+        "    ],\n"
+        "    key=[\"M\", \"N\", \"K\"],\n"
+        ")\n"
+        "@triton.jit\n"
+        "def my_kernel(x_ptr, M, N, K, BLOCK_M: tl.constexpr, "
+        "BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):\n"
+        "    pass\n"
+    )
+
+
+_FOUR_CONFIGS_NO_STAGES4 = (
+    '        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32}, num_warps=8, num_stages=3),\n'
+    '        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32}, num_warps=4, num_stages=2),\n'
+    '        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 32}, num_warps=4, num_stages=3),\n'
+    '        triton.Config({"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 32}, num_warps=8, num_stages=3),'
+)
+
+_FOUR_CONFIGS_WITH_STAGES4 = (
+    '        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32}, num_warps=8, num_stages=4),\n'
+    '        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32}, num_warps=4, num_stages=2),\n'
+    '        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 32}, num_warps=4, num_stages=3),\n'
+    '        triton.Config({"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 32}, num_warps=8, num_stages=3),'
+)
+
+
+def test_submit_kernel_no_op_when_autotune_exclude_empty():
+    """Empty ``autotune_exclude`` (the default) → validator skips the
+    exclude check even on a kernel whose configs WOULD match a hypothetical
+    populated pattern."""
+    from src.agents.coder import _make_submit_tool
+    from src.agents.llm_backend import SUBMIT_OK_SENTINEL
+    from src.agents.planner import OptimizationPlan
+
+    captured: dict = {}
+    source = _kernel_source_with_configs(_FOUR_CONFIGS_WITH_STAGES4)
+    plan = OptimizationPlan(tier=1, technique="t1")  # autotune_exclude=[]
+    submit = _make_submit_tool(captured, plan=plan)
+    result = submit(source_code=source, triton_kernel_name="my_kernel")
+    assert result == SUBMIT_OK_SENTINEL
+    assert "output" in captured
+
+
+def test_submit_kernel_rejects_single_key_exclude_match():
+    """Single-key pattern ``{"num_stages": 4}`` matches any config with
+    that value."""
+    from src.agents.coder import _make_submit_tool
+    from src.agents.planner import OptimizationPlan
+
+    captured: dict = {}
+    source = _kernel_source_with_configs(_FOUR_CONFIGS_WITH_STAGES4)
+    plan = OptimizationPlan(
+        tier=1, technique="t1",
+        autotune_exclude=[{"num_stages": 4}],
+    )
+    submit = _make_submit_tool(captured, plan=plan)
+    result = submit(source_code=source, triton_kernel_name="my_kernel")
+    assert "submit_kernel FAILED" in result
+    assert "autotune_exclude violation" in result
+    assert "num_stages" in result
+    assert "output" not in captured  # captured stays empty on rejection
+
+
+def test_submit_kernel_rejects_multi_key_exclude_match():
+    """Multi-key pattern requires ALL listed keys to match the same config."""
+    from src.agents.coder import _make_submit_tool
+    from src.agents.planner import OptimizationPlan
+
+    captured: dict = {}
+    source = _kernel_source_with_configs(_FOUR_CONFIGS_WITH_STAGES4)
+    plan = OptimizationPlan(
+        tier=1, technique="t1",
+        autotune_exclude=[{"BLOCK_M": 128, "BLOCK_N": 128, "num_stages": 4}],
+    )
+    submit = _make_submit_tool(captured, plan=plan)
+    result = submit(source_code=source, triton_kernel_name="my_kernel")
+    assert "submit_kernel FAILED" in result
+    assert "autotune_exclude violation" in result
+
+
+def test_submit_kernel_no_match_when_partial_key_mismatch():
+    """Pattern ``{"BLOCK_M": 128, "num_stages": 4}`` does NOT match a
+    config with BLOCK_M=128 but num_stages=3 — partial-match requires
+    ALL listed keys equal."""
+    from src.agents.coder import _make_submit_tool
+    from src.agents.llm_backend import SUBMIT_OK_SENTINEL
+    from src.agents.planner import OptimizationPlan
+
+    captured: dict = {}
+    source = _kernel_source_with_configs(_FOUR_CONFIGS_NO_STAGES4)
+    plan = OptimizationPlan(
+        tier=1, technique="t1",
+        autotune_exclude=[{"BLOCK_M": 128, "num_stages": 4}],
+    )
+    submit = _make_submit_tool(captured, plan=plan)
+    result = submit(source_code=source, triton_kernel_name="my_kernel")
+    assert result == SUBMIT_OK_SENTINEL
+
+
+def test_submit_kernel_error_message_names_violations_and_patterns():
+    """Error message lists BOTH the exclude patterns AND the specific
+    configs that violated, plus the closing reminder that the ≥4-config
+    minimum still applies."""
+    from src.agents.coder import _make_submit_tool
+    from src.agents.planner import OptimizationPlan
+
+    captured: dict = {}
+    source = _kernel_source_with_configs(_FOUR_CONFIGS_WITH_STAGES4)
+    plan = OptimizationPlan(
+        tier=1, technique="t1",
+        autotune_exclude=[{"BLOCK_M": 128, "BLOCK_N": 128, "num_stages": 4}],
+    )
+    submit = _make_submit_tool(captured, plan=plan)
+    result = submit(source_code=source, triton_kernel_name="my_kernel")
+    assert "'BLOCK_M': 128" in result
+    assert "'BLOCK_N': 128" in result
+    assert "'num_stages': 4" in result
+    assert "exclude pattern:" in result
+    assert "≥4-config minimum still applies" in result
+
+
+def test_submit_kernel_rejects_multiple_violations_in_one_call():
+    """Multiple violating configs render as multiple lines in the error
+    message — the Coder sees all offenders at once."""
+    from src.agents.coder import _make_submit_tool
+    from src.agents.planner import OptimizationPlan
+
+    captured: dict = {}
+    source = _kernel_source_with_configs(
+        '        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32}, num_warps=8, num_stages=4),\n'
+        '        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64}, num_warps=8, num_stages=4),\n'
+        '        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 32}, num_warps=4, num_stages=3),\n'
+        '        triton.Config({"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 32}, num_warps=8, num_stages=3),'
+    )
+    plan = OptimizationPlan(
+        tier=1, technique="t1",
+        autotune_exclude=[{"BLOCK_M": 128, "BLOCK_N": 128, "num_stages": 4}],
+    )
+    submit = _make_submit_tool(captured, plan=plan)
+    result = submit(source_code=source, triton_kernel_name="my_kernel")
+    assert result.count("matches autotune_exclude") == 2
+
+
+def test_submit_kernel_no_op_when_plan_is_none():
+    """``plan=None`` (translate baseline path's default) → exclude check
+    is skipped regardless of source contents."""
+    from src.agents.coder import _make_submit_tool
+    from src.agents.llm_backend import SUBMIT_OK_SENTINEL
+
+    captured: dict = {}
+    source = _kernel_source_with_configs(_FOUR_CONFIGS_WITH_STAGES4)
+    submit = _make_submit_tool(captured, plan=None)  # baseline path
+    result = submit(source_code=source, triton_kernel_name="my_kernel")
+    assert result == SUBMIT_OK_SENTINEL

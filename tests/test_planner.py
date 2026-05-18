@@ -668,3 +668,82 @@ def test_planner_prompt_omits_sibling_section_when_empty():
         sibling_context="",
     )
     assert "## Siblings already tried" not in prompt
+
+
+# ── autotune_exclude structured-bounds tests ──────────────────────────────────
+
+
+def test_optimization_plan_output_accepts_autotune_exclude():
+    """``OptimizationPlanOutput`` validates the new ``autotune_exclude`` field
+    as a list of dicts mapping str→int (Triton config knobs are all int)."""
+    from src.agents.planner import OptimizationPlanOutput
+    out = OptimizationPlanOutput(
+        tier=1,
+        technique="t1_block_size_tuning",
+        params={"BLOCK_K": "64"},
+        autotune_exclude=[
+            {"BLOCK_M": 128, "BLOCK_N": 128, "num_stages": 4},
+            {"BLOCK_M": 64, "num_stages": 4},
+        ],
+    )
+    assert out.autotune_exclude == [
+        {"BLOCK_M": 128, "BLOCK_N": 128, "num_stages": 4},
+        {"BLOCK_M": 64, "num_stages": 4},
+    ]
+
+
+def test_optimization_plan_output_autotune_exclude_defaults_to_empty_list():
+    """Default is ``[]`` — empty list means no constraint, validator no-op."""
+    from src.agents.planner import OptimizationPlanOutput
+    out = OptimizationPlanOutput(tier=1, technique="t1_block_size_tuning")
+    assert out.autotune_exclude == []
+
+
+def test_optimization_plan_dataclass_autotune_exclude_defaults_to_empty_list():
+    """Internal dataclass default is ``[]``, not ``None`` — consumers can
+    safely iterate without a None-check."""
+    from src.agents.planner import OptimizationPlan
+    p = OptimizationPlan(tier=1, technique="t1_block_size_tuning")
+    assert p.autotune_exclude == []
+
+
+def test_output_to_plan_carries_autotune_exclude():
+    """``_output_to_plan`` propagates the field from Pydantic output to
+    internal dataclass — sibling renderer + Coder closure both read it."""
+    from src.agents.planner import (
+        OptimizationPlan,
+        OptimizationPlanOutput,
+        _output_to_plan,
+    )
+    out = OptimizationPlanOutput(
+        tier=1,
+        technique="t1",
+        autotune_exclude=[{"BLOCK_M": 128, "num_stages": 4}],
+    )
+    plan = _output_to_plan(out)
+    assert isinstance(plan, OptimizationPlan)
+    assert plan.autotune_exclude == [{"BLOCK_M": 128, "num_stages": 4}]
+
+
+def test_submit_plan_tool_accepts_autotune_exclude_kwarg():
+    """``submit_plan`` tool captures the new kwarg when supplied."""
+    from src.agents.planner import _make_submit_plan_tool
+    captured: dict = {}
+    submit_plan = _make_submit_plan_tool(captured)
+    submit_plan(
+        tier=1,
+        technique="t1_block_size_tuning",
+        params={"BLOCK_K": "64"},
+        autotune_exclude=[{"BLOCK_M": 128, "num_stages": 4}],
+    )
+    assert "output" in captured
+    assert captured["output"].autotune_exclude == [{"BLOCK_M": 128, "num_stages": 4}]
+
+
+def test_submit_plan_tool_omitting_autotune_exclude_yields_empty_list():
+    """Tool calls that omit the field produce a plan with ``[]``."""
+    from src.agents.planner import _make_submit_plan_tool
+    captured: dict = {}
+    submit_plan = _make_submit_plan_tool(captured)
+    submit_plan(tier=1, technique="t1_block_size_tuning")
+    assert captured["output"].autotune_exclude == []
