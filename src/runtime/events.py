@@ -76,10 +76,11 @@ CORE_EVENT_KINDS: frozenset[str] = frozenset({
     # ``sibling_count``, ``regressed_actions``, ``consumer``
     # (``"planner"`` | ``"reviewer"``).
     "sibling_context_rendered",
-    # Fires alongside ``coder_failed`` when a Coder/bench-layer failure
-    # produces a persisted tree node. Profile-layer failures emit only
-    # ``coder_failed`` (no tree artifact) and do not fire this.
-    "failure_node_added",
+    # Fires once per iter when ≥1 K-way Coder/bench-layer candidates
+    # failed and a failure-summary node was attached. Payload:
+    # ``node_id``, ``parent_id``, ``action``, ``params``,
+    # ``candidate_count``. Profile-layer failures don't fire this.
+    "failure_summary_added",
     # Fires when Reviewer verdict is dead_end AND child.action_applied
     # already regressed on a sibling — the existing system.md L61-62 rule
     # has now actually fired. Payload: ``action``, ``sibling_iter``.

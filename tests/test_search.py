@@ -1030,13 +1030,18 @@ class TestOrchestratorBenchmarkFailure:
 
         # Reviewer skipped — no surviving candidate, nothing to review.
         assert h.reviewer.review.await_count == 0
-        # One failure node added (K=1; the BenchmarkError went through
-        # the bench-layer persistence site, kernel=submitted source).
+        # One failure-summary node added (K=1; BenchmarkError went through
+        # bench-layer accumulator; summary kernel=None — per-candidate
+        # kernel lives on disk under cand_0/).
         child_ids = [n for n in result.tree._nodes.values() if n.parent_id is not None]
         assert len(child_ids) == 1
-        assert child_ids[0].failure_reason is not None
-        assert "0/3 workloads" in child_ids[0].failure_reason
-        assert child_ids[0].kernel is not None  # bench-layer → kernel was submitted
+        assert child_ids[0].failure_details is not None
+        assert len(child_ids[0].failure_details) == 1
+        assert "0/3 workloads" in child_ids[0].failure_details[0].reason
+        # Summary nodes always carry kernel=None; per-candidate source is
+        # preserved on disk via has_kernel_source=True.
+        assert child_ids[0].kernel is None
+        assert child_ids[0].failure_details[0].has_kernel_source is True
         warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
         # A2 emits the "all N Coder candidates failed bench — skipping"
         # warning instead of the legacy per-branch dead-end log.
@@ -1074,12 +1079,13 @@ class TestOrchestratorBenchmarkFailure:
             "Partial-failure kernels must not reach the reviewer"
         )
         children = [n for n in result.tree._nodes.values() if n.parent_id is not None]
-        # Failure node carries the partial-bench reason. Non-expandable
-        # (DEAD_END / CODER_FAILED) so it can't be promoted as the best
-        # node by frontier/best_node filters.
+        # Failure-summary node carries the partial-bench reason in its
+        # single FailureDetail entry. Non-expandable (DEAD_END /
+        # CODER_FAILED) so it can't be promoted by frontier/best_node.
         assert len(children) == 1
-        assert "partial bench failure" in children[0].failure_reason
-        assert "wl2" in children[0].failure_reason
+        fd = children[0].failure_details[0]
+        assert "partial bench failure" in fd.reason
+        assert "wl2" in fd.reason
 
     @pytest.mark.asyncio
     async def test_baseline_partial_workload_failure_fails_closed(self, _orch_harness):
@@ -1188,24 +1194,25 @@ class TestOrchestratorCoderFailure:
             h.reviewer.review.return_value = _promising_review_stub()
             result = await orch.run(h.baseline, workloads=None, roofline=h.roofline)
 
-        # Tree contains root + ONE failure node (iter 1's ImplementationError)
-        # + ONE success node (iter 2's retry). The failure node is non-
-        # expandable (DEAD_END / CODER_FAILED), so frontier()/best_node()
-        # behavior is unchanged from the pre-feature contract.
+        # Tree contains root + ONE summary node (iter 1's ImplementationError
+        # collapses K=1 into one summary) + ONE success node (iter 2's retry).
+        # The summary is non-expandable (DEAD_END / CODER_FAILED), so
+        # frontier()/best_node() behavior is unchanged from the pre-feature contract.
         assert h.coder.implement.await_count == 2, (
             "Orchestrator must continue to the next iteration after Coder failure"
         )
         children = [n for n in result.tree._nodes.values() if n.parent_id is not None]
-        successes = [n for n in children if n.failure_reason is None]
-        failures = [n for n in children if n.failure_reason is not None]
+        successes = [n for n in children if n.failure_details is None]
+        failures = [n for n in children if n.failure_details is not None]
         assert len(successes) == 1, (
             f"Expected exactly one success-node from the retry; got {len(successes)}"
         )
         assert len(failures) == 1, (
-            f"Expected one failure-node from the ImplementationError; got {len(failures)}"
+            f"Expected one summary node from the ImplementationError; got {len(failures)}"
         )
-        assert "turn budget" in failures[0].failure_reason
-        assert failures[0].kernel is None  # turn-exhaust = no submitted kernel
+        assert "turn budget" in failures[0].failure_details[0].reason
+        assert failures[0].kernel is None  # summary nodes always None
+        assert failures[0].failure_details[0].has_kernel_source is False  # turn-exhaust
         warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
         # A2: the iter-SKIPPED warning names how many K candidates failed.
         # Phrase is "all N Coder candidates failed" (where N == K).
@@ -1242,18 +1249,22 @@ class TestOrchestratorCoderFailure:
             orch = Orchestrator(h.config, h.planner, h.coder, h.reviewer, h.retriever)
             result = await orch.run(h.baseline, workloads=None, roofline=h.roofline)
 
-        # Root + one failure node per Coder failure (per failure-node
-        # retention). consecutive_agent_failures still tracks iters
-        # (not per-candidate), so QUARANTINE_THRESHOLD still triggers
-        # ALL_DEAD_END after the same number of awaits as before.
-        # K=4 default Coder fan-out × QUARANTINE_THRESHOLD iters = 4*N
-        # failure nodes + 1 root.
-        expected_failure_nodes = QUARANTINE_THRESHOLD * h.config.coder_n_candidates
-        assert len(result.tree._nodes) == 1 + expected_failure_nodes
-        # Every non-root node is a failure node from ImplementationError.
+        # Root + one summary node per iter (per failure-node collapse).
+        # Each iter's K candidates collapse into ONE summary node with K
+        # failure_details entries. consecutive_agent_failures still ticks
+        # per-iter (not per-candidate), so QUARANTINE_THRESHOLD still
+        # triggers ALL_DEAD_END after the same number of awaits as before.
+        # Tree shape: root + QUARANTINE_THRESHOLD summary nodes.
         non_root = [n for n in result.tree._nodes.values() if n.parent_id is not None]
-        assert all(n.failure_reason is not None for n in non_root)
-        assert all(n.kernel is None for n in non_root)  # turn-exhaust
+        assert len(non_root) == QUARANTINE_THRESHOLD
+        assert all(n.failure_details is not None for n in non_root)
+        # Summary nodes always carry kernel=None; per-candidate kernels live
+        # on disk under cand_<i>/ (here turn-exhaust → has_kernel_source=False).
+        assert all(n.kernel is None for n in non_root)
+        for summary in non_root:
+            assert len(summary.failure_details) == h.config.coder_n_candidates
+            for fd in summary.failure_details:
+                assert fd.has_kernel_source is False  # turn-exhaust
         assert h.coder.implement.await_count == QUARANTINE_THRESHOLD * h.config.coder_n_candidates
         assert result.tree.get_node(0).consecutive_agent_failures >= QUARANTINE_THRESHOLD
 
@@ -1323,14 +1334,14 @@ class TestDeadReasonField:
     async def test_bench_failure_records_bench_failure_reason(
         self, _orch_harness, tmp_path,
     ):
-        """A2 + failure-node retention (2026-05-17): BenchmarkError now
-        creates a non-expandable failure node carrying ``dead_reason ==
-        CODER_FAILED`` and the raw bench-error message in
-        ``failure_reason``. Per-candidate ``coder_failed`` event payload
-        keeps the reason for telemetry consumers; the tree node carries
-        the same string for Planner-side sibling rendering. Distinct from
-        winner-side kills (REVIEWER_JUDGED, profile error) — see
-        ``test_reviewer_dead_end_records_reviewer_judged_reason``.
+        """A2 + failure-node collapse (2026-05-18): BenchmarkError on a
+        K=1 iter creates a non-expandable failure-summary node carrying
+        ``dead_reason == CODER_FAILED`` and a one-element
+        ``failure_details`` list with the raw bench-error message.
+        Per-candidate ``coder_failed`` event payload keeps the reason
+        for telemetry; the summary node carries it for Planner-side
+        sibling rendering. Distinct from winner-side kills
+        (REVIEWER_JUDGED, profile error).
         """
         import json
 
@@ -1363,7 +1374,7 @@ class TestDeadReasonField:
         assert len(children) == 1
         failure = children[0]
         assert failure.dead_reason == DeadReason.CODER_FAILED
-        assert "0/3 workloads survived" in failure.failure_reason
+        assert "0/3 workloads survived" in failure.failure_details[0].reason
 
         records = [
             json.loads(line)
@@ -1373,8 +1384,8 @@ class TestDeadReasonField:
         coder_failed = [r for r in records if r["kind"] == "coder_failed"]
         assert len(coder_failed) == 1
         assert "0/3 workloads survived" in coder_failed[0]["reason"]
-        # New event fires alongside coder_failed for persisted failures.
-        added = [r for r in records if r["kind"] == "failure_node_added"]
+        # New summary event fires once per iter for persisted failures.
+        added = [r for r in records if r["kind"] == "failure_summary_added"]
         assert len(added) == 1
 
     @pytest.mark.asyncio

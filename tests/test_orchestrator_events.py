@@ -698,35 +698,35 @@ async def test_dump_node_receives_real_ncu_rep_src_on_advance(harness, monkeypat
 
 
 @pytest.mark.asyncio
-async def test_dump_node_called_for_failure_nodes_on_skipped(harness, monkeypatch):
-    """Skipped iterations from Coder/bench-layer failures DO call
-    ``tree_dump.dump_node`` — each persisted failure node streams its
-    own meta.json (and kernel.py when the Coder reached submit_kernel).
+async def test_dump_failure_summary_called_for_failure_nodes_on_skipped(
+    harness, monkeypatch
+):
+    """Skipped iterations from K-way Coder/bench-layer failures call
+    ``tree_dump.dump_failure_summary_node`` once per iter (not K times) —
+    failure-node collapse attaches one summary node carrying all K
+    failure_details, not K per-candidate nodes.
 
-    Per failure-node retention (2026-05-17): failed candidates are
-    first-class tree artifacts the search machinery surfaces to the
-    next Planner call, so they must materialize on disk the same way
-    success nodes do. (Profile-layer failures still stay drop-on-the-
-    floor and don't dump.) Previous contract — "skipped iter ⇒ no
-    dump" — applied before failure nodes existed.
+    Per failure-node collapse (2026-05-18): K failed candidates collapse
+    into a single failure-summary node per iter; one
+    ``dump_failure_summary_node`` call writes ``meta.json`` plus
+    ``cand_<i>/{kernel.py, meta.json}`` for each candidate. Per-candidate
+    ``coder_failed`` events still fire K times (unchanged).
     """
     from src.agents.coder import ImplementationError
     from src.runtime import tree_dump
 
-    calls: list = []
+    summary_calls: list = []
 
     def spy(node, *args, **kwargs):
-        calls.append(node.id)
+        summary_calls.append(node.id)
 
-    monkeypatch.setattr(tree_dump, "dump_node", spy)
+    monkeypatch.setattr(tree_dump, "dump_failure_summary_node", spy)
 
     harness.coder.implement = AsyncMock(side_effect=ImplementationError("budget exhausted"))
     await _run_orch(harness)
-    # Baseline root dump fires before the loop. Each K-way candidate
-    # that failed at Coder/bench layer also dumps its failure node.
-    non_root = [c for c in calls if c != 0]
-    assert len(non_root) == harness.config.coder_n_candidates, (
-        f"Expected K={harness.config.coder_n_candidates} failure-node dumps; got {non_root}"
+    # Each all-K-fail iter dumps exactly one summary node, regardless of K.
+    assert len(summary_calls) >= 1, (
+        f"Expected ≥1 failure-summary dump; got {summary_calls}"
     )
 
 

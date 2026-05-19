@@ -20,6 +20,24 @@ if TYPE_CHECKING:
 
 
 @dataclass
+class FailureDetail:
+    """One failed K-way Coder candidate collapsed into a failure-summary node.
+
+    Carried by ``TreeNode.failure_details`` (a list) on summary nodes;
+    the list has one entry per failed candidate from that iter.
+    ``reason`` is truncated upstream (~200 chars) and read verbatim by
+    ``render_siblings``' failure-flatten path. ``has_kernel_source``
+    mirrors on-disk presence of
+    ``tree/node_<id>/cand_<candidate_idx>/kernel.py`` — False on
+    turn-exhaust paths where the Coder never submitted a kernel.
+    """
+
+    candidate_idx: int
+    reason: str
+    has_kernel_source: bool
+
+
+@dataclass
 class TreeNode:
     """A node in the search tree representing one kernel version."""
 
@@ -71,10 +89,17 @@ class TreeNode:
     # on live nodes and legacy checkpoints; paired with
     # ``branch_quality = DEAD_END`` at every kill site via ``mark_dead``.
     dead_reason: "DeadReason | None" = None
-    # Raw error string from ``coder_failed.reason``; non-None only on
-    # failure nodes added via ``add_failure_child``. Truncated upstream
-    # (~200 chars) and read verbatim by ``render_siblings``.
-    failure_reason: str | None = None
+    # Per-candidate failure list on failure-summary nodes attached via
+    # ``add_failure_summary``. ``None`` on the root, on every live /
+    # success node, and on every legacy DEAD_END node that predates
+    # failure-node collapse. The list has one ``FailureDetail`` per
+    # failed K-way candidate from the iter that produced this node;
+    # set together with ``branch_quality=DEAD_END`` and
+    # ``dead_reason=CODER_FAILED`` at end-of-iter persistence. Read by
+    # ``render_siblings`` (flattened into the FAILED-block accumulator)
+    # and by ``tree_dump.dump_failure_summary_node`` (per-candidate
+    # ``cand_<idx>/`` disk layout).
+    failure_details: list[FailureDetail] | None = None
 
     def mark_dead(self, reason: "DeadReason") -> None:
         """Mark this node DEAD_END and record the cause atomically.
@@ -143,35 +168,44 @@ class SearchTree:
         self._next_id += 1
         return node
 
-    def add_failure_child(
+    def add_failure_summary(
         self,
         parent_id: int,
-        kernel: "Kernel | None",
-        action_applied: str,
         *,
+        action_applied: str,
         action_params: dict | None,
-        failure_reason: str,
         iter_no: int,
+        failure_details: list[FailureDetail],
     ) -> TreeNode:
-        """Add a non-expandable failure node under ``parent_id``.
+        """Attach one failure-summary node under ``parent_id`` collapsing
+        all failed K-way Coder candidates from a single iter into one
+        tree entry.
 
-        ``kernel = None`` for turn-exhaust paths (Coder never reached
-        ``submit_kernel``); otherwise the submitted-but-crashed source
-        rides through for postmortem inspection. Marked DEAD_END +
-        CODER_FAILED via ``mark_dead`` so ``frontier()``/``best_node()``
-        exclude it (no trustworthy score). ``consecutive_agent_failures``
-        stays an iter-level orchestrator counter — not bumped here.
+        Node properties: ``kernel=None`` (per-candidate sources live on
+        disk under ``tree/node_<id>/cand_<idx>/kernel.py``, not on the
+        TreeNode), ``score=None``, ``branch_quality=DEAD_END``,
+        ``dead_reason=CODER_FAILED`` (set atomically via ``mark_dead``
+        so ``_eligible_for_best`` excludes it). Excluded from
+        ``frontier()`` and ``best_node()`` like the legacy per-candidate
+        failure nodes were.
+
+        ``failure_details`` MUST be non-empty — callers don't attach an
+        empty summary; if the iter had zero failures, no summary node
+        is added. ``consecutive_agent_failures`` stays an iter-level
+        orchestrator counter — not bumped here.
         """
+        if not failure_details:
+            raise ValueError("failure_details must be non-empty")
         parent = self._nodes[parent_id]
         node = TreeNode(
             id=self._next_id,
-            kernel=kernel,
+            kernel=None,
             parent_id=parent_id,
             action_applied=action_applied,
             action_params=action_params,
             depth=parent.depth + 1,
             iter_no=iter_no,
-            failure_reason=failure_reason,
+            failure_details=list(failure_details),
         )
         node.mark_dead(DeadReason.CODER_FAILED)
         parent.children_ids.append(node.id)
@@ -337,14 +371,17 @@ class SearchTree:
             if exclude_id is not None and child_id == exclude_id:
                 continue
             child = self._nodes[child_id]
-            if child.failure_reason is not None:
-                failure_entries.append((
-                    child.iter_no,
-                    child.id,
-                    child.action_applied,
-                    child.action_params,
-                    child.failure_reason,
-                ))
+            if child.failure_details is not None:
+                # Flatten summary's details so dedup downstream sees
+                # one entry per failed candidate.
+                for fd in child.failure_details:
+                    failure_entries.append((
+                        child.iter_no,
+                        child.id,
+                        child.action_applied,
+                        child.action_params,
+                        fd.reason,
+                    ))
                 continue
             action_label = _format_action_label(
                 child.action_applied, child.action_params,
@@ -533,7 +570,11 @@ def _serialize_node(node: TreeNode) -> dict:
         "consecutive_agent_failures": node.consecutive_agent_failures,
         "iter_no": node.iter_no,
         "last_review": _serialize_review_feedback(node.last_review),
-        "failure_reason": node.failure_reason,
+        "failure_details": (
+            [asdict(fd) for fd in node.failure_details]
+            if node.failure_details is not None
+            else None
+        ),
     }
 
 
@@ -754,8 +795,31 @@ def _deserialize_node(data: dict) -> TreeNode:
         # legacy nodes have no Reviewer feedback recorded.
         last_review=_deserialize_review_feedback(data.get("last_review")),
         dead_reason=dr,
-        failure_reason=data.get("failure_reason"),
+        failure_details=_deserialize_failure_details(data),
     )
+
+
+def _deserialize_failure_details(data: dict) -> "list[FailureDetail] | None":
+    """Read failure_details from checkpoint; synthesize from legacy
+    failure_reason when loading pre-collapse checkpoints.
+
+    has_kernel_source=False unconditionally for legacy synthesis: legacy
+    on-disk layout has kernel.py at tree/node_<id>/kernel.py (flat), not
+    at the new tree/node_<id>/cand_0/kernel.py path the flag points at.
+    Setting True would mislead postmortem readers. See the design spec's
+    "has_kernel_source semantics under legacy load" note for rationale.
+    """
+    new_fmt = data.get("failure_details")
+    if new_fmt is not None:
+        return [FailureDetail(**fd) for fd in new_fmt]
+    legacy = data.get("failure_reason")
+    if legacy is not None:
+        return [FailureDetail(
+            candidate_idx=0,
+            reason=legacy,
+            has_kernel_source=False,
+        )]
+    return None
 
 
 def _deserialize_profiling(data):

@@ -1,11 +1,12 @@
-"""Tier-1 unit tests for failure-node retention.
+"""Tier-1 unit tests for failure-node collapse.
 
-Covers: DeadReason enum extension, TreeNode.failure_reason field,
-SearchTree.add_failure_child, render_siblings failure rendering with
-dedup/ordering/cap, consumer split, backward-compat checkpoint load.
+Covers: DeadReason enum, TreeNode.failure_details list field,
+SearchTree.add_failure_summary, render_siblings failure rendering with
+dedup/ordering/cap (still byte-identical when reasons match across
+candidates), consumer split, backward-compat checkpoint load synthesis.
 
-Spec: doc/specs/2026-05-17-failure-node-retention-design.md
-Plan: doc/plans/2026-05-17-failure-node-retention-plan.md
+Spec: doc/specs/2026-05-18-failure-node-collapse-design.md
+Plan: doc/plans/2026-05-18-failure-node-collapse-plan.md
 """
 from __future__ import annotations
 
@@ -20,10 +21,10 @@ def test_dead_reason_coder_failed_member_exists():
     assert DeadReason.CODER_FAILED == "coder_failed"
 
 
-def test_failure_node_added_event_kind_registered():
-    """``failure_node_added`` is a known event kind so emit() won't warn."""
+def test_failure_summary_added_event_kind_registered():
+    """``failure_summary_added`` is a known event kind so emit() won't warn."""
     from src.runtime.events import CORE_EVENT_KINDS
-    assert "failure_node_added" in CORE_EVENT_KINDS
+    assert "failure_summary_added" in CORE_EVENT_KINDS
 
 
 # ── Task 2: TreeNode.failure_reason field + serialization ────────────────────
@@ -36,44 +37,59 @@ def _spec():
                       pytorch_reference="", t_sol_us=1.0)
 
 
-def test_tree_node_failure_reason_defaults_to_none():
-    """New ``failure_reason`` field defaults to None on success nodes."""
+def test_tree_node_failure_details_defaults_to_none():
+    """``failure_details`` field defaults to None on success / live nodes."""
     from src.search.tree import TreeNode
     from src.kernels.kernel import Kernel
     node = TreeNode(id=0, kernel=Kernel(spec=_spec(), source_code=""))
-    assert node.failure_reason is None
+    assert node.failure_details is None
 
 
-def test_tree_node_failure_reason_round_trips_through_serialize():
-    """A node carrying ``failure_reason`` survives serialize→deserialize."""
+def test_tree_node_failure_details_round_trips_through_serialize():
+    """A summary node carrying ``failure_details`` survives serialize→deserialize."""
+    import pytest
+    pytest.importorskip("sol_execbench", reason="checkpoint load imports ScoreResult chain")
     import tempfile
     from pathlib import Path
-    from src.search.tree import SearchTree, TreeNode
+    from src.search.tree import FailureDetail, SearchTree
     from src.kernels.kernel import Kernel
     tree = SearchTree()
     root = tree.add_root(Kernel(spec=_spec(), source_code=""))
-    # Manually fabricate a "failure node" — Task 4 adds the convenience
-    # method; this test only verifies the field plumbing.
-    fake = TreeNode(
-        id=99, kernel=Kernel(spec=_spec(), source_code=""),
-        parent_id=root.id, depth=1, iter_no=3,
-        failure_reason="autotune burn-in failed: cudaErrorInvalidAddressSpace",
+    fn = tree.add_failure_summary(
+        parent_id=root.id,
+        action_applied="t1_block_size_tuning",
+        action_params={"BLOCK_K": 32},
+        iter_no=3,
+        failure_details=[
+            FailureDetail(0, "autotune burn-in failed: cudaErrorInvalidAddressSpace", True),
+            FailureDetail(1, "Coder exhausted turn budget", False),
+        ],
     )
-    tree._nodes[99] = fake
-    tree._next_id = 100
 
     with tempfile.TemporaryDirectory() as d:
         ckpt = Path(d) / "ckpt.json"
         tree.save(ckpt)
         loaded = SearchTree.load(ckpt)
 
-    reloaded = loaded.get_node(99)
-    assert reloaded.failure_reason == "autotune burn-in failed: cudaErrorInvalidAddressSpace"
+    reloaded = loaded.get_node(fn.id)
+    assert reloaded.failure_details is not None
+    assert len(reloaded.failure_details) == 2
+    assert reloaded.failure_details[0].reason == "autotune burn-in failed: cudaErrorInvalidAddressSpace"
+    assert reloaded.failure_details[0].has_kernel_source is True
+    assert reloaded.failure_details[1].has_kernel_source is False
 
 
-def test_tree_node_failure_reason_legacy_checkpoint_loads_as_none():
-    """Pre-feature checkpoint (no ``failure_reason`` key) deserializes
-    with ``failure_reason=None`` — backward-compat for in-flight runs."""
+def test_legacy_checkpoint_failure_reason_synthesizes_failure_details():
+    """Pre-collapse checkpoint with ``failure_reason: str`` synthesizes a
+    1-element ``failure_details`` list on load.
+
+    ``has_kernel_source=False`` unconditionally on legacy synthesis: the
+    legacy on-disk layout has ``kernel.py`` at the flat path
+    ``tree/node_<id>/kernel.py``, not at ``cand_0/kernel.py``; the flag
+    must not lie about the new-layout presence.
+    """
+    import pytest
+    pytest.importorskip("sol_execbench", reason="checkpoint load imports ScoreResult chain")
     import json
     import tempfile
     from pathlib import Path
@@ -88,19 +104,21 @@ def test_tree_node_failure_reason_legacy_checkpoint_loads_as_none():
                                     "input_shapes": [],
                                     "definition_path": None,
                                     "pytorch_reference": "", "t_sol_us": 1.0},
-                           "source_code": "",
+                           "source_code": "# crashed",
                            "triton_kernel_name": "",
                            "dps": False,
                            "autotune_configs": [],
                            "autotune_keys": [],
                            "autotune_winner": {}},
-                "score": None, "branch_quality": None,
-                "action_applied": "", "action_params": None,
-                "depth": 0, "profiling": None,
+                "score": None, "branch_quality": "dead_end",
+                "action_applied": "t1_block_size_tuning",
+                "action_params": {"BLOCK_K": 32},
+                "depth": 1, "profiling": None,
                 "per_workload_latency_us": None,
                 "consecutive_agent_failures": 0,
-                "iter_no": -1, "last_review": None, "dead_reason": None,
-                # NOTE: no failure_reason key — legacy shape
+                "iter_no": 5, "last_review": None,
+                "dead_reason": "coder_failed",
+                "failure_reason": "autotune burn-in failed: cudaErrorInvalidAddressSpace",
             },
         },
     }
@@ -108,7 +126,12 @@ def test_tree_node_failure_reason_legacy_checkpoint_loads_as_none():
         ckpt = Path(d) / "ckpt.json"
         ckpt.write_text(json.dumps(legacy))
         tree = SearchTree.load(ckpt)
-    assert tree.get_node(0).failure_reason is None
+    n = tree.get_node(0)
+    assert n.failure_details is not None
+    assert len(n.failure_details) == 1
+    assert n.failure_details[0].candidate_idx == 0
+    assert n.failure_details[0].reason == "autotune burn-in failed: cudaErrorInvalidAddressSpace"
+    assert n.failure_details[0].has_kernel_source is False
 
 
 # ── Task 3: ACTSConfig.failure_sibling_cap field ──────────────────────────────
@@ -129,28 +152,35 @@ def test_failure_sibling_cap_zero_means_uncapped():
 
 # ── Task 4: add_failure_child + frontier/best_node exclusion ──────────────────
 
-def test_add_failure_child_field_assignments():
-    """``add_failure_child`` produces a node with the spec'd field shape."""
+def test_add_failure_summary_field_assignments():
+    """``add_failure_summary`` produces a node with the spec'd field shape."""
     from src.runtime.events import DeadReason
     from src.agents.reviewer import BranchQuality
-    from src.search.tree import SearchTree
+    from src.search.tree import FailureDetail, SearchTree
     from src.kernels.kernel import Kernel
     tree = SearchTree()
     root = tree.add_root(Kernel(spec=_spec(), source_code=""))
-    failure = tree.add_failure_child(
+    failure = tree.add_failure_summary(
         parent_id=root.id,
-        kernel=Kernel(spec=_spec(), source_code="bad-kernel"),
         action_applied="t1_block_size_tuning",
         action_params={"BLOCK_K": 32},
-        failure_reason="autotune burn-in failed: cudaErrorInvalidAddressSpace",
         iter_no=6,
+        failure_details=[
+            FailureDetail(0, "autotune burn-in failed: cudaErrorInvalidAddressSpace", True),
+        ],
     )
     assert failure.score is None
     assert failure.last_review is None
     assert failure.branch_quality == BranchQuality.DEAD_END
     assert failure.dead_reason == DeadReason.CODER_FAILED
     assert failure.children_ids == []
-    assert failure.failure_reason == "autotune burn-in failed: cudaErrorInvalidAddressSpace"
+    # Summary nodes always have kernel=None (per-candidate kernels live
+    # on disk under tree/node_<id>/cand_<idx>/).
+    assert failure.kernel is None
+    assert failure.failure_details is not None
+    assert len(failure.failure_details) == 1
+    assert failure.failure_details[0].reason == "autotune burn-in failed: cudaErrorInvalidAddressSpace"
+    assert failure.failure_details[0].has_kernel_source is True
     assert failure.action_applied == "t1_block_size_tuning"
     assert failure.action_params == {"BLOCK_K": 32}
     assert failure.parent_id == root.id
@@ -160,75 +190,80 @@ def test_add_failure_child_field_assignments():
     assert failure.id in root.children_ids
 
 
-def test_add_failure_child_accepts_none_kernel_for_turn_exhaust():
-    """Turn-exhaust path has no submitted kernel; method must accept
-    ``kernel=None`` and record the failure anyway."""
-    from src.search.tree import SearchTree
+def test_add_failure_summary_records_turn_exhaust_with_has_kernel_source_false():
+    """Turn-exhaust path has no submitted kernel; FailureDetail.has_kernel_source
+    records the bit so postmortem layout matches on-disk truth."""
+    from src.search.tree import FailureDetail, SearchTree
     from src.kernels.kernel import Kernel
     tree = SearchTree()
     root = tree.add_root(Kernel(spec=_spec(), source_code=""))
-    failure = tree.add_failure_child(
+    failure = tree.add_failure_summary(
         parent_id=root.id,
-        kernel=None,
         action_applied="t3_loop_unroll",
         action_params=None,
-        failure_reason="Coder exhausted turn budget (8) without calling submit_kernel.",
         iter_no=7,
+        failure_details=[
+            FailureDetail(0, "Coder exhausted turn budget (8) without calling submit_kernel.", False),
+        ],
     )
     assert failure.kernel is None
     assert failure.action_params is None
+    assert failure.failure_details[0].has_kernel_source is False
 
 
-def test_frontier_excludes_failure_nodes():
-    """Failure nodes have branch_quality == DEAD_END → ``frontier()`` skips."""
-    from src.search.tree import SearchTree
+def test_frontier_excludes_failure_summary_nodes():
+    """Summary nodes have branch_quality == DEAD_END → ``frontier()`` skips."""
+    from src.search.tree import FailureDetail, SearchTree
     from src.kernels.kernel import Kernel
     tree = SearchTree()
     root = tree.add_root(Kernel(spec=_spec(), source_code=""))
-    tree.add_failure_child(
-        parent_id=root.id, kernel=None,
-        action_applied="t1", action_params=None,
-        failure_reason="boom", iter_no=1,
+    tree.add_failure_summary(
+        parent_id=root.id,
+        action_applied="t1", action_params=None, iter_no=1,
+        failure_details=[FailureDetail(0, "boom", False)],
     )
     frontier_ids = [n.id for n in tree.frontier()]
-    # Root is expandable, failure node is not.
+    # Root is expandable, summary is not.
     assert root.id in frontier_ids
     assert all(n.dead_reason is None for n in tree.frontier())
 
 
-def test_best_node_excludes_failure_nodes_even_when_only_node_with_no_score():
+def test_best_node_excludes_failure_summary_nodes_even_when_only_dead_end():
     """``best_node()`` filters on ``_eligible_for_best``; CODER_FAILED is
-    excluded so a failure-only tree falls back to root."""
-    from src.search.tree import SearchTree
+    excluded so a summary-only tree falls back to root."""
+    from src.search.tree import FailureDetail, SearchTree
     from src.kernels.kernel import Kernel
     tree = SearchTree()
     root = tree.add_root(Kernel(spec=_spec(), source_code=""))
-    tree.add_failure_child(
-        parent_id=root.id, kernel=None,
-        action_applied="t1", action_params=None,
-        failure_reason="boom", iter_no=1,
+    tree.add_failure_summary(
+        parent_id=root.id,
+        action_applied="t1", action_params=None, iter_no=1,
+        failure_details=[FailureDetail(0, "boom", False)],
     )
-    # No scored nodes → root fallback (existing behavior, but ensures
-    # the failure node didn't accidentally become a candidate).
     assert tree.best_node().id == root.id
 
 
 # ── Task 5: render_siblings failure rendering ──────────────────────────────────
 
 def _add_failure(tree, parent_id, action, params, reason, iter_no, cand_idx=0):
-    """Helper: build a failure node. ``cand_idx`` is kept on the helper
-    signature (not the production API) so multi-candidate-per-iter tests
-    can document their order, but the value is ignored — ordering inside
-    one iter is by child id, which the tree assigns in insertion order."""
-    from src.kernels.kernel import Kernel
-    del cand_idx
-    return tree.add_failure_child(
+    """Helper: build a failure-summary node carrying ONE candidate detail.
+
+    Migrated from the legacy per-candidate ``add_failure_child`` API to
+    the collapse-era ``add_failure_summary`` API; the test contract
+    (one ``_add_failure`` call ⇒ one failure rendered by
+    ``render_siblings``) is preserved because the flatten-then-dedup
+    path treats a 1-element ``failure_details`` list identically to a
+    legacy single-failure node. Tests calling this K times to simulate
+    K candidate failures end up with K summary nodes; the
+    render-time dedup on ``(action, params, reason)`` collapses them to
+    a single ``FAILED ×K`` line just as before."""
+    from src.search.tree import FailureDetail
+    return tree.add_failure_summary(
         parent_id=parent_id,
-        kernel=Kernel(spec=_spec(), source_code=""),
         action_applied=action,
         action_params=params,
-        failure_reason=reason,
         iter_no=iter_no,
+        failure_details=[FailureDetail(cand_idx, reason, True)],
     )
 
 
@@ -448,6 +483,8 @@ def test_legacy_checkpoint_round_trip_renders_success_only():
     render siblings → no FAILED lines for either consumer. Backward-compat
     regression guard for in-flight runs that started before this feature
     landed."""
+    import pytest
+    pytest.importorskip("sol_execbench", reason="checkpoint load imports ScoreResult chain")
     import json
     import tempfile
     from pathlib import Path
@@ -529,5 +566,5 @@ def test_legacy_checkpoint_round_trip_renders_success_only():
     assert "FAILED" not in rendered_planner
     rendered_reviewer = tree.render_siblings(0, consumer="reviewer")
     assert "FAILED" not in rendered_reviewer
-    # Legacy children inherit ``failure_reason = None``.
-    assert tree.get_node(1).failure_reason is None
+    # Legacy success children have no failure_details set.
+    assert tree.get_node(1).failure_details is None

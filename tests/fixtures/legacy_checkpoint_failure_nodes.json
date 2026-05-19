@@ -1,0 +1,52 @@
+{
+  "next_id": 3,
+  "nodes": {
+    "0": {
+      "id": 0, "parent_id": null, "children_ids": [1, 2],
+      "action_applied": "", "action_params": null, "depth": 0,
+      "branch_quality": "promising", "dead_reason": null,
+      "score": null,
+      "kernel": {
+        "spec": {"name": "t", "kernel_type": "elementwise",
+                 "flop_count": 0, "memory_bytes": 0,
+                 "input_shapes": [], "definition_path": null,
+                 "pytorch_reference": "", "t_sol_us": 1.0},
+        "source_code": "# baseline", "num_warps": 4, "num_stages": 2,
+        "block_size": 128, "triton_kernel_name": "k", "dps": false
+      },
+      "profiling": null, "per_workload_latency_us": null,
+      "consecutive_agent_failures": 0, "iter_no": -1, "last_review": null,
+      "failure_reason": null
+    },
+    "1": {
+      "id": 1, "parent_id": 0, "children_ids": [],
+      "action_applied": "t1_block_size_tuning",
+      "action_params": {"BLOCK_M": 64}, "depth": 1,
+      "branch_quality": "dead_end", "dead_reason": "coder_failed",
+      "score": null,
+      "kernel": {
+        "spec": {"name": "t", "kernel_type": "elementwise",
+                 "flop_count": 0, "memory_bytes": 0,
+                 "input_shapes": [], "definition_path": null,
+                 "pytorch_reference": "", "t_sol_us": 1.0},
+        "source_code": "# candidate that crashed at bench",
+        "num_warps": 4, "num_stages": 2, "block_size": 128,
+        "triton_kernel_name": "k", "dps": false
+      },
+      "profiling": null, "per_workload_latency_us": null,
+      "consecutive_agent_failures": 0, "iter_no": 1, "last_review": null,
+      "failure_reason": "BenchmarkError: OOM on workload uuid-A"
+    },
+    "2": {
+      "id": 2, "parent_id": 0, "children_ids": [],
+      "action_applied": "t1_block_size_tuning",
+      "action_params": {"BLOCK_M": 32}, "depth": 1,
+      "branch_quality": "dead_end", "dead_reason": "coder_failed",
+      "score": null,
+      "kernel": null,
+      "profiling": null, "per_workload_latency_us": null,
+      "consecutive_agent_failures": 0, "iter_no": 1, "last_review": null,
+      "failure_reason": "ImplementationError: Coder exhausted turns"
+    }
+  }
+}

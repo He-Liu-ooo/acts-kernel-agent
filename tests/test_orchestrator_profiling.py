@@ -212,10 +212,12 @@ class TestProfilingSkippedOnDeadBranch:
             "profile_kernel must not run when no candidate survived bench"
         )
         children = [n for n in result.tree._nodes.values() if n.parent_id is not None]
-        # One failure node (K=1 in this harness) carrying the partial-bench reason.
+        # One failure-summary node (K=1 in this harness) with 1 failure_details
+        # entry carrying the partial-bench reason.
         assert len(children) == 1
-        assert children[0].failure_reason is not None
-        assert "partial bench failure" in children[0].failure_reason
+        assert children[0].failure_details is not None
+        assert len(children[0].failure_details) == 1
+        assert "partial bench failure" in children[0].failure_details[0].reason
 
 
 class TestProfilerErrorMarksDeadEnd:

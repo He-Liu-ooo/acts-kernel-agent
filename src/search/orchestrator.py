@@ -312,55 +312,83 @@ def detect_plateau(
     return max(recent) - min(recent) <= delta + 1e-9
 
 
-def _persist_failure_node(
-    tree: "SearchTree",
-    parent: "TreeNode",
+def _accumulate_iter_failure(
+    iter_failures: "list",
+    iter_failure_kernels: "list",
     *,
-    plan,
-    kernel,
-    failure_reason: str,
     iter_no: int,
     candidate_idx: int,
+    kernel,
+    reason: str,
 ) -> None:
-    """Emit ``coder_failed``, attach a failure node, emit
-    ``failure_node_added``, stream the on-disk artifacts. Shared by the
-    5 K-way fan-out failure sites (ImplementationError, EntrypointBinding,
-    BenchmarkError, CUDA sticky-state, partial bench).
+    """Append one failed K-way candidate to the iter-level accumulators
+    and emit the per-candidate ``coder_failed`` event.
 
-    Reward-hack and profile-layer paths emit ``coder_failed`` standalone
-    instead — they intentionally drop the candidate without producing a
-    tree artifact, so they aren't routed through this helper.
+    Replaces the legacy per-candidate persistence path (which mutated the
+    tree immediately at each of the 5 failure sites). Under failure-node
+    collapse, the tree-attach + per-node dump + ``failure_summary_added``
+    event happen once per iter via ``_persist_iter_failure_summary``
+    after the per-candidate bench loop has finished pushing every
+    failure into the accumulators.
     """
-    from src.runtime.tree_dump import dump_node
+    from src.search.tree import FailureDetail
 
+    iter_failures.append(FailureDetail(
+        candidate_idx=candidate_idx,
+        reason=reason,
+        has_kernel_source=(kernel is not None),
+    ))
+    iter_failure_kernels.append((candidate_idx, kernel))
     emit(
         "coder_failed",
         iter=iter_no,
         candidate_idx=candidate_idx,
-        reason=failure_reason,
+        reason=reason,
     )
-    fn = tree.add_failure_child(
-        parent_id=parent.id,
-        kernel=kernel,
+
+
+def _persist_iter_failure_summary(
+    tree: "SearchTree",
+    parent: "TreeNode",
+    *,
+    plan,
+    iter_no: int,
+    iter_failures: "list",
+    iter_failure_kernels: "list",
+) -> None:
+    """End-of-iter: attach one failure-summary node + dump per-candidate
+    artifacts + emit ``failure_summary_added``. No-op when
+    ``iter_failures`` is empty (e.g. all-K-succeed iter; Planner-failed
+    iter that never reached the gather).
+
+    Profile-layer failures intentionally do not push into
+    ``iter_failures`` — they emit ``coder_failed`` only and stay out of
+    the summary, per the existing "downstream-of-truth, don't dilute the
+    FAILED block" rationale.
+    """
+    if not iter_failures:
+        return
+    from src.runtime import tree_dump
+
+    fn = tree.add_failure_summary(
+        parent.id,
         action_applied=plan.technique,
         action_params=plan.params,
-        failure_reason=failure_reason,
         iter_no=iter_no,
+        failure_details=iter_failures,
+    )
+    tree_dump.dump_failure_summary_node(
+        fn, iter_failure_kernels, iter_no=iter_no,
     )
     emit(
-        "failure_node_added",
+        "failure_summary_added",
         iter=iter_no,
-        candidate_idx=candidate_idx,
         node_id=str(fn.id),
         parent_id=str(parent.id),
         action=plan.technique,
         params=plan.params,
-        reason=failure_reason,
+        candidate_count=len(iter_failures),
     )
-    # Failure-node artifacts mirror success nodes: meta.json always,
-    # kernel.py only when the Coder reached submit_kernel. Raw error
-    # rides via tree_dump's existing ``failure_detail`` channel.
-    dump_node(fn, iter_no=iter_no, ncu_rep_src=None, failure_detail=failure_reason)
 
 
 def _render_and_emit_sibling_context(
@@ -879,6 +907,9 @@ class Orchestrator:
             # becomes the tree node — losers are not added to the tree.
             K = self._config.coder_n_candidates
 
+            iter_failures: list[FailureDetail] = []
+            iter_failure_kernels: list[tuple[int, "Kernel | None"]] = []
+
             async def _run_one_coder(_cand_idx: int):
                 # Per-call trace_span so ``UsageAccumulator.invocations``
                 # ticks K times per iter (a single outer span would close
@@ -912,10 +943,10 @@ class Orchestrator:
                 if isinstance(result, ImplementationError):
                     agent_failure_count += 1
                     # Turn-exhaust path: no kernel was submitted.
-                    _persist_failure_node(
-                        tree, parent, plan=plan, kernel=None,
-                        failure_reason=str(result)[:200],
+                    _accumulate_iter_failure(
+                        iter_failures, iter_failure_kernels,
                         iter_no=iter_no, candidate_idx=cand_idx,
+                        kernel=None, reason=str(result)[:200],
                     )
                 elif isinstance(result, BaseException):
                     # Unexpected exception class — re-raise so the crash
@@ -934,6 +965,11 @@ class Orchestrator:
                 )
                 if agent_failure_count > 0:
                     parent.consecutive_agent_failures += 1
+                _persist_iter_failure_summary(
+                    tree, parent, plan=plan, iter_no=iter_no,
+                    iter_failures=iter_failures,
+                    iter_failure_kernels=iter_failure_kernels,
+                )
                 emit("iter_end", iter=iter_no, outcome=ITER_SKIPPED)
                 epsilon = max(self._config.epsilon_end, epsilon - decay)
                 continue
@@ -969,10 +1005,11 @@ class Orchestrator:
                     cand_output.triton_kernel_name,
                 )
                 if not ok:
-                    _persist_failure_node(
-                        tree, parent, plan=plan, kernel=cand_kernel,
-                        failure_reason=f"EntrypointBinding: {reason[:160]}",
+                    _accumulate_iter_failure(
+                        iter_failures, iter_failure_kernels,
                         iter_no=iter_no, candidate_idx=cand_idx,
+                        kernel=cand_kernel,
+                        reason=f"EntrypointBinding: {reason[:160]}",
                     )
                     continue
                 try:
@@ -1017,10 +1054,10 @@ class Orchestrator:
                     )
                     break
                 except BenchmarkError as exc:
-                    _persist_failure_node(
-                        tree, parent, plan=plan, kernel=cand_kernel,
-                        failure_reason=str(exc)[:200],
+                    _accumulate_iter_failure(
+                        iter_failures, iter_failure_kernels,
                         iter_no=iter_no, candidate_idx=cand_idx,
+                        kernel=cand_kernel, reason=str(exc)[:200],
                     )
                     continue
                 except RuntimeError as exc:
@@ -1038,10 +1075,11 @@ class Orchestrator:
                             raise CUDAContextPoisoned(
                                 f"3+ consecutive cuda.synchronize() failures: {exc}"
                             ) from exc
-                    _persist_failure_node(
-                        tree, parent, plan=plan, kernel=cand_kernel,
-                        failure_reason=f"CUDA sticky-state: {msg[:160]}",
+                    _accumulate_iter_failure(
+                        iter_failures, iter_failure_kernels,
                         iter_no=iter_no, candidate_idx=cand_idx,
+                        kernel=cand_kernel,
+                        reason=f"CUDA sticky-state: {msg[:160]}",
                     )
                     continue
 
@@ -1050,12 +1088,13 @@ class Orchestrator:
                     # require fully_successful, so the candidate cannot
                     # become a winner. Treat as per-candidate infra
                     # failure (no quarantine bump).
-                    _persist_failure_node(
-                        tree, parent, plan=plan, kernel=cand_kernel,
-                        failure_reason=(
+                    _accumulate_iter_failure(
+                        iter_failures, iter_failure_kernels,
+                        iter_no=iter_no, candidate_idx=cand_idx,
+                        kernel=cand_kernel,
+                        reason=(
                             f"partial bench failure: {cand_bench.workload_errors}"
                         )[:200],
-                        iter_no=iter_no, candidate_idx=cand_idx,
                     )
                     continue
 
@@ -1076,6 +1115,11 @@ class Orchestrator:
                     iter_no,
                 )
                 parent.consecutive_agent_failures += 1
+                _persist_iter_failure_summary(
+                    tree, parent, plan=plan, iter_no=iter_no,
+                    iter_failures=iter_failures,
+                    iter_failure_kernels=iter_failure_kernels,
+                )
                 emit("iter_end", iter=iter_no, outcome=ITER_SKIPPED)
                 epsilon = max(self._config.epsilon_end, epsilon - decay)
                 continue
@@ -1091,6 +1135,11 @@ class Orchestrator:
                 # (stochastic decoder variance at T=1.0, not the
                 # parent's fault).
                 parent.consecutive_agent_failures = 0
+                _persist_iter_failure_summary(
+                    tree, parent, plan=plan, iter_no=iter_no,
+                    iter_failures=iter_failures,
+                    iter_failure_kernels=iter_failure_kernels,
+                )
                 emit("iter_end", iter=iter_no, outcome=ITER_SKIPPED)
                 epsilon = max(self._config.epsilon_end, epsilon - decay)
                 continue
@@ -1194,6 +1243,15 @@ class Orchestrator:
                 # Coder output AND bench results. Profile failures are
                 # infra; clear quarantine.
                 parent.consecutive_agent_failures = 0
+                # Profile-layer failures themselves don't populate
+                # iter_failures (event-only by design), but bench-layer
+                # failures from earlier in the per-candidate loop might
+                # — persist them now before skipping.
+                _persist_iter_failure_summary(
+                    tree, parent, plan=plan, iter_no=iter_no,
+                    iter_failures=iter_failures,
+                    iter_failure_kernels=iter_failure_kernels,
+                )
                 emit("iter_end", iter=iter_no, outcome=ITER_SKIPPED)
                 epsilon = max(self._config.epsilon_end, epsilon - decay)
                 continue
@@ -1290,6 +1348,14 @@ class Orchestrator:
                         child, parent, iter_no,
                         reason=DeadReason.REWARD_HACK_CONFIRMED,
                         bumps_agent_failures=True,
+                    )
+                    # Channel-B confirmed-kill `continue`s past the
+                    # end-of-iter persist below; flush K-1 sibling
+                    # failures here so they aren't dropped.
+                    _persist_iter_failure_summary(
+                        tree, parent, plan=plan, iter_no=iter_no,
+                        iter_failures=iter_failures,
+                        iter_failure_kernels=iter_failure_kernels,
                     )
                     epsilon = max(self._config.epsilon_end, epsilon - decay)
                     continue
@@ -1423,6 +1489,14 @@ class Orchestrator:
                 else None
             )
             tree_dump.dump_node(child, iter_no=iter_no, ncu_rep_src=ncu_rep_src)
+
+            # Attach summary sibling alongside the winner on mixed
+            # outcomes; no-op when all K candidates succeeded.
+            _persist_iter_failure_summary(
+                tree, parent, plan=plan, iter_no=iter_no,
+                iter_failures=iter_failures,
+                iter_failure_kernels=iter_failure_kernels,
+            )
 
             # Single end-of-iter best scan — reused for target / plateau checks.
             best = tree.best_node()
