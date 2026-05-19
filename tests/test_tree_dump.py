@@ -729,3 +729,102 @@ def test_finalize_tree_skips_nodes_with_no_meta_json(tmp_path):
         assert not (tmp_path / "tree" / "node_0" / "meta.json").exists()
     finally:
         tree_dump.unbind()
+
+
+def _make_failure_summary_setup():
+    """Tier-1-safe failure-summary fixture: tree with root + summary node
+    + per-candidate kernel list. No ScoreResult / ProfilingResult imports."""
+    from src.kernels.kernel import Kernel, KernelSpec, KernelType
+    from src.search.tree import FailureDetail, SearchTree
+    spec = KernelSpec(name="t", kernel_type=KernelType.ELEMENTWISE,
+                      flop_count=0, memory_bytes=0, input_shapes=[],
+                      pytorch_reference="", t_sol_us=1.0)
+    tree = SearchTree()
+    tree.add_root(Kernel(spec=spec, source_code="# baseline"))
+    details = [
+        FailureDetail(0, "RewardHackDetected: torch.cuda.Event", True),
+        FailureDetail(1, "Coder exhausted turns", False),  # turn-exhaust
+        FailureDetail(2, "BenchmarkError: OOM", True),
+    ]
+    fn = tree.add_failure_summary(
+        parent_id=0, action_applied="t1_block_size_tuning",
+        action_params={"BLOCK_M": 64}, iter_no=5, failure_details=details,
+    )
+    candidate_kernels = [
+        (0, Kernel(spec=spec, source_code="# cand0")),
+        (1, None),  # turn-exhaust
+        (2, Kernel(spec=spec, source_code="# cand2")),
+    ]
+    return tree, fn, candidate_kernels
+
+
+def test_dump_failure_summary_writes_meta_and_cand_subdirs(tmp_path):
+    """Summary node dump writes meta.json + cand_<i>/{kernel.py, meta.json}
+    for each candidate, skipping kernel.py on turn-exhaust paths."""
+    import json
+    from src.runtime import tree_dump
+    tree_dump.bind(tmp_path / "tree")
+    try:
+        _, fn, cand_kernels = _make_failure_summary_setup()
+        tree_dump.dump_failure_summary_node(fn, cand_kernels, iter_no=5)
+        node_dir = tmp_path / "tree" / f"node_{fn.id}"
+        assert (node_dir / "meta.json").exists()
+        meta = json.loads((node_dir / "meta.json").read_text())
+        assert meta["dead_reason"] == "coder_failed"
+        assert meta["branch_quality"] == "dead_end"
+        assert meta["action_applied"] == "t1_block_size_tuning"
+        assert meta["action_params"] == {"BLOCK_M": 64}
+        assert meta["score"] is None
+        assert len(meta["failure_details"]) == 3
+        assert meta["failure_details"][1]["has_kernel_source"] is False
+        # Per-candidate subdirs
+        assert (node_dir / "cand_0" / "kernel.py").read_text() == "# cand0"
+        assert (node_dir / "cand_0" / "meta.json").exists()
+        cand0_meta = json.loads((node_dir / "cand_0" / "meta.json").read_text())
+        assert cand0_meta["candidate_idx"] == 0
+        assert cand0_meta["has_kernel_source"] is True
+        assert "RewardHackDetected" in cand0_meta["reason"]
+        # Turn-exhaust: meta.json yes, kernel.py no.
+        assert not (node_dir / "cand_1" / "kernel.py").exists()
+        assert (node_dir / "cand_1" / "meta.json").exists()
+        cand1_meta = json.loads((node_dir / "cand_1" / "meta.json").read_text())
+        assert cand1_meta["has_kernel_source"] is False
+        assert (node_dir / "cand_2" / "kernel.py").read_text() == "# cand2"
+    finally:
+        tree_dump.unbind()
+
+
+def test_dump_failure_summary_unbound_is_noop(tmp_path):
+    """Calling dump_failure_summary_node with no bound root is a no-op."""
+    from src.runtime import tree_dump
+    tree_dump.unbind()  # ensure unbound
+    _, fn, cand_kernels = _make_failure_summary_setup()
+    # Should not raise; should not write anything to tmp_path.
+    tree_dump.dump_failure_summary_node(fn, cand_kernels, iter_no=5)
+    assert not (tmp_path / f"node_{fn.id}").exists()
+
+
+def test_node_summary_failure_count_for_summary_node():
+    """_node_summary on a failure-summary node carries failure_count + dead flags."""
+    from src.runtime.tree_dump import _node_summary
+    _, fn, _ = _make_failure_summary_setup()
+    summary = _node_summary(fn, is_best=False)
+    assert summary["failure_count"] == 3
+    assert summary["dead_reason"] == "coder_failed"
+    assert summary["sol_score"] is None
+    assert summary["speedup"] is None
+    assert summary["is_dead"] is True
+
+
+def test_node_summary_no_failure_count_on_success_node():
+    """Success nodes don't carry failure_count (field omitted)."""
+    from src.kernels.kernel import Kernel, KernelSpec, KernelType
+    from src.runtime.tree_dump import _node_summary
+    from src.search.tree import TreeNode
+    spec = KernelSpec(name="t", kernel_type=KernelType.ELEMENTWISE,
+                      flop_count=0, memory_bytes=0, input_shapes=[],
+                      pytorch_reference="", t_sol_us=1.0)
+    node = TreeNode(id=1, kernel=Kernel(spec=spec, source_code=""),
+                    parent_id=0, action_applied="tiling", iter_no=1, depth=1)
+    summary = _node_summary(node, is_best=False)
+    assert "failure_count" not in summary

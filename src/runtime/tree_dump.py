@@ -106,6 +106,57 @@ def dump_node(node: "TreeNode", *, iter_no: int,
                        node.id, exc)
 
 
+def dump_failure_summary_node(
+    node: "TreeNode",
+    candidate_kernels: "list[tuple[int, Kernel | None]]",
+    *,
+    iter_no: int,
+) -> None:
+    """Stream-write tree/node_<id>/ for one failure-summary node.
+
+    Writes:
+      tree/node_<id>/meta.json            — summary (see _build_summary_meta)
+      tree/node_<id>/cand_<i>/kernel.py   — for each (i, kernel) where kernel is not None
+      tree/node_<id>/cand_<i>/meta.json   — for every (i, _), even None-kernel entries
+
+    No-op when unbound; never raises (OSError logged + swallowed) so a
+    tree-dump hiccup cannot kill a running search.
+
+    Invariant: ``node.failure_details[i].has_kernel_source`` MUST match
+    on-disk presence of ``cand_<i>/kernel.py``. Per the project spec
+    "has_kernel_source semantics under legacy load" note, legacy-loaded
+    nodes carry ``False`` even when the legacy flat ``kernel.py`` exists;
+    postmortems read legacy artifacts directly via the on-disk shape.
+    """
+    if _root is None:
+        return
+    try:
+        node_dir = _root / f"node_{node.id}"
+        node_dir.mkdir(parents=True, exist_ok=True)
+        meta = _build_summary_meta(node, iter_no=iter_no)
+        (node_dir / "meta.json").write_text(json.dumps(meta, indent=2))
+        # The orchestrator builds failure_details and candidate_kernels
+        # in lockstep at every accumulator push (same length, same
+        # candidate_idx ordering), so zipping is safe and skips the K
+        # dict-lookups the previous shape paid.
+        details = node.failure_details or []
+        for fd, (cand_idx, kernel) in zip(details, candidate_kernels):
+            cand_dir = node_dir / f"cand_{cand_idx}"
+            cand_dir.mkdir(parents=True, exist_ok=True)
+            if kernel is not None:
+                (cand_dir / "kernel.py").write_text(kernel.source_code)
+            (cand_dir / "meta.json").write_text(json.dumps({
+                "candidate_idx": cand_idx,
+                "reason": fd.reason,
+                "has_kernel_source": kernel is not None,
+            }, indent=2))
+    except OSError as exc:
+        logger.warning(
+            "tree_dump.dump_failure_summary_node failed for node %s: %s",
+            node.id, exc,
+        )
+
+
 def _branch_quality_str(node: "TreeNode") -> str | None:
     """Return ``branch_quality.value`` or None when unset. Single source
     of truth for the lowercased-enum-or-null shape used by both the
@@ -185,6 +236,34 @@ def _build_meta(node: "TreeNode", *, iter_no: int,
     return result
 
 
+def _build_summary_meta(node: "TreeNode", *, iter_no: int) -> dict:
+    """Compose meta.json shape for a failure-summary node.
+
+    Reuses ``_late_bound_fields`` so the six shared keys
+    (``branch_quality`` / ``dead_reason`` / ``score`` /
+    ``per_workload_latency_us`` / ``children_ids`` / ``last_review``)
+    stay byte-identical with ``_build_meta``'s success path — score /
+    review / per-workload always resolve to None / {} on a fresh summary
+    node via the shared serializers. ``finalize_tree`` then skips the
+    late-bound rewrite for summary nodes because no field can mutate.
+    """
+    return {
+        "id": node.id,
+        "parent_id": node.parent_id,
+        "depth": node.depth,
+        "iter_no": iter_no,
+        "action_applied": node.action_applied,
+        "action_params": node.action_params,
+        "analytical": None,
+        "consecutive_agent_failures": node.consecutive_agent_failures,
+        "trace_workflow": "acts_iter",
+        **_late_bound_fields(node),
+        "failure_details": [
+            asdict(fd) for fd in (node.failure_details or [])
+        ],
+    }
+
+
 def _node_summary(node: "TreeNode", *, is_best: bool) -> dict:
     """Reduce a TreeNode to a label-dict consumed by index.json + the
     three visualization formatters. Returned shape is stable; callers
@@ -196,7 +275,7 @@ def _node_summary(node: "TreeNode", *, is_best: bool) -> dict:
     speedup = node.score.speedup if node.score is not None else None
     is_dead = node.branch_quality == BranchQuality.DEAD_END
     dr = node.dead_reason.value if isinstance(node.dead_reason, DeadReason) else None
-    return {
+    out = {
         "id": node.id,
         "iter_no": node.iter_no,
         "action": node.action_applied or "baseline",
@@ -207,6 +286,9 @@ def _node_summary(node: "TreeNode", *, is_best: bool) -> dict:
         "is_best": is_best,
         "is_dead": is_dead,
     }
+    if node.failure_details is not None:
+        out["failure_count"] = len(node.failure_details)
+    return out
 
 
 def finalize_tree(tree) -> None:
@@ -227,6 +309,14 @@ def finalize_tree(tree) -> None:
         return
     try:
         for node in tree.nodes():
+            # Failure-summary nodes have no late-bound fields (no beam
+            # eviction of dead nodes; no post-review attach), so their
+            # streamed meta.json is already final. Skipping avoids
+            # contaminating the summary's distinct shape with success-
+            # path keys from _late_bound_fields (e.g. ``score: null`` is
+            # idempotent but ``per_workload_latency_us: {}`` is too).
+            if node.failure_details is not None:
+                continue
             meta_path = _root / f"node_{node.id}" / "meta.json"
             if not meta_path.exists():
                 # Node was added but never streamed (e.g., root, or a
