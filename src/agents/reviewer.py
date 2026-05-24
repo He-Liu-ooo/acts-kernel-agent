@@ -567,6 +567,7 @@ class ReviewerAgent:
         reviewer_metric_queries: bool = False,
         iter_idx: int = 0,
         sibling_context: str = "",
+        max_turns: int | None = None,
     ) -> ReviewerFeedback:
         """Interpret eval results into structured Reviewer feedback.
 
@@ -622,7 +623,7 @@ class ReviewerAgent:
         # inside each tool body preserves end-to-end type safety.
         submit_tool = function_tool(_make_submit_review_tool(captured), strict_mode=False)
         tools: list = [submit_tool]
-        max_turns = 4
+        default_max_turns = 4
         # System prompt mentions of ``query_metric`` are conditional on the
         # same flag that gates tool registration — see ``__init__`` for the
         # rationale (live-run ``Tool query_metric not found`` regression).
@@ -639,10 +640,14 @@ class ReviewerAgent:
                 strict_mode=False,
             )
             tools.append(query_tool)
-            max_turns = 6
+            default_max_turns = 6
             instructions = (
                 self._instructions_base + "\n\n" + self._instructions_metric_queries
             )
+        # cfg-tunable override (ACTSConfig.reviewer_max_turns). None
+        # preserves the 4-or-6 toggle above so existing behavior is
+        # unchanged; non-None overrides both branches uniformly.
+        effective_max_turns = default_max_turns if max_turns is None else max_turns
         agent = Agent(
             name="Reviewer",
             instructions=instructions,
@@ -660,18 +665,20 @@ class ReviewerAgent:
                 error_reason=reason,
             )
 
-        # Turn budget: ``max_turns`` is 4 (submit-only) or 6 (multi-turn,
-        # query_metric enabled). The submit-only path (2*N+2 with N=1)
-        # reserves room for one invalid submit + corrected submit +
-        # confirmation, so a single Pydantic slip self-corrects in-loop
-        # instead of degrading to rule-based. The multi-turn path adds
-        # room for one query_metric fetch.
+        # Turn budget: by default ``max_turns`` is 4 (submit-only) or 6
+        # (multi-turn, query_metric enabled). The submit-only path
+        # (2*N+2 with N=1) reserves room for one invalid submit +
+        # corrected submit + confirmation, so a single Pydantic slip
+        # self-corrects in-loop instead of degrading to rule-based. The
+        # multi-turn path adds room for one query_metric fetch. The cfg
+        # override (``ACTSConfig.reviewer_max_turns``) supersedes both
+        # branches when set.
         try:
             result = await run_agent(
                 agent,
                 prompt,
                 run_config=make_run_config(temperature=0.3),
-                max_turns=max_turns,
+                max_turns=effective_max_turns,
             )
         except MaxTurnsExceeded:
             if "output" in captured:

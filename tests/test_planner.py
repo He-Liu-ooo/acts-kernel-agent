@@ -747,3 +747,95 @@ def test_submit_plan_tool_omitting_autotune_exclude_yields_empty_list():
     submit_plan = _make_submit_plan_tool(captured)
     submit_plan(tier=1, technique="t1_block_size_tuning")
     assert captured["output"].autotune_exclude == []
+
+
+# ── cfg-tunable max_turns budget ──────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_plan_max_turns_kwarg_overrides_default():
+    """plan(max_turns=N) threads N into run_agent. None (omitted) preserves
+    the hardcoded budget of 4."""
+    from src.agents.planner import (
+        OptimizationPlanOutput,
+        _make_submit_plan_tool,
+    )
+
+    captured_holder: list[dict] = []
+
+    def _capture_factory(captured_dict: dict):
+        captured_holder.append(captured_dict)
+        return _make_submit_plan_tool(captured_dict)
+
+    async def _side_effect(*args, **kwargs):
+        captured_holder[0]["output"] = OptimizationPlanOutput(
+            tier=1,
+            technique="block_size_tuning",
+            params={"block_size": "128"},
+            target_region="loop",
+            rationale="ok",
+        )
+        return MagicMock(final_output="done")
+
+    with (
+        patch("src.agents.planner._SDK_AVAILABLE", True),
+        patch("src.agents.planner.Agent"),
+        patch("src.agents.planner.run_agent", new_callable=AsyncMock) as mock_run,
+        patch("src.agents.planner.make_run_config", return_value=None),
+        patch("src.agents.planner.function_tool", side_effect=lambda f, **kw: f),
+        patch("src.agents.planner._make_submit_plan_tool", side_effect=_capture_factory),
+    ):
+        mock_run.side_effect = _side_effect
+        await PlannerAgent(model=MagicMock()).plan(
+            kernel_source="src",
+            profiling_summary="",
+            past_experiences=[],
+            available_actions=[],
+            max_turns=8,
+        )
+
+    assert mock_run.await_args.kwargs.get("max_turns") == 8
+
+
+@pytest.mark.asyncio
+async def test_plan_max_turns_none_preserves_default_4():
+    """Regression guard: omitting max_turns (or passing None) keeps the
+    long-standing hardcoded budget of 4."""
+    from src.agents.planner import (
+        OptimizationPlanOutput,
+        _make_submit_plan_tool,
+    )
+
+    captured_holder: list[dict] = []
+
+    def _capture_factory(captured_dict: dict):
+        captured_holder.append(captured_dict)
+        return _make_submit_plan_tool(captured_dict)
+
+    async def _side_effect(*args, **kwargs):
+        captured_holder[0]["output"] = OptimizationPlanOutput(
+            tier=1,
+            technique="block_size_tuning",
+            params={"block_size": "128"},
+            target_region="loop",
+            rationale="ok",
+        )
+        return MagicMock(final_output="done")
+
+    with (
+        patch("src.agents.planner._SDK_AVAILABLE", True),
+        patch("src.agents.planner.Agent"),
+        patch("src.agents.planner.run_agent", new_callable=AsyncMock) as mock_run,
+        patch("src.agents.planner.make_run_config", return_value=None),
+        patch("src.agents.planner.function_tool", side_effect=lambda f, **kw: f),
+        patch("src.agents.planner._make_submit_plan_tool", side_effect=_capture_factory),
+    ):
+        mock_run.side_effect = _side_effect
+        await PlannerAgent(model=MagicMock()).plan(
+            kernel_source="src",
+            profiling_summary="",
+            past_experiences=[],
+            available_actions=[],
+        )
+
+    assert mock_run.await_args.kwargs.get("max_turns") == 4

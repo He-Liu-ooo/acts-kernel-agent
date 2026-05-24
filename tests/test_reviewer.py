@@ -917,6 +917,79 @@ async def test_review_flag_off_still_uses_max_turns_4():
 
 
 @pytest.mark.asyncio
+async def test_review_max_turns_kwarg_overrides_flag_off_default():
+    """review(max_turns=N, reviewer_metric_queries=False) → run_agent
+    receives N, overriding the hardcoded 4."""
+    capture_factory, fake_run = _simulate_review_submission(
+        outcome="improved",
+        bottleneck_classification="memory_bound",
+        branch_quality=BranchQuality.PROMISING,
+    )
+    with (
+        patch("src.agents.reviewer._SDK_AVAILABLE", True),
+        patch("src.agents.reviewer.Agent"),
+        patch("src.agents.reviewer.run_agent", new_callable=AsyncMock) as mock_run,
+        patch("src.agents.reviewer.make_run_config", return_value=None),
+        patch("src.agents.reviewer.function_tool", side_effect=lambda f, **kw: f),
+        patch("src.agents.reviewer._make_submit_review_tool", side_effect=capture_factory),
+    ):
+        mock_run.side_effect = fake_run
+        await ReviewerAgent(model=MagicMock()).review(
+            kernel_source="def k(): pass",
+            profiling_summary="",
+            sol_score=0.5,
+            headroom_pct=50.0,
+            bottleneck=BottleneckType.MEMORY_BOUND,
+            max_turns=7,
+        )
+
+    assert mock_run.await_args.kwargs.get("max_turns") == 7
+
+
+@pytest.mark.asyncio
+async def test_review_max_turns_kwarg_overrides_flag_on_default():
+    """review(max_turns=N, reviewer_metric_queries=True) → run_agent
+    receives N, overriding the hardcoded 6."""
+    capture_factory, fake_run = _simulate_review_submission(
+        outcome="improved",
+        bottleneck_classification="memory_bound",
+        branch_quality=BranchQuality.PROMISING,
+    )
+    with (
+        patch("src.agents.reviewer._SDK_AVAILABLE", True),
+        patch("src.agents.reviewer.Agent"),
+        patch("src.agents.reviewer.run_agent", new_callable=AsyncMock) as mock_run,
+        patch("src.agents.reviewer.make_run_config", return_value=None),
+        patch("src.agents.reviewer.function_tool", side_effect=lambda f, **kw: f),
+        patch("src.agents.reviewer._make_submit_review_tool", side_effect=capture_factory),
+    ):
+        mock_run.side_effect = fake_run
+        await ReviewerAgent(model=MagicMock()).review(
+            kernel_source="def k(): pass",
+            profiling_summary="",
+            sol_score=0.5,
+            headroom_pct=50.0,
+            bottleneck=BottleneckType.MEMORY_BOUND,
+            reviewer_metric_queries=True,
+            max_turns=10,
+        )
+
+    assert mock_run.await_args.kwargs.get("max_turns") == 10
+
+
+@pytest.mark.asyncio
+async def test_review_max_turns_none_preserves_4_or_6_toggle():
+    """Regression guard: omitting max_turns keeps today's 4/6 conditional
+    intact (verified by the two existing tests above)."""
+    # Covered by:
+    #   test_review_flag_off_still_uses_max_turns_4  (None + off → 4)
+    #   test_review_flag_on_uses_max_turns_6         (None + on  → 6)
+    # This sentinel exists so a future refactor that drops the toggle
+    # without updating those tests at least surfaces the intent here.
+    pass
+
+
+@pytest.mark.asyncio
 async def test_review_flag_on_threads_raw_metrics_into_prompt_menu():
     """End-to-end: review(reviewer_metric_queries=True, profiling=...)
     builds the prompt with the menu populated from profiling.raw_metrics."""

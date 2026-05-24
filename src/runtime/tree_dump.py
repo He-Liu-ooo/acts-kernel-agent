@@ -273,6 +273,19 @@ def _node_summary(node: "TreeNode", *, is_best: bool) -> dict:
     bq = _branch_quality_str(node)
     sol_score = node.score.sol_score if node.score is not None else None
     speedup = node.score.speedup if node.score is not None else None
+    # Single representative latency for visualization. Scored nodes carry
+    # the per-iter representative workload latency on ``score`` directly.
+    # The root (and any pre-score node with bench data) has no score yet
+    # but does have a populated ``per_workload_latency_us`` — fall back to
+    # the median value across workloads so the root label still shows the
+    # baseline's middle-shape latency.
+    if node.score is not None:
+        latency_us = node.score.candidate_latency_us
+    elif node.per_workload_latency_us:
+        sorted_lats = sorted(node.per_workload_latency_us.values())
+        latency_us = sorted_lats[len(sorted_lats) // 2]
+    else:
+        latency_us = None
     is_dead = node.branch_quality == BranchQuality.DEAD_END
     dr = node.dead_reason.value if isinstance(node.dead_reason, DeadReason) else None
     out = {
@@ -283,6 +296,7 @@ def _node_summary(node: "TreeNode", *, is_best: bool) -> dict:
         "dead_reason": dr,
         "sol_score": sol_score,
         "speedup": speedup,
+        "latency_us": latency_us,
         "is_best": is_best,
         "is_dead": is_dead,
     }
@@ -514,6 +528,8 @@ def _render_dot(tree, best_id: int) -> str:
             label_lines.append(score_part)
         if s["speedup"] is not None:
             label_lines.append(f"speedup={s['speedup']:.2f}x")
+        if s.get("latency_us") is not None:
+            label_lines.append(f"latency={s['latency_us']:.0f} us")
         if bq_part:
             label_lines.append(bq_part)
         if s.get("dead_reason"):
@@ -541,7 +557,12 @@ def _render_mermaid(tree, best_id: int) -> str:
         star = " ★" if s["is_best"] else ""
         bq_part = f"<br/>{s['branch_quality'].upper()}" if s["branch_quality"] else ""
         dr_part = f"<br/>{s['dead_reason'].upper()}" if s.get("dead_reason") else ""
-        label = f"iter={s['iter_no']} · {action}{star}<br/>{score_part}{bq_part}{dr_part}"
+        lat_part = (
+            f"<br/>latency={s['latency_us']:.0f} us"
+            if s.get("latency_us") is not None
+            else ""
+        )
+        label = f"iter={s['iter_no']} · {action}{star}<br/>{score_part}{lat_part}{bq_part}{dr_part}"
         lines.append(f'  n{n.id}["{label}"]:::{cls}')
     for n in tree.nodes():
         if n.parent_id is None:

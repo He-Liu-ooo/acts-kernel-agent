@@ -790,6 +790,7 @@ class Orchestrator:
                         roofline=roofline,
                         prev_sol_score=None,
                         iter_idx=0,
+                        max_turns=self._config.reviewer_max_turns,
                     )
             except Exception as exc:  # noqa: BLE001 — baseline review must not abort
                 logger.warning(
@@ -873,6 +874,7 @@ class Orchestrator:
                         reviewer_feedback=_render_review_for_planner(parent.last_review),
                         bottleneck=run_bottleneck,
                         sibling_context=sibling_context,
+                        max_turns=self._config.planner_max_turns,
                     )
             except PlanningError as exc:
                 logger.warning(
@@ -1436,6 +1438,7 @@ class Orchestrator:
                         reviewer_metric_queries=self._config.reviewer_metric_queries,
                         iter_idx=iter_no,
                         sibling_context=reviewer_sibling_context,
+                        max_turns=self._config.reviewer_max_turns,
                     )
                 if feedback.degraded:
                     logger.warning(

@@ -128,6 +128,14 @@ class ACTSConfig:
     # forced temperature, not from per-call prompt or temperature
     # perturbation. See doc/search.md for the selection algorithm.
     coder_n_candidates: int = 4
+    # Per-agent SDK turn-budget overrides. Default None preserves the
+    # hardcoded budgets in agents/planner.py (4) and agents/reviewer.py
+    # (4 when reviewer_metric_queries=False, 6 when True). Non-None
+    # overrides both reviewer branches uniformly so the cfg knob is a
+    # clean separable lever for budget-allocation experiments. See
+    # doc/specs/2026-05-19-llm-call-pareto-experiment-design.md.
+    planner_max_turns: int | None = None
+    reviewer_max_turns: int | None = None
     # Outer-loop iteration budget (Planner→Coder→Reviewer cycles per run),
     # not a cap on tree path length. Also sets the epsilon decay horizon.
     max_depth: int = 20
@@ -285,6 +293,7 @@ def load_config(path: Path) -> ACTSConfig:
         "search": [
             "beam_width", "beam_diversity", "reviewer_metric_queries",
             "coder_n_candidates",
+            "planner_max_turns", "reviewer_max_turns",
             "max_depth", "epsilon_start", "epsilon_end",
             "failure_sibling_cap",
         ],

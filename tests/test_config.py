@@ -343,6 +343,79 @@ def test_acts_config_coder_n_candidates_bool_accepted():
     assert cfg.coder_n_candidates == 1  # noqa: E712 — bool→int coercion intent
 
 
+# ── planner_max_turns / reviewer_max_turns (cfg-tunable agent budgets) ──
+
+
+def test_acts_config_planner_max_turns_default_none():
+    """Default = None means \"preserve hardcoded planner.py budget of 4\".
+    Non-None overrides. Keeps existing-runs behavior identical."""
+    from src.config import ACTSConfig
+
+    cfg = ACTSConfig()
+    assert cfg.planner_max_turns is None
+
+
+def test_acts_config_reviewer_max_turns_default_none():
+    """Default = None means \"preserve hardcoded reviewer.py 4/6 toggle\".
+    Non-None overrides both branches of the metric_queries conditional."""
+    from src.config import ACTSConfig
+
+    cfg = ACTSConfig()
+    assert cfg.reviewer_max_turns is None
+
+
+def test_load_config_planner_max_turns_from_cfg():
+    """`[search] planner_max_turns = 6` overrides the default."""
+    from src.config import load_config
+
+    cfg_text = "search: { planner_max_turns = 6; };\n"
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".cfg", delete=False) as f:
+        f.write(cfg_text)
+        f.flush()
+        cfg = load_config(Path(f.name))
+
+    assert cfg.planner_max_turns == 6
+
+
+def test_load_config_reviewer_max_turns_from_cfg():
+    """`[search] reviewer_max_turns = 8` overrides the default."""
+    from src.config import load_config
+
+    cfg_text = "search: { reviewer_max_turns = 8; };\n"
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".cfg", delete=False) as f:
+        f.write(cfg_text)
+        f.flush()
+        cfg = load_config(Path(f.name))
+
+    assert cfg.reviewer_max_turns == 8
+
+
+def test_load_config_planner_max_turns_omitted_uses_none():
+    """Omitted setting → None → preserves planner.py's hardcoded budget."""
+    from src.config import load_config
+
+    cfg_text = "search: { beam_width = 5; };\n"
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".cfg", delete=False) as f:
+        f.write(cfg_text)
+        f.flush()
+        cfg = load_config(Path(f.name))
+
+    assert cfg.planner_max_turns is None
+
+
+def test_load_config_reviewer_max_turns_omitted_uses_none():
+    """Omitted setting → None → preserves reviewer.py's 4/6 toggle."""
+    from src.config import load_config
+
+    cfg_text = "search: { beam_width = 5; };\n"
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".cfg", delete=False) as f:
+        f.write(cfg_text)
+        f.flush()
+        cfg = load_config(Path(f.name))
+
+    assert cfg.reviewer_max_turns is None
+
+
 # ── validate_hardware_spec() ───────────────────────────────────────────
 
 

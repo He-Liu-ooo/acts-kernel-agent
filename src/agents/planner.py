@@ -252,6 +252,7 @@ class PlannerAgent:
         reviewer_feedback: str | None = None,
         bottleneck: BottleneckType | None = None,
         sibling_context: str = "",
+        max_turns: int | None = None,
     ) -> OptimizationPlan:
         """Generate a structured optimization plan for the next iteration.
 
@@ -297,19 +298,22 @@ class PlannerAgent:
         # plus the +1 buffer the SDK needs to land confirmation cleanly.
         # Without the retry budget, a single Pydantic validation slip
         # downgrades to MaxTurnsExceeded; the captured-output recovery
-        # below would then have to catch it implicitly.
+        # below would then have to catch it implicitly. cfg-tunable via
+        # ACTSConfig.planner_max_turns (None preserves the default of 4).
+        effective_max_turns = 4 if max_turns is None else max_turns
         try:
             result = await run_agent(
                 agent,
                 prompt,
                 run_config=make_run_config(temperature=0.3),
-                max_turns=4,
+                max_turns=effective_max_turns,
             )
         except MaxTurnsExceeded as exc:
             if "output" in captured:
                 return _validate_and_convert(captured["output"], available_actions)
             raise PlanningError(
-                "Planner exhausted turn budget (4) without calling submit_plan."
+                f"Planner exhausted turn budget ({effective_max_turns}) "
+                "without calling submit_plan."
             ) from exc
 
         if result is None:

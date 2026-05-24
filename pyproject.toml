@@ -32,6 +32,16 @@ dev = [
     "pytest>=7.0",
     "pytest-asyncio>=0.21",
 ]
+# Experiment-analysis extras. Used by scripts/analyze_llm_call_pareto.py
+# (post-hoc sweep analysis) and its tests in
+# tests/test_analyze_llm_call_pareto.py. Kept out of `dependencies`
+# because the optimization pipeline itself does not import pandas /
+# matplotlib — only the offline analysis pipeline does. Install via:
+#   pip install -e ".[analysis]"
+analysis = [
+    "pandas>=2.0",
+    "matplotlib>=3.7",
+]
 # Marker extra for SOL-ExecBench. Not resolvable from PyPI — install via:
 #   uv pip install -e /path/to/SOL-ExecBench --no-deps
 # (see configs/venvs/3.12.md). Listed here so `pip show` / metadata tools
