@@ -9,7 +9,7 @@ The user prompt is assembled programmatically by `ReviewerAgent.build_user_promp
 <kernel source code in a Python code block; triple backticks in the source are escaped>
 
 ## Run context
-- Bottleneck: <memory_bound | compute_bound | balanced>
+- Bottleneck (this run): <memory_bound | compute_bound | balanced>
 
 ## Profiling summary
 ### Analytical (roofline)

@@ -9,7 +9,7 @@ The user prompt is assembled programmatically by `PlannerAgent.build_user_prompt
 <kernel source code in a Python code block>
 
 ## Run context
-- Bottleneck: <memory_bound | compute_bound | balanced>
+- Bottleneck (this run): <memory_bound | compute_bound | balanced>
 
 ## Profiling summary
 <key metrics from the profiler — pct_peak_*, arithmetic_intensity (MACs/byte, run-level invariant), NCU signals>

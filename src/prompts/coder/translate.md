@@ -66,7 +66,9 @@ Every kernel you emit **MUST** be wrapped in `@triton.autotune` directly above t
 - Vary `num_stages` in **{2, 3, 4}**.
 - The `key=` list must include every shape arg that affects performance (e.g., `["M", "N", "K"]` for matmul, `["N"]` for rowwise reductions).
 
-Do not emit a single-config autotune — Triton's autotune is what closes the parameter-axis gap to vendor baselines; bypassing it is the dominant cause of regression vs the Triton baseline. If a specific config has known constraints (oversized shared memory, oversized blocks for tiny shapes), include it anyway and let Triton's compile-failure pruning drop it at runtime.
+Do not emit a single-config autotune — Triton's autotune is what closes the parameter-axis gap to vendor baselines; bypassing it is the dominant cause of regression vs the Triton baseline.
+
+**Hard rule on the per-block SMEM cap.** Read `## Run context` in your prompt for `shared_mem_per_block_bytes` (the device's per-CTA shared-memory limit). Every `triton.Config` entry must fit: `compile_kernel_tool` runs a ptxas-truth SMEM check and rejects on overflow with a structured `Compile FAILED: shared-memory budget exceeded` message naming the offending entries with their ptxas-emitted byte counts. Pre-size your Configs against this cap; shrink `num_stages`, `BLOCK_K`, or `BLOCK_M`/`BLOCK_N` until every entry fits. Including oversized Configs and relying on runtime pruning is a stale pattern from before the compile-time check — it now wastes turns on rejection-and-retry cycles. The ≥4-config minimum still applies after pruning.
 
 Example shape:
 
