@@ -57,6 +57,11 @@ class HardwareSpec:
     MAC_per_cycle_fp8_tc: float = 0.0
     MAC_per_cycle_int8_tc: float = 0.0
     MAC_per_cycle_nvfp4_tc: float = 0.0  # Blackwell only
+    # Per-launch shared memory limits (NVIDIA: per-CTA & per-SM dynamic SMEM).
+    # Sourced from cudaDevAttrMaxSharedMemoryPerBlockOptin / per-SM dynamic
+    # SMEM at detect_hardware() time; 0 means unknown (callers skip checks).
+    shared_mem_per_block_bytes: int = 0
+    shared_mem_per_multiprocessor_bytes: int = 0
 
     # ── derived properties ────────────────────────────────────────────────
 
@@ -85,6 +90,21 @@ class HardwareSpec:
         """Peak FP16 throughput in TFLOPS (Tensor Cores)."""
         return self.MAC_per_cycle_fp16_tc * self.freq_GHz * 2 / 1e3
 
+    @property
+    def peak_flops_tf32(self) -> float:
+        """Peak TF32 throughput in TFLOPS (Tensor Cores)."""
+        return self.MAC_per_cycle_tf32_tc * self.freq_GHz * 2 / 1e3
+
+    @property
+    def peak_flops_fp8(self) -> float:
+        """Peak FP8 throughput in TFLOPS (Tensor Cores, Hopper+)."""
+        return self.MAC_per_cycle_fp8_tc * self.freq_GHz * 2 / 1e3
+
+    @property
+    def peak_flops_nvfp4(self) -> float:
+        """Peak NVFP4 throughput in TFLOPS (Tensor Cores, Blackwell only)."""
+        return self.MAC_per_cycle_nvfp4_tc * self.freq_GHz * 2 / 1e3
+
 
 def load_hardware_spec(path: Path) -> HardwareSpec:
     """Load a HardwareSpec from a SOLAR arch config YAML.
@@ -109,6 +129,8 @@ def load_hardware_spec(path: Path) -> HardwareSpec:
         MAC_per_cycle_fp8_tc=raw.get("MAC_per_cycle_fp8_tc", 0.0),
         MAC_per_cycle_int8_tc=raw.get("MAC_per_cycle_int8_tc", 0.0),
         MAC_per_cycle_nvfp4_tc=raw.get("MAC_per_cycle_nvfp4_tc", 0.0),
+        shared_mem_per_block_bytes=raw.get("shared_mem_per_block_bytes", 0),
+        shared_mem_per_multiprocessor_bytes=raw.get("shared_mem_per_multiprocessor_bytes", 0),
     )
 
 
@@ -436,12 +458,25 @@ def detect_hardware() -> HardwareSpec:
     compute_capability = (
         float(f"{major}.{minor}") if major is not None and minor is not None else 0.0
     )
+    # Per-block opt-in SMEM cap (the realistic launch ceiling that Triton
+    # targets via cudaFuncSetAttribute). ``shared_memory_per_block_optin``
+    # is a recent torch attr; fall back to ``shared_memory_per_block`` on
+    # older torch, then to 0 if neither is present.
+    shared_mem_per_block_bytes = getattr(
+        props, "shared_memory_per_block_optin",
+        getattr(props, "shared_memory_per_block", 0),
+    )
+    shared_mem_per_multiprocessor_bytes = getattr(
+        props, "shared_memory_per_multiprocessor", 0,
+    )
     detected = HardwareSpec(
         name=props.name,
         freq_GHz=props.clock_rate / 1_000_000,  # kHz → GHz
         compute_capability=compute_capability,
         SRAM_capacity=props.L2_cache_size,
         DRAM_capacity=props.total_memory,
+        shared_mem_per_block_bytes=shared_mem_per_block_bytes,
+        shared_mem_per_multiprocessor_bytes=shared_mem_per_multiprocessor_bytes,
     )
 
     yaml_path = _lookup_arch_yaml(detected.name)
@@ -473,6 +508,14 @@ def detect_hardware() -> HardwareSpec:
         compute_capability=detected.compute_capability or yaml_spec.compute_capability,
         SRAM_capacity=detected.SRAM_capacity or yaml_spec.SRAM_capacity,
         DRAM_capacity=detected.DRAM_capacity or yaml_spec.DRAM_capacity,
+        shared_mem_per_block_bytes=(
+            detected.shared_mem_per_block_bytes
+            or yaml_spec.shared_mem_per_block_bytes
+        ),
+        shared_mem_per_multiprocessor_bytes=(
+            detected.shared_mem_per_multiprocessor_bytes
+            or yaml_spec.shared_mem_per_multiprocessor_bytes
+        ),
     )
 
 
@@ -520,5 +563,34 @@ def validate_hardware_spec(spec: HardwareSpec, detected: HardwareSpec) -> list[s
                 f"(name={spec.name!r}), detected={detected.freq_GHz:.3f} GHz "
                 f"(name={detected.name!r}) — both sources report boost clock, "
                 f"so a >10% delta likely means wrong YAML"
+            )
+    if (
+        spec.shared_mem_per_block_bytes > 0
+        and detected.shared_mem_per_block_bytes > 0
+    ):
+        ratio = spec.shared_mem_per_block_bytes / detected.shared_mem_per_block_bytes
+        if ratio < 0.9 or ratio > 1.1:
+            issues.append(
+                f"shared_mem_per_block_bytes mismatch: "
+                f"spec={spec.shared_mem_per_block_bytes} B "
+                f"(name={spec.name!r}), detected={detected.shared_mem_per_block_bytes} B "
+                f"(name={detected.name!r}) — Phase B SMEM check will reject "
+                f"against the wrong per-block cap"
+            )
+    if (
+        spec.shared_mem_per_multiprocessor_bytes > 0
+        and detected.shared_mem_per_multiprocessor_bytes > 0
+    ):
+        ratio = (
+            spec.shared_mem_per_multiprocessor_bytes
+            / detected.shared_mem_per_multiprocessor_bytes
+        )
+        if ratio < 0.9 or ratio > 1.1:
+            issues.append(
+                f"shared_mem_per_multiprocessor_bytes mismatch: "
+                f"spec={spec.shared_mem_per_multiprocessor_bytes} B "
+                f"(name={spec.name!r}), "
+                f"detected={detected.shared_mem_per_multiprocessor_bytes} B "
+                f"(name={detected.name!r})"
             )
     return issues

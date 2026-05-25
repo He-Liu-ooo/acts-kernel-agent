@@ -18,3 +18,6 @@ MAC_per_cycle_bf16_tc: 72695    # 364.2 TFLOPS dense
 MAC_per_cycle_fp8_tc: 145409    # 728.5 TFLOPS dense
 MAC_per_cycle_int8_tc: 145409   # 728.5 TOPS dense
 # nvfp4 is Blackwell-only; Ada has no NVFP4 support
+# Per-launch shared memory (Ada AD102 datasheet):
+shared_mem_per_block_bytes: 101376              # 99 KB opt-in per-CTA cap
+shared_mem_per_multiprocessor_bytes: 102400     # 100 KB per-SM total

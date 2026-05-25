@@ -750,3 +750,78 @@ def test_load_config_problem_path_omitted_uses_default():
         cfg = load_config(Path(f.name))
 
     assert cfg.problem_path == "placeholder"
+
+
+# ── HardwareSpec shared-memory fields (hw-spec injection Task 1) ───────
+
+
+_SMEM_YAML = """\
+name: "TestGPU"
+freq_GHz: 2.0
+compute_capability: 8.9
+shared_mem_per_block_bytes: 101376
+shared_mem_per_multiprocessor_bytes: 102400
+"""
+
+
+def test_hardware_spec_new_smem_fields_load_from_yaml():
+    """YAML carries the two new shared-memory fields; load_hardware_spec reads them."""
+    spec = load_hardware_spec(_write_yaml(_SMEM_YAML))
+    assert spec.shared_mem_per_block_bytes == 101376
+    assert spec.shared_mem_per_multiprocessor_bytes == 102400
+
+
+def test_detect_hardware_populates_smem_fields():
+    """detect_hardware reads shared_memory_per_block_optin + per_multiprocessor."""
+    props = SimpleNamespace(
+        name="FakeGPU",
+        major=8, minor=9,
+        total_memory=48 * 1024**3,
+        L2_cache_size=96 * 1024**2,
+        clock_rate=2_505_000,  # kHz → 2.505 GHz
+        shared_memory_per_block_optin=101376,
+        shared_memory_per_multiprocessor=102400,
+    )
+    fake = _fake_torch(cuda_available=True, props=props)
+    with patch.dict(sys.modules, {"torch": fake}):
+        spec = detect_hardware()
+    assert spec.shared_mem_per_block_bytes == 101376
+    assert spec.shared_mem_per_multiprocessor_bytes == 102400
+
+
+def test_detect_hardware_falls_back_when_optin_missing():
+    """Older torch lacking ``shared_memory_per_block_optin`` falls back to
+    ``shared_memory_per_block``. The ``_optin`` suffix was added in recent
+    torch; the docstring promise of "older driver compat" requires the
+    fallback path."""
+    props = SimpleNamespace(
+        name="FakeGPU",
+        major=8, minor=9,
+        total_memory=48 * 1024**3,
+        L2_cache_size=96 * 1024**2,
+        clock_rate=2_505_000,
+        # NO shared_memory_per_block_optin attribute on purpose
+        shared_memory_per_block=49152,
+        shared_memory_per_multiprocessor=102400,
+    )
+    fake = _fake_torch(cuda_available=True, props=props)
+    with patch.dict(sys.modules, {"torch": fake}):
+        spec = detect_hardware()
+    assert spec.shared_mem_per_block_bytes == 49152  # fallback path
+    assert spec.shared_mem_per_multiprocessor_bytes == 102400
+
+
+def test_validate_hardware_spec_tolerates_smem_mismatch_under_threshold():
+    """A ~2% diff in ``shared_mem_per_block_bytes`` does NOT flag (under 10%)."""
+    yaml_spec = HardwareSpec(name="X", shared_mem_per_block_bytes=101376)
+    detected = HardwareSpec(name="X", shared_mem_per_block_bytes=99000)
+    issues = validate_hardware_spec(yaml_spec, detected)
+    assert not any("shared_mem_per_block" in i for i in issues)
+
+
+def test_validate_hardware_spec_flags_smem_mismatch_over_threshold():
+    """A >2x diff in ``shared_mem_per_block_bytes`` triggers a warning."""
+    yaml_spec = HardwareSpec(name="X", shared_mem_per_block_bytes=49152)
+    detected = HardwareSpec(name="X", shared_mem_per_block_bytes=101376)
+    issues = validate_hardware_spec(yaml_spec, detected)
+    assert any("shared_mem_per_block" in i for i in issues)
