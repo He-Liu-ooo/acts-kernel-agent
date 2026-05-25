@@ -51,6 +51,8 @@ Frozen dataclass using the SOLAR arch YAML schema. Load from YAML via `load_hard
 | `SRAM_byte_per_cycle` | float | L2 bandwidth per cycle |
 | `DRAM_capacity` | int | Total GPU memory in bytes |
 | `DRAM_byte_per_cycle` | float | DRAM bandwidth per cycle |
+| `shared_mem_per_block_bytes` | int | Per-block shared memory budget (opt-in dynamic SMEM ceiling). Default `0` = unknown. Populated by `detect_hardware()` from `props.shared_memory_per_block_optin` (defensive `getattr` fallback to `.shared_memory_per_block` on older torch). Read from YAML via `raw.get("shared_mem_per_block_bytes", 0)`. Consumed by the Phase B SMEM check in `compile_kernel_tool` and the `## Run context` prompt block rendered by `render_run_context()`. |
+| `shared_mem_per_multiprocessor_bytes` | int | Per-SM shared memory budget (architectural ceiling). Default `0` = unknown. Populated by `detect_hardware()` from `props.shared_memory_per_multiprocessor`. Read from YAML via `raw.get("shared_mem_per_multiprocessor_bytes", 0)`. Same Phase B / run-context consumers as the per-block field. |
 | `MAC_per_cycle_fp32_sm` | float | FP32 MACs/cycle (CUDA cores) |
 | `MAC_per_cycle_tf32_tc` | float | TF32 MACs/cycle (Tensor Cores) |
 | `MAC_per_cycle_fp16_tc` | float | FP16 MACs/cycle (Tensor Cores) |
@@ -67,10 +69,17 @@ Frozen dataclass using the SOLAR arch YAML schema. Load from YAML via `load_hard
 | `peak_memory_bandwidth_gb_s` | `DRAM_byte_per_cycle * freq_GHz` | GB/s |
 | `peak_sram_bandwidth_gb_s` | `SRAM_byte_per_cycle * freq_GHz` | GB/s |
 | `peak_flops_fp32` | `MAC_per_cycle_fp32_sm * freq_GHz * 2 / 1e3` | TFLOPS |
+| `peak_flops_tf32` | `MAC_per_cycle_tf32_tc * freq_GHz * 2 / 1e3` | TFLOPS |
 | `peak_flops_bf16` | `MAC_per_cycle_bf16_tc * freq_GHz * 2 / 1e3` | TFLOPS |
 | `peak_flops_fp16` | `MAC_per_cycle_fp16_tc * freq_GHz * 2 / 1e3` | TFLOPS |
+| `peak_flops_fp8` | `MAC_per_cycle_fp8_tc * freq_GHz * 2 / 1e3` | TFLOPS |
+| `peak_flops_nvfp4` | `MAC_per_cycle_nvfp4_tc * freq_GHz * 2 / 1e3` | TFLOPS (Blackwell-only; zero on pre-Blackwell arches) |
 
 Dimensional analysis for the FLOPS rows: `MAC/cycle * GHz * 2` → `1e9 MACs/sec * 2 ops/MAC` → ops/sec; divide by `1e12` for TFLOPS, i.e. `* 1e9 * 2 / 1e12 = * 2 / 1e3`. The previous `/1e6` divisor returned PFLOPS while claiming TFLOPS — a 1000× overstatement.
+
+**INT8 deliberately excluded** from the `peak_flops_*` family. INT8 Tensor Core throughput is reported in TOPS (integer ops/sec), not TFLOPS — mixing it into a TFLOPS-typed property family would be a unit-error footgun for downstream consumers (e.g. dominant-dtype selection in `render_run_context()`). Operators that need INT8 peak should compute it directly from `MAC_per_cycle_int8_tc * freq_GHz * 2 / 1e3` and label the result TOPS.
+
+**Zero-peak omit behavior.** `render_run_context()` in `src/agents/llm_backend.py` consumes the full `{fp32, tf32, bf16, fp16, fp8, nvfp4}` dtype-peaks dict to pick the dominant peak for the workload's compute dtype. When **all** peaks evaluate to 0.0 (uninitialized `MAC_per_cycle_*` fields on a named `HardwareSpec` — e.g. a placeholder spec or a test fixture), the entire `Peak FLOPS` line is omitted from the rendered `## Hardware` block rather than printed as a misleading `Peak FLOPS (bf16/fp16/fp32): 0.0 TFLOPS`. The bandwidth lines render independently and are unaffected.
 
 ## ACTSConfig
 
@@ -150,6 +159,8 @@ The `load_config` `FileNotFoundError` guard is correspondingly scoped: it fires 
      - `freq_GHz` — boost clock from `clock_rate / 1_000_000` (kHz → GHz)
      - `SRAM_capacity` — `L2_cache_size`
      - `DRAM_capacity` — `total_memory`
+     - `shared_mem_per_block_bytes` — `props.shared_memory_per_block_optin` (defensive `getattr` fallback to `.shared_memory_per_block` on older torch that predates the opt-in dynamic-SMEM attribute).
+     - `shared_mem_per_multiprocessor_bytes` — `props.shared_memory_per_multiprocessor`.
      - `compute_capability` — derived as `props.major + props.minor / 10` (defensive `getattr` for test stubs missing the attrs).
   2. Look up the device name in `_ACTS_ARCH_YAMLS` via `_lookup_arch_yaml(detected.name)`.
   3. If a YAML is registered AND on disk, load it via `load_hardware_spec` and merge with the runtime spec via `dataclasses.replace`. **Runtime ground-truth wins** for `name` / `freq_GHz` / `SRAM_capacity` / `DRAM_capacity`; the YAML supplies `MAC_per_cycle_*` + `*_byte_per_cycle` + tier ratios.
@@ -162,10 +173,12 @@ The `load_config` `FileNotFoundError` guard is correspondingly scoped: it fires 
 
 Compares config-source `spec` against runtime-`detected` spec and returns a list of mismatch messages (empty = no mismatch). Catches the silent-miscalibration class of bugs where the YAML or placeholder substitution doesn't match the actual GPU.
 
-Three checks, each with **10% tolerance** and **per-field skip-if-zero**:
+Five checks, each with **10% tolerance** and **per-field skip-if-zero**:
 - `DRAM_capacity` — GPU-family fingerprint (Ada 48 GiB ≠ H100 80 GiB).
 - `SRAM_capacity` (L2) — discriminates within a family that shares DRAM (Ada 96 MiB vs H100 50 MiB).
 - `freq_GHz` — both sources report boost clock, so >10% delta likely means wrong YAML.
+- `shared_mem_per_block_bytes` — per-block opt-in SMEM ceiling; >10% delta flags a wrong-YAML / wrong-arch pairing (e.g. Ada 99 KiB vs Hopper 227 KiB).
+- `shared_mem_per_multiprocessor_bytes` — per-SM SMEM ceiling; same wrong-arch signal as the per-block field. Both new checks are warn-don't-raise, parallel to the existing three. See `doc/specs/2026-05-24-coding-hw-spec-design.md` §4 for the design rationale.
 
 Call sites:
 1. `load_config()` — after loading a YAML via `arch_config_path`, validates against `detect_hardware()`.

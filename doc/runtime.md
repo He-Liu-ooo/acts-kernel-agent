@@ -55,11 +55,11 @@ Module-level handle registration, guarded by `_lock`. `RunContext.create` calls 
 
 ### Event catalog — `CORE_EVENT_KINDS`
 
-Frozenset of 34 kinds:
+Frozenset of 36 kinds:
 
 **Run scope** — `run_start`, `baseline_attempt`, `baseline_success`, `baseline_failure`, `baseline_ready`, `verify_start`, `verify_done`, `run_end`, `clock_lock_unavailable`, `clock_drift_detected`.
 
-**Per-iteration** — `iter_start`, `planner_selected`, `planner_failed`, `coder_submitted`, `coder_failed`, `bench_done`, `profile_done`, `score_computed`, `reviewer_feedback`, `reviewer_metric_query`, `branch_dead_end`, `iter_end`, `trace_emitted`, `reward_hack_detected`, `reward_hack_confirmed`, `reward_hack_cleared`, `calibration_warning`, `sibling_context_rendered`, `failure_summary_added`, `repeated_pathway_dead_end`, `autotune_burn_in_done`.
+**Per-iteration** — `iter_start`, `planner_selected`, `planner_failed`, `coder_submitted`, `coder_failed`, `bench_done`, `profile_done`, `score_computed`, `reviewer_feedback`, `reviewer_metric_query`, `branch_dead_end`, `iter_end`, `trace_emitted`, `reward_hack_detected`, `reward_hack_confirmed`, `reward_hack_cleared`, `calibration_warning`, `sibling_context_rendered`, `failure_summary_added`, `repeated_pathway_dead_end`, `autotune_burn_in_done`, `smem_overflow_detected`, `smem_check_skipped`.
 
 **SOL integration sub-grouping** (added 2026-04-27, distributed across the two scopes above):
 
@@ -82,6 +82,39 @@ Frozenset of 34 kinds:
 
 **Triton autotune integration sub-grouping** (added 2026-05-14, A1 PR 1):
 - `autotune_burn_in_done` (per-iter) — fires once per iter after benchmark-captured autotune winners are copied onto the kernel. Payload: `iter`, `workload_count: int`, `winner_count: int`. Per-workload winners themselves persist on `Kernel.autotune_winner: dict[workload.uuid, cfg]`.
+
+**Hardware-spec injection sub-grouping** (added 2026-05-24, both per-iter; see [`doc/specs/2026-05-24-coding-hw-spec-design.md`](specs/2026-05-24-coding-hw-spec-design.md) §9):
+
+- `smem_overflow_detected` (per-iter) — fires once per Coder `compile_kernel_tool` rejection when one or more autotune Configs warm up successfully but report a ptxas `shared` footprint that exceeds the hardware's per-block SMEM cap. Multiple violating Configs in the same compile-tool call aggregate into one event. Payload: `iter`, `role: "coder"`, `violation_count: int`, `worst_footprint_bytes: int`, `cap_bytes: int`. The compile tool surfaces an `smem_overflow` error to the Coder LLM as a recoverable tool failure, not a hard kill.
+- `smem_check_skipped` (per-iter) — fires when the SMEM budget check is bypassed (or, for `cfg_overrides_recorded_kwarg`, when a single Config is skipped within an otherwise-running check). Payload: `iter`, `role: "coder"`, `reason ∈ {"no_autotuner", "no_hardware_cap", "sample_args_missing", "host_wrapper_failed", "host_wrapper_crashed_after_capture", "recorder_no_capture", "warmup_failed", "cfg_overrides_recorded_kwarg", "dps_synth_failed"}`, optional `config_idx: int`, optional `key: str`. The nine reasons split into three groups by emission cadence:
+
+  **At most once per compile-tool call** (no `config_idx`):
+  - `no_autotuner` — the kernel has no `@triton.autotune`.
+  - `no_hardware_cap` — the configured `HardwareSpec` has no per-block cap.
+  - `sample_args_missing` — no sample args are available to drive a warmup.
+  - `host_wrapper_failed` — the Phase A recorder pass raised **before** the recorder captured any JIT args (no capture happened at all).
+  - `host_wrapper_crashed_after_capture` — the Phase A recorder pass raised **after** the recorder successfully captured first-call JIT args. The captured args are preserved and used for Phase B warmup; the wrapper crash itself is non-fatal to the SMEM check. Telemetry slug deliberately distinct from `host_wrapper_failed` so postmortems can tell "no capture" apart from "capture succeeded, wrapper crashed downstream."
+  - `recorder_no_capture` — the recorder pass completed cleanly but the patched `autotuner.run` was never invoked (the wrapper's control flow didn't reach the kernel launch — e.g., an early return on a degenerate input shape).
+  - `dps_synth_failed` — emitted from the Coder side when DPS output-buffer synthesis (`_maybe_synth_dps_outputs` in `src/agents/coder.py`) fails. Means `inspect.signature(host_wrapper_fn)` was unparseable or the buffer-shape heuristic couldn't determine the missing positional shape. Fail-open: the compile-tool call continues without a synthesized output buffer.
+
+  **Per Config that fails** (carries `config_idx: int`):
+  - `warmup_failed` — the Config errored out during its Phase B warmup launch; surviving Configs are still measured.
+  - `cfg_overrides_recorded_kwarg` — fires **per conflicting key** when a host wrapper passed a kwarg that also appears in the autotune `Config.kwargs` dict. Payload additionally carries `key: str` (the conflicting kwarg name). The Config is **skipped** (no warmup, no measurement) rather than silently using the cfg-side value, so the conflict is visible in telemetry. Multiple conflicting keys on the same Config produce multiple events with the same `config_idx`.
+
+  All `smem_check_skipped` emission sites in `src/agents/coder.py` and `src/eval/smem_check.py` now thread the orchestrator `iter_no` through (previously these payloads always carried `iter=null` because the emit calls lacked the keyword); the 15-fix sweep wired `iter=iter_no` at every emission site so postmortems can group skip events with the rest of the iter's narrative.
+
+The recorder mechanism (Phase A) drives `host_wrapper_fn(*sample_args)` once per compile-tool call with the kernel's `autotuner.run` method instance-patched to capture the real positional + keyword JIT args the host wrapper passes through (including any meta-params the wrapper computes from input shapes). The captured args feed Phase B, which then warms up each Config in isolation to read its ptxas-truth `CompiledKernel.metadata.shared` footprint. `host_wrapper_failed` fires when the wrapper raises during the recorder pass **before** any capture happened; `host_wrapper_crashed_after_capture` fires when the wrapper raises **after** the recorder successfully captured first-call args (the captured args are still usable, Phase B proceeds); `recorder_no_capture` fires when the wrapper returns cleanly but the patched `autotuner.run` was never invoked. All three are non-fatal: the SMEM check is skipped for the whole compile-tool call (or, for `cfg_overrides_recorded_kwarg`, only the conflicting Config), the Configs still ship to the Coder, and the compile-tool result is `ok` modulo any other gate. See [`doc/specs/2026-05-24-coding-hw-spec-design.md`](specs/2026-05-24-coding-hw-spec-design.md) §6.8 for the 15-fix-sweep rationale.
+
+The companion prompt-side surface lives in the agents layer: `src/agents/llm_backend.py::render_run_context(bottleneck, *, hardware: HardwareSpec | None = None)` builds the `## Run context` section shared by all three agent prompts. When `hardware` is `None` or carries an empty `name` (no spec configured), the function falls through to bottleneck-only — matching pre-extension behavior so call sites without a configured `HardwareSpec` don't break. When a named `HardwareSpec` is supplied, six lines are appended under the bottleneck line, in order:
+
+1. `Hardware: <name> (sm_<compute_capability>)`
+2. `Shared mem per block: <cap_B> B (~<cap_KB> KB)`
+3. `Shared mem per SM: <per_sm_B> B (~<per_sm_KB> KB)`
+4. `Peak FLOPS (<dtype_label>): <peak> TFLOPS` — `dtype_label` is the dominant-dtype label (highest of `peak_flops_fp32`, `peak_flops_bf16`, `peak_flops_fp16`; ties joined by `/` in alphabetical order, so Ada-class hardware where bf16 and fp16 tie renders `Peak FLOPS (bf16/fp16):`).
+5. `Peak DRAM bandwidth: <gb_s> GB/s`
+6. `Per-Config shared-mem rule: num_stages × (input_tile_elements_loaded_to_smem) × dtype_bytes ≤ <cap>` — phrased naming-agnostic so the prompt doesn't presume any specific meta-param naming convention. The actual ptxas-truth SMEM check (which fires the `smem_overflow_detected` / `smem_check_skipped` events above) reads `CompiledKernel.metadata.shared` and is naming-free.
+
+See [`doc/specs/2026-05-24-coding-hw-spec-design.md`](specs/2026-05-24-coding-hw-spec-design.md) §5.1 (rendered block + dominant-dtype rule) and §9 (event payloads) for the design rationale.
 
 Notable semantics:
 

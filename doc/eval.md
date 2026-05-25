@@ -311,6 +311,73 @@ Source-hash-keyed JSON cache: key = `sha256(source_hash + repr(workload) + mode 
 - `curated` (default) — `--section Occupancy WarpStateStats MemoryWorkloadAnalysis ComputeWorkloadAnalysis` plus explicit `--metrics` for tensor-core utilization, stable grouped diagnostics, and the enumerated stall metrics.
 - `full` — `--set full` for debug; parser still pulls the curated subset, but `raw_metrics` captures everything NCU emitted.
 
+## SMEM Budget Check — `smem_check.py`
+
+Per-`Config` shared-memory budget validation for `@triton.autotune` kernels. Called from `src/agents/coder.py::_make_compile_tool` immediately after `compile_kernel()` succeeds — surfaces violations through the existing tool-error retry path (`_record_failure` → `ImplementationError.tool_errors`) so the Coder self-corrects, same as any other compile-time failure.
+
+### `SMEMViolation`
+
+Frozen dataclass surfacing a single over-budget `Config`:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `config_idx` | `int` | Index into `autotuner.configs` (positional, so the Coder can map the violation back to a specific `triton.Config(...)` in source) |
+| `config_kwargs` | `dict` | The `kwargs` payload of the offending `Config` (block sizes, etc.) |
+| `num_warps` | `int` | `Config.num_warps` for the offending entry |
+| `num_stages` | `int` | `Config.num_stages` |
+| `footprint` | `int` | ptxas-reported shared-memory bytes for this `(kwargs, num_warps, num_stages)` triple |
+
+### Functions
+
+- `_read_compiled_smem(compiled) -> int | None` — extracts ptxas-reported SMEM bytes from a Triton compile artifact. Duck-typed across Triton versions: modern builds expose `.metadata.shared`, older builds expose `.shared`. Returns `None` when neither attribute is present so the caller can skip that `Config` (fail-open per `Config`, not per kernel).
+- `_latest_cache_entry(jit_fn) -> Any | None` — pulls the last-insertion-order entry from `JITFunction.cache[device][hash]` (Triton's per-device compile cache). Returns `None` when the cache is empty. Used to recover the just-warmed compile artifact without re-implementing Triton's keying scheme.
+- `_capture_jit_args_via_host_wrapper(autotuner, host_wrapper_fn, sample_args, *, iter_no=None) -> tuple | None` — drives `host_wrapper_fn(*sample_args)` exactly once with `autotuner.run` instance-patched to a no-launch recorder closure. The recorder captures the `(args, kwargs)` the host wrapper passes to the autotuner internally and returns `None` immediately (no GPU launch). On exit the instance attribute is removed via `del autotuner.run`, restoring class-method dispatch. Returns the recorded JIT args, or `None` only when the host wrapper raised **before** the recorder fired (no-capture-at-all). When the host wrapper raises **after** the recorder captured the first call's args, the captured args are still returned and a telemetry event with slug `host_wrapper_crashed_after_capture` is emitted via `events.emit(iter=iter_no, ...)` — the budget sweep proceeds on the recovered args. The `iter_no` kwarg is threaded into every emitted event as `iter=iter_no`. The host wrapper tolerates the `None` return because it allocates its output buffer (`c`) **before** calling the kernel and never reads back the kernel's return value. Triton 3.6.0 ground-truth: `Autotuner.__getitem__` returns a lambda that does late-bound `self.run(...)` lookup, so instance-attribute assignment cleanly shadows the class method during the recorder window.
+- `check_autotune_smem_budget(autotuner, host_wrapper_fn, sample_args, *, cap_bytes, iter_no=None) -> list[SMEMViolation]` — top-level entry point. `host_wrapper_fn` is **required** (no `None` fallback; the legacy direct-warmup path has been removed). Calls `_capture_jit_args_via_host_wrapper(autotuner, host_wrapper_fn, sample_args, iter_no=iter_no)` to recover the real JIT args the wrapper would pass, then sweeps each `Config` with `autotuner.fn.warmup(*jit_args, ...)` and aggregates violations. For each `Config`, recorded kwargs are merged with `cfg.kwargs`; when a key appears in **both** dicts the conflict is fatal for that `Config` only — `smem_check_skipped(reason="cfg_overrides_recorded_kwarg", config_idx=i, key=<key>, iter=iter_no)` is emitted and the `Config` is skipped rather than silently letting `cfg.kwargs` override the captured value. Per-`Config` warmup failures emit `smem_check_skipped(reason="warmup_failed", config_idx=i, iter=iter_no)` and `continue` — a single broken `Config` does not abort the rest of the sweep. Returns the aggregated list (empty when every `Config` is within budget, or when the check was fully skipped). `iter_no` is forwarded to every `events.emit` call so emitted telemetry is iteration-attributable.
+
+### Fail-open discipline
+
+Two layers of fail-open behaviour, both deliberate:
+
+1. **Per-`Config` warmup failure** — caught and recorded as `smem_check_skipped`, sweep continues. A `Config` whose warmup raises (shape mismatch, dtype mismatch, helper-import failure) is excluded from violation reporting rather than blocking the whole kernel.
+2. **Per-`Config` missing SMEM attribute** — `_read_compiled_smem` returning `None` (neither `.metadata.shared` nor `.shared` present) skips that `Config`'s budget check entirely. Triton-version drift never turns into a false positive.
+
+The aggregated violations list is the only signal the Coder sees — an empty list means "no over-budget `Config` was observed," which under fail-open includes "we couldn't measure footprint." The cap is a Coder-visible lint, not a hard correctness gate; failures are recoverable through self-correction.
+
+### Skip reasons
+
+Nine total `smem_check_skipped` slugs, each pinpointing a distinct fail-open path. All events carry `iter=iter_no` (threaded from the orchestrator via `check_autotune_smem_budget(..., iter_no=...)`); per-`Config` slugs additionally carry `config_idx=i`.
+
+| Slug | Payload (beyond `iter`) | When | Layer |
+|---|---|---|---|
+| `no_autotuner` | — | The kernel has no `@triton.autotune` (no autotuner instance to sweep) | Pre-check |
+| `no_hardware_cap` | — | `HardwareSpec` lacks an SMEM-per-block cap to compare against | Pre-check |
+| `sample_args_missing` | — | Caller passed empty / `None` `sample_args` — nothing to drive the recorder | Pre-check |
+| `host_wrapper_failed` | — | `host_wrapper_fn(*sample_args)` raised inside the recorder window **before** the recorder fired (no captured args) | Recorder |
+| `recorder_no_capture` | — | Host wrapper completed without ever calling into `autotuner.run` — recorder closure never fired | Recorder |
+| `host_wrapper_crashed_after_capture` | — | Host wrapper raised **after** the recorder captured the first call's args; the captured args are returned and the sweep proceeds. Informational — not a skip of the budget sweep itself, but logged on the same telemetry channel for symmetry. | Recorder |
+| `warmup_failed` | `config_idx` | Per-`Config` `autotuner.fn.warmup(...)` raised; sweep continues, this `Config` is excluded | Per-`Config` |
+| `cfg_overrides_recorded_kwarg` | `config_idx`, `key` | A kwarg key appears in **both** the recorded host-wrapper kwargs and the `Config.kwargs` payload; the `Config` is skipped rather than silently letting `cfg.kwargs` override the captured value | Per-`Config` |
+| `dps_synth_failed` | (Coder-side payload; see `doc/agents.md`) | Emitted from the Coder side when DPS sample-arg synthesis fails before `check_autotune_smem_budget` can be called | Coder-side (upstream of `smem_check`) |
+
+The first three short-circuit the whole check (empty violations list returned). `host_wrapper_failed` and `recorder_no_capture` are the recorder-layer hard-fail slugs (no JIT args recovered → empty violations list). `host_wrapper_crashed_after_capture` is the soft-recover slug — args were recovered, the sweep ran on them. `warmup_failed` and `cfg_overrides_recorded_kwarg` are per-`Config` slugs that let the sweep continue on the remaining `Configs`. `dps_synth_failed` originates upstream of `smem_check.py` (in the Coder's sample-arg synthesis path) and prevents `check_autotune_smem_budget` from being called at all.
+
+### Why ptxas truth, not a static formula
+
+ptxas is the only authoritative source for actual SMEM allocation. A static formula over the kernel's `tl.zeros(...)`-declared buffers (`BLOCK_M * BLOCK_K * sizeof(dtype) + ...`) misses three real effects:
+
+- **Pipeline-stage sharing** — `@triton.autotune`'s `num_stages` rotates buffers across stages, so a kernel with two `BLOCK_M * BLOCK_K` operand tiles at `num_stages=3` may share allocations rather than triple them.
+- **Load fusion** — ptxas fuses adjacent loads into wider transactions, collapsing what a static formula would count as two buffers into one.
+- **Hoisted allocations** — ptxas hoists per-iteration scratch out of loop bodies, changing the live-set footprint vs. a syntactic counter.
+
+A static formula both over-counts (would flag legal `Configs`) and under-counts (would miss real SMEM exhaustion). Reading ptxas's number after `warmup(...)` short-circuits all of this: there is no regex parser, no shape dispatch (matmul vs. reduction vs. elementwise) — the check works for every kernel shape because ptxas itself is the oracle.
+
+### Known limitations and version pin
+
+- **Multi-call host wrappers** — when the host wrapper invokes the autotuner more than once per call (e.g. split-K matmul that fires a partial-product launch followed by a reduction launch), the recorder captures **only the first invocation's** JIT args. The subsequent launches are silently elided. This is acceptable in practice because SMEM footprint is per-launch-invariant across the autotuner's `Config` sweep — the budget question is "does this `Config`'s tile fit?", and the first launch's tile geometry answers it for every Config the autotuner will explore.
+- **Triton 3.6.0 pin** — the recorder-patch trick relies on `Autotuner.__getitem__` returning a lambda that does **late-bound** `self.run(...)` lookup, which lets an instance-attribute `autotuner.run = recorder` shadow the class method during the recorder window. This was ground-truth verified against Triton 3.6.0. A future Triton release that eagerly binds `self.run` at `__getitem__` time (early binding) would break the shadowing and the recorder would never fire — surfacing as `recorder_no_capture` rather than a silent miss. Since the legacy direct-warmup fallback has been removed, recorder failure means the budget sweep is skipped entirely for that iteration (empty violations list) rather than degrading to a partial check.
+
+Design rationale: `doc/specs/2026-05-24-coding-hw-spec-design.md` §6.
+
 ## Types — `types.py`
 
 Shared eval primitives imported across memory / search / pipeline without pulling in the full `roofline.py` / `profiler.py` modules. Hosts `BottleneckType` (`MEMORY_BOUND`, `COMPUTE_BOUND`, `BALANCED`). Kept in a leaf module so `eval/profiler.py` and `memory/experience.py` can both type-check against it without a circular import.

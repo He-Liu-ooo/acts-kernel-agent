@@ -181,7 +181,7 @@ Shared helper that renders a kernel source as a fenced `## Current kernel` markd
 
 ### render_run_context(bottleneck) -> str
 
-Shared helper that renders the once-per-run `## Run context\n- Bottleneck: <x>` section consumed by Planner and Reviewer prompts. Takes a non-None `BottleneckType`; callers that may not have a bottleneck (e.g. Planner's first iteration in the placeholder path) gate the call themselves. Keeps the section header + field label in one place so future additions (hardware, workload id) don't drift between agents.
+Shared helper that renders the once-per-run `## Run context\n- Bottleneck (this run): <x>` section consumed by Planner and Reviewer prompts. Takes a non-None `BottleneckType`; callers that may not have a bottleneck (e.g. Planner's first iteration in the placeholder path) gate the call themselves. Keeps the section header + field label in one place so future additions (hardware, workload id) don't drift between agents.
 
 ## Shared submit-tool helpers
 
