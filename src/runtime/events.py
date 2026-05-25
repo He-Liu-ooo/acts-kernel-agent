@@ -107,6 +107,21 @@ CORE_EVENT_KINDS: frozenset[str] = frozenset({
     "operator_baseline_load",
     "operator_baseline_success",
     "operator_baseline_failure",
+    # Hardware-spec injection — Phase B SMEM check inside compile_kernel_tool.
+    # See doc/specs/2026-05-24-coding-hw-spec-design.md §9.
+    # ``smem_overflow_detected`` payload: ``role`` ("coder"), ``violation_count``,
+    # ``worst_footprint_bytes``, ``cap_bytes``. Fires once per compile-tool
+    # rejection (multiple violating Configs aggregated into one event).
+    # ``smem_check_skipped`` payload: ``role``, ``reason`` ∈ {``no_autotuner``,
+    # ``no_hardware_cap``, ``sample_args_missing``, ``host_wrapper_failed``,
+    # ``recorder_no_capture``, ``warmup_failed``}, optional ``config_idx``.
+    # Six skip reasons (recorder-patch redesign 2026-05-25 added the
+    # ``host_wrapper_failed`` and ``recorder_no_capture`` cases). First three
+    # fire at most once per compile-tool call; ``warmup_failed`` fires
+    # per-Config; ``host_wrapper_failed`` + ``recorder_no_capture`` fire
+    # once per host-wrapper drive.
+    "smem_overflow_detected",
+    "smem_check_skipped",
 })
 
 # ``iter_end.outcome`` values. Kept as string constants (not an enum) so

@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from pydantic import ValidationError
 
+    from src.config import HardwareSpec
     from src.eval.types import BottleneckType
 
 try:
@@ -309,9 +310,79 @@ def render_kernel_section(kernel_source: str) -> str:
     return "## Current kernel\n```python\n" + safe_source + "\n```"
 
 
-def render_run_context(bottleneck: BottleneckType) -> str:
-    """Render the once-per-run context section shared by Planner and Reviewer
-    prompts. Callers that may not have a bottleneck are expected to gate
-    the call themselves rather than relying on a ``None`` return.
+def render_run_context(
+    bottleneck: "BottleneckType | None" = None,
+    *,
+    hardware: "HardwareSpec | None" = None,
+) -> str:
+    """Render the once-per-run context section shared by all three agent prompts.
+
+    The ``hardware`` kwarg appends a 6-line hw budget block under the
+    bottleneck line. ``hardware=None`` or an empty-named ``HardwareSpec``
+    (no spec configured) falls back to bottleneck-only.
+
+    ``bottleneck=None`` is supported for the baseline-generation path
+    (``CoderAgent.translate``) where the once-per-run bottleneck has not
+    yet been classified. The function still renders the hw block when
+    ``hardware`` is supplied; the bottleneck line reads "not yet classified
+    (baseline generation)". When BOTH bottleneck and hardware are None,
+    returns the empty string so the caller can skip section emission
+    without a guard.
+
+    Per the hw-spec-injection spec (doc/specs/2026-05-24-coding-hw-spec-
+    design.md §5.1), the rule line is rendered in NAMING-AGNOSTIC prose
+    (``input_tile_elements_loaded_to_smem`` rather than ``BLOCK_M+BLOCK_N``)
+    so the prompt doesn't presume any specific meta-param naming
+    convention. The actual SMEM check (Phase B, lives in
+    ``src/agents/coder.py::_make_compile_tool``) reads ptxas truth from
+    ``CompiledKernel.metadata.shared`` — naming-free.
     """
-    return f"## Run context\n- Bottleneck: {bottleneck.value}"
+    has_bottleneck = bottleneck is not None
+    has_hw = hardware is not None and hardware.name
+    if not has_bottleneck and not has_hw:
+        return ""
+
+    lines = ["## Run context"]
+    if has_bottleneck:
+        lines.append(f"- Bottleneck (this run): {bottleneck.value}")
+    else:
+        lines.append("- Bottleneck (this run): not yet classified (baseline generation)")
+    if has_hw:
+        # Dominant-dtype selection per spec §3 decision 8: highest of the
+        # derived peak-FLOPS properties; ties joined by '/' in alphabetical
+        # order. Includes Hopper/Blackwell low-precision Tensor Core peaks
+        # (fp8, nvfp4) and tf32 — int8 is omitted because it's TOPS, not
+        # TFLOPS (different unit).
+        dtype_peaks = {
+            "fp32": hardware.peak_flops_fp32,
+            "tf32": hardware.peak_flops_tf32,
+            "bf16": hardware.peak_flops_bf16,
+            "fp16": hardware.peak_flops_fp16,
+            "fp8": hardware.peak_flops_fp8,
+            "nvfp4": hardware.peak_flops_nvfp4,
+        }
+        max_peak = max(dtype_peaks.values())
+        cap = hardware.shared_mem_per_block_bytes
+        per_sm = hardware.shared_mem_per_multiprocessor_bytes
+        # CUDA convention: sm_<major><minor> as concatenated integers
+        # (e.g. 8.9 → "sm_89", 9.0 → "sm_90"). Float repr "sm_8.9" is
+        # not a valid arch identifier.
+        sm_id = f"sm_{int(round(hardware.compute_capability * 10))}"
+        lines.extend([
+            f"- Hardware: {hardware.name} ({sm_id})",
+            f"- Shared mem per block: {cap} B (~{cap // 1024} KB)",
+            f"- Shared mem per SM: {per_sm} B (~{per_sm // 1024} KB)",
+        ])
+        # When the operator hasn't populated any MAC_per_cycle_* fields,
+        # every peak is 0 — rendering "Peak FLOPS (bf16/fp16/.../fp32): 0.0
+        # TFLOPS" is meaningless and misleading. Skip the line entirely.
+        if max_peak > 0:
+            dominant = sorted(d for d, p in dtype_peaks.items() if p == max_peak)
+            dtype_label = "/".join(dominant)
+            lines.append(f"- Peak FLOPS ({dtype_label}): {max_peak:.1f} TFLOPS")
+        lines.extend([
+            f"- Peak DRAM bandwidth: {hardware.peak_memory_bandwidth_gb_s:.0f} GB/s",
+            f"- Per-Config shared-mem rule: num_stages × "
+            f"(input_tile_elements_loaded_to_smem) × dtype_bytes ≤ {cap}",
+        ])
+    return "\n".join(lines)
