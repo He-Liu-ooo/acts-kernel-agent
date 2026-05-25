@@ -116,6 +116,11 @@ async def generate_triton_baseline(
                     definition=definition,
                     workloads=workloads,
                     prior_failures=prior_failures,
+                    # Baseline is conventionally iter 0 — threads through
+                    # to compile_kernel_tool's events.emit calls so the
+                    # SMEM telemetry on baseline-attempt failures lands
+                    # with iter=0 instead of iter=null. Fix #8 plumbing.
+                    iter_no=0,
                 )
         except ImplementationError as exc:
             prior_failures.append(

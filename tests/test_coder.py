@@ -1685,3 +1685,726 @@ def test_submit_kernel_no_op_when_plan_is_none():
     submit = _make_submit_tool(captured, plan=None)  # baseline path
     result = submit(source_code=source, triton_kernel_name="my_kernel")
     assert result == SUBMIT_OK_SENTINEL
+
+
+# ── hw-spec injection (hw-spec injection Task 3) ───────────────────────
+
+
+def test_coder_build_user_prompt_includes_run_context_when_bottleneck_and_hardware_present():
+    """Coder prompt now carries the run-context block when both bottleneck+hardware passed."""
+    from src.agents.coder import CoderAgent
+    from src.agents.planner import OptimizationPlan
+    from src.config import HardwareSpec
+    from src.eval.types import BottleneckType
+
+    plan = OptimizationPlan(
+        tier=1, technique="t1_coalesced_load",
+        params={}, target_region="", rationale="r",
+    )
+    hw = HardwareSpec(
+        name="TestGPU",
+        compute_capability=8.9,
+        freq_GHz=2.0,
+        DRAM_byte_per_cycle=400,
+        MAC_per_cycle_fp32_sm=1000,
+        shared_mem_per_block_bytes=101376,
+        shared_mem_per_multiprocessor_bytes=102400,
+    )
+    prompt = CoderAgent.build_user_prompt(
+        kernel_source="def x(): pass",
+        plan=plan,
+        bottleneck=BottleneckType.MEMORY_BOUND,
+        hardware=hw,
+    )
+    assert "## Run context" in prompt
+    assert "Hardware: TestGPU" in prompt
+    assert "Shared mem per block: 101376 B" in prompt
+
+
+def test_coder_build_user_prompt_omits_run_context_when_bottleneck_none():
+    """Backward-compat: no bottleneck AND no hardware → no run-context section."""
+    from src.agents.coder import CoderAgent
+    from src.agents.planner import OptimizationPlan
+
+    plan = OptimizationPlan(
+        tier=1, technique="t1_coalesced_load",
+        params={}, target_region="", rationale="r",
+    )
+    prompt = CoderAgent.build_user_prompt(kernel_source="def x(): pass", plan=plan)
+    assert "## Run context" not in prompt
+
+
+def test_coder_build_user_prompt_renders_hw_block_when_bottleneck_none():
+    """Pre-classification path: hardware populated but bottleneck=None.
+
+    The Coder still needs to see the SMEM cap so it can author autotune
+    configs within budget on the first attempt. The previous gate
+    (``if bottleneck is not None``) dropped the entire Run-context block
+    when only hardware was provided; the new gate mirrors
+    ``build_translate_prompt`` and renders when EITHER signal is set.
+    Codex P-HIGH 2026-05-25, fix #4.
+    """
+    from src.agents.coder import CoderAgent
+    from src.agents.planner import OptimizationPlan
+    from src.config import HardwareSpec
+
+    plan = OptimizationPlan(
+        tier=1, technique="t1_coalesced_load",
+        params={}, target_region="", rationale="r",
+    )
+    hw = HardwareSpec(
+        name="TestGPU",
+        compute_capability=8.9,
+        freq_GHz=2.0,
+        DRAM_byte_per_cycle=400,
+        MAC_per_cycle_fp32_sm=1000,
+        shared_mem_per_block_bytes=101376,
+        shared_mem_per_multiprocessor_bytes=102400,
+    )
+    prompt = CoderAgent.build_user_prompt(
+        kernel_source="def x(): pass",
+        plan=plan,
+        bottleneck=None,
+        hardware=hw,
+    )
+    assert "## Run context" in prompt
+    assert "Hardware: TestGPU" in prompt
+    assert "Shared mem per block: 101376 B" in prompt
+
+
+# ── compile_kernel_tool SMEM check (hw-spec injection Task 5) ──────────
+
+
+def _hw_with_smem(cap: int = 101376):
+    """Helper: HardwareSpec with named-spec + the smem cap configured."""
+    from src.config import HardwareSpec
+    return HardwareSpec(
+        name="TestGPU",
+        compute_capability=8.9,
+        freq_GHz=2.0,
+        DRAM_byte_per_cycle=400,
+        MAC_per_cycle_fp32_sm=1000,
+        shared_mem_per_block_bytes=cap,
+        shared_mem_per_multiprocessor_bytes=cap + 1024,
+    )
+
+
+def _make_kernel_spec_for_smem_tests():
+    """Minimal KernelSpec for the SMEM-check tests in this section."""
+    from src.kernels.kernel import KernelSpec, KernelType
+    return KernelSpec(
+        name="smem_test_kernel",
+        kernel_type=KernelType.MATMUL,
+        entrypoint="x",
+    )
+
+
+def test_compile_tool_rejects_smem_overflow(monkeypatch):
+    """compile_kernel_tool returns 'Compile FAILED: shared-memory budget exceeded' on overflow."""
+    from src.agents.coder import _make_compile_tool
+    from src.eval.smem_check import SMEMViolation
+    from src.kernels.compiler import CompilationResult
+
+    fake_autotuner = object()
+    fake_result = CompilationResult(
+        success=True, error_message="",
+        compiled_fn=lambda: None,
+        triton_autotuner=fake_autotuner,
+    )
+    monkeypatch.setattr(
+        "src.agents.coder.compile_kernel",
+        lambda kernel, cache_dir=None: fake_result,
+    )
+
+    def _stub_check(autotuner, *, host_wrapper_fn, sample_args, cap_bytes, iter_no=None):
+        return [SMEMViolation(
+            config_idx=0,
+            config_kwargs={"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64},
+            num_warps=8, num_stages=4, footprint=262144,
+        )]
+    monkeypatch.setattr(
+        "src.agents.coder.check_autotune_smem_budget", _stub_check,
+    )
+
+    hw = _hw_with_smem()
+    error_log: list[str] = []
+    spec = _make_kernel_spec_for_smem_tests()
+    tool = _make_compile_tool(
+        spec, error_log=error_log, hardware=hw, sample_args=(0,),
+    )
+    out = tool("def x(): pass")
+    assert out.startswith("Compile FAILED: shared-memory budget exceeded"), out
+    assert "262144" in out
+    assert error_log == [out]
+
+
+def test_compile_tool_passes_when_no_hardware(monkeypatch):
+    """hardware=None: SMEM check is no-op; tool returns the success string."""
+    from src.agents.coder import _make_compile_tool
+    from src.kernels.compiler import CompilationResult
+
+    fake_result = CompilationResult(success=True, error_message="", compiled_fn=lambda: None)
+    monkeypatch.setattr(
+        "src.agents.coder.compile_kernel",
+        lambda kernel, cache_dir=None: fake_result,
+    )
+    tool = _make_compile_tool(
+        _make_kernel_spec_for_smem_tests(), hardware=None, sample_args=(0,),
+    )
+    out = tool("def x(): pass")
+    assert "Compilation successful" in out
+
+
+def test_compile_tool_passes_when_sample_args_missing(monkeypatch):
+    """sample_args=None: emits smem_check_skipped(reason='sample_args_missing'), still passes."""
+    from src.agents.coder import _make_compile_tool
+    from src.kernels.compiler import CompilationResult
+
+    fake_autotuner = object()
+    fake_result = CompilationResult(
+        success=True, error_message="",
+        compiled_fn=lambda: None,
+        triton_autotuner=fake_autotuner,
+    )
+    monkeypatch.setattr(
+        "src.agents.coder.compile_kernel",
+        lambda kernel, cache_dir=None: fake_result,
+    )
+    captured_events: list[tuple] = []
+    monkeypatch.setattr(
+        "src.runtime.events.emit",
+        lambda kind, **kw: captured_events.append((kind, kw)),
+    )
+
+    hw = _hw_with_smem()
+    tool = _make_compile_tool(
+        _make_kernel_spec_for_smem_tests(), hardware=hw, sample_args=None,
+    )
+    out = tool("def x(): pass")
+    assert "Compilation successful" in out
+    assert any(
+        k == "smem_check_skipped" and kw.get("reason") == "sample_args_missing"
+        for k, kw in captured_events
+    )
+
+
+def test_compile_tool_passes_when_cap_zero(monkeypatch):
+    """hardware.shared_mem_per_block_bytes==0: skip check entirely."""
+    from src.agents.coder import _make_compile_tool
+    from src.config import HardwareSpec
+    from src.kernels.compiler import CompilationResult
+
+    hw = HardwareSpec(name="X", shared_mem_per_block_bytes=0)  # unconfigured
+    fake_result = CompilationResult(success=True, error_message="", compiled_fn=lambda: None)
+    monkeypatch.setattr(
+        "src.agents.coder.compile_kernel",
+        lambda kernel, cache_dir=None: fake_result,
+    )
+    tool = _make_compile_tool(
+        _make_kernel_spec_for_smem_tests(), hardware=hw, sample_args=(0,),
+    )
+    out = tool("def x(): pass")
+    assert "Compilation successful" in out
+
+
+def test_compile_tool_skips_when_no_autotuner(monkeypatch):
+    """Kernels without @triton.autotune (translate baseline) skip the check cleanly."""
+    from src.agents.coder import _make_compile_tool
+    from src.kernels.compiler import CompilationResult
+
+    fake_result = CompilationResult(
+        success=True, error_message="",
+        compiled_fn=lambda: None,
+        triton_autotuner=None,
+    )
+    monkeypatch.setattr(
+        "src.agents.coder.compile_kernel",
+        lambda kernel, cache_dir=None: fake_result,
+    )
+    captured_events: list[tuple] = []
+    monkeypatch.setattr(
+        "src.runtime.events.emit",
+        lambda kind, **kw: captured_events.append((kind, kw)),
+    )
+
+    hw = _hw_with_smem()
+    tool = _make_compile_tool(
+        _make_kernel_spec_for_smem_tests(), hardware=hw, sample_args=(0,),
+    )
+    out = tool("def x(): pass")
+    assert "Compilation successful" in out
+    assert any(
+        k == "smem_check_skipped" and kw.get("reason") == "no_autotuner"
+        for k, kw in captured_events
+    )
+
+
+def test_compile_tool_passes_when_host_wrapper_capture_fails(monkeypatch):
+    """If host wrapper raises during the recorder drive, check_autotune_smem_budget
+    returns [] (after emitting host_wrapper_failed) and compile_kernel_tool reports
+    success. The same wrapper will fail in check_correctness_tool with a clearer
+    signal — Phase B doesn't double up the error."""
+    from src.agents.coder import _make_compile_tool
+    from src.kernels.compiler import CompilationResult
+
+    fake_autotuner = object()
+    fake_result = CompilationResult(
+        success=True, error_message="",
+        compiled_fn=lambda *args, **kwargs: None,
+        triton_autotuner=fake_autotuner,
+    )
+    monkeypatch.setattr(
+        "src.agents.coder.compile_kernel",
+        lambda kernel, cache_dir=None: fake_result,
+    )
+    # Stub check_autotune_smem_budget to return [] (simulates the empty list
+    # the real helper returns after emitting host_wrapper_failed upstream).
+    monkeypatch.setattr(
+        "src.agents.coder.check_autotune_smem_budget",
+        lambda autotuner, **kwargs: [],
+    )
+
+    hw = _hw_with_smem()
+    tool = _make_compile_tool(
+        _make_kernel_spec_for_smem_tests(), hardware=hw, sample_args=(0,),
+    )
+    out = tool("def x(): pass")
+    assert "Compilation successful" in out
+
+
+def test_compile_tool_emits_no_hardware_cap_skip_when_unconfigured(monkeypatch):
+    """When hardware is None or cap==0, emit smem_check_skipped(reason='no_hardware_cap')
+    so events.jsonl can tell 'check ran and passed' from 'check was bypassed'.
+
+    Regression for Codex 2026-05-25 P3 telemetry-gap finding.
+    """
+    from src.agents.coder import _make_compile_tool
+    from src.kernels.compiler import CompilationResult
+
+    fake_result = CompilationResult(success=True, error_message="", compiled_fn=lambda: None)
+    monkeypatch.setattr(
+        "src.agents.coder.compile_kernel",
+        lambda kernel, cache_dir=None: fake_result,
+    )
+    captured_events: list[tuple] = []
+    monkeypatch.setattr(
+        "src.runtime.events.emit",
+        lambda kind, **kw: captured_events.append((kind, kw)),
+    )
+
+    tool = _make_compile_tool(
+        _make_kernel_spec_for_smem_tests(), hardware=None, sample_args=(0,),
+    )
+    out = tool("def x(): pass")
+    assert "Compilation successful" in out
+    assert any(
+        k == "smem_check_skipped" and kw.get("reason") == "no_hardware_cap"
+        for k, kw in captured_events
+    ), f"Expected no_hardware_cap event; got {captured_events}"
+
+
+def test_compile_tool_auto_derives_triton_kernel_name_from_source(monkeypatch):
+    """In the production Coder tool flow, triton_kernel_name is declared
+    only at submit_kernel time, not at compile_kernel_tool time. So
+    Kernel(source) is constructed with kernel_name='', compile_kernel
+    can't resolve the autotuner, and the SMEM check skips as no_autotuner
+    on every iter.
+
+    Fix: auto-derive the name from source (exactly one @triton.jit def
+    → use it; multiple or zero → leave empty + skip cleanly).
+
+    Regression for Codex 2026-05-25 P2 no-autotuner-resolved finding.
+    """
+    from src.agents.coder import _make_compile_tool
+    from src.kernels.compiler import CompilationResult
+
+    captured_kernel_names: list[str] = []
+
+    def _capture_compile(kernel, cache_dir=None):
+        captured_kernel_names.append(kernel.triton_kernel_name)
+        return CompilationResult(
+            success=True, error_message="", compiled_fn=lambda: None,
+            triton_autotuner=None,
+        )
+
+    monkeypatch.setattr("src.agents.coder.compile_kernel", _capture_compile)
+
+    hw = _hw_with_smem()
+    tool = _make_compile_tool(
+        _make_kernel_spec_for_smem_tests(), hardware=hw, sample_args=(0,),
+    )
+    src_one_jit = (
+        "import triton\n"
+        "@triton.jit\n"
+        "def my_kernel(x_ptr, BLOCK: tl.constexpr):\n"
+        "    pass\n"
+    )
+    out = tool(src_one_jit)
+    assert "Compilation successful" in out
+    # compile_kernel was called with kernel.triton_kernel_name='my_kernel',
+    # so _resolve_triton_autotuner had a name to look up.
+    assert captured_kernel_names == ["my_kernel"]
+
+
+def test_compile_tool_leaves_kernel_name_empty_on_multi_jit_source(monkeypatch):
+    """Two @triton.jit defs → can't auto-disambiguate → leave kernel_name
+    empty, SMEM check skips cleanly via no_autotuner."""
+    from src.agents.coder import _make_compile_tool
+    from src.kernels.compiler import CompilationResult
+
+    captured_kernel_names: list[str] = []
+
+    def _capture_compile(kernel, cache_dir=None):
+        captured_kernel_names.append(kernel.triton_kernel_name)
+        return CompilationResult(
+            success=True, error_message="", compiled_fn=lambda: None,
+            triton_autotuner=None,
+        )
+
+    monkeypatch.setattr("src.agents.coder.compile_kernel", _capture_compile)
+
+    hw = _hw_with_smem()
+    tool = _make_compile_tool(
+        _make_kernel_spec_for_smem_tests(), hardware=hw, sample_args=(0,),
+    )
+    src_two_jits = (
+        "import triton\n"
+        "@triton.jit\n"
+        "def helper_kernel(x_ptr, BLOCK: tl.constexpr):\n"
+        "    pass\n"
+        "@triton.jit\n"
+        "def main_kernel(x_ptr, BLOCK: tl.constexpr):\n"
+        "    pass\n"
+    )
+    out = tool(src_two_jits)
+    assert "Compilation successful" in out
+    assert captured_kernel_names == [""]
+
+
+# ── DPS host wrapper sample_args synth (Codex P-HIGH 2026-05-25, fix #1) ──
+
+
+def test_compile_tool_handles_dps_kernel_via_synth_output_buffer(monkeypatch):
+    """DPS host wrapper ``def f(a, b, c)`` expects an output buffer ``c``
+    that the input generator doesn't produce. Without synth, the recorder
+    inside ``check_autotune_smem_budget`` does ``host_wrapper_fn(*sample_args)``
+    → TypeError ("missing positional argument c") → SMEM check fails open
+    with the generic ``host_wrapper_failed`` slug.
+
+    The DPS-synth helper inspects the host-wrapper signature, sees one
+    missing positional, and appends ``torch.empty_like(sample_args[0])``
+    so the recorder receives ``(a, b, c)``. Verified by asserting the
+    check_autotune_smem_budget stub captures all 3 args.
+    """
+    pytest_torch = pytest.importorskip("torch")
+    from src.agents.coder import _make_compile_tool
+    from src.kernels.compiler import CompilationResult
+
+    def dps_host_wrapper(a, b, c):
+        # Real wrapper would launch the JIT; for the test the recorder
+        # never actually drives this (we stub check_autotune_smem_budget).
+        return None
+
+    fake_autotuner = object()
+    fake_result = CompilationResult(
+        success=True, error_message="",
+        compiled_fn=dps_host_wrapper,
+        triton_autotuner=fake_autotuner,
+    )
+    monkeypatch.setattr(
+        "src.agents.coder.compile_kernel",
+        lambda kernel, cache_dir=None: fake_result,
+    )
+
+    captured: dict = {}
+
+    def _stub_check(autotuner, *, host_wrapper_fn, sample_args, cap_bytes, iter_no=None):
+        captured["sample_args"] = sample_args
+        return []  # no violations — we only care about the args shape
+
+    monkeypatch.setattr(
+        "src.agents.coder.check_autotune_smem_budget", _stub_check,
+    )
+
+    a = pytest_torch.zeros(4)
+    b = pytest_torch.zeros(4)
+    hw = _hw_with_smem()
+    tool = _make_compile_tool(
+        _make_kernel_spec_for_smem_tests(),
+        hardware=hw,
+        sample_args=(a, b),
+    )
+    out = tool("def x(): pass")
+    assert "Compilation successful" in out
+    # The synth helper appended one output buffer so the recorder receives 3 args.
+    assert len(captured["sample_args"]) == 3
+    assert captured["sample_args"][0] is a
+    assert captured["sample_args"][1] is b
+    # The synthesized buffer is a torch.Tensor shaped like the first input.
+    assert isinstance(captured["sample_args"][2], pytest_torch.Tensor)
+    assert captured["sample_args"][2].shape == a.shape
+
+
+def test_compile_tool_emits_dps_synth_failed_when_torch_missing(monkeypatch):
+    """When the DPS synth heuristic can't infer the missing-arg shape
+    (no torch, or first input not a tensor), emit a distinct
+    ``smem_check_skipped(reason='dps_synth_failed')`` slug — separate from
+    the generic ``host_wrapper_failed`` so events.jsonl can attribute the
+    skip to a synth gap rather than a wrapper raise."""
+    from src.agents.coder import _make_compile_tool
+    from src.kernels.compiler import CompilationResult
+
+    def dps_host_wrapper(a, b, c):
+        return None
+
+    fake_autotuner = object()
+    fake_result = CompilationResult(
+        success=True, error_message="",
+        compiled_fn=dps_host_wrapper,
+        triton_autotuner=fake_autotuner,
+    )
+    monkeypatch.setattr(
+        "src.agents.coder.compile_kernel",
+        lambda kernel, cache_dir=None: fake_result,
+    )
+
+    captured_events: list[tuple] = []
+    monkeypatch.setattr(
+        "src.runtime.events.emit",
+        lambda kind, **kw: captured_events.append((kind, kw)),
+    )
+
+    # First positional isn't a tensor — synth can't infer the missing-arg
+    # shape, must emit dps_synth_failed and fall through to "Compilation
+    # successful" without invoking check_autotune_smem_budget.
+    hw = _hw_with_smem()
+    tool = _make_compile_tool(
+        _make_kernel_spec_for_smem_tests(),
+        hardware=hw,
+        sample_args=(0, 0),  # ints, not tensors
+        iter_no=7,
+    )
+    out = tool("def x(): pass")
+    assert "Compilation successful" in out
+    matching = [
+        (k, kw) for k, kw in captured_events
+        if k == "smem_check_skipped" and kw.get("reason") == "dps_synth_failed"
+    ]
+    assert matching, f"Expected dps_synth_failed event; got {captured_events}"
+    # iter_no plumbing arrives on the dps_synth_failed event too (fix #8 + #1).
+    assert matching[0][1].get("iter") == 7
+
+
+# ── iter_no plumbing through events.emit (Codex P-MED 2026-05-25, fix #8) ──
+
+
+def test_compile_tool_threads_iter_no_to_events(monkeypatch):
+    """``_make_compile_tool(..., iter_no=42)`` must thread that into every
+    ``events.emit(...)`` call inside the tool body so events.jsonl can
+    align SMEM-check telemetry with the iter that produced it. Without
+    this, every event lands with ``iter=null`` and pareto / regression
+    analysis loses the iter cross-reference."""
+    from src.agents.coder import _make_compile_tool
+    from src.kernels.compiler import CompilationResult
+
+    # ``hardware=None`` triggers the ``no_hardware_cap`` emit path —
+    # a deterministic skip slug that fires without needing a real autotuner.
+    fake_result = CompilationResult(
+        success=True, error_message="", compiled_fn=lambda: None,
+    )
+    monkeypatch.setattr(
+        "src.agents.coder.compile_kernel",
+        lambda kernel, cache_dir=None: fake_result,
+    )
+    captured_events: list[tuple] = []
+    monkeypatch.setattr(
+        "src.runtime.events.emit",
+        lambda kind, **kw: captured_events.append((kind, kw)),
+    )
+
+    tool = _make_compile_tool(
+        _make_kernel_spec_for_smem_tests(),
+        hardware=None,
+        sample_args=(0,),
+        iter_no=42,
+    )
+    out = tool("def x(): pass")
+    assert "Compilation successful" in out
+    matching = [
+        (k, kw) for k, kw in captured_events
+        if k == "smem_check_skipped" and kw.get("reason") == "no_hardware_cap"
+    ]
+    assert matching, f"Expected no_hardware_cap event; got {captured_events}"
+    assert matching[0][1].get("iter") == 42
+
+
+# ── kernel.autotune_configs target-aware parse (fix #14) ───────────────
+
+
+def test_compile_tool_kernel_autotune_configs_match_resolved_name(monkeypatch):
+    """A source with two ``@triton.autotune`` decorators must parse
+    ``kernel.autotune_configs`` against the resolved ``triton_kernel_name``
+    rather than picking up the first decorator it walks. Previously,
+    ``Kernel(spec, source)`` ran ``__post_init__`` with an empty name,
+    matching the FIRST autotuned function and silently mis-attributing
+    its configs to whatever the auto-derivation later resolves as the
+    primary kernel. The fix passes the resolved name to the constructor
+    so ``__post_init__`` parses with the right target."""
+    from src.agents.coder import _make_compile_tool
+    from src.kernels.compiler import CompilationResult
+
+    captured_kernels: list = []
+
+    def _capture_compile(kernel, cache_dir=None):
+        captured_kernels.append(kernel)
+        return CompilationResult(
+            success=True, error_message="", compiled_fn=lambda: None,
+            triton_autotuner=None,
+        )
+
+    monkeypatch.setattr("src.agents.coder.compile_kernel", _capture_compile)
+
+    # Source has two @triton.jit defs, but ONLY the second has @triton.autotune.
+    # Auto-derive: ``triton_kernel_names_in`` returns [helper, main]; len !=1 →
+    # resolved_name stays empty. Verify the empty-name case still produces
+    # ZERO autotune_configs from the helper (no @autotune on helper, only on
+    # main_kernel), avoiding the legacy "first @autotune anywhere" attribution.
+    src = (
+        "import triton\n"
+        "import triton.language as tl\n"
+        "\n"
+        "@triton.jit\n"
+        "def helper_kernel(x_ptr, BLOCK: tl.constexpr):\n"
+        "    pass\n"
+        "\n"
+        "@triton.autotune(\n"
+        "    configs=[\n"
+        '        triton.Config({"BLOCK": 64}, num_warps=2, num_stages=2),\n'
+        '        triton.Config({"BLOCK": 128}, num_warps=4, num_stages=2),\n'
+        '        triton.Config({"BLOCK": 64}, num_warps=4, num_stages=3),\n'
+        '        triton.Config({"BLOCK": 128}, num_warps=4, num_stages=4),\n'
+        "    ],\n"
+        '    key=["x"],\n'
+        ")\n"
+        "@triton.jit\n"
+        "def main_kernel(x_ptr, BLOCK: tl.constexpr):\n"
+        "    pass\n"
+    )
+
+    hw = _hw_with_smem()
+    tool = _make_compile_tool(
+        _make_kernel_spec_for_smem_tests(), hardware=hw, sample_args=(0,),
+    )
+    out = tool(src)
+    assert "Compilation successful" in out
+
+    # Two JIT defs → resolved_name=='' → Kernel parses autotune with no
+    # target filter; legacy "first @autotune anywhere" behavior surfaces
+    # the SECOND function's decorator because that's the only one.
+    k = captured_kernels[0]
+    assert k.triton_kernel_name == ""
+    assert len(k.autotune_configs) == 4  # parsed from main_kernel's decorator
+
+
+def test_compile_tool_kernel_autotune_configs_target_aware_on_single_jit(monkeypatch):
+    """Single @triton.jit → resolved_name is that name. The constructor
+    parses ``autotune_configs`` filtered against that name, so a source
+    with a misplaced (and irrelevant) decorator above an unrelated function
+    doesn't pollute the primary kernel's configs.
+
+    This is the meaningful regression: previously ``Kernel(spec, src)``
+    parsed with name='', could pick up wrong @autotune; now the resolved
+    name flows into __post_init__ so the right target is matched.
+    """
+    from src.agents.coder import _make_compile_tool
+    from src.kernels.compiler import CompilationResult
+
+    captured_kernels: list = []
+
+    def _capture_compile(kernel, cache_dir=None):
+        captured_kernels.append(kernel)
+        return CompilationResult(
+            success=True, error_message="", compiled_fn=lambda: None,
+            triton_autotuner=None,
+        )
+
+    monkeypatch.setattr("src.agents.coder.compile_kernel", _capture_compile)
+
+    # Exactly one @triton.jit def → auto-derived name flows into ctor.
+    src = (
+        "import triton\n"
+        "import triton.language as tl\n"
+        "\n"
+        "@triton.autotune(\n"
+        "    configs=[\n"
+        '        triton.Config({"BLOCK": 64}, num_warps=2, num_stages=2),\n'
+        '        triton.Config({"BLOCK": 128}, num_warps=4, num_stages=2),\n'
+        '        triton.Config({"BLOCK": 64}, num_warps=4, num_stages=3),\n'
+        '        triton.Config({"BLOCK": 128}, num_warps=4, num_stages=4),\n'
+        "    ],\n"
+        '    key=["x"],\n'
+        ")\n"
+        "@triton.jit\n"
+        "def main_kernel(x_ptr, BLOCK: tl.constexpr):\n"
+        "    pass\n"
+    )
+
+    hw = _hw_with_smem()
+    tool = _make_compile_tool(
+        _make_kernel_spec_for_smem_tests(), hardware=hw, sample_args=(0,),
+    )
+    out = tool(src)
+    assert "Compilation successful" in out
+
+    k = captured_kernels[0]
+    assert k.triton_kernel_name == "main_kernel"
+    # autotune_configs was parsed against the resolved name, picks up
+    # the decorator above main_kernel.
+    assert len(k.autotune_configs) == 4
+
+
+# ── orchestrator K-way shared sample_args (fix #15) ────────────────────
+
+
+@pytest.mark.asyncio
+async def test_implement_accepts_shared_sample_args_kwarg():
+    """Orchestrator's K-way fan-out passes ``sample_args`` (computed once
+    per iter) to every parallel ``implement()`` so the K candidates share
+    one tuple object instead of pinning K copies through their closures.
+
+    This test verifies the kwarg is accepted and threaded into the
+    compile-tool factory; the cross-candidate-sharing semantics belong
+    in the orchestrator's test suite.
+    """
+    capture_agent, fake_run = _simulate_submission(_VALID_SOURCE, _VALID_NAME)
+
+    captured: dict = {}
+
+    def capture_compile_factory(*args, sample_args=None, **kwargs):
+        captured["sample_args"] = sample_args
+        return lambda src: "Compilation successful"
+
+    shared = ("shared", "tuple", "object")
+
+    with (
+        patch("src.agents.coder.Agent", side_effect=capture_agent),
+        patch("src.agents.coder.run_agent", new_callable=AsyncMock) as mock_run,
+        patch("src.agents.coder.make_run_config", return_value=None),
+        patch("src.agents.coder.function_tool", side_effect=lambda f: f),
+        patch("src.agents.coder._make_compile_tool", side_effect=capture_compile_factory),
+    ):
+        mock_run.side_effect = fake_run
+        agent = CoderAgent(model=MagicMock())
+        await agent.implement(
+            kernel_source="src",
+            plan=OptimizationPlan(tier=1, technique="t1"),
+            kernel_spec=_make_spec(),
+            reference_fn=_ref,
+            input_generators=[_gen],
+            iter_no=3,
+            sample_args=shared,
+        )
+
+    # The orchestrator-supplied tuple is the SAME object the factory saw —
+    # confirms no per-candidate regeneration via input_generators[0](0).
+    assert captured["sample_args"] is shared

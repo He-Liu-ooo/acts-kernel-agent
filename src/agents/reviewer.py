@@ -60,6 +60,7 @@ from src.agents.llm_backend import (
 from src.runtime.events import emit as events_emit
 
 if TYPE_CHECKING:
+    from src.config import HardwareSpec
     from src.eval.profiler import ProfilingResult
     from src.eval.roofline import RooflineResult
     from src.eval.types import BottleneckType
@@ -477,6 +478,7 @@ class ReviewerAgent:
         roofline: "RooflineResult | None" = None,
         reviewer_metric_queries: bool = False,
         sibling_context: str = "",
+        hardware: "HardwareSpec | None" = None,
     ) -> str:
         """Assemble the user prompt from runtime data.
 
@@ -490,7 +492,7 @@ class ReviewerAgent:
         sections: list[str] = []
 
         sections.append(render_kernel_section(kernel_source))
-        sections.append(render_run_context(bottleneck))
+        sections.append(render_run_context(bottleneck, hardware=hardware))
         if profiling is not None:
             sections.append(
                 "## Profiling summary\n"
@@ -568,6 +570,7 @@ class ReviewerAgent:
         iter_idx: int = 0,
         sibling_context: str = "",
         max_turns: int | None = None,
+        hardware: "HardwareSpec | None" = None,
     ) -> ReviewerFeedback:
         """Interpret eval results into structured Reviewer feedback.
 
@@ -613,6 +616,7 @@ class ReviewerAgent:
             roofline=roofline,
             reviewer_metric_queries=reviewer_metric_queries,
             sibling_context=sibling_context,
+            hardware=hardware,
         )
 
         captured: dict = {}

@@ -791,6 +791,7 @@ class Orchestrator:
                         prev_sol_score=None,
                         iter_idx=0,
                         max_turns=self._config.reviewer_max_turns,
+                        hardware=self._config.hardware,
                     )
             except Exception as exc:  # noqa: BLE001 — baseline review must not abort
                 logger.warning(
@@ -875,6 +876,7 @@ class Orchestrator:
                         bottleneck=run_bottleneck,
                         sibling_context=sibling_context,
                         max_turns=self._config.planner_max_turns,
+                        hardware=self._config.hardware,
                     )
             except PlanningError as exc:
                 logger.warning(
@@ -912,6 +914,21 @@ class Orchestrator:
             iter_failures: list[FailureDetail] = []
             iter_failure_kernels: list[tuple[int, "Kernel | None"]] = []
 
+            # Generate ``sample_args`` ONCE per iter and share across all K
+            # candidate Coder calls. K parallel ``implement()``s otherwise
+            # each pin a private tuple through their closures (~K× CUDA-
+            # memory footprint on large inputs). The recorder inside
+            # ``check_autotune_smem_budget`` only reads from this tuple,
+            # so sharing is safe. Fail-open: on generator error, leave
+            # None and let the SMEM check skip with ``sample_args_missing``.
+            # Codex P-LOW 2026-05-25, fix #15.
+            shared_sample_args: tuple | None = None
+            if input_generators:
+                try:
+                    shared_sample_args = input_generators[0](0)
+                except Exception:
+                    shared_sample_args = None
+
             async def _run_one_coder(_cand_idx: int):
                 # Per-call trace_span so ``UsageAccumulator.invocations``
                 # ticks K times per iter (a single outer span would close
@@ -928,6 +945,9 @@ class Orchestrator:
                         input_generators=input_generators,
                         definition=definition,
                         workloads=workloads,
+                        bottleneck=run_bottleneck,
+                        iter_no=iter_no,
+                        sample_args=shared_sample_args,
                     )
 
             candidate_results = await asyncio.gather(
@@ -1439,6 +1459,7 @@ class Orchestrator:
                         iter_idx=iter_no,
                         sibling_context=reviewer_sibling_context,
                         max_turns=self._config.reviewer_max_turns,
+                        hardware=self._config.hardware,
                     )
                 if feedback.degraded:
                     logger.warning(

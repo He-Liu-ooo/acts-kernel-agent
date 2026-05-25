@@ -45,19 +45,24 @@ if TYPE_CHECKING:
     from agents import OpenAIChatCompletionsModel as _Model
 
     from src.agents.planner import OptimizationPlan
+    from src.config import HardwareSpec
+    from src.eval.types import BottleneckType
 
 from src.agents.llm_backend import (
     SUBMIT_OK_SENTINEL,
     format_submit_validation_error,
     make_run_config,
     render_kernel_section,
+    render_run_context,
     run_agent,
 )
 from src.config import ACTSConfig
 from src.eval.correctness import ComparisonPolicy, verify_correctness
 from src.eval.profiler import triton_kernel_names_in
+from src.eval.smem_check import check_autotune_smem_budget
 from src.kernels.compiler import compile_kernel
 from src.kernels.kernel import Kernel, KernelSpec
+from src.runtime import events
 
 PROMPT_DIR = Path(__file__).resolve().parent.parent / "prompts" / "coder"
 
@@ -252,11 +257,131 @@ def _record_failure(error_log: list[str] | None, msg: str) -> str:
     return msg
 
 
+def _format_smem_violation(hardware: "HardwareSpec", violations: list) -> str:
+    """Build the ``Compile FAILED:`` string for Phase B SMEM overflow.
+
+    Parallel to ``_format_exclude_violation`` for ``autotune_exclude``;
+    names the cap, the offending configs, and the levers the Coder
+    should adjust. See spec §6.4 for the rendered format.
+    """
+    cap = hardware.shared_mem_per_block_bytes
+    lines = [
+        "Compile FAILED: shared-memory budget exceeded (ptxas-reported).",
+        f"Per-block SMEM cap on {hardware.name} "
+        f"(sm_{int(hardware.compute_capability * 10)}): "
+        f"{cap} B (~{cap // 1024} KB).",
+        "Offending @triton.autotune configs (ptxas-emitted SMEM, not estimate):",
+    ]
+    for v in violations:
+        kw_str = ", ".join(f"{k}={val}" for k, val in v.config_kwargs.items())
+        lines.append(
+            f"  config[{v.config_idx}] {{{kw_str}, "
+            f"num_warps={v.num_warps}, num_stages={v.num_stages}}} → "
+            f"{v.footprint} B (~{v.footprint // 1024} KB)"
+        )
+    lines.append(
+        "Reduce num_stages, shrink BLOCK_K, or shrink BLOCK_M/N. "
+        "The cap is in `## Run context` of your prompt."
+    )
+    lines.append(
+        "Re-submit @triton.autotune with updated configs; the ≥4-config "
+        "minimum still applies."
+    )
+    return "\n".join(lines)
+
+
+def _maybe_synth_dps_outputs(
+    host_wrapper_fn: Callable,
+    sample_args: tuple,
+    *,
+    iter_no: int | None = None,
+) -> tuple | None:
+    """Append synthesized output buffers to *sample_args* when the host
+    wrapper's signature requires more positional args than the generator
+    produces — the DPS pattern (``def kernel_fn(a, b, c)`` where ``c`` is
+    the pre-allocated output).
+
+    Returns the (possibly-extended) tuple on success, or ``None`` when the
+    synth heuristic can't infer the missing-arg shape (no torch / first
+    input not a tensor / inspect failure). Emits
+    ``smem_check_skipped(reason='dps_synth_failed', iter=iter_no)`` on the
+    None path so events.jsonl distinguishes this from the generic
+    ``host_wrapper_failed`` fail-open. Codex P-HIGH 2026-05-25, fix #1.
+    """
+    import inspect
+
+    try:
+        sig = inspect.signature(host_wrapper_fn)
+    except (TypeError, ValueError):
+        # Builtins / C-extensions without introspectable signatures —
+        # leave sample_args alone; the downstream warmup will report
+        # ``host_wrapper_failed`` if the shape is wrong.
+        return sample_args
+
+    positional_kinds = (
+        inspect.Parameter.POSITIONAL_ONLY,
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+    )
+    # Count required positional params (no default). VAR_POSITIONAL
+    # (*args) is unbounded → no synth needed; leave sample_args as-is.
+    required_positional = 0
+    has_var_positional = False
+    for p in sig.parameters.values():
+        if p.kind == inspect.Parameter.VAR_POSITIONAL:
+            has_var_positional = True
+            break
+        if p.kind in positional_kinds and p.default is inspect.Parameter.empty:
+            required_positional += 1
+
+    if has_var_positional or required_positional <= len(sample_args):
+        return sample_args
+
+    missing = required_positional - len(sample_args)
+    # The DPS convention: every extra positional is an output buffer
+    # shape-compatible with one of the inputs. We approximate via
+    # ``torch.empty_like(sample_args[0])`` per missing slot — works for
+    # matmul (``c`` shaped like ``a @ b`` mismatches but the recorder
+    # only needs SOMETHING that lets the wrapper drive past the alloc;
+    # the wrapper itself replaces the buffer on real allocation paths)
+    # and for elementwise DPS. Surfaces ``dps_synth_failed`` if torch
+    # is unavailable or the first input isn't a tensor.
+    try:
+        import torch
+    except ImportError:
+        events.emit(
+            "smem_check_skipped", role="coder", reason="dps_synth_failed",
+            iter=iter_no,
+        )
+        return None
+
+    first = sample_args[0] if sample_args else None
+    if not isinstance(first, torch.Tensor):
+        events.emit(
+            "smem_check_skipped", role="coder", reason="dps_synth_failed",
+            iter=iter_no,
+        )
+        return None
+
+    try:
+        extras = tuple(torch.empty_like(first) for _ in range(missing))
+    except Exception:
+        events.emit(
+            "smem_check_skipped", role="coder", reason="dps_synth_failed",
+            iter=iter_no,
+        )
+        return None
+
+    return tuple(sample_args) + extras
+
+
 def _make_compile_tool(
     kernel_spec: KernelSpec,
     cache_dir: Path | None = None,
     *,
     error_log: list[str] | None = None,
+    hardware: "HardwareSpec | None" = None,
+    sample_args: tuple | None = None,
+    iter_no: int | None = None,
 ) -> Callable[[str], str]:
     """Build a compile tool bound to a specific KernelSpec.
 
@@ -269,18 +394,128 @@ def _make_compile_tool(
     errors so they can ride out as ``ImplementationError.tool_errors``
     for cross-attempt memory. Success returns are not logged — they
     are not failures to remember.
+
+    *hardware* / *sample_args* — Phase B SMEM check (hw-spec injection
+    Task 5). When ``hardware.shared_mem_per_block_bytes > 0`` AND the
+    compiled kernel has a resolvable ``triton_autotuner`` AND
+    ``sample_args`` is provided, the tool calls
+    ``check_autotune_smem_budget`` after compile success. On overflow,
+    returns the structured rejection from ``_format_smem_violation`` so
+    the LLM's in-loop retry path can fix the autotune block. Missing
+    inputs (no hardware, no cap, no sample_args, no autotuner) skip
+    cleanly with a ``smem_check_skipped`` event.
     """
 
     def compile_kernel_tool(source_code: str) -> str:
-        kernel = Kernel(spec=kernel_spec, source_code=source_code)
+        # Auto-derive ``triton_kernel_name`` from source so ``compile_kernel``
+        # can resolve the autotuner for the Phase B SMEM check. The LLM
+        # only declares this name at ``submit_kernel`` time (later in the
+        # tool flow), so at compile_kernel_tool time we don't have it via
+        # the schema. Without this auto-derivation, every production iter
+        # falls into the ``no_autotuner`` skip path because
+        # ``_resolve_triton_autotuner`` short-circuits on
+        # ``kernel.triton_kernel_name == ""``. Codex P2 2026-05-25.
+        #
+        # Exactly-one ``@triton.jit def`` → use that name. Multiple or
+        # zero → leave empty, autotuner stays None, SMEM check skips
+        # cleanly via the existing ``no_autotuner`` branch. The Coder's
+        # later ``submit_kernel`` validator still cross-checks the
+        # LLM-declared name against the source independently.
+        #
+        # Pass the resolved name to the ``Kernel`` constructor so
+        # ``__post_init__`` parses ``autotune_configs`` / ``autotune_keys``
+        # against the right ``@triton.jit def`` — for multi-decorator
+        # sources, picking the wrong one silently mis-attributes the
+        # primary kernel's autotune block to a helper (Codex P-LOW
+        # 2026-05-25, fix #14).
+        jit_names = triton_kernel_names_in(source_code)
+        resolved_name = jit_names[0] if len(jit_names) == 1 else ""
+        kernel = Kernel(
+            spec=kernel_spec,
+            source_code=source_code,
+            triton_kernel_name=resolved_name,
+        )
         result = compile_kernel(kernel, cache_dir=cache_dir)
-        if result.success:
-            return (
-                f"Compilation successful (entrypoint: '{kernel_spec.entrypoint}')."
+        if not result.success:
+            return _record_failure(
+                error_log,
+                f"Compilation FAILED:\n{result.error_message}",
             )
-        return _record_failure(
-            error_log,
-            f"Compilation FAILED:\n{result.error_message}",
+
+        # Phase B SMEM check — fail-open on every "we don't know enough"
+        # condition; the compile/correctness gauntlet downstream still
+        # catches real overflows. The check exists to catch the OBVIOUS
+        # autotune-overcommit cases proactively, not as the sole guard.
+        if hardware is None or hardware.shared_mem_per_block_bytes == 0:
+            # Emit the documented telemetry so events.jsonl can distinguish
+            # "check ran and passed" from "check was bypassed because no
+            # cap was configured". Codex P3 2026-05-25.
+            events.emit(
+                "smem_check_skipped", role="coder", reason="no_hardware_cap",
+                iter=iter_no,
+            )
+        else:
+            if result.triton_autotuner is None:
+                events.emit(
+                    "smem_check_skipped", role="coder", reason="no_autotuner",
+                    iter=iter_no,
+                )
+            elif sample_args is None:
+                events.emit(
+                    "smem_check_skipped", role="coder", reason="sample_args_missing",
+                    iter=iter_no,
+                )
+            else:
+                # DPS host wrappers take pre-allocated output buffer(s) as
+                # positional args after the inputs (``def matmul(a, b, c)``),
+                # while ``sample_args`` from ``input_generators[0]`` carries
+                # only the user-facing inputs ``(a, b)``. Without synthesizing
+                # the missing positional, the recorder's
+                # ``host_wrapper_fn(*sample_args)`` raises TypeError → SMEM
+                # check fails open with the generic ``host_wrapper_failed``
+                # slug. Inspect the host-wrapper signature and append
+                # ``torch.empty_like`` of the first input tensor for each
+                # missing positional (the common DPS pattern: extras are
+                # output buffers shape-compatible with one of the inputs).
+                # Synth failure emits the distinct ``dps_synth_failed`` skip
+                # slug (fail-open). Codex P-HIGH 2026-05-25, fix #1.
+                effective_sample_args = _maybe_synth_dps_outputs(
+                    result.compiled_fn, sample_args, iter_no=iter_no,
+                )
+                if effective_sample_args is None:
+                    return (
+                        f"Compilation successful "
+                        f"(entrypoint: '{kernel_spec.entrypoint}')."
+                    )
+                # ``result.compiled_fn`` is the entrypoint callable resolved by
+                # ``compile_kernel`` — for production kernels this IS the host
+                # wrapper that derives c / M / N / K / strides and calls the
+                # JIT. The recorder inside ``check_autotune_smem_budget``
+                # drives this wrapper once to capture the full JIT args
+                # (Phase B recorder-patch redesign 2026-05-25; see spec §6.2).
+                violations = check_autotune_smem_budget(
+                    result.triton_autotuner,
+                    host_wrapper_fn=result.compiled_fn,
+                    sample_args=effective_sample_args,
+                    cap_bytes=hardware.shared_mem_per_block_bytes,
+                    iter_no=iter_no,
+                )
+                if violations:
+                    events.emit(
+                        "smem_overflow_detected",
+                        role="coder",
+                        violation_count=len(violations),
+                        worst_footprint_bytes=max(v.footprint for v in violations),
+                        cap_bytes=hardware.shared_mem_per_block_bytes,
+                        iter=iter_no,
+                    )
+                    return _record_failure(
+                        error_log,
+                        _format_smem_violation(hardware, violations),
+                    )
+
+        return (
+            f"Compilation successful (entrypoint: '{kernel_spec.entrypoint}')."
         )
 
     return compile_kernel_tool
@@ -501,6 +736,10 @@ class CoderAgent:
         self._model = model
         cfg = config or ACTSConfig()
         self._max_turns = 2 * cfg.max_debug_retries + 2
+        # Cached hardware spec — threaded into compile_kernel_tool for the
+        # Phase B SMEM check (see hw-spec-injection Task 5) and into
+        # build_user_prompt for the ## Run context hw block.
+        self._hardware = cfg.hardware
         if model is not None:
             self._instructions = (PROMPT_DIR / "system.md").read_text()
             self._translate_instructions = (PROMPT_DIR / "translate.md").read_text()
@@ -517,13 +756,31 @@ class CoderAgent:
     def build_user_prompt(
         kernel_source: str,
         plan: OptimizationPlan,
+        *,
+        bottleneck: "BottleneckType | None" = None,
+        hardware: "HardwareSpec | None" = None,
     ) -> str:
         """Assemble the user prompt from the current kernel and the plan.
 
         Reviewer feedback is intentionally not included — the Planner has
         already consumed it and distilled its conclusions into the plan.
+
+        ``bottleneck`` (when set) is rendered as a ``## Run context``
+        section between the kernel source and the plan; ``hardware``
+        (when set) appends the hw-budget block under the bottleneck line
+        (see ``render_run_context``). Both default None so existing
+        no-context call sites (test fixtures, placeholder paths) keep
+        working unchanged.
         """
         sections: list[str] = [render_kernel_section(kernel_source)]
+
+        # Render the Run-context block when EITHER signal is populated.
+        # The render helper itself tolerates ``bottleneck=None`` and emits
+        # a "not yet classified" line, so a hw-only configuration (baseline
+        # path before classification) still surfaces the SMEM cap. Mirrors
+        # the gate in ``build_translate_prompt``.
+        if bottleneck is not None or (hardware is not None and hardware.name):
+            sections.append(render_run_context(bottleneck, hardware=hardware))
 
         plan_lines = [
             f"- Tier: {plan.tier}",
@@ -556,13 +813,47 @@ class CoderAgent:
         definition: Any | None = None,
         workloads: list[Any] | None = None,
         plan: "OptimizationPlan | None" = None,
+        iter_no: int | None = None,
+        sample_args: tuple | None = None,
     ) -> KernelCodeOutput:
         # Shared across all three tool factories so every FAILED return
         # rides out via ``ImplementationError.tool_errors`` for the
         # baseline_generator's cross-attempt memory.
         tool_errors: list[str] = []
+        # Phase B SMEM check (hw-spec injection Task 5) needs one
+        # representative input tuple to call ``kernel.warmup()`` with so
+        # ptxas reports the actual SMEM footprint per Config.
+        #
+        # When the orchestrator provides ``sample_args`` (K-way fan-out:
+        # all K candidates share one tuple to avoid the K× CUDA-memory
+        # footprint pinned through their closures), use that. Otherwise
+        # synthesize once from the first input_generator (translate path,
+        # test fixtures). If generation fails or no generators are bound,
+        # the SMEM check skips with a ``sample_args_missing`` event
+        # (fail-open). Codex P-LOW 2026-05-25, fix #15.
+        if sample_args is None and input_generators:
+            try:
+                sample_args = input_generators[0](0)
+            except Exception:
+                sample_args = None
+        # Phase B SMEM check is gated on an actually-configured cap; a
+        # zero-cap spec (no YAML loaded, detect_hardware fallback) leaves
+        # the check off. The empty-name proxy used to overlap with this
+        # by accident — split the semantics so a populated cap with an
+        # empty name still runs the check. Codex P-LOW 2026-05-25, fix #13.
+        hw_for_check = (
+            self._hardware
+            if self._hardware.shared_mem_per_block_bytes > 0
+            else None
+        )
         compile_tool = function_tool(
-            _make_compile_tool(kernel_spec, error_log=tool_errors)
+            _make_compile_tool(
+                kernel_spec,
+                error_log=tool_errors,
+                hardware=hw_for_check,
+                sample_args=sample_args,
+                iter_no=iter_no,
+            )
         )
         correctness_tool = function_tool(
             _make_correctness_tool(
@@ -627,6 +918,9 @@ class CoderAgent:
         input_generators: list[Callable[[int], tuple]] | None = None,
         definition: Any | None = None,
         workloads: list[Any] | None = None,
+        bottleneck: "BottleneckType | None" = None,
+        iter_no: int | None = None,
+        sample_args: tuple | None = None,
     ) -> KernelCodeOutput:
         """Apply the optimization plan to the kernel source code.
 
@@ -661,13 +955,20 @@ class CoderAgent:
         return await self._run_tool_agent(
             agent_name="Coder",
             instructions=self._instructions,
-            prompt=self.build_user_prompt(kernel_source=kernel_source, plan=plan),
+            prompt=self.build_user_prompt(
+                kernel_source=kernel_source,
+                plan=plan,
+                bottleneck=bottleneck,
+                hardware=self._hardware if self._hardware.name else None,
+            ),
             kernel_spec=kernel_spec,
             reference_fn=reference_fn,
             input_generators=input_generators,
             definition=definition,
             workloads=workloads,
             plan=plan,
+            iter_no=iter_no,
+            sample_args=sample_args,
         )
 
     @staticmethod
@@ -676,6 +977,8 @@ class CoderAgent:
         kernel_spec: KernelSpec,
         *,
         prior_failures: Sequence[AttemptFailure] = (),
+        bottleneck: "BottleneckType | None" = None,
+        hardware: "HardwareSpec | None" = None,
     ) -> str:
         """Assemble the user prompt for a one-shot PyTorch→Triton port.
 
@@ -687,9 +990,23 @@ class CoderAgent:
         ``ImplementationError`` catch. Empty default = no section rendered
         (backward-compatible for callers that don't supply it). See
         ``doc/specs/2026-05-13-cross-attempt-memory-design.md``.
+
+        ``bottleneck`` / ``hardware`` (when set) render a ``## Run
+        context`` block so the Coder sees the hw budget when drafting
+        the baseline — the Phase B SMEM check fires in compile_kernel_tool
+        for translate() the same as for implement(), so the LLM benefits
+        from seeing the cap proactively.
         """
         safe_reference = reference_source.replace("```", r"\`\`\`")
         sections: list[str] = []
+
+        # render_run_context returns "" when both bottleneck and hardware
+        # are None; baseline-generation path passes bottleneck=None but
+        # has hardware → renders the hw block with a "not yet classified"
+        # bottleneck line so the Coder sees the SMEM cap on first attempt.
+        ctx = render_run_context(bottleneck, hardware=hardware)
+        if ctx:
+            sections.append(ctx)
 
         if prior_failures:
             intro = (
@@ -737,6 +1054,8 @@ class CoderAgent:
         definition: Any | None = None,
         workloads: list[Any] | None = None,
         prior_failures: Sequence[AttemptFailure] = (),
+        bottleneck: "BottleneckType | None" = None,
+        iter_no: int | None = None,
     ) -> KernelCodeOutput:
         """Port a PyTorch reference into a Triton kernel in one agent run.
 
@@ -772,10 +1091,13 @@ class CoderAgent:
                 reference_source=reference_source,
                 kernel_spec=kernel_spec,
                 prior_failures=prior_failures,
+                bottleneck=bottleneck,
+                hardware=self._hardware if self._hardware.name else None,
             ),
             kernel_spec=kernel_spec,
             reference_fn=reference_fn,
             input_generators=input_generators,
             definition=definition,
             workloads=workloads,
+            iter_no=iter_no,
         )

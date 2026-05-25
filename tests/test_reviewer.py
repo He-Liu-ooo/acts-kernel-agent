@@ -1734,3 +1734,33 @@ def test_reviewer_prompt_omits_sibling_section_when_empty():
         sibling_context="",
     )
     assert "## Siblings already tried" not in prompt
+
+
+# ── hw-spec injection (hw-spec injection Task 3) ───────────────────────
+
+
+def test_reviewer_build_user_prompt_threads_hardware_through_render_run_context():
+    """Hardware kwarg reaches render_run_context so the hw block lands in the prompt."""
+    from src.agents.reviewer import ReviewerAgent
+    from src.config import HardwareSpec
+
+    hw = HardwareSpec(
+        name="TestGPU",
+        compute_capability=8.9,
+        freq_GHz=2.0,
+        DRAM_byte_per_cycle=400,
+        MAC_per_cycle_fp32_sm=1000,
+        shared_mem_per_block_bytes=101376,
+        shared_mem_per_multiprocessor_bytes=102400,
+    )
+    agent = ReviewerAgent(model=None)
+    prompt = agent.build_user_prompt(
+        kernel_source="def x(): pass",
+        profiling_summary="...",
+        sol_score=0.5,
+        headroom_pct=50.0,
+        bottleneck=BottleneckType.MEMORY_BOUND,
+        hardware=hw,
+    )
+    assert "Hardware: TestGPU" in prompt
+    assert "Shared mem per block: 101376 B" in prompt
