@@ -710,6 +710,16 @@ class Orchestrator:
         # len(workloads) < 2 or workloads is None.
         repr_idx = (len(workloads) // 2) if workloads else 0
 
+        # Workload shapes for the ``## Run context`` block — derived once
+        # from ``Workload.axes.values()`` (SOL's canonical dict-of-int
+        # axes). Threaded into every Planner / Reviewer / Coder call so
+        # the agents reason against the iter-time shape envelope instead
+        # of a single representative. None when the placeholder path runs
+        # (no workloads) — render_run_context omits the line.
+        workload_shapes_for_prompt: list[tuple[int, ...]] | None = (
+            [tuple(w.axes.values()) for w in workloads] if workloads else None
+        )
+
         # Per-iteration (flops, nbytes) are invariant across the run —
         # derived from (definition, representative workload) or from the
         # baseline spec in the placeholder path — so hoist them out of
@@ -792,6 +802,7 @@ class Orchestrator:
                         iter_idx=0,
                         max_turns=self._config.reviewer_max_turns,
                         hardware=self._config.hardware,
+                        workload_shapes=workload_shapes_for_prompt,
                     )
             except Exception as exc:  # noqa: BLE001 — baseline review must not abort
                 logger.warning(
@@ -877,6 +888,7 @@ class Orchestrator:
                         sibling_context=sibling_context,
                         max_turns=self._config.planner_max_turns,
                         hardware=self._config.hardware,
+                        workload_shapes=workload_shapes_for_prompt,
                     )
             except PlanningError as exc:
                 logger.warning(
@@ -948,6 +960,7 @@ class Orchestrator:
                         bottleneck=run_bottleneck,
                         iter_no=iter_no,
                         sample_args=shared_sample_args,
+                        workload_shapes=workload_shapes_for_prompt,
                     )
 
             candidate_results = await asyncio.gather(
@@ -1460,6 +1473,7 @@ class Orchestrator:
                         sibling_context=reviewer_sibling_context,
                         max_turns=self._config.reviewer_max_turns,
                         hardware=self._config.hardware,
+                        workload_shapes=workload_shapes_for_prompt,
                     )
                 if feedback.degraded:
                     logger.warning(

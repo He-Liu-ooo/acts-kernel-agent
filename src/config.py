@@ -62,6 +62,14 @@ class HardwareSpec:
     # SMEM at detect_hardware() time; 0 means unknown (callers skip checks).
     shared_mem_per_block_bytes: int = 0
     shared_mem_per_multiprocessor_bytes: int = 0
+    # Device counters surfaced into the ``## Run context`` prompt block so
+    # agents can reason about grid sizing (sm_count) and num_warps ceilings
+    # (max_threads_per_block). Sourced from
+    # ``torch.cuda.get_device_properties().multi_processor_count`` and
+    # ``.max_threads_per_block`` at detect_hardware() time; 0 means unknown
+    # and the renderer omits the corresponding line.
+    sm_count: int = 0
+    max_threads_per_block: int = 0
 
     # ── derived properties ────────────────────────────────────────────────
 
@@ -131,6 +139,8 @@ def load_hardware_spec(path: Path) -> HardwareSpec:
         MAC_per_cycle_nvfp4_tc=raw.get("MAC_per_cycle_nvfp4_tc", 0.0),
         shared_mem_per_block_bytes=raw.get("shared_mem_per_block_bytes", 0),
         shared_mem_per_multiprocessor_bytes=raw.get("shared_mem_per_multiprocessor_bytes", 0),
+        sm_count=raw.get("sm_count", 0),
+        max_threads_per_block=raw.get("max_threads_per_block", 0),
     )
 
 
@@ -469,6 +479,8 @@ def detect_hardware() -> HardwareSpec:
     shared_mem_per_multiprocessor_bytes = getattr(
         props, "shared_memory_per_multiprocessor", 0,
     )
+    sm_count = getattr(props, "multi_processor_count", 0)
+    max_threads_per_block = getattr(props, "max_threads_per_block", 0)
     detected = HardwareSpec(
         name=props.name,
         freq_GHz=props.clock_rate / 1_000_000,  # kHz → GHz
@@ -477,6 +489,8 @@ def detect_hardware() -> HardwareSpec:
         DRAM_capacity=props.total_memory,
         shared_mem_per_block_bytes=shared_mem_per_block_bytes,
         shared_mem_per_multiprocessor_bytes=shared_mem_per_multiprocessor_bytes,
+        sm_count=sm_count,
+        max_threads_per_block=max_threads_per_block,
     )
 
     yaml_path = _lookup_arch_yaml(detected.name)
@@ -515,6 +529,10 @@ def detect_hardware() -> HardwareSpec:
         shared_mem_per_multiprocessor_bytes=(
             detected.shared_mem_per_multiprocessor_bytes
             or yaml_spec.shared_mem_per_multiprocessor_bytes
+        ),
+        sm_count=detected.sm_count or yaml_spec.sm_count,
+        max_threads_per_block=(
+            detected.max_threads_per_block or yaml_spec.max_threads_per_block
         ),
     )
 
@@ -591,6 +609,23 @@ def validate_hardware_spec(spec: HardwareSpec, detected: HardwareSpec) -> list[s
                 f"spec={spec.shared_mem_per_multiprocessor_bytes} B "
                 f"(name={spec.name!r}), "
                 f"detected={detected.shared_mem_per_multiprocessor_bytes} B "
+                f"(name={detected.name!r})"
+            )
+    if spec.sm_count > 0 and detected.sm_count > 0:
+        ratio = spec.sm_count / detected.sm_count
+        if ratio < 0.9 or ratio > 1.1:
+            issues.append(
+                f"sm_count mismatch: spec={spec.sm_count} "
+                f"(name={spec.name!r}), detected={detected.sm_count} "
+                f"(name={detected.name!r})"
+            )
+    if spec.max_threads_per_block > 0 and detected.max_threads_per_block > 0:
+        ratio = spec.max_threads_per_block / detected.max_threads_per_block
+        if ratio < 0.9 or ratio > 1.1:
+            issues.append(
+                f"max_threads_per_block mismatch: "
+                f"spec={spec.max_threads_per_block} "
+                f"(name={spec.name!r}), detected={detected.max_threads_per_block} "
                 f"(name={detected.name!r})"
             )
     return issues

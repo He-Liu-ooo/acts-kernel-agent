@@ -110,11 +110,11 @@ The companion prompt-side surface lives in the agents layer: `src/agents/llm_bac
 1. `Hardware: <name> (sm_<compute_capability>)`
 2. `Shared mem per block: <cap_B> B (~<cap_KB> KB)`
 3. `Shared mem per SM: <per_sm_B> B (~<per_sm_KB> KB)`
-4. `Peak FLOPS (<dtype_label>): <peak> TFLOPS` — `dtype_label` is the dominant-dtype label (highest of `peak_flops_fp32`, `peak_flops_bf16`, `peak_flops_fp16`; ties joined by `/` in alphabetical order, so Ada-class hardware where bf16 and fp16 tie renders `Peak FLOPS (bf16/fp16):`).
+4. `Peak FLOPS (TFLOPS): <dtype>=<peak> · <dtype>=<peak> · ...` — every non-zero dtype peak across `{fp32, tf32, bf16, fp16, fp8, nvfp4}` rendered on one line sorted by value descending, tied dtypes grouped alphabetically with `/`. Ada-class hardware where bf16 and fp16 tie renders `Peak FLOPS (TFLOPS): fp8=728.4 · bf16/fp16=364.2 · fp32=91.1`. Omitted entirely when every peak is 0.0. Replaces the prior single-dominant-dtype pick — see `doc/config.md` "Multi-dtype peak rendering" for rationale.
 5. `Peak DRAM bandwidth: <gb_s> GB/s`
 6. `Per-Config shared-mem rule: num_stages × (input_tile_elements_loaded_to_smem) × dtype_bytes ≤ <cap>` — phrased naming-agnostic so the prompt doesn't presume any specific meta-param naming convention. The actual ptxas-truth SMEM check (which fires the `smem_overflow_detected` / `smem_check_skipped` events above) reads `CompiledKernel.metadata.shared` and is naming-free.
 
-See [`doc/specs/2026-05-24-coding-hw-spec-design.md`](specs/2026-05-24-coding-hw-spec-design.md) §5.1 (rendered block + dominant-dtype rule) and §9 (event payloads) for the design rationale.
+See [`doc/specs/2026-05-24-coding-hw-spec-design.md`](specs/2026-05-24-coding-hw-spec-design.md) §5.1 (rendered block) and §9 (event payloads) for the design rationale. The dominant-dtype rule originally specified there was retired 2026-05-25 in favor of multi-dtype peak rendering — see `doc/config.md` "Multi-dtype peak rendering" for the current contract.
 
 Notable semantics:
 

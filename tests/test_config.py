@@ -825,3 +825,50 @@ def test_validate_hardware_spec_flags_smem_mismatch_over_threshold():
     detected = HardwareSpec(name="X", shared_mem_per_block_bytes=101376)
     issues = validate_hardware_spec(yaml_spec, detected)
     assert any("shared_mem_per_block" in i for i in issues)
+
+
+# ── HardwareSpec count fields (run-context enrichment, 2026-05-25) ─────
+
+
+_COUNT_YAML = """\
+name: "TestGPU"
+freq_GHz: 2.0
+compute_capability: 8.9
+sm_count: 142
+max_threads_per_block: 1024
+"""
+
+
+def test_hardware_spec_new_count_fields_load_from_yaml():
+    """YAML carries the two new count fields; load_hardware_spec reads them."""
+    spec = load_hardware_spec(_write_yaml(_COUNT_YAML))
+    assert spec.sm_count == 142
+    assert spec.max_threads_per_block == 1024
+
+
+def test_detect_hardware_populates_count_fields():
+    """detect_hardware reads multi_processor_count + max_threads_per_block via getattr."""
+    props = SimpleNamespace(
+        name="FakeGPU",
+        major=8, minor=9,
+        total_memory=48 * 1024**3,
+        L2_cache_size=96 * 1024**2,
+        clock_rate=2_505_000,
+        shared_memory_per_block_optin=101376,
+        shared_memory_per_multiprocessor=102400,
+        multi_processor_count=142,
+        max_threads_per_block=1024,
+    )
+    fake = _fake_torch(cuda_available=True, props=props)
+    with patch.dict(sys.modules, {"torch": fake}):
+        spec = detect_hardware()
+    assert spec.sm_count == 142
+    assert spec.max_threads_per_block == 1024
+
+
+def test_validate_hardware_spec_flags_sm_count_mismatch():
+    """A >10% diff in ``sm_count`` triggers a warning."""
+    yaml_spec = HardwareSpec(name="X", sm_count=80)
+    detected = HardwareSpec(name="X", sm_count=142)
+    issues = validate_hardware_spec(yaml_spec, detected)
+    assert any("sm_count" in i for i in issues)

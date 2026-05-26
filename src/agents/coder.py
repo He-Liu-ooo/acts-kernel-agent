@@ -759,6 +759,7 @@ class CoderAgent:
         *,
         bottleneck: "BottleneckType | None" = None,
         hardware: "HardwareSpec | None" = None,
+        workload_shapes: list[tuple[int, ...]] | None = None,
     ) -> str:
         """Assemble the user prompt from the current kernel and the plan.
 
@@ -768,9 +769,10 @@ class CoderAgent:
         ``bottleneck`` (when set) is rendered as a ``## Run context``
         section between the kernel source and the plan; ``hardware``
         (when set) appends the hw-budget block under the bottleneck line
-        (see ``render_run_context``). Both default None so existing
-        no-context call sites (test fixtures, placeholder paths) keep
-        working unchanged.
+        (see ``render_run_context``). ``workload_shapes`` (when supplied
+        + non-empty) appends a Workload-shapes line. Both / all default
+        None so existing no-context call sites (test fixtures, placeholder
+        paths) keep working unchanged.
         """
         sections: list[str] = [render_kernel_section(kernel_source)]
 
@@ -780,7 +782,13 @@ class CoderAgent:
         # path before classification) still surfaces the SMEM cap. Mirrors
         # the gate in ``build_translate_prompt``.
         if bottleneck is not None or (hardware is not None and hardware.name):
-            sections.append(render_run_context(bottleneck, hardware=hardware))
+            sections.append(
+                render_run_context(
+                    bottleneck,
+                    hardware=hardware,
+                    workload_shapes=workload_shapes,
+                )
+            )
 
         plan_lines = [
             f"- Tier: {plan.tier}",
@@ -921,6 +929,7 @@ class CoderAgent:
         bottleneck: "BottleneckType | None" = None,
         iter_no: int | None = None,
         sample_args: tuple | None = None,
+        workload_shapes: list[tuple[int, ...]] | None = None,
     ) -> KernelCodeOutput:
         """Apply the optimization plan to the kernel source code.
 
@@ -960,6 +969,7 @@ class CoderAgent:
                 plan=plan,
                 bottleneck=bottleneck,
                 hardware=self._hardware if self._hardware.name else None,
+                workload_shapes=workload_shapes,
             ),
             kernel_spec=kernel_spec,
             reference_fn=reference_fn,
@@ -979,6 +989,7 @@ class CoderAgent:
         prior_failures: Sequence[AttemptFailure] = (),
         bottleneck: "BottleneckType | None" = None,
         hardware: "HardwareSpec | None" = None,
+        workload_shapes: list[tuple[int, ...]] | None = None,
     ) -> str:
         """Assemble the user prompt for a one-shot PyTorch→Triton port.
 
@@ -1004,7 +1015,9 @@ class CoderAgent:
         # are None; baseline-generation path passes bottleneck=None but
         # has hardware → renders the hw block with a "not yet classified"
         # bottleneck line so the Coder sees the SMEM cap on first attempt.
-        ctx = render_run_context(bottleneck, hardware=hardware)
+        ctx = render_run_context(
+            bottleneck, hardware=hardware, workload_shapes=workload_shapes,
+        )
         if ctx:
             sections.append(ctx)
 
@@ -1056,6 +1069,7 @@ class CoderAgent:
         prior_failures: Sequence[AttemptFailure] = (),
         bottleneck: "BottleneckType | None" = None,
         iter_no: int | None = None,
+        workload_shapes: list[tuple[int, ...]] | None = None,
     ) -> KernelCodeOutput:
         """Port a PyTorch reference into a Triton kernel in one agent run.
 
@@ -1093,6 +1107,7 @@ class CoderAgent:
                 prior_failures=prior_failures,
                 bottleneck=bottleneck,
                 hardware=self._hardware if self._hardware.name else None,
+                workload_shapes=workload_shapes,
             ),
             kernel_spec=kernel_spec,
             reference_fn=reference_fn,

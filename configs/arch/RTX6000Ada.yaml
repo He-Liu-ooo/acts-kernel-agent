@@ -21,3 +21,5 @@ MAC_per_cycle_int8_tc: 145409   # 728.5 TOPS dense
 # Per-launch shared memory (Ada AD102 datasheet):
 shared_mem_per_block_bytes: 101376              # 99 KB opt-in per-CTA cap
 shared_mem_per_multiprocessor_bytes: 102400     # 100 KB per-SM total
+sm_count: 142                                   # Ada AD102 datasheet
+max_threads_per_block: 1024

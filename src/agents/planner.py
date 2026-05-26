@@ -195,6 +195,7 @@ class PlannerAgent:
         bottleneck: BottleneckType | None = None,
         sibling_context: str = "",
         hardware: "HardwareSpec | None" = None,
+        workload_shapes: list[tuple[int, ...]] | None = None,
     ) -> str:
         """Assemble the user prompt from runtime data.
 
@@ -202,13 +203,21 @@ class PlannerAgent:
         "## Run context" section so the Planner sees the once-per-run
         classification up front instead of having to reparse it from a
         profiling summary. ``hardware`` (when set) appends a hw-budget
-        block to the same Run-context section — see render_run_context.
+        block to the same Run-context section. ``workload_shapes`` (when
+        set + non-empty) appends a Workload-shapes line at the end of
+        the Run-context block. See render_run_context.
         """
         sections: list[str] = []
 
         sections.append(render_kernel_section(kernel_source))
         if bottleneck is not None or (hardware is not None and hardware.name):
-            sections.append(render_run_context(bottleneck, hardware=hardware))
+            sections.append(
+                render_run_context(
+                    bottleneck,
+                    hardware=hardware,
+                    workload_shapes=workload_shapes,
+                )
+            )
         sections.append("## Profiling summary\n" + profiling_summary)
 
         if past_experiences:
@@ -257,6 +266,7 @@ class PlannerAgent:
         sibling_context: str = "",
         max_turns: int | None = None,
         hardware: "HardwareSpec | None" = None,
+        workload_shapes: list[tuple[int, ...]] | None = None,
     ) -> OptimizationPlan:
         """Generate a structured optimization plan for the next iteration.
 
@@ -281,6 +291,7 @@ class PlannerAgent:
             bottleneck=bottleneck,
             sibling_context=sibling_context,
             hardware=hardware,
+            workload_shapes=workload_shapes,
         )
 
         captured: dict = {}

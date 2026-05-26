@@ -255,13 +255,21 @@ def check_autotune_smem_budget(
         )
         try:
             autotuner.fn.warmup(*recorded_args, **call_kwargs)
-        except Exception:
+        except Exception as exc:
+            # Surface the swallowed exception in the event payload so
+            # postmortems can distinguish TypeError (constexpr missing
+            # from cfg.kwargs — common with warp-spec / persistent-grid
+            # kernels) from ptxas crash / OOM / etc. ``exc_msg`` capped
+            # at 160 chars to bound events.jsonl bloat from long Triton
+            # tracebacks. Trigger run: run_20260525T080053_565567Z.
             events.emit(
                 "smem_check_skipped",
                 iter=iter_no,
                 role="coder",
                 reason="warmup_failed",
                 config_idx=i,
+                exc_class=type(exc).__name__,
+                exc_msg=str(exc)[:160],
             )
             continue
         compiled = _latest_cache_entry(autotuner.fn)

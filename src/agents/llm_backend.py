@@ -310,16 +310,71 @@ def render_kernel_section(kernel_source: str) -> str:
     return "## Current kernel\n```python\n" + safe_source + "\n```"
 
 
+def _tensor_core_tile_for(
+    compute_capability: float, dominant_dtype: str
+) -> str | None:
+    """Look up the canonical Tensor Core tile shape for an arch + dtype.
+
+    Returns the per-arch native tile (e.g. ``"m16n16k16"`` for fp16 on
+    Ampere/Ada) so the renderer can surface BLOCK_K guidance to the Coder.
+    Returns ``None`` when:
+    - ``compute_capability < 7.0`` (pre-Volta, no Tensor Cores),
+    - the arch supports Tensor Cores but not for *this* dtype
+      (e.g. fp8 on Volta/Turing/Ampere),
+    - the arch is unknown (defensive default).
+
+    Ties in ``dominant_dtype`` are slash-joined (e.g. ``"bf16/fp16"``) by
+    the caller; this helper picks the alphabetical-first member, matching
+    the rest of the rendering convention.
+    """
+    if compute_capability < 7.0:
+        return None
+    dtype = dominant_dtype.split("/")[0] if "/" in dominant_dtype else dominant_dtype
+
+    # Volta + Turing: fp16 only on Tensor Cores.
+    if 7.0 <= compute_capability < 8.0:
+        if dtype == "fp16":
+            return "m16n16k16"
+        return None
+    # Ampere: fp16/bf16 → m16n16k16, tf32 → m16n16k8.
+    if 8.0 <= compute_capability < 8.9:
+        if dtype in ("fp16", "bf16"):
+            return "m16n16k16"
+        if dtype == "tf32":
+            return "m16n16k8"
+        return None
+    # Ada (sm_89): Ampere set + fp8 → m16n16k32.
+    if compute_capability == 8.9:
+        if dtype in ("fp16", "bf16"):
+            return "m16n16k16"
+        if dtype == "tf32":
+            return "m16n16k8"
+        if dtype == "fp8":
+            return "m16n16k32"
+        return None
+    # Hopper (sm_90): WGMMA family — single prose descriptor.
+    if compute_capability == 9.0:
+        return "WGMMA m64×N×K (N multiple of 8; K=16 for fp16/bf16, 32 for fp8)"
+    # Blackwell (sm_100+): tcgen05 placeholder — exact tile shapes are
+    # still moving; render a pointer instead of risking a stale literal.
+    if compute_capability >= 10.0:
+        return "tcgen05 — see docs"
+    return None
+
+
 def render_run_context(
     bottleneck: "BottleneckType | None" = None,
     *,
     hardware: "HardwareSpec | None" = None,
+    workload_shapes: list[tuple[int, ...]] | None = None,
 ) -> str:
     """Render the once-per-run context section shared by all three agent prompts.
 
-    The ``hardware`` kwarg appends a 6-line hw budget block under the
-    bottleneck line. ``hardware=None`` or an empty-named ``HardwareSpec``
-    (no spec configured) falls back to bottleneck-only.
+    The ``hardware`` kwarg appends the hw-budget block under the bottleneck
+    line: SMEM caps, SM count, max threads/block, L2 cache, peak FLOPS
+    table, peak DRAM bandwidth, Tensor Core tile descriptor, and the
+    per-Config SMEM rule. ``hardware=None`` or an empty-named
+    ``HardwareSpec`` (no spec configured) falls back to bottleneck-only.
 
     ``bottleneck=None`` is supported for the baseline-generation path
     (``CoderAgent.translate``) where the once-per-run bottleneck has not
@@ -328,6 +383,13 @@ def render_run_context(
     (baseline generation)". When BOTH bottleneck and hardware are None,
     returns the empty string so the caller can skip section emission
     without a guard.
+
+    ``workload_shapes`` (when supplied + non-empty) appends a "Workload
+    shapes:" line after the hw block. Up to 3 shapes render literally as
+    tuples; more than 3 summarize as per-dim min-max ranges with the
+    total count. Tuple shape is caller-defined (each element is whatever
+    dim ordering the orchestrator passes — typically `(M, N, K)` for
+    matmul-shape problems, derived from `Workload.axes.values()`).
 
     Per the hw-spec-injection spec (doc/specs/2026-05-24-coding-hw-spec-
     design.md §5.1), the rule line is rendered in NAMING-AGNOSTIC prose
@@ -348,11 +410,15 @@ def render_run_context(
     else:
         lines.append("- Bottleneck (this run): not yet classified (baseline generation)")
     if has_hw:
-        # Dominant-dtype selection per spec §3 decision 8: highest of the
-        # derived peak-FLOPS properties; ties joined by '/' in alphabetical
-        # order. Includes Hopper/Blackwell low-precision Tensor Core peaks
-        # (fp8, nvfp4) and tf32 — int8 is omitted because it's TOPS, not
-        # TFLOPS (different unit).
+        # All non-zero dtype peaks render together, sorted descending by
+        # value, with ties grouped (alphabetical, '/'-joined). Replaces
+        # the prior single-dominant-dtype pick (spec §3 decision 8) — on
+        # Ada/Hopper that picked fp8 as "dominant" and a bf16-workload
+        # LLM would measure pct_peak against the wrong ceiling. Showing
+        # every peak lets the LLM (and the Reviewer's pct_peak prose)
+        # pick the right one for its workload dtype. Includes
+        # Hopper/Blackwell low-precision Tensor Core peaks (fp8, nvfp4)
+        # and tf32 — int8 is omitted because it's TOPS, not TFLOPS.
         dtype_peaks = {
             "fp32": hardware.peak_flops_fp32,
             "tf32": hardware.peak_flops_tf32,
@@ -361,7 +427,6 @@ def render_run_context(
             "fp8": hardware.peak_flops_fp8,
             "nvfp4": hardware.peak_flops_nvfp4,
         }
-        max_peak = max(dtype_peaks.values())
         cap = hardware.shared_mem_per_block_bytes
         per_sm = hardware.shared_mem_per_multiprocessor_bytes
         # CUDA convention: sm_<major><minor> as concatenated integers
@@ -373,16 +438,96 @@ def render_run_context(
             f"- Shared mem per block: {cap} B (~{cap // 1024} KB)",
             f"- Shared mem per SM: {per_sm} B (~{per_sm // 1024} KB)",
         ])
+        # SM count + max threads/block — agents use these for grid sizing
+        # and num_warps ceilings respectively. Omit each line when the
+        # underlying HardwareSpec field is 0 (mirrors the zero-peak-FLOPS
+        # omit policy from fix #7).
+        if hardware.sm_count > 0:
+            lines.append(f"- SM count: {hardware.sm_count}")
+        if hardware.max_threads_per_block > 0:
+            max_warps = hardware.max_threads_per_block // 32
+            lines.append(
+                f"- Max threads per block: {hardware.max_threads_per_block} "
+                f"(warp size 32 → num_warps ≤ {max_warps})"
+            )
+        # L2 cache — Triton can't control L2 directly but knowing the
+        # capacity informs tile-reuse reasoning (does the working set
+        # fit in L2 across SMs?). Surfaced from SRAM_capacity.
+        if hardware.SRAM_capacity > 0:
+            l2_mib = hardware.SRAM_capacity // (1024 * 1024)
+            lines.append(
+                f"- L2 cache: {hardware.SRAM_capacity} B (~{l2_mib} MiB)"
+            )
         # When the operator hasn't populated any MAC_per_cycle_* fields,
-        # every peak is 0 — rendering "Peak FLOPS (bf16/fp16/.../fp32): 0.0
-        # TFLOPS" is meaningless and misleading. Skip the line entirely.
-        if max_peak > 0:
-            dominant = sorted(d for d, p in dtype_peaks.items() if p == max_peak)
-            dtype_label = "/".join(dominant)
-            lines.append(f"- Peak FLOPS ({dtype_label}): {max_peak:.1f} TFLOPS")
-        lines.extend([
-            f"- Peak DRAM bandwidth: {hardware.peak_memory_bandwidth_gb_s:.0f} GB/s",
+        # every peak is 0 — skip the line entirely rather than emit a
+        # meaningless "0.0 TFLOPS" entry. Otherwise group ties (peaks
+        # within 1e-3 TFLOPS are considered equal — guards against
+        # float-equality false-misses from arithmetic in `peak_flops_*`
+        # properties) and render highest-to-lowest.
+        nonzero = [(d, p) for d, p in dtype_peaks.items() if p > 0]
+        dominant_dtype: str | None = None
+        if nonzero:
+            by_value: dict[float, list[str]] = {}
+            for d, p in nonzero:
+                # Bucket by rounded value so bf16==fp16 ties resolve
+                # even when derived from independent properties.
+                key = round(p, 3)
+                by_value.setdefault(key, []).append(d)
+            entries = []
+            sorted_peaks = sorted(by_value, reverse=True)
+            for p in sorted_peaks:
+                names = "/".join(sorted(by_value[p]))
+                entries.append(f"{names}={p:.1f}")
+            lines.append(
+                f"- Peak FLOPS (TFLOPS): {' · '.join(entries)}"
+            )
+            # Dominant-dtype pick for the Tensor Core tile lookup only —
+            # the slash-joined name of the highest-peak group (e.g.
+            # "bf16/fp16" when those tie at Ada's TC peak). Renderer
+            # passes this slug through to _tensor_core_tile_for, which
+            # picks the alphabetical-first member internally.
+            top = sorted_peaks[0]
+            dominant_dtype = "/".join(sorted(by_value[top]))
+        lines.append(
+            f"- Peak DRAM bandwidth: {hardware.peak_memory_bandwidth_gb_s:.0f} GB/s"
+        )
+        # Tensor Core tile descriptor — derived from compute_capability +
+        # dominant_dtype, omitted when the helper returns None (pre-Volta,
+        # unsupported dtype on this arch, or unknown arch).
+        if dominant_dtype is not None:
+            tc_tile = _tensor_core_tile_for(
+                hardware.compute_capability, dominant_dtype
+            )
+            if tc_tile is not None:
+                lines.append(
+                    f"- Tensor Core tile ({dominant_dtype}): {tc_tile}"
+                )
+        lines.append(
             f"- Per-Config shared-mem rule: num_stages × "
-            f"(input_tile_elements_loaded_to_smem) × dtype_bytes ≤ {cap}",
-        ])
+            f"(input_tile_elements_loaded_to_smem) × dtype_bytes ≤ {cap}"
+        )
+
+    # Workload shapes — appended after the hw block when the orchestrator
+    # supplies the iter-time workload set. Short lists render literally;
+    # long lists summarize as per-dim min-max ranges with the count.
+    if workload_shapes:
+        if len(workload_shapes) <= 3:
+            shape_str = ", ".join(
+                "(" + ", ".join(str(v) for v in s) + ")" for s in workload_shapes
+            )
+            lines.append(f"- Workload shapes: {shape_str}")
+        else:
+            # Per-dim min-max — uses the first shape's length as the dim
+            # count; ragged shapes (mixed lengths) fall back to the
+            # shortest common prefix to avoid index-out-of-range on
+            # off-axis dims.
+            min_len = min(len(s) for s in workload_shapes)
+            ranges = []
+            for dim_idx in range(min_len):
+                vals = [s[dim_idx] for s in workload_shapes]
+                ranges.append(f"{min(vals)}-{max(vals)}")
+            lines.append(
+                f"- Workload shapes: (N={len(workload_shapes)}) "
+                f"ranges {{{', '.join(ranges)}}}"
+            )
     return "\n".join(lines)

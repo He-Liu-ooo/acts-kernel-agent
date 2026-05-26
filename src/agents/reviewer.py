@@ -479,6 +479,7 @@ class ReviewerAgent:
         reviewer_metric_queries: bool = False,
         sibling_context: str = "",
         hardware: "HardwareSpec | None" = None,
+        workload_shapes: list[tuple[int, ...]] | None = None,
     ) -> str:
         """Assemble the user prompt from runtime data.
 
@@ -492,7 +493,13 @@ class ReviewerAgent:
         sections: list[str] = []
 
         sections.append(render_kernel_section(kernel_source))
-        sections.append(render_run_context(bottleneck, hardware=hardware))
+        sections.append(
+            render_run_context(
+                bottleneck,
+                hardware=hardware,
+                workload_shapes=workload_shapes,
+            )
+        )
         if profiling is not None:
             sections.append(
                 "## Profiling summary\n"
@@ -571,6 +578,7 @@ class ReviewerAgent:
         sibling_context: str = "",
         max_turns: int | None = None,
         hardware: "HardwareSpec | None" = None,
+        workload_shapes: list[tuple[int, ...]] | None = None,
     ) -> ReviewerFeedback:
         """Interpret eval results into structured Reviewer feedback.
 
@@ -617,6 +625,7 @@ class ReviewerAgent:
             reviewer_metric_queries=reviewer_metric_queries,
             sibling_context=sibling_context,
             hardware=hardware,
+            workload_shapes=workload_shapes,
         )
 
         captured: dict = {}

@@ -898,3 +898,28 @@ def test_planner_build_user_prompt_renders_hw_block_when_bottleneck_none():
     )
     assert "Hardware: TestGPU" in prompt
     assert "Shared mem per block: 101376 B" in prompt
+
+
+def test_planner_build_user_prompt_threads_workload_shapes():
+    """workload_shapes kwarg threads through build_user_prompt to render_run_context."""
+    from src.config import HardwareSpec
+    from src.eval.types import BottleneckType
+    hw = HardwareSpec(
+        name="TestGPU", compute_capability=8.9, freq_GHz=2.0,
+        DRAM_byte_per_cycle=400, MAC_per_cycle_fp32_sm=1000,
+        shared_mem_per_block_bytes=101376,
+        shared_mem_per_multiprocessor_bytes=102400,
+    )
+    prompt = PlannerAgent.build_user_prompt(
+        kernel_source="def x(): pass",
+        profiling_summary="",
+        past_experiences=[],
+        available_actions=[],
+        tree_context="",
+        bottleneck=BottleneckType.MEMORY_BOUND,
+        sibling_context="",
+        hardware=hw,
+        workload_shapes=[(1024, 4096, 2048), (2048, 4096, 2048)],
+    )
+    assert "Workload shapes:" in prompt
+    assert "(1024, 4096, 2048)" in prompt

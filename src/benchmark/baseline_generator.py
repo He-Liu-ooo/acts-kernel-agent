@@ -121,6 +121,7 @@ async def generate_triton_baseline(
                     # SMEM telemetry on baseline-attempt failures lands
                     # with iter=0 instead of iter=null. Fix #8 plumbing.
                     iter_no=0,
+                    workload_shapes=[tuple(w.axes.values()) for w in workloads],
                 )
         except ImplementationError as exc:
             prior_failures.append(

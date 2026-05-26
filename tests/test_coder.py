@@ -1772,6 +1772,51 @@ def test_coder_build_user_prompt_renders_hw_block_when_bottleneck_none():
     assert "Shared mem per block: 101376 B" in prompt
 
 
+def test_coder_build_user_prompt_threads_workload_shapes():
+    """workload_shapes kwarg threads through both build_user_prompt and
+    build_translate_prompt to render_run_context."""
+    from src.agents.coder import CoderAgent
+    from src.agents.planner import OptimizationPlan
+    from src.config import HardwareSpec
+    from src.eval.types import BottleneckType
+    from src.kernels.kernel import KernelSpec, KernelType
+
+    plan = OptimizationPlan(
+        tier=1, technique="t1_coalesced_load",
+        params={}, target_region="", rationale="r",
+    )
+    hw = HardwareSpec(
+        name="TestGPU",
+        compute_capability=8.9,
+        freq_GHz=2.0,
+        DRAM_byte_per_cycle=400,
+        MAC_per_cycle_fp32_sm=1000,
+        shared_mem_per_block_bytes=101376,
+        shared_mem_per_multiprocessor_bytes=102400,
+    )
+    shapes = [(1024, 4096, 2048), (2048, 4096, 2048)]
+    prompt = CoderAgent.build_user_prompt(
+        kernel_source="def x(): pass",
+        plan=plan,
+        bottleneck=BottleneckType.MEMORY_BOUND,
+        hardware=hw,
+        workload_shapes=shapes,
+    )
+    assert "Workload shapes:" in prompt
+    assert "(1024, 4096, 2048)" in prompt
+
+    spec = KernelSpec(name="k", kernel_type=KernelType.MATMUL, entrypoint="x")
+    translate_prompt = CoderAgent.build_translate_prompt(
+        reference_source="def x(): pass",
+        kernel_spec=spec,
+        bottleneck=None,
+        hardware=hw,
+        workload_shapes=shapes,
+    )
+    assert "Workload shapes:" in translate_prompt
+    assert "(1024, 4096, 2048)" in translate_prompt
+
+
 # ── compile_kernel_tool SMEM check (hw-spec injection Task 5) ──────────
 
 

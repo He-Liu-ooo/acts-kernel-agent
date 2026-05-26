@@ -430,6 +430,80 @@ def test_check_autotune_smem_budget_threads_iter_no_into_events(monkeypatch):
         assert it == 42, f"event {kind} missing iter=42 (got {it!r})"
 
 
+def test_warmup_failed_event_carries_exception_detail(monkeypatch):
+    """``smem_check_skipped(reason='warmup_failed')`` must include
+    ``exc_class`` and ``exc_msg`` so postmortems can distinguish the
+    failure modes the bare ``except Exception:`` would otherwise mask:
+    signature mismatch (TypeError: missing constexpr), ptxas crash
+    (CompileTimeAssertionFailure), OOM, etc. Without these fields the
+    diagnostic blind spot from ``run_20260525T080053_565567Z`` recurs —
+    every smem_check_skipped looks identical in events.jsonl.
+    """
+    fn = _FakeJITFunction()
+    configs = [_FakeConfig({"BLOCK_M": 64})]
+    autotuner = _FakeAutotuner(configs=configs, fn=fn)
+
+    def _warmup(*args, **kwargs):
+        raise TypeError("missing required argument 'NUM_PRODUCER_WARPS'")
+
+    fn.warmup = _warmup
+    captured: list[dict] = []
+    monkeypatch.setattr(
+        "src.eval.smem_check.events.emit",
+        lambda kind, *, iter=None, **kw: captured.append(
+            {"kind": kind, "iter": iter, **kw}
+        ),
+    )
+
+    def host_wrapper(a):
+        autotuner.run(a, grid=(1,))
+
+    violations = check_autotune_smem_budget(
+        autotuner, host_wrapper, sample_args=("a",), cap_bytes=101376,
+    )
+    assert violations == []
+    warmup_events = [e for e in captured if e.get("reason") == "warmup_failed"]
+    assert len(warmup_events) == 1, captured
+    ev = warmup_events[0]
+    assert ev["exc_class"] == "TypeError"
+    assert "NUM_PRODUCER_WARPS" in ev["exc_msg"]
+    assert ev["config_idx"] == 0
+
+
+def test_warmup_failed_exc_msg_truncated_to_bound():
+    """Long Triton tracebacks can run into KB. The exc_msg field caps at
+    ~160 chars so events.jsonl doesn't bloat — pin the cap so a future
+    well-meaning widening doesn't silently land an unbounded payload.
+    """
+    fn = _FakeJITFunction()
+    configs = [_FakeConfig({"BLOCK_M": 64})]
+    autotuner = _FakeAutotuner(configs=configs, fn=fn)
+    long_msg = "x" * 5000
+
+    def _warmup(*args, **kwargs):
+        raise RuntimeError(long_msg)
+
+    fn.warmup = _warmup
+    captured: list[dict] = []
+    import src.eval.smem_check as _smem
+    orig_emit = _smem.events.emit
+    _smem.events.emit = lambda kind, *, iter=None, **kw: captured.append(
+        {"kind": kind, "iter": iter, **kw}
+    )
+    try:
+        def host_wrapper(a):
+            autotuner.run(a, grid=(1,))
+
+        check_autotune_smem_budget(
+            autotuner, host_wrapper, sample_args=("a",), cap_bytes=101376,
+        )
+    finally:
+        _smem.events.emit = orig_emit
+    warmup_events = [e for e in captured if e.get("reason") == "warmup_failed"]
+    assert len(warmup_events) == 1
+    assert len(warmup_events[0]["exc_msg"]) <= 160
+
+
 def test_check_autotune_smem_budget_replays_recorded_kwargs():
     """Host wrappers that pass shape/stride args via keyword: recorder MUST
     capture kwargs AND replay them in warmup. Without this, warmup raises

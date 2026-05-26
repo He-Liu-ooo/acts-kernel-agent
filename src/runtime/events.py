@@ -119,7 +119,11 @@ CORE_EVENT_KINDS: frozenset[str] = frozenset({
     # ``host_wrapper_failed`` and ``recorder_no_capture`` cases). First three
     # fire at most once per compile-tool call; ``warmup_failed`` fires
     # per-Config; ``host_wrapper_failed`` + ``recorder_no_capture`` fire
-    # once per host-wrapper drive.
+    # once per host-wrapper drive. ``warmup_failed`` additionally carries
+    # ``exc_class`` (exception type name) + ``exc_msg`` (str(exc)[:160]) so
+    # the swallowed exception is recoverable from events.jsonl — added after
+    # run_20260525T080053_565567Z had all-configs-skip events with no signal
+    # for which exception class fired.
     "smem_overflow_detected",
     "smem_check_skipped",
 })
