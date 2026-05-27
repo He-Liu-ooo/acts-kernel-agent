@@ -262,6 +262,33 @@ class ACTSConfig:
     triton_baseline_kernel_name: str | None = None
     triton_baseline_enforce_autotune: bool = False
 
+    # Bench-subprocess isolation (2026-05-24). Per-iter bench + NCU profile
+    # runs in a short-lived ``python -m src.eval.bench_worker`` subprocess;
+    # flip to False for in-process debugging (single-step into bench without
+    # IPC overhead). See doc/specs/2026-05-24-bench-subprocess-isolation-
+    # design.md §3 decision #7.
+    bench_use_subprocess: bool = True
+    # Consecutive worker-process crashes (non-zero exit or signal-kill)
+    # before raising ``WorkerProcessUnstable`` and aborting the run.
+    # Mirrors CUDAContextPoisoned's 3-strike escalation.
+    worker_crash_threshold: int = 3
+    # Total-lifetime watchdog on the per-iter worker subprocess (wraps
+    # ``proc.wait(timeout=...)``). Guards against a frozen / runaway
+    # child; on expiry the helper calls ``terminate()`` then ``kill()``
+    # and raises ``WorkerCrashed``.
+    #
+    # Default 180000s (~50h) effectively disables the watchdog while the
+    # subprocess refactor is bedding in — there is no evidence yet of a
+    # frozen-child failure mode that needs a tight watchdog, and the
+    # original 30s default killed healthy workers mid-NCU (Codex
+    # 2026-05-26). Operators with hard wallclock budgets should set this
+    # explicitly in ``[runtime] worker_timeout_s`` to the actual
+    # envelope. The single-timeout shape (one ``proc.wait`` watchdog
+    # covering startup + work + teardown) is itself spec §13 deferred
+    # tech-debt — a spawn-vs-lifetime split would let us keep a tight
+    # startup guard separately from a generous work guard.
+    worker_timeout_s: float = 180000.0
+
     def __post_init__(self) -> None:
         # Reject non-int / <1: K=0 silently skips iters as "all 0
         # candidates failed"; non-int (e.g. ``1.5``) crashes ``range(K)``
@@ -275,6 +302,14 @@ class ACTSConfig:
         if self.coder_n_candidates < 1:
             raise ValueError(
                 f"coder_n_candidates must be >= 1, got {self.coder_n_candidates}",
+            )
+        if self.worker_crash_threshold < 1:
+            raise ValueError(
+                f"worker_crash_threshold must be >= 1, got {self.worker_crash_threshold}",
+            )
+        if self.worker_timeout_s <= 0:
+            raise ValueError(
+                f"worker_timeout_s must be > 0, got {self.worker_timeout_s}",
             )
         if self.use_operator_baseline:
             if not self.triton_baseline_path:
@@ -343,6 +378,9 @@ def load_config(path: Path) -> ACTSConfig:
             "triton_baseline_dps",
             "triton_baseline_kernel_name",
             "triton_baseline_enforce_autotune",
+            "bench_use_subprocess",
+            "worker_crash_threshold",
+            "worker_timeout_s",
         ],
     }
     defaults = ACTSConfig()

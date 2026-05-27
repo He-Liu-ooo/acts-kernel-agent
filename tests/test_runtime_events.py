@@ -31,3 +31,15 @@ def test_autotune_burn_in_done_in_core_event_kinds():
     Missing the registration would downgrade the emit() to log noise via
     the unknown-kind WARNING path."""
     assert "autotune_burn_in_done" in events.CORE_EVENT_KINDS
+
+
+def test_bench_worker_event_kinds_registered():
+    """Bench-subprocess isolation (2026-05-24) — four new event kinds for
+    the per-iter worker subprocess lifecycle. emit() warns on unknown
+    kinds so a missing entry would silently downgrade these to log noise.
+    See doc/specs/2026-05-24-bench-subprocess-isolation-design.md §5.5."""
+    from src.runtime.events import CORE_EVENT_KINDS
+    assert "bench_worker_spawned" in CORE_EVENT_KINDS
+    assert "bench_worker_exited" in CORE_EVENT_KINDS
+    assert "bench_worker_crashed" in CORE_EVENT_KINDS
+    assert "worker_chunk_merged" in CORE_EVENT_KINDS

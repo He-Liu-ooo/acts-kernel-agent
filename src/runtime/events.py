@@ -126,6 +126,27 @@ CORE_EVENT_KINDS: frozenset[str] = frozenset({
     # for which exception class fired.
     "smem_overflow_detected",
     "smem_check_skipped",
+    # Bench-subprocess isolation (2026-05-24). Per-iter K-way bench + NCU
+    # profile runs in a fresh ``python -m src.eval.bench_worker`` child;
+    # parent merges artifacts on clean exit, bumps a crash counter on
+    # non-zero exit. See doc/specs/2026-05-24-bench-subprocess-isolation-
+    # design.md §5.5.
+    # ``bench_worker_spawned`` payload: ``iter``, ``worker_dir``,
+    # ``request_path``. Fired by parent immediately before Popen.
+    # ``bench_worker_exited`` payload: ``iter``, ``returncode``,
+    # ``walltime_s``. Fired by parent after proc.wait() regardless of
+    # outcome (clean exit AND crashes).
+    # ``bench_worker_crashed`` payload: ``iter``, ``returncode``,
+    # ``stderr_tail`` (last 2KB of worker.log), ``consecutive``. Fired
+    # ONLY on non-zero / signal-kill exit (or missing response.json /
+    # watchdog timeout).
+    # ``worker_chunk_merged`` payload: ``iter``, ``event_count``,
+    # ``ncu_rep_count``. Fired by parent after merging ``worker/
+    # events.jsonl`` + copying ``.ncu-rep`` files on clean exit.
+    "bench_worker_spawned",
+    "bench_worker_exited",
+    "bench_worker_crashed",
+    "worker_chunk_merged",
 })
 
 # ``iter_end.outcome`` values. Kept as string constants (not an enum) so

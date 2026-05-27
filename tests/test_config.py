@@ -872,3 +872,50 @@ def test_validate_hardware_spec_flags_sm_count_mismatch():
     detected = HardwareSpec(name="X", sm_count=142)
     issues = validate_hardware_spec(yaml_spec, detected)
     assert any("sm_count" in i for i in issues)
+
+
+# ── Bench-subprocess isolation knobs (2026-05-24) ──────────────────────
+
+
+def test_acts_config_bench_use_subprocess_defaults_true():
+    """Per-iter bench + NCU subprocess is on by default (production path);
+    flip to False for in-process debugging. Mirrors use_operator_baseline
+    pattern. See doc/specs/2026-05-24-bench-subprocess-isolation-design.md §3."""
+    from src.config import ACTSConfig
+    cfg = ACTSConfig()
+    assert cfg.bench_use_subprocess is True
+
+
+def test_acts_config_worker_crash_threshold_defaults_three():
+    """3 consecutive worker crashes → WorkerProcessUnstable whole-run abort.
+    Mirrors CUDAContextPoisoned's 3-strike escalation."""
+    from src.config import ACTSConfig
+    cfg = ACTSConfig()
+    assert cfg.worker_crash_threshold == 3
+
+
+def test_acts_config_worker_timeout_defaults_180000():
+    """Total-lifetime watchdog on ``proc.wait()``. Default ~50h
+    effectively disables the watchdog while the subprocess refactor
+    beds in — the original 30s default killed healthy workers mid-NCU
+    (Codex 2026-05-26). Operators with hard wallclock budgets override
+    via ``[runtime] worker_timeout_s`` in cfg. Field was renamed from
+    ``worker_startup_timeout_s`` to reflect actual total-lifetime
+    semantics."""
+    from src.config import ACTSConfig
+    cfg = ACTSConfig()
+    assert cfg.worker_timeout_s == 180000.0
+
+
+def test_acts_config_worker_crash_threshold_rejects_zero():
+    import pytest
+    from src.config import ACTSConfig
+    with pytest.raises(ValueError, match="worker_crash_threshold"):
+        ACTSConfig(worker_crash_threshold=0)
+
+
+def test_acts_config_worker_timeout_rejects_non_positive():
+    import pytest
+    from src.config import ACTSConfig
+    with pytest.raises(ValueError, match="worker_timeout_s"):
+        ACTSConfig(worker_timeout_s=0.0)
