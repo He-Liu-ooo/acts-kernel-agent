@@ -19,6 +19,20 @@ Every ACTS run produces exactly one `runs/run_<UTC>/` directory holding a human-
 
 The six artifact families are independent: `events.jsonl` records the orchestrator's narrative (what the search did); `traces/*.jsonl` records what the SDK actually dispatched; `tree/` records every committed node's full state; `report.txt` carries the rendered end-of-run summary + resolved config; `usage.json` carries per-run token/turn accounting rollups derived from the trace stream. Cross-referencing them is how you verify claims that any single stream cannot make on its own — see the truthfulness note on `coder_submitted` below, the `tree/` section's trace cross-reference recipe, and the "Per-run usage accounting" section's `(iter, agent)` keying.
 
+### Per-iter worker dir (`<run_dir>/iter_<n>/worker/`)
+
+The bench-subprocess isolation refactor (2026-05-27) introduces a per-iter scratch directory used for the K-way bench + NCU profile run that the orchestrator now dispatches into a `python -m src.eval.bench_worker` child. Created lazily by `bench_subprocess.run_bench_subprocess(...)` before `subprocess.Popen`; merged into the canonical run artifacts on clean exit by `bench_subprocess.merge_worker_artifacts(...)`.
+
+| Path | Direction | Purpose |
+|------|-----------|---------|
+| `request.json` | parent → child | Serialized worker request (kernel sources, workload spec, profile config). Written by parent before Popen, read by worker on startup. |
+| `response.json` | child → parent | Structured per-candidate bench + profile results. Written by worker before exit, read by parent for narrative-event emission (`coder_failed`, winner `bench_done` / `profile_done`, etc.). |
+| `events.jsonl` | child-written | Worker-side narrative chunk (today: profile-gauntlet `coder_failed` on non-winner candidates that bench-succeeded but profile-failed). Concatenated into the canonical `<run_dir>/events.jsonl` by `merge_worker_artifacts` on clean exit. |
+| `cand_<idx>.ncu-rep` | child-written | Per profile-gauntlet winner `.ncu-rep`. Copied into `tree/node_<id>/ncu.ncu-rep` + the ncu cache by `merge_worker_artifacts` on clean exit. |
+| `worker.log` | child stdout+stderr | Captured child output. On non-clean exit, the last 2KB are peeled into `bench_worker_crashed.stderr_tail` via `bench_subprocess._read_tail`. |
+
+On clean exit, `merge_worker_artifacts` migrates the events chunk and `.ncu-rep` files into canonical locations and the parent emits `worker_chunk_merged{event_count, ncu_rep_count}`. On non-clean exit (`WorkerCrashed` — non-zero / signal-kill / missing `response.json` / watchdog timeout), the worker dir is **left intact as a postmortem package**; `bench_worker_crashed` carries the `worker.log` tail, but `request.json` / partial `response.json` / partial `events.jsonl` / any captured `.ncu-rep` files remain on disk for offline inspection.
+
 ## `timefmt.py`
 
 Two UTC timestamp formatters, deliberately distinct so run-directory names and JSONL payloads never mix formats.
@@ -55,11 +69,11 @@ Module-level handle registration, guarded by `_lock`. `RunContext.create` calls 
 
 ### Event catalog — `CORE_EVENT_KINDS`
 
-Frozenset of 36 kinds:
+Frozenset of 40 kinds:
 
 **Run scope** — `run_start`, `baseline_attempt`, `baseline_success`, `baseline_failure`, `baseline_ready`, `verify_start`, `verify_done`, `run_end`, `clock_lock_unavailable`, `clock_drift_detected`.
 
-**Per-iteration** — `iter_start`, `planner_selected`, `planner_failed`, `coder_submitted`, `coder_failed`, `bench_done`, `profile_done`, `score_computed`, `reviewer_feedback`, `reviewer_metric_query`, `branch_dead_end`, `iter_end`, `trace_emitted`, `reward_hack_detected`, `reward_hack_confirmed`, `reward_hack_cleared`, `calibration_warning`, `sibling_context_rendered`, `failure_summary_added`, `repeated_pathway_dead_end`, `autotune_burn_in_done`, `smem_overflow_detected`, `smem_check_skipped`.
+**Per-iteration** — `iter_start`, `planner_selected`, `planner_failed`, `coder_submitted`, `coder_failed`, `bench_done`, `profile_done`, `score_computed`, `reviewer_feedback`, `reviewer_metric_query`, `branch_dead_end`, `iter_end`, `trace_emitted`, `reward_hack_detected`, `reward_hack_confirmed`, `reward_hack_cleared`, `calibration_warning`, `sibling_context_rendered`, `failure_summary_added`, `repeated_pathway_dead_end`, `autotune_burn_in_done`, `smem_overflow_detected`, `smem_check_skipped`, `bench_worker_spawned`, `bench_worker_exited`, `bench_worker_crashed`, `worker_chunk_merged`.
 
 **SOL integration sub-grouping** (added 2026-04-27, distributed across the two scopes above):
 
@@ -115,6 +129,15 @@ The companion prompt-side surface lives in the agents layer: `src/agents/llm_bac
 6. `Per-Config shared-mem rule: num_stages × (input_tile_elements_loaded_to_smem) × dtype_bytes ≤ <cap>` — phrased naming-agnostic so the prompt doesn't presume any specific meta-param naming convention. The actual ptxas-truth SMEM check (which fires the `smem_overflow_detected` / `smem_check_skipped` events above) reads `CompiledKernel.metadata.shared` and is naming-free.
 
 See [`doc/specs/2026-05-24-coding-hw-spec-design.md`](specs/2026-05-24-coding-hw-spec-design.md) §5.1 (rendered block) and §9 (event payloads) for the design rationale. The dominant-dtype rule originally specified there was retired 2026-05-25 in favor of multi-dtype peak rendering — see `doc/config.md` "Multi-dtype peak rendering" for the current contract.
+
+**Bench-subprocess isolation sub-grouping** (added 2026-05-27, all per-iter; see [`doc/specs/2026-05-24-bench-subprocess-isolation-design.md`](specs/2026-05-24-bench-subprocess-isolation-design.md) §5.5):
+
+- `bench_worker_spawned` (per-iter) — fires once per iter from the parent, immediately before `subprocess.Popen`. Payload: `iter`, `worker_dir: str` (`<run_dir>/iter_<n>/worker`), `request_path: str` (`worker_dir/request.json`). Marks the start of the per-iter K-way bench + NCU profile run in a fresh `python -m src.eval.bench_worker` child.
+- `bench_worker_exited` (per-iter) — fires once per iter from the parent after `proc.wait()` returns, regardless of outcome. Payload: `iter`, `returncode: int`, `walltime_s: float`. Always paired with `bench_worker_spawned`.
+- `bench_worker_crashed` (per-iter) — fires from the parent ONLY on non-zero / signal-kill exit (or missing `response.json` / watchdog timeout). Payload: `iter`, `returncode: int`, `stderr_tail: str` (last 2KB of `worker.log` via `bench_subprocess._read_tail`), `consecutive: int` (consecutive-crash counter). The worker dir is left intact on this path as a postmortem package.
+- `worker_chunk_merged` (per-iter) — fires from the parent after `bench_subprocess.merge_worker_artifacts(...)` runs on clean exit. Payload: `iter`, `event_count: int` (lines concatenated from `worker/events.jsonl` into the canonical `<run_dir>/events.jsonl`), `ncu_rep_count: int` (per-winner `cand_<idx>.ncu-rep` files copied into `tree/node_<id>/ncu.ncu-rep` + the ncu cache).
+
+Event-emission shift (2026-05-27): per-candidate `coder_failed`, `reward_hack_detected`, winner `bench_done`, and winner `profile_done` are emitted **parent-side** from the response-handling loop in the orchestrator — they're reconstructible from the worker's structured `response.json` payload, so the parent owns emission to keep the iter narrative coherent if the worker crashes mid-stream. The worker only emits events the parent cannot reconstruct (today: profile-gauntlet `coder_failed` on non-winner candidates that bench-succeeded but profile-failed), written into `worker/events.jsonl` and merged into `<run_dir>/events.jsonl` on clean exit via `merge_worker_artifacts`. Worker-side `_emit` prepends `{"ts": iso_ts(), ...}` matching the parent's `events.emit` shape, so post-merge the canonical stream is indistinguishable from a single-process run.
 
 Notable semantics:
 
@@ -233,6 +256,17 @@ are no-ops when unbound and swallow `OSError` (logged at `WARNING`) so
 a tree-dump hiccup cannot kill a running search. `RunContext.create`
 calls `bind(run_dir / "tree")` after `events.bind(...)`;
 `RunContext.close` calls `unbind()`.
+
+`ncu_rep_src` provenance (post bench-subprocess isolation, 2026-05-27):
+for per-iter K-way profile-gauntlet winners the `.ncu-rep` source path
+is now `<run_dir>/iter_<n>/worker/cand_<winner_idx>.ncu-rep` (written by
+the worker, not the profiler's local tmpdir). The migration into
+`tree/node_<id>/ncu.ncu-rep` + the ncu cache is owned by
+`bench_subprocess.merge_worker_artifacts(...)` on clean worker exit
+rather than the orchestrator passing `ncu_rep_src` directly into
+`dump_node`. The Phase C winner re-profile path is unchanged:
+parent-side profiler, `cache_dir or _ncu_tmpdir()` as the source root,
+`ncu_rep_src` plumbed straight into `dump_node` as before.
 
 DEAD_END cause schema in `meta.json`:
 

@@ -27,13 +27,17 @@ This table covers only the **eval-harness slice** of Phase A. The wider Phase A 
 
 ### Orchestrator-Side (after Coder returns, every iteration)
 
-Run by the orchestrator. Never part of the Coder's tool loop — prevents the LLM from gaming benchmark numbers.
+Driven by the orchestrator but **not all in-process**. Never part of the Coder's tool loop — prevents the LLM from gaming benchmark numbers.
 
-| Module | Purpose |
-|--------|---------|
-| `benchmark.py` | Latency measurement via CUDA events |
-| `profiler.py` | Analytical roofline metrics + curated NCU signals (per-iter diagnostics; bottleneck classification is NOT re-derived per iter) |
-| `scorer.py` | SOL score computation (using static T_SOL from roofline.py) |
+| Module | Purpose | Execution site |
+|--------|---------|----------------|
+| `benchmark.py` | Latency measurement via CUDA events (per-iter K-way + autotune burn-in) | Inside `bench_worker` subprocess |
+| `profiler.py` | Analytical roofline metrics + curated NCU signals (per-iter profile gauntlet for the latency-survivor winner) | Inside `bench_worker` subprocess (NCU spawned as grandchild) |
+| `scorer.py` | SOL score computation (using static T_SOL from roofline.py) | Parent (orchestrator response loop) |
+
+Per-iter K-way bench + autotune burn-in + profile gauntlet are executed inside a `python -m src.eval.bench_worker` subprocess (one per iter). The parent does dispatch + response-handling only; this isolates per-iter GPU state and lets the orchestrator survive worker crashes without bringing down the search loop. Parent-side eval paths that **do** stay in-process: operator-baseline gate, baseline / winner-verification, and the Phase C winner re-profile in `pipeline/report.py` (unchanged — `cache_dir or _ncu_tmpdir()` source path).
+
+The IPC + artifact-merge boundary: `src/eval/bench_worker.py::run_iter` (worker side: builds the bench + profile-gauntlet response from the parent's request, including `cand_<winner_idx>.ncu-rep` under `<run_dir>/iter_<n>/worker/`) and `src/eval/bench_subprocess.py::run_bench_subprocess` + `merge_worker_artifacts` (parent side: async dispatch, response decode, and on clean exit copy the worker's `.ncu-rep` into both the shared source-hash-keyed NCU cache and `tree/node_<id>/ncu.ncu-rep`). The worker no longer emits per-candidate events; the parent re-emits from the response. `merge_worker_artifacts` is always called. See `doc/search.md` and `doc/runtime.md` for the orchestrator wiring + event taxonomy.
 
 ## 5-Stage Correctness Gate — `correctness.py`
 
@@ -246,7 +250,9 @@ The explicit `--metrics` list also requests the stable members of the diagnostic
 
 ### NCU subprocess driver — `_profiler_driver.py`
 
-NCU wraps a fresh Python subprocess that imports the compiled kernel and launches it **once** (after one warmup). The driver reads a JSON spec file (path passed as its sole argv) with shape:
+NCU wraps a fresh Python subprocess that imports the compiled kernel and launches it **once** (after one warmup). Under the bench-subprocess refactor the per-iter profile gauntlet call is itself wrapped in an additional Python subprocess (`bench_worker`), so for per-iter K-way runs the NCU driver executes as a **grandchild** of the orchestrator (parent → `bench_worker` → `ncu`). The `.ncu-rep` is written under `<run_dir>/iter_<n>/worker/cand_<winner_idx>.ncu-rep` and then merged into the canonical `tree/node_<id>/ncu.ncu-rep` plus the shared source-hash-keyed NCU cache by `src/eval/bench_subprocess.py::merge_worker_artifacts` on clean worker exit. The Phase C winner re-profile in `pipeline/report.py` is **unchanged** (parent-side profiler, `cache_dir or _ncu_tmpdir()` source path) — the grandchild topology applies to per-iter profile gauntlet calls only.
+
+The driver reads a JSON spec file (path passed as its sole argv) with shape:
 
 ```json
 {

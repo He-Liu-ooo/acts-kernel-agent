@@ -149,6 +149,27 @@ The `load_config` `FileNotFoundError` guard is correspondingly scoped: it fires 
 
 `load_config` also extends the `_section_map` `[runtime]` keys to absorb the five fields, with a third coercion branch: when `default_val is None` (Optional fields), libconf's native value is stored directly — the previous `type(default_val)(value)` path tried `NoneType(value)` → `TypeError`.
 
+### Bench-subprocess isolation knobs
+
+Per-iter K-way bench, autotune burn-in, and the NCU profile gauntlet run in a short-lived `python -m src.eval.bench_worker` subprocess by default, isolating the orchestrator from CUDA-context poisoning, driver-level crashes, and ptxas/SOL hangs. The three knobs below (all read from the `.cfg` `[runtime]` section, mirroring the `use_operator_baseline` pattern) tune the isolation envelope. See `doc/eval.md` for the IPC contract + crash taxonomy and `doc/specs/2026-05-24-bench-subprocess-isolation-design.md` for the design rationale.
+
+| Field | Type | Default | Purpose |
+|-------|------|---------|---------|
+| `bench_use_subprocess` | `bool` | `True` | **Dispatch flag.** When True, per-iter bench + autotune burn-in + NCU profile gauntlet run in a `python -m src.eval.bench_worker` subprocess. When False, runs in-process (single-step debugging without IPC overhead); the orchestrator loses crash isolation. |
+| `worker_crash_threshold` | `int` | `3` | Consecutive worker-process non-zero exits (or signal-kills) before raising `WorkerProcessUnstable` and aborting the whole run. Mirrors `CUDAContextPoisoned`'s 3-strike escalation. Must be `>= 1` (enforced in `__post_init__`). |
+| `worker_timeout_s` | `float` | `180000.0` | Total-lifetime watchdog passed to `proc.wait(timeout=...)`. On expiry the helper calls `terminate()` then `kill()` and raises `WorkerCrashed`. Default 180000s (~50 h) **effectively disables the watchdog** while the subprocess refactor beds in — there is no evidence yet of a frozen-child failure mode that needs a tight watchdog, and the original 30s default killed healthy workers mid-NCU (Codex 2026-05-26). Operators with hard wallclock budgets should set this explicitly to the actual envelope (worst-case K-way bench (warmup + timed × workloads × K) + NCU profile (~60s) + import overhead is in the low thousands of seconds). **Renamed from `worker_startup_timeout_s`** (Codex 2026-05-26: original name implied startup-only scope but the field has always been the total-lifetime watchdog). Must be `> 0` (enforced in `__post_init__`). A spawn-vs-lifetime split is deferred — see PROCESS / spec §13. |
+
+```libconfig
+runtime:
+{
+    bench_use_subprocess = true;
+    worker_crash_threshold = 3;
+    worker_timeout_s = 180000.0;
+};
+```
+
+`load_config` extends the `_section_map` `[runtime]` keys to include all three fields; the cfg loader does not accept the old name `worker_startup_timeout_s`.
+
 ## Functions
 
 - `load_config(path) -> ACTSConfig`: Parse `.cfg` file, fall back to defaults. Loads arch YAML if `[hardware] arch_config_path` is set; after load, calls `validate_hardware_spec()` against `detect_hardware()` and logs a `WARNING` per mismatch.

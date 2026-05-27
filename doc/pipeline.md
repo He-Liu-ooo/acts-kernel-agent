@@ -64,6 +64,8 @@ GPU clocks are locked at run start so per-iter latency isn't poisoned by DVFS-dr
 
 Delegates to `Orchestrator.run()`. Runs up to `max_depth` iterations with 3 agents (Planner → Coder → Reviewer). The `reference_fn` + `input_generators` returned by Phase A are forwarded verbatim every iteration so the Coder's correctness tool remains bound to the problem's oracle.
 
+`optimize(..., run_dir: Path | None = None)` accepts a new kwarg threaded by `main()` from `ctx.run_dir` so the orchestrator can locate per-iter worker directories for the bench-subprocess isolation path. `optimize()` derives `ncu_cache_dir = run_dir / "ncu_cache"` and passes both into `Orchestrator.run(..., run_dir=, ncu_cache_dir=)`; the orchestrator in turn forwards `run_dir` to `run_bench_subprocess`, which creates per-iter worker dirs under `<run_dir>/iter_<n>/worker/`. When `run_dir` is None (test paths without a `RunContext`, or the `RunContext` `OSError` fallback), the worker dir falls back to a tempdir hoisted outside the iter loop and registered for `atexit` cleanup. The orchestrator logs a `WARNING` when `bench_use_subprocess=True` but `run_dir is None` — a silent fallback to the in-process bench path would disable CUDA-context isolation without surfacing the regression.
+
 ### Phase C: Report
 
 `generate_report(result, ...)` walks the root-to-best path on `result.tree` to build the `technique_trace`, carries the audit flags (`reward_hack_suspect`, `calibration_warning`) off the best node's `ScoreResult`, and unwraps `termination_reason` to a plain string. `render_report` formats the report for the CLI and surfaces audit flags as explicit `[AUDIT]` lines so a flagged run can't be skimmed past.

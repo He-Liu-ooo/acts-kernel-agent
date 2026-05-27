@@ -69,6 +69,8 @@ Planner --> Coder x K (asyncio.gather, K=4 default) --> [per-candidate sequentia
 
 The Coder axis fans out to K parallel `Coder.implement()` calls per iter (best-of-K, `ACTSConfig.coder_n_candidates=4` default; set `=1` to opt out and recover the pre-A2 1-call shape). Compile + correctness self-correction happens inside each Coder call's own tool loop. The K outputs are then ranked sequentially through anti-cheat + benchmark + profile — the first candidate to clear profiling wins the iter and becomes the tree node. The Planner and Reviewer paths are unchanged; K-way multiplies cost only on the Coder axis. This converts the per-iter comparison from "median LLM draft vs baseline" to "best-of-K vs baseline," closing the failure mode where a regressing median Coder draft makes every iter lose. Failed Coder candidates (compile / correctness / entrypoint-binding / partial-bench / sticky-CUDA) collapse into ONE failure-summary sibling node per iter — its `failure_details: list[FailureDetail]` carries one entry per failed candidate, and per-candidate kernel sources live on disk under `tree/node_<id>/cand_<idx>/kernel.py` for postmortem. Profile-layer failures stay as `coder_failed` events only.
 
+The K-way per-candidate bench + autotune burn-in + NCU profile gauntlet runs in a per-iter subprocess (`python -m src.eval.bench_worker`) so sticky CUDA-context errors (e.g. `cudaErrorIllegalAddress`) die with the child instead of poisoning the rest of the run. The parent orchestrates Planner / Coder K-way fan-out, dispatches the bench gauntlet via `src/eval/bench_subprocess.py`, and merges the child's results + events + `.ncu-rep` artifacts back into the live run on clean exit. See `doc/search.md` and `doc/eval.md` for the subprocess contract.
+
 On compilation or correctness failure inside a Coder call, that call's tool loop handles retries internally. If the retry budget is exhausted, that candidate is dropped from the survivor set. If all K fail, the iter is marked SKIPPED; Coder-layer and bench-layer failures collapse into one failure-summary node per iter under the parent for Planner visibility (worst case 2 nodes per iter regardless of K), while profile-layer failures emit `coder_failed` events only without tree mutation. No separate Debugger agent.
 
 **Operator caveat**: K-way assumes the LLM backend serves the K requests concurrently. Serial backends (locally hosted TGI with one slot, provider-side queues capped below K) turn the `asyncio.gather` into K sequential calls and pay K× wallclock for the same token cost as the parallel case — set `coder_n_candidates=1` in that environment.
@@ -150,9 +152,11 @@ The orchestrator runs benchmarking and profiling on the Coder's output. These ar
 
 | Module | Called by | Purpose |
 |--------|-----------|---------|
-| `benchmark.py` | Orchestrator | Latency measurement (CUDA events) |
-| `profiler.py` | Orchestrator | Per-iter analytical roofline diagnostics (arithmetic intensity, achieved TFLOPs / GB·s, pct-of-peak — free) + curated NCU section subprocess for occupancy/L2/TC/stall (every iter, representative workload); full-workload re-profile at Phase C. Bottleneck *classification* is computed once-per-run by `eval/roofline.py::classify_run` (Phase A) and threaded through; the per-iter analytical block refines diagnosis but never re-classifies. See JOURNAL "Profiler approach: analytical classification + curated NCU section (2026-04-20)" and "Bottleneck classify-once (2026-04-22)". |
+| `benchmark.py` | Orchestrator (via `bench_worker` subprocess) | Latency measurement (CUDA events) |
+| `profiler.py` | Orchestrator (via `bench_worker` subprocess for per-iter; parent for Phase C) | Per-iter analytical roofline diagnostics (arithmetic intensity, achieved TFLOPs / GB·s, pct-of-peak — free) + curated NCU section subprocess for occupancy/L2/TC/stall (every iter, representative workload); full-workload re-profile at Phase C. Bottleneck *classification* is computed once-per-run by `eval/roofline.py::classify_run` (Phase A) and threaded through; the per-iter analytical block refines diagnosis but never re-classifies. See JOURNAL "Profiler approach: analytical classification + curated NCU section (2026-04-20)" and "Bottleneck classify-once (2026-04-22)". |
 | `scorer.py` | Orchestrator | SOL score computation (using static T_SOL from roofline.py) |
+
+Per-iter K-way `benchmark.py` + `profiler.py` execution lives in a per-iter subprocess (`src.eval.bench_worker`, dispatched via `src.eval.bench_subprocess`) for blast-radius containment — sticky CUDA-context errors (`cudaErrorIllegalAddress` etc.) die with the child instead of poisoning the rest of the run. The parent handles dispatch + response-handling + artifact merge. Phase C winner re-profile in `pipeline/report.py` still runs in the parent (single trusted candidate, no isolation needed).
 
 | Metric | Tool | Method |
 |--------|------|--------|
@@ -460,8 +464,9 @@ Phase B: Search Loop (autonomous, 3-agent)
   -> CODER (with tools): plan + kernel code -> compile -> correctness check
      -> correctness always checked against PyTorch reference on every selected workload
      -> self-correction loop on failure (up to max_debug_retries; SDK turn budget 2*N+1)
-  -> [DETERMINISTIC EVAL]: benchmark (CUDA events) -> profiler (analytical roofline
-     per-iter; curated NCU subprocess per-iter on representative workload) -> SOL score
+  -> [DETERMINISTIC EVAL] (in per-iter `bench_worker` subprocess):
+     benchmark (CUDA events) -> profiler (analytical roofline per-iter; curated
+     NCU subprocess per-iter on representative workload) -> SOL score
   -> REVIEWER: eval results + SOL score + headroom + run_bottleneck + live
                ProfilingResult -> structured feedback + branch_quality
   -> Tree update: defer committing child.score + per_workload_latency_us until
