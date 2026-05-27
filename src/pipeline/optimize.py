@@ -457,6 +457,8 @@ _PLACEHOLDER_HARDWARE_SPEC = HardwareSpec(
 async def optimize(
     problem_path: str,
     config: ACTSConfig | None = None,
+    *,
+    run_dir: Path | None = None,
 ) -> tuple[SearchResult, "OptimizationReport"]:
     """Run the full ACTS optimization pipeline.
 
@@ -548,6 +550,15 @@ async def optimize(
         input_generators=input_generators,
         problem_definition_path=definition_path,
         definition=definition,
+        # Bench-subprocess isolation (2026-05-24): thread run_dir through
+        # so the orchestrator can construct ``<run_dir>/iter_<n>/worker/``
+        # for per-iter bench-worker subprocesses + a shared NCU cache for
+        # cross-iter reprofile hits. When ``run_dir is None`` (passed in
+        # from a null RunContext OR test direct-call), orchestrator
+        # falls back to in-process bypass. See doc/specs/2026-05-24-
+        # bench-subprocess-isolation-design.md §3 decisions #6 + #7.
+        run_dir=run_dir,
+        ncu_cache_dir=(run_dir / "ncu_cache") if run_dir is not None else None,
     )
 
     from src.pipeline.report import generate_report
@@ -1009,7 +1020,11 @@ def main(argv: list[str] | None = None) -> None:
     try:
         try:
             result, report = asyncio.run(
-                optimize(acts_config.problem_path, config=acts_config)
+                optimize(
+                    acts_config.problem_path,
+                    config=acts_config,
+                    run_dir=ctx.run_dir,
+                )
             )
         except Exception:
             emit(

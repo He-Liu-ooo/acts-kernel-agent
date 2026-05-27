@@ -10,6 +10,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import tempfile
+import time
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -53,7 +55,32 @@ class CUDAContextPoisoned(RuntimeError):
     consecutive sync failures the context is presumed unrecoverable
     (sticky illegal-memory-access, stream poisoning) and the run is
     aborted to avoid burning iterations producing meaningless results.
+
+    Bench-subprocess isolation (2026-05-24) retires this on the bench
+    path — the parent no longer runs ``torch.cuda.synchronize()`` for
+    bench (the child process owns CUDA touches; sticky errors die with
+    the child). The class + ``_CUDA_STICKY_PATTERNS`` set stay in code
+    as defensive guards for any remaining parent-side CUDA touches
+    (Coder's ``run_correctness`` tool, Phase C re-profile).
     """
+
+
+class WorkerProcessUnstable(RuntimeError):
+    """Raised when consecutive bench-worker subprocess crashes hit the
+    configured threshold (``ACTSConfig.worker_crash_threshold``, default 3).
+
+    The orchestrator catches transient worker crashes and recovers by
+    treating the iter as failed and bumping a counter. After N
+    consecutive crashes the worker is presumed unrecoverable
+    (out-of-tree environment bug, broken Python module on PYTHONPATH,
+    persistent OOM) and the run is aborted to avoid burning iterations
+    producing meaningless results.
+
+    Mirrors ``CUDAContextPoisoned`` (3-strike escalation) but for the
+    out-of-process bench worker rather than parent-side CUDA sync.
+    See doc/specs/2026-05-24-bench-subprocess-isolation-design.md §5.6.
+    """
+
 
 if TYPE_CHECKING:
     from sol_execbench.core.data import Definition, Workload
@@ -150,6 +177,143 @@ def _select_best_candidate(
         return (-score, cand_idx)
 
     return min(bench_results, key=_sort_key)
+
+
+# ───────────────────── Bench-subprocess serialization helpers (2026-05-24) ─
+# Used by the K-way bench dispatch path to (a) marshal `KernelSpec` /
+# `HardwareSpec` into JSON for the worker's request.json, and (b) rehydrate
+# `BenchmarkResult` / `ProfilingResult` from response.json so the post-winner
+# code path stays unchanged. Defensive against extra/missing fields — uses
+# `dataclasses.fields(...)` to filter unknown keys so the worker can add
+# new fields in future versions without breaking parent-side rehydration.
+
+
+def _serialize_kernel_spec_for_request(spec: "KernelSpec") -> dict:
+    """Dump KernelSpec for cross-process JSON IPC.
+
+    Walks the dataclass via ``dataclasses.asdict`` and coerces enum →
+    ``.value`` + ``Path`` → ``str`` recursively so the result is
+    JSON-safe (``dataclasses.asdict`` leaves Enum and Path as-is, which
+    would crash ``json.dumps``). Mirrors ``src/eval/bench_worker.py::
+    _encode`` style. The child rehydrates via ``KernelSpec.from_dict``
+    when it needs the full object.
+    """
+    import enum
+    from dataclasses import asdict
+
+    def _coerce(v):
+        if isinstance(v, enum.Enum):
+            return v.value
+        if isinstance(v, Path):
+            return str(v)
+        if isinstance(v, dict):
+            return {k: _coerce(x) for k, x in v.items()}
+        if isinstance(v, (list, tuple)):
+            return [_coerce(x) for x in v]
+        return v
+
+    return _coerce(asdict(spec))
+
+
+def _rebuild_cand_kernel(
+    request_candidates: list[dict], cand_idx: int, spec: "KernelSpec"
+) -> "Kernel":
+    """Reconstruct the `Kernel` for a single candidate index, sharing the
+    iter's `KernelSpec` (entrypoint + tolerance + kernel_type all stable
+    across the K-way fan-out). Used to attach kernels to failure-summary
+    nodes after the worker subprocess returns."""
+    from src.kernels.kernel import Kernel
+
+    cand = next(c for c in request_candidates if c["candidate_idx"] == cand_idx)
+    return Kernel(
+        spec=spec,
+        source_code=cand["source_code"],
+        triton_kernel_name=cand["triton_kernel_name"],
+        dps=cand.get("dps", False),
+    )
+
+
+def _rehydrate_bench_result(data: dict) -> "BenchmarkResult":
+    """Reconstruct `BenchmarkResult` from response.json dict. `last_outputs`
+    isn't transferred across IPC (GPU tensors) — child already cleared it
+    and ran `check_lazy_outputs_after_bench` before returning; downstream
+    code treats an empty list as "no outputs to re-check" which is the
+    correct semantic post-worker."""
+    from dataclasses import fields
+    from src.eval.benchmark import BenchmarkResult
+
+    known = {f.name for f in fields(BenchmarkResult)}
+    kwargs = {k: v for k, v in data.items() if k in known}
+    kwargs.setdefault("last_outputs", [])
+    return BenchmarkResult(**kwargs)
+
+
+def _rehydrate_profiling_result(data: dict | None) -> "ProfilingResult | None":
+    """Reconstruct ``ProfilingResult`` (incl. nested ``AnalyticalMetrics``
+    + ``NCUMetrics``) from response.json dict. Returns ``None`` when
+    ``data`` is ``None`` (no winner profile — gauntlet exhausted in
+    child or no winner).
+
+    Defensive forward-compat (Codex 2026-05-27 fix #5): the ``_filtered``
+    helper drops UNKNOWN keys (so future workers can add fields without
+    breaking older parents), AND every dataclass construction is wrapped
+    in try/except so MISSING required keys degrade to ``None`` for the
+    nested block instead of crashing the entire orchestrator. Without
+    the try/except, a worker that omits e.g. ``warp_stall_runner_up_pct``
+    from NCUMetrics would raise TypeError past the orchestrator's
+    ``except WorkerCrashed`` and abort the whole run on a survivable
+    schema mismatch.
+    """
+    if data is None:
+        return None
+    from dataclasses import fields
+    from src.eval.profiler import AnalyticalMetrics, NCUMetrics, ProfilingResult
+
+    def _filtered(cls, src: dict) -> dict:
+        known = {f.name for f in fields(cls)}
+        return {k: v for k, v in src.items() if k in known}
+
+    ad = data.get("analytical")
+    if ad:
+        try:
+            analytical = AnalyticalMetrics(**_filtered(AnalyticalMetrics, ad))
+        except TypeError as exc:
+            logger.warning(
+                "AnalyticalMetrics rehydration failed (missing required "
+                "field?): %s — treating as analytical=None", exc,
+            )
+            analytical = None
+    else:
+        analytical = None
+    nd = data.get("ncu")
+    if nd:
+        try:
+            ncu = NCUMetrics(**_filtered(NCUMetrics, nd))
+        except TypeError as exc:
+            logger.warning(
+                "NCUMetrics rehydration failed (missing required field?): "
+                "%s — treating as ncu=None", exc,
+            )
+            ncu = None
+    else:
+        ncu = None
+    rep_path = data.get("ncu_rep_path")
+    pr_kwargs = _filtered(ProfilingResult, {
+        "analytical": analytical,
+        "ncu": ncu,
+        "raw_metrics": data.get("raw_metrics", {}) or {},
+        "metric_groups": data.get("metric_groups", {}) or {},
+        "degraded_reason": data.get("degraded_reason"),
+        "ncu_rep_path": Path(rep_path) if rep_path else None,
+    })
+    try:
+        return ProfilingResult(**pr_kwargs)
+    except TypeError as exc:
+        logger.warning(
+            "ProfilingResult rehydration failed: %s — treating winner "
+            "profile as None", exc,
+        )
+        return None
 
 
 class TerminationReason(str, Enum):
@@ -468,6 +632,13 @@ class Orchestrator:
         # on first use so test paths that mock CUDA don't pay the
         # ``env_snapshot`` cost. Reset per ``run()`` invocation.
         self._environment = None
+        # Bench-subprocess isolation (2026-05-24). Counts consecutive
+        # ``WorkerCrashed`` outcomes from the per-iter bench worker;
+        # reaches ``ACTSConfig.worker_crash_threshold`` (default 3) →
+        # raise ``WorkerProcessUnstable`` and abort the run. Mirrors
+        # ``consecutive_cuda_errors`` shape (counter + escalation).
+        # Reset to 0 on every clean worker exit.
+        self.consecutive_worker_crashes = 0
 
     def _kill_branch(
         self,
@@ -533,6 +704,8 @@ class Orchestrator:
         input_generators: list[Callable[[int], tuple]] | None = None,
         problem_definition_path: Path | None = None,
         definition: Definition | None = None,
+        run_dir: Path | None = None,
+        ncu_cache_dir: Path | None = None,
     ) -> SearchResult:
         """Execute the full search loop from baseline to best kernel.
 
@@ -820,6 +993,50 @@ class Orchestrator:
                     degraded=baseline_feedback.degraded,
                 )
 
+        # ─── Bench-dispatch invariants — computed ONCE per run() ───
+        # Codex 2026-05-27 fix #7: previously `_effective_run_dir`,
+        # `_effective_ncu_cache`, and `_subprocess_enabled` were
+        # computed inside the iter loop, so the `run_dir is None`
+        # fallback branch allocated a fresh `tempfile.mkdtemp(...)` PER
+        # iter and leaked them across long test runs (also broke
+        # cross-iter NCU cache sharing). Compute once + best-effort
+        # cleanup via the run()'s outer try/finally below.
+        _subprocess_enabled = (
+            self._config.bench_use_subprocess and run_dir is not None
+        )
+        # Codex 2026-05-27 fix #3: silent downgrade is an operator
+        # safety regression — the cfg toggle for CUDA-isolation becomes
+        # a no-op when RunContext fell back to run_dir=None (disk-full,
+        # permission denied). Log loudly so operators see it.
+        if self._config.bench_use_subprocess and run_dir is None:
+            logger.warning(
+                "ACTSConfig.bench_use_subprocess=True but run_dir is None — "
+                "silently falling back to in-process bypass. CUDA-context "
+                "isolation (the entire point of bench_use_subprocess) is "
+                "DISABLED for this run. Verify RunContext.create() didn't "
+                "OSError into its null-RunContext fallback."
+            )
+        if run_dir is not None:
+            _effective_run_dir = run_dir
+        else:
+            _effective_run_dir = Path(
+                tempfile.mkdtemp(prefix="acts_inproc_run_"),
+            )
+            # Best-effort cleanup at interpreter shutdown — keeps /tmp
+            # from accumulating one acts_inproc_run_* per test session.
+            # Fires even on uncaught exception inside the for-iter loop;
+            # ignore_errors so a half-deleted dir doesn't mask the real
+            # failure.
+            import atexit
+            import shutil as _shutil
+            atexit.register(
+                _shutil.rmtree, _effective_run_dir, ignore_errors=True,
+            )
+        _effective_ncu_cache = (
+            ncu_cache_dir if ncu_cache_dir is not None
+            else _effective_run_dir / "ncu_cache"
+        )
+
         for iteration in range(self._config.max_depth):
             iter_no = iteration + 1
             frontier = tree.frontier()
@@ -1009,31 +1226,36 @@ class Orchestrator:
                 epsilon = max(self._config.epsilon_end, epsilon - decay)
                 continue
 
-            # Per-survivor: sequential anti-cheat + precompile + bench.
-            # Anti-cheat scope is per-candidate (Q4) so a monkey-patch by
-            # one sibling can't taint the others. A channel-A
-            # ``RewardHackDetected`` aborts the iter (no sibling
-            # fallback): ``per_iter_anti_cheat`` is a detector, not a
-            # restorer, so the process state may stay tainted and
-            # profiling any later candidate would compound the taint.
-            # (Restoring state explicitly is JOURNAL'd tech-debt.)
-            bench_results: list[tuple[int, Any, Kernel, Any, Any]] = []
-            iter_tainted_by_hack = False
+            # ───── Bench dispatch (subprocess or in-process bypass) ─────
+            # Per-iter K-way bench + autotune burn-in + NCU profile runs
+            # in a short-lived ``python -m src.eval.bench_worker`` child
+            # for CUDA-context isolation (closes the trigger pattern
+            # from `runs/sweep_l1_048/.../run_20260520T011532_929220Z` +
+            # `runs/run_20260526T074709_405554Z` — sticky CUDA errors
+            # like `cudaErrorIllegalAddress` die with the child, the
+            # next iter spawns a fresh context). Falls back to inline
+            # ``run_iter(...)`` when ``ACTSConfig.bench_use_subprocess
+            # =False`` (debugging) OR ``run_dir is None`` (tests).
+            # See doc/specs/2026-05-24-bench-subprocess-isolation-design.md.
+            from src.eval.bench_subprocess import (
+                WorkerCrashed,
+                merge_worker_artifacts,
+                run_bench_subprocess,
+            )
+            from src.eval.bench_worker import build_request
+            from src.eval.bench_worker import run_iter as _run_iter_inproc
+
+            # Entrypoint-binding pre-filter (stays in parent — mis-bound
+            # candidates are dropped before they cross the IPC boundary
+            # so the child only sees valid candidates).
+            request_candidates: list[dict] = []
             for cand_idx, cand_output in survivors:
-                # Build the candidate Kernel once — used by every path
-                # below (entrypoint failure, bench failure, success).
-                # Mis-bound kernels persist with the submitted source so
-                # postmortems can inspect what the Coder produced.
                 cand_kernel = Kernel(
                     spec=baseline.spec,
                     source_code=cand_output.source_code,
                     triton_kernel_name=cand_output.triton_kernel_name,
                     dps=getattr(cand_output, "dps", False),
                 )
-                # Entrypoint-binding check drops the candidate so the
-                # K-way fan-out picks another survivor — different from
-                # the baseline path (which raises) because here a
-                # mis-bound candidate is one of K, not the run's anchor.
                 ok, reason = find_jit_name_in_entrypoint(
                     cand_output.source_code,
                     baseline.spec.entrypoint,
@@ -1047,106 +1269,266 @@ class Orchestrator:
                         reason=f"EntrypointBinding: {reason[:160]}",
                     )
                     continue
-                try:
-                    # Precompile must run inside per_iter_anti_cheat so
-                    # candidate-source import-time side effects register
-                    # as drift (not as the new baseline).
-                    with per_iter_anti_cheat(self._config.anti_cheat_critical_names):
-                        cand_compiled_fn, cand_autotuner = _safe_precompile(
-                            cand_kernel, role="Child",
-                        )
-                        cand_bench = benchmark_kernel(
-                            cand_kernel,
-                            self._config,
-                            workloads=workloads,
-                            input_generators=input_generators,
-                            definition=definition,
-                            kernel_fn=cand_compiled_fn,
-                            autotuner=cand_autotuner,
-                        )
-                    check_lazy_outputs_after_bench(cand_bench.last_outputs)
-                    cand_bench.last_outputs.clear()
-                except RewardHackDetected as exc:
-                    # Agent-fault + process tainted: abort the iter
-                    # (no sibling fallback). The dedicated
-                    # ``reward_hack_detected`` event preserves the
-                    # channel-A trust-boundary signal for telemetry
-                    # consumers; ``coder_failed`` runs alongside for
-                    # the all-failures bookkeeping.
+                request_candidates.append({
+                    "candidate_idx": cand_idx,
+                    "source_code": cand_output.source_code,
+                    "triton_kernel_name": cand_output.triton_kernel_name,
+                    "entrypoint": baseline.spec.entrypoint,
+                    "dps": getattr(cand_output, "dps", False),
+                })
+
+            if not request_candidates:
+                # All survivors dropped at entrypoint-binding pre-filter.
+                # Same SKIPPED path as "all-K-fail-bench" today.
+                parent.consecutive_agent_failures = 0
+                _persist_iter_failure_summary(
+                    tree, parent, plan=plan, iter_no=iter_no,
+                    iter_failures=iter_failures,
+                    iter_failure_kernels=iter_failure_kernels,
+                )
+                emit("iter_end", iter=iter_no, outcome=ITER_SKIPPED)
+                epsilon = max(self._config.epsilon_end, epsilon - decay)
+                continue
+
+            # Dispatch invariants (``_subprocess_enabled``,
+            # ``_effective_run_dir``, ``_effective_ncu_cache``) are
+            # hoisted out of the iter loop — see the once-per-run
+            # block before the for-iteration loop (Codex 2026-05-27
+            # fix #7). Per-iter only the worker_dir derives from them.
+            worker_dir = _effective_run_dir / f"iter_{iter_no}" / "worker"
+            worker_dir.mkdir(parents=True, exist_ok=True)
+
+            request = build_request(
+                run_dir=_effective_run_dir,
+                iter_no=iter_no,
+                worker_dir=worker_dir,
+                ncu_cache_dir=_effective_ncu_cache,
+                candidates=request_candidates,
+                kernel_spec=_serialize_kernel_spec_for_request(baseline.spec),
+                workloads=[
+                    wl.model_dump(mode="json") for wl in (workloads or [])
+                ],
+                definition_path=problem_definition_path or Path(""),
+                hardware_spec=self._config.hardware,
+                anti_cheat_critical_names=list(
+                    self._config.anti_cheat_critical_names
+                ),
+                bench_config={
+                    "warmup_runs": self._config.warmup_runs,
+                    "timed_runs": self._config.timed_runs,
+                    "burn_in_seed": -1,
+                },
+                profile_config={
+                    "ncu_enabled": True,
+                    "analytical_enabled": True,
+                    # Roofline-derived inputs computed once-per-iter in
+                    # parent; threaded into child so the worker doesn't
+                    # re-derive (cheap, but the dependency on SOLAR/
+                    # roofline_shapes lives parent-side).
+                    "iter_flops": iter_flops,
+                    "iter_nbytes": iter_nbytes,
+                    "repr_workload_idx": repr_idx,
+                    # SOL ranking + profile context required by the
+                    # child's profile gauntlet (Codex 2026-05-26 fix
+                    # #1). Without ``t_sol_us`` / ``baseline_latency_us``
+                    # the worker falls back to defaults that diverge
+                    # from the parent's ranking contract. Without
+                    # ``problem_definition_path`` / ``blob_roots``,
+                    # safetensors-backed workloads crash the worker
+                    # before any candidate is evaluated AND the NCU
+                    # subprocess loses the inputs it needs to
+                    # reconstruct workload state on profile.
+                    "t_sol_us": roofline.t_sol_us,
+                    "baseline_latency_us": baseline_bench.median_latency_us,
+                    "problem_definition_path": (
+                        str(problem_definition_path)
+                        if problem_definition_path is not None else None
+                    ),
+                    "blob_roots": [
+                        str(p) for p in (_resolve_blob_roots(
+                            self._config.safetensors_blob_roots,
+                            problem_definition_path,
+                        ) or [])
+                    ],
+                },
+            )
+
+            emit(
+                "bench_worker_spawned",
+                iter=iter_no,
+                worker_dir=str(worker_dir),
+                request_path=str(worker_dir / "request.json"),
+            )
+            walltime_start = time.time()
+
+            try:
+                if _subprocess_enabled:
+                    response = await run_bench_subprocess(
+                        request=request,
+                        worker_dir=worker_dir,
+                        worker_crash_threshold=self._config.worker_crash_threshold,
+                        worker_timeout_s=self._config.worker_timeout_s,
+                    )
+                else:
+                    response = _run_iter_inproc(request)
+            except WorkerCrashed as exc:
+                walltime_s = time.time() - walltime_start
+                self.consecutive_worker_crashes += 1
+                emit(
+                    "bench_worker_crashed",
+                    iter=iter_no,
+                    returncode=exc.returncode,
+                    stderr_tail=exc.stderr_tail,
+                    consecutive=self.consecutive_worker_crashes,
+                )
+                emit(
+                    "bench_worker_exited",
+                    iter=iter_no,
+                    returncode=exc.returncode,
+                    walltime_s=walltime_s,
+                )
+                if (
+                    self.consecutive_worker_crashes
+                    >= self._config.worker_crash_threshold
+                ):
+                    raise WorkerProcessUnstable(
+                        f"{self.consecutive_worker_crashes} consecutive "
+                        f"worker crashes; last: rc={exc.returncode}"
+                    ) from exc
+                # Treat all K as failed → single failure-summary node.
+                for cand in request_candidates:
+                    _accumulate_iter_failure(
+                        iter_failures, iter_failure_kernels,
+                        iter_no=iter_no,
+                        candidate_idx=cand["candidate_idx"],
+                        kernel=_rebuild_cand_kernel(
+                            request_candidates,
+                            cand["candidate_idx"],
+                            baseline.spec,
+                        ),
+                        reason=f"WorkerCrashed: rc={exc.returncode}",
+                    )
+                # NOTE (Codex 2026-05-26 review P2 fix #1): do NOT bump
+                # ``parent.consecutive_agent_failures`` here. Worker
+                # crashes are infrastructure failures already tracked
+                # by ``self.consecutive_worker_crashes`` (3-strike
+                # escalation to ``WorkerProcessUnstable``). Double-
+                # counting them on the agent-quarantine axis would
+                # remove the only frontier node from ``frontier()``
+                # after just two transient crashes (``QUARANTINE_
+                # THRESHOLD = 2``), ending the search as
+                # ``ALL_DEAD_END`` *before* the third crash could
+                # raise the correct ``WorkerProcessUnstable``.
+                _persist_iter_failure_summary(
+                    tree, parent, plan=plan, iter_no=iter_no,
+                    iter_failures=iter_failures,
+                    iter_failure_kernels=iter_failure_kernels,
+                )
+                emit("iter_end", iter=iter_no, outcome=ITER_SKIPPED)
+                epsilon = max(self._config.epsilon_end, epsilon - decay)
+                continue
+
+            walltime_s = time.time() - walltime_start
+            emit(
+                "bench_worker_exited",
+                iter=iter_no,
+                returncode=0,
+                walltime_s=walltime_s,
+            )
+            self.consecutive_worker_crashes = 0  # reset on clean exit
+
+            # Always merge per-iter worker chunk into canonical run
+            # artifacts (events.jsonl concat + .ncu-rep copy into
+            # shared cache + tree/node_<id>/), regardless of dispatch
+            # mode. Codex 2026-05-27 fix #4: previously gated on
+            # ``_subprocess_enabled`` — in-process bypass paths
+            # (debugging, tests, RunContext OSError fallback) silently
+            # lost any worker-emitted events AND any .ncu-rep files the
+            # in-process worker call produced via
+            # ``profile_kernel(cache_dir=worker_dir)``. The merge is a
+            # no-op when worker wrote nothing, so unconditional merge
+            # is safe + ensures consistent telemetry across modes.
+            counts = merge_worker_artifacts(
+                run_dir=_effective_run_dir,
+                worker_dir=worker_dir,
+                iter_no=iter_no,
+                response=response,
+                ncu_cache_dir=_effective_ncu_cache,
+            )
+            emit("worker_chunk_merged", iter=iter_no, **counts)
+
+            # Per-candidate verdict accumulation — replaces the OLD
+            # per-candidate try/except branches. ``not_run`` candidates
+            # (post-channel-A-trip siblings) are silent; failed
+            # candidates accumulate into iter_failures + emit
+            # ``coder_failed``.
+            bench_results: list[tuple[int, Any, Kernel, Any, Any]] = []
+            for cand_resp in response["candidates"]:
+                cand_idx = cand_resp["candidate_idx"]
+                status = cand_resp["status"]
+                if status == "success":
+                    cand_kernel = _rebuild_cand_kernel(
+                        request_candidates, cand_idx, baseline.spec,
+                    )
+                    cand_bench = _rehydrate_bench_result(
+                        cand_resp["bench_result"]
+                    )
+                    # The live Triton ``Autotuner`` object can't cross
+                    # IPC; ``_child_autotuner`` becomes a sentinel:
+                    # non-None iff bench captured autotune winners.
+                    # Downstream gate ``_child_autotuner is not None``
+                    # at the autotune_burn_in_done emit behaves
+                    # identically (records winners when present).
+                    cand_autotuner = (
+                        cand_bench.autotune_winner_per_workload or None
+                    )
+                    cand_output_obj = next(
+                        s_out for s_idx, s_out in survivors
+                        if s_idx == cand_idx
+                    )
+                    bench_results.append((
+                        cand_idx, cand_output_obj, cand_kernel,
+                        cand_bench, cand_autotuner,
+                    ))
+                elif status == "channel_a_tripped":
                     agent_failure_count += 1
-                    iter_tainted_by_hack = True
                     emit(
                         "reward_hack_detected",
                         iter=iter_no,
                         candidate_idx=cand_idx,
-                        reason=str(exc)[:200],
+                        reason=cand_resp.get("reason", "")[:200],
                     )
                     emit(
                         "coder_failed",
                         iter=iter_no,
                         candidate_idx=cand_idx,
-                        reason=f"reward-hack: {str(exc)[:180]}",
-                    )
-                    break
-                except BenchmarkError as exc:
-                    _accumulate_iter_failure(
-                        iter_failures, iter_failure_kernels,
-                        iter_no=iter_no, candidate_idx=cand_idx,
-                        kernel=cand_kernel, reason=str(exc)[:200],
-                    )
-                    continue
-                except RuntimeError as exc:
-                    msg = str(exc)
-                    msg_lower = msg.lower()
-                    if not any(p in msg_lower for p in _CUDA_STICKY_PATTERNS):
-                        raise
-                    try:
-                        import torch
-                        torch.cuda.synchronize()
-                        consecutive_cuda_errors = 0
-                    except Exception:
-                        consecutive_cuda_errors += 1
-                        if consecutive_cuda_errors >= 3:
-                            raise CUDAContextPoisoned(
-                                f"3+ consecutive cuda.synchronize() failures: {exc}"
-                            ) from exc
-                    _accumulate_iter_failure(
-                        iter_failures, iter_failure_kernels,
-                        iter_no=iter_no, candidate_idx=cand_idx,
-                        kernel=cand_kernel,
-                        reason=f"CUDA sticky-state: {msg[:160]}",
-                    )
-                    continue
-
-                if not cand_bench.is_fully_successful:
-                    # Partial-workload failure: downstream profile/score
-                    # require fully_successful, so the candidate cannot
-                    # become a winner. Treat as per-candidate infra
-                    # failure (no quarantine bump).
-                    _accumulate_iter_failure(
-                        iter_failures, iter_failure_kernels,
-                        iter_no=iter_no, candidate_idx=cand_idx,
-                        kernel=cand_kernel,
                         reason=(
-                            f"partial bench failure: {cand_bench.workload_errors}"
-                        )[:200],
+                            f"reward-hack: "
+                            f"{cand_resp.get('reason', '')[:180]}"
+                        ),
                     )
-                    continue
+                elif status in ("bench_failed", "entrypoint_failed"):
+                    cand_kernel = _rebuild_cand_kernel(
+                        request_candidates, cand_idx, baseline.spec,
+                    )
+                    _accumulate_iter_failure(
+                        iter_failures, iter_failure_kernels,
+                        iter_no=iter_no, candidate_idx=cand_idx,
+                        kernel=cand_kernel,
+                        reason=cand_resp.get("reason", "")[:200],
+                    )
+                # ``not_run`` is silent — sibling of a channel-A trip;
+                # never evaluated, no event, no failure node.
 
-                bench_results.append(
-                    (cand_idx, cand_output, cand_kernel, cand_bench, cand_autotuner)
-                )
-                consecutive_cuda_errors = 0
-
-            if iter_tainted_by_hack:
-                # Bench loop broke on the first detection — earlier
-                # siblings' bench_results were collected before the
-                # patch tripped on a later sibling, but they may already
-                # have read patched primitives; profile would compound
-                # the taint.
+            # Channel-A iter-level abort (mirrors OLD iter_tainted path).
+            # Child broke on first detection; remaining cands marked
+            # not_run in response. Process taint dies with the child →
+            # iter N+1 spawns a fresh context (spec §3 decision #9
+            # cross-iter slice).
+            if response.get("aborted_by_channel_A"):
                 logger.warning(
                     "Iteration %d: channel-A reward-hack detected — "
-                    "aborting iter (process state may be tainted).",
+                    "aborting iter (worker process terminated).",
                     iter_no,
                 )
                 parent.consecutive_agent_failures += 1
@@ -1159,129 +1541,21 @@ class Orchestrator:
                 epsilon = max(self._config.epsilon_end, epsilon - decay)
                 continue
 
-            if not bench_results:
-                logger.warning(
-                    "Iteration %d: all %d Coder candidates failed bench — skipping",
-                    iter_no, K,
-                )
-                # ``survivors`` was non-empty (gated above), so at least
-                # one Coder produced output → parent is productive.
-                # Clear quarantine even if K-1 siblings failed agent-side
-                # (stochastic decoder variance at T=1.0, not the
-                # parent's fault).
-                parent.consecutive_agent_failures = 0
-                _persist_iter_failure_summary(
-                    tree, parent, plan=plan, iter_no=iter_no,
-                    iter_failures=iter_failures,
-                    iter_failure_kernels=iter_failure_kernels,
-                )
-                emit("iter_end", iter=iter_no, outcome=ITER_SKIPPED)
-                epsilon = max(self._config.epsilon_end, epsilon - decay)
-                continue
-
-            # Rank-and-fallback winner selection. The fastest
-            # bench-successful candidate may be unprofileable; if it
-            # entered the tree pre-profile, a single ProfilerError
-            # would kill the whole iter even when K-1 valid siblings
-            # exist — defeating K-way's reliability. Iterate candidates
-            # in SOL-Score order (highest first; tie-break lowest idx),
-            # profile each, commit only the first profile-success.
-            # Channel-B reward-hack on the winner still kills the iter
-            # without fallback (rare; agent-fault).
-            profile_blob_roots = _resolve_blob_roots(
-                self._config.safetensors_blob_roots,
-                problem_definition_path,
-            )
-            remaining = list(bench_results)
-            winner_idx = None
-            coder_output = None
-            child_kernel = None
-            bench = None
-            _child_autotuner = None
-            profiling = None
-            repr_workload_latency_s = None
-            # 1-indexed rank of the profile-success winner; surfaced in
-            # ``coder_submitted.n_profile_attempts`` as a companion to
-            # ``n_survivors`` (bench-survivors, not profile-survivors).
-            profile_attempts = 0
-
-            while remaining:
-                entry = _select_best_candidate(
-                    remaining,
-                    t_sol_us=roofline.t_sol_us,
-                    baseline_latency_us=baseline_bench.median_latency_us,
-                )
-                e_idx, e_coder_output, e_kernel, e_bench, e_autotuner = entry
-                remaining = [e for e in remaining if e[0] != e_idx]
-                profile_attempts += 1
-
-                e_repr_lat_s = _representative_latency_s(
-                    e_bench, workloads, repr_idx,
-                )
-                if e_repr_lat_s is None:
-                    logger.warning(
-                        "Iteration %d: candidate %d representative workload "
-                        "latency unavailable — falling back to next-ranked",
-                        iter_no, e_idx,
-                    )
-                    emit(
-                        "coder_failed",
-                        iter=iter_no,
-                        candidate_idx=e_idx,
-                        reason="representative workload latency unavailable",
-                    )
-                    continue
-
-                try:
-                    e_profiling = profile_kernel(
-                        e_kernel,
-                        repr_workload_axes,
-                        repr_input_generator,
-                        hardware_spec=self._config.hardware,
-                        flops=iter_flops,
-                        nbytes=iter_nbytes,
-                        latency_s=e_repr_lat_s,
-                        problem_definition_path=problem_definition_path,
-                        blob_roots=profile_blob_roots,
-                    )
-                except ProfilerError as exc:
-                    logger.warning(
-                        "Iteration %d: candidate %d profile failed (%s) — "
-                        "falling back to next-ranked",
-                        iter_no, e_idx, exc,
-                    )
-                    emit(
-                        "coder_failed",
-                        iter=iter_no,
-                        candidate_idx=e_idx,
-                        reason=f"profile error: {str(exc)[:180]}",
-                    )
-                    continue
-
-                # Winner — this candidate cleared bench AND profile.
-                winner_idx = e_idx
-                coder_output = e_coder_output
-                child_kernel = e_kernel
-                bench = e_bench
-                _child_autotuner = e_autotuner
-                profiling = e_profiling
-                repr_workload_latency_s = e_repr_lat_s
-                break
-
+            # No-winner case (combines OLD all-K-fail-bench branch +
+            # all-profile-gauntlet-fail branch; child has run both
+            # gauntlets and reports a single winner or None).
+            winner_idx = response.get("winner_idx")
             if winner_idx is None:
                 logger.warning(
-                    "Iteration %d: all %d Coder candidates failed the "
-                    "profile gauntlet — skipping",
-                    iter_no, len(bench_results),
+                    "Iteration %d: no winner from bench/profile-gauntlet "
+                    "— skipping",
+                    iter_no,
                 )
-                # bench_results was non-empty → parent produced valid
-                # Coder output AND bench results. Profile failures are
-                # infra; clear quarantine.
+                # At least one Coder produced output → parent productive
+                # → clear quarantine even if K-1 siblings failed
+                # (stochastic decoder variance at T=1.0, not parent's
+                # fault).
                 parent.consecutive_agent_failures = 0
-                # Profile-layer failures themselves don't populate
-                # iter_failures (event-only by design), but bench-layer
-                # failures from earlier in the per-candidate loop might
-                # — persist them now before skipping.
                 _persist_iter_failure_summary(
                     tree, parent, plan=plan, iter_no=iter_no,
                     iter_failures=iter_failures,
@@ -1290,6 +1564,28 @@ class Orchestrator:
                 emit("iter_end", iter=iter_no, outcome=ITER_SKIPPED)
                 epsilon = max(self._config.epsilon_end, epsilon - decay)
                 continue
+
+            # Winner rehydration — child already ranked + profiled;
+            # parent unpacks winner_idx, winner's bench tuple, and the
+            # winner profile dataclass.
+            winner_entry = next(
+                e for e in bench_results if e[0] == winner_idx
+            )
+            (
+                _w_idx, coder_output, child_kernel, bench, _child_autotuner,
+            ) = winner_entry
+            profiling = _rehydrate_profiling_result(
+                response.get("winner_profile")
+            )
+            repr_workload_latency_s = _representative_latency_s(
+                bench, workloads, repr_idx,
+            )
+            # ``profile_attempts`` was the OLD gauntlet's 1-indexed
+            # rank of the profile-success winner. Child runs the
+            # gauntlet now and doesn't currently report the rank; the
+            # parent records 1 as a conservative placeholder. Surfaced
+            # in ``coder_submitted.n_profile_attempts``.
+            profile_attempts = 1
 
             # Winner committed to the tree (only after profile success).
             child = tree.add_child(
