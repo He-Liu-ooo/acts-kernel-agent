@@ -446,6 +446,57 @@ class TestRenderProfilingBlock:
         assert "[DEGRADED:" in text
         assert "TFLOPS" not in text
 
+    def _make_profiling_with_dtype(
+        self,
+        *,
+        compute_peak_dtype: str = "fp32",
+        compute_peak_calibration_warning: bool = False,
+    ):
+        from src.eval.profiler import (
+            AnalyticalMetrics,
+            NCUMetrics,
+            ProfilingResult,
+        )
+        return ProfilingResult(
+            analytical=AnalyticalMetrics(
+                achieved_tflops=36.42,
+                achieved_bandwidth_gb_s=12.0,
+                pct_peak_compute=0.10,
+                pct_peak_bandwidth=0.012,
+                compute_peak_dtype=compute_peak_dtype,
+                compute_peak_calibration_warning=compute_peak_calibration_warning,
+            ),
+            ncu=NCUMetrics(
+                sm_occupancy_pct=70.0, l2_hit_rate_pct=50.0,
+                tensor_core_util_pct=0.0,
+                warp_stall_dominant="x", warp_stall_dominant_pct=0.0,
+                warp_stall_runner_up="y", warp_stall_runner_up_pct=0.0,
+            ),
+        )
+
+    def test_render_dtype_label_next_to_pct_peak_compute(self):
+        text = render_report(OptimizationReport(
+            termination_reason="budget",
+            total_iterations=1,
+            winner_profiling_per_workload={
+                "wl-uuid": self._make_profiling_with_dtype(compute_peak_dtype="bf16"),
+            },
+        ))
+        assert "compute 10.0% [bf16]" in text
+
+    def test_render_fp32_fallback_marker_visible(self):
+        text = render_report(OptimizationReport(
+            termination_reason="budget",
+            total_iterations=1,
+            winner_profiling_per_workload={
+                "wl-uuid": self._make_profiling_with_dtype(
+                    compute_peak_dtype="fp32_fallback",
+                    compute_peak_calibration_warning=True,
+                ),
+            },
+        ))
+        assert "compute 10.0% [fp32_fallback]" in text
+
     def test_render_profiling_block_happy_path_unchanged(self):
         """Sanity: the analytical TFLOPS / GB/s / pct_peak line still
         renders for a workload with valid analytical metrics. Guards

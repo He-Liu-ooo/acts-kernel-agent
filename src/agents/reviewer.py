@@ -187,7 +187,9 @@ def render_profiling_summary(
             a = profiling.analytical
             lines.extend([
                 f"- achieved: {a.achieved_tflops:.2f} TFLOPS / {a.achieved_bandwidth_gb_s:.2f} GB/s",
-                f"- pct_peak: compute {a.pct_peak_compute * 100:.1f}% · bw {a.pct_peak_bandwidth * 100:.1f}%",
+                f"- pct_peak: compute {a.pct_peak_compute * 100:.1f}% "
+                f"[{a.compute_peak_dtype}] · "
+                f"bw {a.pct_peak_bandwidth * 100:.1f}%",
             ])
         else:
             lines.append("- achieved / pct_peak: [unavailable — no byte count]")

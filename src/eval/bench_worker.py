@@ -169,7 +169,11 @@ def build_request(
     See spec §5.1 for the full schema.
     """
     return {
-        "schema_version": 1,
+        # 2 (2026-05-28): profile_kernel forwards input_dtypes through to
+        # AnalyticalMetrics; the response carries the dtype label and
+        # calibration_warning. Schema-bump rationale + migration notes in
+        # doc/specs/2026-05-28-pct-peak-dtype-and-warmup-traceback-design.md.
+        "schema_version": 2,
         "run_dir": str(run_dir),
         "iter_no": iter_no,
         "worker_dir": str(worker_dir),
@@ -585,7 +589,8 @@ def run_iter(request: dict) -> dict:
         )
 
     return {
-        "schema_version": 1,
+        # 2 (2026-05-28): see _build_request_payload for rationale.
+        "schema_version": 2,
         "iter_no": iter_no,
         "candidates": response_candidates,
         "winner_idx": winner_idx,
@@ -656,6 +661,17 @@ def _run_profile_gauntlet(
             )
             continue
 
+        # Best-effort capture of the materialized input dtypes so the
+        # analytical pct_peak.compute denominator can pick the matching
+        # tensor-core peak (see _pick_compute_peak). Failures collapse
+        # to an empty list and the fp32_fallback path engages.
+        from src.eval.profiler import _collect_input_dtypes
+        try:
+            _repr_inputs = repr_input_generator(0)
+        except Exception:
+            _repr_inputs = ()
+        _repr_dtypes = _collect_input_dtypes(_repr_inputs)
+
         try:
             profile = profile_kernel(
                 w_kernel,
@@ -668,6 +684,7 @@ def _run_profile_gauntlet(
                 cache_dir=worker_dir,
                 problem_definition_path=problem_definition_path,
                 blob_roots=blob_roots,
+                input_dtypes=_repr_dtypes,
             )
         except ProfilerError as exc:
             _emit(

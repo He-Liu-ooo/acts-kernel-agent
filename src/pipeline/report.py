@@ -238,6 +238,18 @@ def generate_report(
             if effective_blob_roots is None and definition_path is not None:
                 effective_blob_roots = [definition_path.parent]
 
+            # Materialize the inputs once to capture dtypes for the
+            # pct_peak.compute denominator (see _pick_compute_peak). The
+            # per-workload generator is called again inside profile_kernel,
+            # so this is a small redundant call but keeps the dtype-gather
+            # path uniform across the three profile_kernel sites.
+            from src.eval.profiler import _collect_input_dtypes
+            try:
+                _repr_inputs = ig(0)
+            except Exception:
+                _repr_inputs = ()
+            _repr_dtypes = _collect_input_dtypes(_repr_inputs)
+
             per_workload_profiling[w.uuid] = profile_kernel(
                 best.kernel,
                 w.model_dump(mode="json"),
@@ -249,6 +261,7 @@ def generate_report(
                 cache_dir=cache_dir,
                 problem_definition_path=definition_path,
                 blob_roots=effective_blob_roots,
+                input_dtypes=_repr_dtypes,
             )
 
     score = best.score
@@ -437,7 +450,8 @@ def _render_profiling_block(
                     f"    [{uuid}] "
                     f"{roofline_prefix}"
                     f"{a.achieved_tflops:.2f} TFLOPS / {a.achieved_bandwidth_gb_s:.2f} GB/s "
-                    f"(pct_peak: compute {a.pct_peak_compute * 100:.1f}% · "
+                    f"(pct_peak: compute {a.pct_peak_compute * 100:.1f}% "
+                    f"[{a.compute_peak_dtype}] · "
                     f"bw {a.pct_peak_bandwidth * 100:.1f}%)"
                 )
         if all_ncu_missing:

@@ -172,7 +172,7 @@ def test_build_request_assembles_schema_v1(tmp_path):
             "blob_roots": [],
         },
     )
-    assert req["schema_version"] == 1
+    assert req["schema_version"] == 2  # bumped 2026-05-28 for input_dtypes plumbing
     assert req["iter_no"] == 7
     assert len(req["candidates"]) == 2
     assert req["candidates"][0]["candidate_idx"] == 0
@@ -336,7 +336,7 @@ def test_run_iter_happy_path_all_K_succeed(tmp_path, monkeypatch):
     req = _build_minimal_request(tmp_path, K=2)
     resp = run_iter(req)
 
-    assert resp["schema_version"] == 1
+    assert resp["schema_version"] == 2  # bumped 2026-05-28 for input_dtypes plumbing
     assert resp["iter_no"] == 1
     assert len(resp["candidates"]) == 2
     assert all(c["status"] == "success" for c in resp["candidates"])
@@ -520,7 +520,7 @@ def test_main_cli_reads_request_writes_response(tmp_path, monkeypatch):
     assert rc == 0
     assert response_path.exists()
     resp = json.loads(response_path.read_text())
-    assert resp["schema_version"] == 1
+    assert resp["schema_version"] == 2  # bumped 2026-05-28 for input_dtypes plumbing
     assert resp["iter_no"] == 1
 
 

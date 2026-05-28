@@ -27,6 +27,7 @@ guard.
 
 from __future__ import annotations
 
+import traceback
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -259,9 +260,18 @@ def check_autotune_smem_budget(
             # Surface the swallowed exception in the event payload so
             # postmortems can distinguish TypeError (constexpr missing
             # from cfg.kwargs — common with warp-spec / persistent-grid
-            # kernels) from ptxas crash / OOM / etc. ``exc_msg`` capped
-            # at 160 chars to bound events.jsonl bloat from long Triton
-            # tracebacks. Trigger run: run_20260525T080053_565567Z.
+            # kernels) from ptxas crash / OOM / etc.
+            #
+            # Carries the FULL traceback, tail-sliced at 2048 chars.
+            # Triton's CompilationError annotates the failing source
+            # line at the END of the chain (``at <line>:<col>:``); the
+            # prior head-sliced ``exc_msg`` cap was cutting that
+            # annotation. Trigger run: run_20260527T150715_440277Z
+            # (iter-0 had 6 head-truncated events that all looked
+            # identical and hid the Triton line-col annotation).
+            tb_text = "".join(
+                traceback.format_exception(type(exc), exc, exc.__traceback__)
+            )
             events.emit(
                 "smem_check_skipped",
                 iter=iter_no,
@@ -269,7 +279,7 @@ def check_autotune_smem_budget(
                 reason="warmup_failed",
                 config_idx=i,
                 exc_class=type(exc).__name__,
-                exc_msg=str(exc)[:160],
+                exc_traceback=tb_text[-2048:],
             )
             continue
         compiled = _latest_cache_entry(autotuner.fn)

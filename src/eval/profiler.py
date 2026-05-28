@@ -451,6 +451,16 @@ class AnalyticalMetrics:
     achieved_bandwidth_gb_s: float
     pct_peak_compute: float
     pct_peak_bandwidth: float
+    # Dtype label used to pick the compute-peak denominator.
+    # Values: "bf16" | "fp16" | "tf32" | "fp8" | "nvfp4" | "fp32" |
+    # "fp32_fallback". "fp32" = legitimate fp32 choice;
+    # "fp32_fallback" = heuristic cascaded because the preferred dtype
+    # peak was missing or zero. See _pick_compute_peak.
+    compute_peak_dtype: str = "fp32"
+    # True when _pick_compute_peak fell back (no input_dtypes, unknown
+    # dtype, or chosen peak was zero). Renderer flags the line with
+    # the fp32_fallback label so the operator sees the heuristic fired.
+    compute_peak_calibration_warning: bool = False
 
 
 @dataclass(frozen=True)
@@ -522,19 +532,146 @@ class ProfilingResult:
         )
 
 
+# Maps torch dtype name spellings → the HardwareSpec peak_flops attribute
+# whose denominator that dtype should use. The dtype name is normalised
+# via str(t.dtype).removeprefix("torch.").lower() at the call site, so
+# both "bfloat16" and "bf16" are accepted.
+_DTYPE_PEAK_ATTR: dict[str, str] = {
+    "float32": "peak_flops_fp32", "fp32": "peak_flops_fp32",
+    "tfloat32": "peak_flops_tf32", "tf32": "peak_flops_tf32",
+    "float16": "peak_flops_fp16", "fp16": "peak_flops_fp16", "half": "peak_flops_fp16",
+    "bfloat16": "peak_flops_bf16", "bf16": "peak_flops_bf16",
+    "float8_e4m3fn": "peak_flops_fp8", "float8_e5m2": "peak_flops_fp8", "fp8": "peak_flops_fp8",
+    "nvfp4": "peak_flops_nvfp4",
+}
+
+# Lower rank = lower precision = preferred denominator. Equal-rank pairs
+# (bf16 / fp16) tie and the first survivor of the sort wins; both map to
+# the same peak class on Hopper/Ada so the choice is observationally
+# identical.
+_PRECISION_RANK: dict[str, int] = {
+    "peak_flops_nvfp4": 0,
+    "peak_flops_fp8":   1,
+    "peak_flops_bf16":  2,
+    "peak_flops_fp16":  2,
+    "peak_flops_tf32":  3,
+    "peak_flops_fp32":  4,
+}
+
+_PEAK_ATTR_LABEL: dict[str, str] = {
+    "peak_flops_nvfp4": "nvfp4",
+    "peak_flops_fp8":   "fp8",
+    "peak_flops_bf16":  "bf16",
+    "peak_flops_fp16":  "fp16",
+    "peak_flops_tf32":  "tf32",
+    "peak_flops_fp32":  "fp32",
+}
+
+
+def _collect_input_dtypes(tensors: Any) -> list[str]:
+    """Best-effort extract lowercase dtype names from tensor-like args.
+
+    Accepts any of:
+
+    * a tuple/list of tensors (``(t1, t2, ...)``),
+    * the ``(args, kwargs)`` shape produced by some input generators,
+    * a dict of tensors keyed by name.
+
+    Returns the dtype names with the ``torch.`` prefix stripped (e.g.
+    ``"bfloat16"``, ``"float32"``). Non-tensor items (ints, strings,
+    ``None``) are skipped. An empty list means no dtype info was
+    recoverable — :func:`_pick_compute_peak` engages the fp32_fallback
+    path on the caller's behalf.
+    """
+    if tensors is None:
+        return []
+    items: list[Any] = []
+    if (
+        isinstance(tensors, tuple)
+        and len(tensors) == 2
+        and isinstance(tensors[1], dict)
+        and isinstance(tensors[0], (list, tuple))
+    ):
+        items.extend(tensors[0])
+        items.extend(tensors[1].values())
+    elif isinstance(tensors, (list, tuple)):
+        items.extend(tensors)
+    elif isinstance(tensors, dict):
+        items.extend(tensors.values())
+    else:
+        return []
+    out: list[str] = []
+    for t in items:
+        dt = getattr(t, "dtype", None)
+        if dt is None:
+            continue
+        out.append(str(dt).removeprefix("torch."))
+    return out
+
+
+def _pick_compute_peak(
+    input_dtypes: list[str] | None,
+    hardware_spec: HardwareSpec,
+) -> tuple[float, str, bool]:
+    """Return ``(peak_tflops, dtype_label, calibration_warning)``.
+
+    Picks the lowest-precision input dtype's matching hardware peak. Falls
+    back to ``peak_flops_fp32`` (label ``"fp32_fallback"``, warning True)
+    when:
+
+    * ``input_dtypes`` is None or empty,
+    * no input dtype maps to a known peak attribute, or
+    * the chosen peak (and every peak between it and fp32 on the
+      precision ladder) is zero.
+
+    Does not raise; the caller decides what to do with a zero peak.
+    """
+    candidates: list[str] = []
+    for dt in input_dtypes or []:
+        norm = dt.lower().removeprefix("torch.")
+        attr = _DTYPE_PEAK_ATTR.get(norm)
+        if attr is not None:
+            candidates.append(attr)
+
+    if not candidates:
+        return (hardware_spec.peak_flops_fp32, "fp32_fallback", True)
+
+    candidates.sort(key=lambda a: _PRECISION_RANK[a])
+    chosen_attr = candidates[0]
+    chosen_peak = getattr(hardware_spec, chosen_attr)
+
+    if chosen_peak > 0:
+        return (chosen_peak, _PEAK_ATTR_LABEL[chosen_attr], False)
+
+    # Cascade up the precision ladder to the first nonzero peak.
+    for attr in ("peak_flops_fp16", "peak_flops_bf16", "peak_flops_tf32", "peak_flops_fp32"):
+        if _PRECISION_RANK[attr] <= _PRECISION_RANK[chosen_attr]:
+            continue
+        peak = getattr(hardware_spec, attr)
+        if peak > 0:
+            return (peak, "fp32_fallback", True)
+
+    return (0.0, "fp32_fallback", True)
+
+
 def _compute_analytical(
     *,
     flops: int,
     nbytes: int,
     latency_s: float,
     hardware_spec: HardwareSpec,
+    input_dtypes: list[str] | None = None,
 ) -> AnalyticalMetrics:
     """Derive per-iteration achieved-throughput metrics from measured latency.
 
-    Returns achieved TFLOPS / bandwidth and their percent-of-peak ratios.
-    The kernel's arithmetic_intensity and the hardware's ridge_point are
-    run-level invariants and live on ``RooflineResult`` instead — this
-    function does not recompute them per iteration.
+    The compute-peak denominator is chosen via :func:`_pick_compute_peak`
+    from ``input_dtypes`` (the materialized input-tensor dtypes at bench
+    time). Omitting the kwarg or passing ``None`` engages the
+    ``fp32_fallback`` path — same numeric denominator as before this
+    change, but the returned ``AnalyticalMetrics`` carries
+    ``compute_peak_calibration_warning=True`` so the renderer can flag the
+    line. See ``doc/specs/2026-05-28-pct-peak-dtype-and-warmup-traceback-
+    design.md`` for the dtype-peak selection contract.
 
     Raises ``ProfilerError`` when inputs make analysis meaningless:
     non-positive latency / nbytes, or hardware with zero peak compute /
@@ -547,7 +684,9 @@ def _compute_analytical(
     if flops < 0:
         raise ProfilerError(f"flops must be non-negative, got {flops}")
 
-    peak_tflops = hardware_spec.peak_flops_fp32
+    peak_tflops, peak_label, calibration_warning = _pick_compute_peak(
+        input_dtypes, hardware_spec,
+    )
     peak_bw_gb_s = hardware_spec.peak_memory_bandwidth_gb_s
     if peak_tflops <= 0 or peak_bw_gb_s <= 0:
         raise ProfilerError(
@@ -565,6 +704,8 @@ def _compute_analytical(
         achieved_bandwidth_gb_s=achieved_bandwidth_gb_s,
         pct_peak_compute=pct_peak_compute,
         pct_peak_bandwidth=pct_peak_bandwidth,
+        compute_peak_dtype=peak_label,
+        compute_peak_calibration_warning=calibration_warning,
     )
 
 
@@ -1164,6 +1305,7 @@ def profile_kernel(
     cache_dir: Path | None = None,
     problem_definition_path: Path | None = None,
     blob_roots: list[Path] | None = None,
+    input_dtypes: list[str] | None = None,
 ) -> ProfilingResult:
     """Hybrid analytical + NCU profile (spec §3.2).
 
@@ -1200,6 +1342,7 @@ def profile_kernel(
             nbytes=nbytes,
             latency_s=latency_s,
             hardware_spec=hardware_spec,
+            input_dtypes=input_dtypes,
         )
     else:
         analytical = None

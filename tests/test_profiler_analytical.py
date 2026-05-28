@@ -9,6 +9,8 @@ per-iteration runtime metrics.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from conftest import rtx6000_ada_hardware as _rtx6000_ada
@@ -16,7 +18,9 @@ from src.config import HardwareSpec
 from src.eval.profiler import (
     AnalyticalMetrics,
     ProfilerError,
+    _collect_input_dtypes,
     _compute_analytical,
+    _pick_compute_peak,
 )
 
 
@@ -138,3 +142,237 @@ def test_zero_flops_is_ok():
     hw = _rtx6000_ada()
     r = _compute_analytical(flops=0, nbytes=1_000_000, latency_s=1e-3, hardware_spec=hw)
     assert r.achieved_tflops == 0.0
+
+
+# ── _pick_compute_peak (dtype-aware denominator) ───────────────────────────
+
+
+def test_pick_compute_peak_bfloat16_input():
+    hw = _rtx6000_ada()
+    peak, label, warn = _pick_compute_peak(["bfloat16"], hw)
+    assert peak == pytest.approx(hw.peak_flops_bf16)
+    assert label == "bf16"
+    assert warn is False
+
+
+def test_pick_compute_peak_lowest_precision_wins():
+    hw = _rtx6000_ada()
+    # bf16 should beat fp32 — lowest precision wins
+    peak, label, warn = _pick_compute_peak(["bfloat16", "float32"], hw)
+    assert peak == pytest.approx(hw.peak_flops_bf16)
+    assert label == "bf16"
+    assert warn is False
+
+
+def test_pick_compute_peak_empty_list_falls_back_to_fp32():
+    hw = _rtx6000_ada()
+    peak, label, warn = _pick_compute_peak([], hw)
+    assert peak == pytest.approx(hw.peak_flops_fp32)
+    assert label == "fp32_fallback"
+    assert warn is True
+
+
+def test_pick_compute_peak_none_falls_back_to_fp32():
+    hw = _rtx6000_ada()
+    peak, label, warn = _pick_compute_peak(None, hw)
+    assert peak == pytest.approx(hw.peak_flops_fp32)
+    assert label == "fp32_fallback"
+    assert warn is True
+
+
+def test_pick_compute_peak_unknown_dtype_falls_back_to_fp32():
+    hw = _rtx6000_ada()
+    peak, label, warn = _pick_compute_peak(["mysterious_dtype"], hw)
+    assert peak == pytest.approx(hw.peak_flops_fp32)
+    assert label == "fp32_fallback"
+    assert warn is True
+
+
+def test_pick_compute_peak_bf16_zero_cascades_to_next_nonzero_peak():
+    # Placeholder-style hardware: bf16/fp16/tf32 zeroed but fp32 populated.
+    # The bf16 input dtype should cascade up the precision ladder.
+    hw = replace(
+        _rtx6000_ada(),
+        MAC_per_cycle_bf16_tc=0.0,
+        MAC_per_cycle_fp16_tc=0.0,
+        MAC_per_cycle_tf32_tc=0.0,
+    )
+    peak, label, warn = _pick_compute_peak(["bfloat16"], hw)
+    assert peak == pytest.approx(hw.peak_flops_fp32)
+    assert label == "fp32_fallback"
+    assert warn is True
+
+
+def test_pick_compute_peak_all_zero_returns_zero_with_warning():
+    # Fully-zero spec: helper returns (0.0, "fp32_fallback", True). Caller
+    # (_compute_analytical) is responsible for raising ProfilerError on the
+    # zero peak; this helper does not raise.
+    hw = HardwareSpec()
+    peak, label, warn = _pick_compute_peak(["bfloat16"], hw)
+    assert peak == 0.0
+    assert label == "fp32_fallback"
+    assert warn is True
+
+
+def test_pick_compute_peak_fp32_input_label_is_plain_fp32():
+    hw = _rtx6000_ada()
+    peak, label, warn = _pick_compute_peak(["float32"], hw)
+    assert peak == pytest.approx(hw.peak_flops_fp32)
+    assert label == "fp32"   # legitimate fp32 choice — NOT the fallback label
+    assert warn is False
+
+
+def test_pick_compute_peak_bf16_alias_accepted():
+    hw = _rtx6000_ada()
+    peak1, label1, _ = _pick_compute_peak(["bfloat16"], hw)
+    peak2, label2, _ = _pick_compute_peak(["bf16"], hw)
+    assert peak1 == peak2
+    assert label1 == label2 == "bf16"
+
+
+# ── _compute_analytical(input_dtypes=…) integration ────────────────────────
+
+
+def test_compute_analytical_uses_bf16_peak_when_dtype_bfloat16():
+    hw = _rtx6000_ada()
+    # Size achieved TFLOPS to ~10% of bf16 peak so the ratio is checkable.
+    target = hw.peak_flops_bf16 * 0.10
+    latency_s = 1e-3
+    flops = int(target * latency_s * 1e12)
+    out = _compute_analytical(
+        flops=flops, nbytes=1024, latency_s=latency_s,
+        hardware_spec=hw, input_dtypes=["bfloat16"],
+    )
+    assert out.compute_peak_dtype == "bf16"
+    assert out.compute_peak_calibration_warning is False
+    assert 0.099 < out.pct_peak_compute < 0.101
+
+
+def test_compute_analytical_falls_back_to_fp32_when_no_dtypes():
+    hw = _rtx6000_ada()
+    target = hw.peak_flops_fp32 * 0.10
+    latency_s = 1e-3
+    flops = int(target * latency_s * 1e12)
+    out = _compute_analytical(
+        flops=flops, nbytes=1024, latency_s=latency_s,
+        hardware_spec=hw, input_dtypes=None,
+    )
+    assert out.compute_peak_dtype == "fp32_fallback"
+    assert out.compute_peak_calibration_warning is True
+    assert 0.099 < out.pct_peak_compute < 0.101
+
+
+def test_compute_analytical_legitimate_fp32_input_label():
+    hw = _rtx6000_ada()
+    target = hw.peak_flops_fp32 * 0.10
+    flops = int(target * 1e-3 * 1e12)
+    out = _compute_analytical(
+        flops=flops, nbytes=1024, latency_s=1e-3,
+        hardware_spec=hw, input_dtypes=["float32"],
+    )
+    assert out.compute_peak_dtype == "fp32"
+    assert out.compute_peak_calibration_warning is False
+
+
+def test_compute_analytical_raises_on_all_zero_hardware_even_with_dtypes():
+    hw = HardwareSpec()  # fully zero
+    with pytest.raises(ProfilerError, match="hardware"):
+        _compute_analytical(
+            flops=1, nbytes=1, latency_s=1e-3,
+            hardware_spec=hw, input_dtypes=["bfloat16"],
+        )
+
+
+def test_compute_analytical_input_dtypes_is_optional_kwarg():
+    """Back-compat: pre-existing call sites that omit input_dtypes still
+    work; they get the fp32_fallback path."""
+    hw = _rtx6000_ada()
+    out = _compute_analytical(
+        flops=1, nbytes=1, latency_s=1e-3, hardware_spec=hw,
+    )
+    assert out.compute_peak_dtype == "fp32_fallback"
+    assert out.compute_peak_calibration_warning is True
+
+
+# ── profile_kernel(input_dtypes=…) integration ─────────────────────────────
+
+
+def test_profile_kernel_forwards_input_dtypes_to_analytical(monkeypatch):
+    """``profile_kernel`` threads ``input_dtypes`` into ``_compute_analytical``.
+
+    ``ACTS_DISABLE_NCU=1`` short-circuits the NCU subprocess so the test
+    runs without an NCU binary; the analytical path still executes and is
+    what we assert on.
+    """
+    from src.eval.profiler import profile_kernel
+    from src.kernels.kernel import Kernel, KernelSpec, KernelType
+
+    monkeypatch.setenv("ACTS_DISABLE_NCU", "1")
+
+    kernel = Kernel(
+        spec=KernelSpec(
+            name="fake",
+            kernel_type=KernelType.ELEMENTWISE,
+            entrypoint="fake_kernel",
+        ),
+        source_code="def fake_kernel(): pass\n",
+    )
+    hw = _rtx6000_ada()
+    achieved_tflops = hw.peak_flops_bf16 * 0.10
+    latency_s = 1e-3
+    flops = int(achieved_tflops * latency_s * 1e12)
+
+    result = profile_kernel(
+        kernel,
+        {"uuid": "wl-0", "axes": {}, "inputs": {}},
+        lambda seed=0: (),  # input_generator
+        hardware_spec=hw,
+        flops=flops,
+        nbytes=1024,
+        latency_s=latency_s,
+        input_dtypes=["bfloat16"],
+    )
+    assert result.analytical is not None
+    assert result.analytical.compute_peak_dtype == "bf16"
+    assert result.analytical.compute_peak_calibration_warning is False
+    assert 0.099 < result.analytical.pct_peak_compute < 0.101
+
+
+# ── _collect_input_dtypes (call-site adapter) ──────────────────────────────
+
+
+class _FakeTensor:
+    """Stand-in for torch.Tensor — only needs a ``.dtype`` attribute. The
+    helper stringifies it via ``str(t.dtype).removeprefix('torch.')``."""
+
+    def __init__(self, dtype_name: str) -> None:
+        # Mimic torch's repr: ``torch.bfloat16``.
+        self.dtype = f"torch.{dtype_name}"
+
+
+def test_collect_input_dtypes_tuple_of_tensors():
+    args = (_FakeTensor("bfloat16"), _FakeTensor("float32"))
+    assert _collect_input_dtypes(args) == ["bfloat16", "float32"]
+
+
+def test_collect_input_dtypes_args_kwargs_shape():
+    args = (_FakeTensor("bfloat16"),)
+    kwargs = {"weight": _FakeTensor("bfloat16"), "bias": _FakeTensor("float32")}
+    out = _collect_input_dtypes((args, kwargs))
+    assert sorted(out) == ["bfloat16", "bfloat16", "float32"]
+
+
+def test_collect_input_dtypes_dict_of_tensors():
+    inputs = {"x": _FakeTensor("bfloat16"), "w": _FakeTensor("bfloat16")}
+    assert sorted(_collect_input_dtypes(inputs)) == ["bfloat16", "bfloat16"]
+
+
+def test_collect_input_dtypes_skips_non_tensor_items():
+    args = (_FakeTensor("bfloat16"), 1024, "foo", None)
+    assert _collect_input_dtypes(args) == ["bfloat16"]
+
+
+def test_collect_input_dtypes_empty_returns_empty():
+    assert _collect_input_dtypes(()) == []
+    assert _collect_input_dtypes(None) == []
+    assert _collect_input_dtypes((1, 2, "foo")) == []

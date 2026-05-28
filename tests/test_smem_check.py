@@ -430,14 +430,15 @@ def test_check_autotune_smem_budget_threads_iter_no_into_events(monkeypatch):
         assert it == 42, f"event {kind} missing iter=42 (got {it!r})"
 
 
-def test_warmup_failed_event_carries_exception_detail(monkeypatch):
+def test_warmup_failed_event_carries_exception_traceback(monkeypatch):
     """``smem_check_skipped(reason='warmup_failed')`` must include
-    ``exc_class`` and ``exc_msg`` so postmortems can distinguish the
-    failure modes the bare ``except Exception:`` would otherwise mask:
-    signature mismatch (TypeError: missing constexpr), ptxas crash
-    (CompileTimeAssertionFailure), OOM, etc. Without these fields the
-    diagnostic blind spot from ``run_20260525T080053_565567Z`` recurs —
-    every smem_check_skipped looks identical in events.jsonl.
+    ``exc_class`` and ``exc_traceback`` (formatted via ``traceback.format_exception``)
+    so postmortems can distinguish the failure modes the bare
+    ``except Exception:`` would otherwise mask: signature mismatch
+    (TypeError), ptxas crash, OOM, etc. ``exc_msg`` (the legacy
+    160-char head-slice) is replaced by the full-traceback tail-slice
+    because Triton's CompilationError annotates the source line at the
+    END of the chain — head-slicing cut it off (run_20260525T080053).
     """
     fn = _FakeJITFunction()
     configs = [_FakeConfig({"BLOCK_M": 64})]
@@ -466,15 +467,18 @@ def test_warmup_failed_event_carries_exception_detail(monkeypatch):
     assert len(warmup_events) == 1, captured
     ev = warmup_events[0]
     assert ev["exc_class"] == "TypeError"
-    assert "NUM_PRODUCER_WARPS" in ev["exc_msg"]
+    assert "exc_traceback" in ev
+    assert "exc_msg" not in ev  # negative: legacy key is gone
+    assert "TypeError" in ev["exc_traceback"]
+    assert "NUM_PRODUCER_WARPS" in ev["exc_traceback"]
     assert ev["config_idx"] == 0
 
 
-def test_warmup_failed_exc_msg_truncated_to_bound():
-    """Long Triton tracebacks can run into KB. The exc_msg field caps at
-    ~160 chars so events.jsonl doesn't bloat — pin the cap so a future
-    well-meaning widening doesn't silently land an unbounded payload.
-    """
+def test_warmup_failed_exc_traceback_capped_at_2048_chars():
+    """Long Triton tracebacks can run into KB. ``exc_traceback`` caps at
+    2048 chars (tail-sliced — see test_warmup_failed_exc_traceback_keeps_tail)
+    so events.jsonl doesn't bloat under the worst case where every Config
+    in K-way fan-out fails."""
     fn = _FakeJITFunction()
     configs = [_FakeConfig({"BLOCK_M": 64})]
     autotuner = _FakeAutotuner(configs=configs, fn=fn)
@@ -501,7 +505,48 @@ def test_warmup_failed_exc_msg_truncated_to_bound():
         _smem.events.emit = orig_emit
     warmup_events = [e for e in captured if e.get("reason") == "warmup_failed"]
     assert len(warmup_events) == 1
-    assert len(warmup_events[0]["exc_msg"]) <= 160
+    assert len(warmup_events[0]["exc_traceback"]) <= 2048
+
+
+def test_warmup_failed_exc_traceback_keeps_tail(monkeypatch):
+    """Tail-slice preservation — Triton's CompilationError annotates the
+    failing source line at the END of the exception chain (the
+    ``at <line>:<col>:`` fragment). Head-slicing the 160-char cap was
+    cutting that annotation; the new 2KB tail-slice must keep it.
+    """
+    fn = _FakeJITFunction()
+    configs = [_FakeConfig({"BLOCK_M": 64})]
+    autotuner = _FakeAutotuner(configs=configs, fn=fn)
+    tail_marker = "AT_LINE_57_COL_45_TRITON_ANNOTATION"
+    # Pad with leading X's so the head of the rendered traceback is
+    # noise; the tail-slice must still surface the marker.
+    long_msg = ("X" * 5000) + "\n" + tail_marker
+
+    def _warmup(*args, **kwargs):
+        raise RuntimeError(long_msg)
+
+    fn.warmup = _warmup
+    captured: list[dict] = []
+    monkeypatch.setattr(
+        "src.eval.smem_check.events.emit",
+        lambda kind, *, iter=None, **kw: captured.append(
+            {"kind": kind, "iter": iter, **kw}
+        ),
+    )
+
+    def host_wrapper(a):
+        autotuner.run(a, grid=(1,))
+
+    check_autotune_smem_budget(
+        autotuner, host_wrapper, sample_args=("a",), cap_bytes=101376,
+    )
+    warmup_events = [e for e in captured if e.get("reason") == "warmup_failed"]
+    assert len(warmup_events) == 1
+    tb = warmup_events[0]["exc_traceback"]
+    assert tail_marker in tb, (
+        f"tail marker missing from exc_traceback — head-slice regression? "
+        f"tb head: {tb[:120]!r} tb tail: {tb[-120:]!r}"
+    )
 
 
 def test_check_autotune_smem_budget_replays_recorded_kwargs():
