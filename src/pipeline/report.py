@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
 from src.runtime.usage import UsageBucket, UsageSnapshot, _fmt_tokens
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sol_execbench.core.data import Definition, Workload
@@ -246,7 +249,12 @@ def generate_report(
             from src.eval.profiler import _collect_input_dtypes
             try:
                 _repr_inputs = ig(0)
-            except Exception:
+            except Exception as exc:
+                logger.warning(
+                    "report dtype-gather: input generator raised %s: %s — "
+                    "pct_peak.compute will use fp32_fallback",
+                    type(exc).__name__, exc,
+                )
                 _repr_inputs = ()
             _repr_dtypes = _collect_input_dtypes(_repr_inputs)
 

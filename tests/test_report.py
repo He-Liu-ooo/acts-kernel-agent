@@ -773,3 +773,55 @@ class TestUsageBlockRender:
         text = render_report(rep)
         assert "of which cached input" not in text
         assert "of which reasoning output" not in text
+
+
+# ── swallowed-exception logging (Task 5) ────────────────────────────────
+
+
+def test_report_dtype_gather_logs_on_generator_failure(caplog):
+    """When the per-workload input generator raises (e.g. a poisoned CUDA
+    context), the dtype-gather ``except`` must emit a WARNING before
+    falling back to () — turning silent fp32_fallback into a diagnosable
+    log line."""
+    import logging
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from src.config import HardwareSpec
+
+    tree = SearchTree()
+    root = tree.add_root(_make_kernel("root"))
+    root.score = _make_score(0.3)
+    best = tree.add_child(root.id, _make_kernel("winner"), "tiling")
+    best.score = _make_score(0.8)
+    best.per_workload_latency_us = {"w0": 42.0}
+
+    result = SearchResult(
+        best_node=best,
+        total_iterations=1,
+        termination_reason=TerminationReason.BUDGET,
+        tree=tree,
+    )
+
+    workload = SimpleNamespace(uuid="w0", model_dump=lambda mode="json": {"uuid": "w0"})
+
+    def _boom(_seed):
+        raise RuntimeError("CUDA error: device-side assert triggered")
+
+    caplog.set_level(logging.WARNING, logger="src.pipeline.report")
+    with (
+        patch("src.eval.profiler.profile_kernel", return_value=object()),
+        patch("src.eval.profiler._collect_input_dtypes", return_value=[]),
+    ):
+        generate_report(
+            result,
+            workloads=[workload],
+            input_generators=[_boom],
+            hardware_spec=HardwareSpec(),
+            definition=None,
+        )
+
+    assert any(
+        "device-side assert" in r.message or "input generator raised" in r.message
+        for r in caplog.records
+    )
