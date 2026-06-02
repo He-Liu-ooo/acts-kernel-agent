@@ -14,6 +14,12 @@ def _exp(
     hardware_arch: str = "RTX6000Ada",
     speedup: float = 1.5,
 ) -> Experience:
+    # action_id keyed off row_id so each row has a DISTINCT dedup_key — these
+    # sampling/weighting/fallback tests rely on every constructed row staying a
+    # distinct candidate. (The read-time dedup_best now collapses rows sharing a
+    # (kernel, arch, scope, action_id, condition) key; without a unique action_id
+    # every row here would share one key and the pool would collapse to a single
+    # candidate.)
     return Experience(
         row_id=row_id,
         schema_version=1,
@@ -21,7 +27,7 @@ def _exp(
         hardware_arch=hardware_arch,
         scope="edge",
         speedup=speedup,
-        action_applied=ActionRecord(action_id="a", tier=1, name="n"),
+        action_applied=ActionRecord(action_id=row_id, tier=1, name="n"),
         title="t",
         lesson="l",
         snippet_before="a",
@@ -184,7 +190,7 @@ def test_alpha_one_favors_higher_speedup():
     assert counts["fast"] > 3 * counts["slow"], counts
 
 
-def test_sampling_with_replacement_can_return_duplicates():
+def test_sampling_without_replacement_returns_distinct_rows():
     # Pool size 1 + top_k=3 — pool <= top_k path returns all, no replacement
     pool = [_exp("only")]
     r = MemoryRetriever(_FakeStore(pool), top_k=3, alpha=1.0, read_enabled=True)
@@ -199,5 +205,48 @@ def test_sampling_with_replacement_can_return_duplicates():
     r2 = MemoryRetriever(_FakeStore(pool2), top_k=2, alpha=2.0, read_enabled=True, rng=rng)
     result2 = r2.sample("matmul", "RTX6000Ada")
     assert len(result2) == 2
-    # b's weight is 100^2 = 10000 vs a/c = 1 — both picks should be "b" with replacement
-    assert all(e.row_id == "b" for e in result2)
+    # Sampling is now WITHOUT replacement: the same row can never appear twice.
+    # b's weight (100^2) dominates so it is one of the two picks, but the
+    # second slot must be a DIFFERENT row, not a repeat of "b".
+    assert len({e.row_id for e in result2}) == 2
+    assert "b" in {e.row_id for e in result2}
+
+
+def _e_cond(row_id, *, action_id, condition, speedup):
+    """Builder with explicit action_id + condition (distinct dedup keys)."""
+    return Experience(
+        row_id=row_id, schema_version=1, kernel_type="matmul", hardware_arch="RTX6000Ada",
+        scope="edge", speedup=speedup,
+        action_applied=ActionRecord(action_id, 1, action_id, {}),
+        title="t", lesson="l", snippet_before="", snippet_after="",
+        provenance={}, created_at="2026-06-02T00:00:00+00:00", condition=condition)
+
+
+def test_sample_returns_no_duplicate_row_ids():
+    # Two DISTINCT rows; top_k larger than the pool must NOT repeat either.
+    rows = [_e_cond("a", action_id="t1_grid_shape", condition="compute_bound", speedup=1.5),
+            _e_cond("b", action_id="t1_occupancy", condition="compute_bound", speedup=1.2)]
+    r = MemoryRetriever(_FakeStore(rows), top_k=5, alpha=1.0,
+                        read_enabled=True, rng=random.Random(0))
+    out = r.sample("matmul", "RTX6000Ada")
+    assert len(out) == len({e.row_id for e in out})  # no repeats
+    assert {e.row_id for e in out} == {"a", "b"}
+
+
+def test_sample_collapses_same_key_duplicates():
+    # Same (action, condition) appearing twice -> at most one in the result.
+    rows = [_e_cond("lo", action_id="t1_grid_shape", condition="compute_bound", speedup=1.2),
+            _e_cond("hi", action_id="t1_grid_shape", condition="compute_bound", speedup=1.6)]
+    r = MemoryRetriever(_FakeStore(rows), top_k=5, alpha=1.0,
+                        read_enabled=True, rng=random.Random(0))
+    out = r.sample("matmul", "RTX6000Ada")
+    assert [e.row_id for e in out] == ["hi"]
+
+
+def test_sample_preserves_distinct_conditions():
+    rows = [_e_cond("a", action_id="t1_grid_shape", condition="compute_bound", speedup=1.5),
+            _e_cond("b", action_id="t1_grid_shape", condition="memory_bound", speedup=1.4)]
+    r = MemoryRetriever(_FakeStore(rows), top_k=5, alpha=1.0,
+                        read_enabled=True, rng=random.Random(0))
+    out = r.sample("matmul", "RTX6000Ada")
+    assert {e.row_id for e in out} == {"a", "b"}

@@ -8,7 +8,7 @@ from __future__ import annotations
 import random
 from typing import Protocol
 
-from src.memory.experience import Experience
+from src.memory.experience import Experience, dedup_best
 
 
 class _StoreLike(Protocol):
@@ -27,8 +27,11 @@ class MemoryRetriever:
              inclusion) and weight-sample the remaining ``top_k - len(same)``
              slots from the FULL cross-arch pool.
            - no cross-arch fill available → return whatever fits.
-        4. Weighting: ``random.choices(pool, weights=[s.speedup ** alpha], k=...)``.
-           Sampling is with replacement.
+        4. Weighting: iterative ``random.choices`` weighted by ``speedup ** alpha``,
+           drawing WITHOUT replacement so no lesson row repeats in one prompt.
+
+    The candidate pool is deduped (``dedup_best``) before sampling so
+    un-compacted/legacy rows can't inject the same lesson twice.
     """
 
     def __init__(
@@ -48,7 +51,12 @@ class MemoryRetriever:
     def sample(self, kernel_type: str, hardware_arch: str) -> list[Experience]:
         if not self._read_enabled:
             return []
-        candidates = [e for e in self._store.all() if e.kernel_type == kernel_type]
+        # Defense-in-depth: dedup the candidate pool so un-compacted rows
+        # (e.g. a legacy file not yet rewritten by the store) never inject the
+        # same (kernel, arch, scope, action, condition) lesson twice.
+        candidates = dedup_best(
+            [e for e in self._store.all() if e.kernel_type == kernel_type]
+        )
         if not candidates:
             return []
         if hardware_arch:
@@ -69,11 +77,19 @@ class MemoryRetriever:
         return same + self._weighted_sample(other, remaining)
 
     def _weighted_sample(self, pool: list[Experience], k: int) -> list[Experience]:
-        """Speedup-weighted random sample with replacement (``random.choices``).
+        """Speedup-weighted random sample WITHOUT replacement.
 
-        Returns the whole pool unsampled when it does not exceed ``k``.
-        """
+        Returns the whole pool (order preserved) when it does not exceed ``k``.
+        Drawing without replacement guarantees the Planner never sees the same
+        lesson row twice in one prompt (the prior ``random.choices`` drew WITH
+        replacement)."""
         if len(pool) <= k:
-            return pool
-        weights = [e.speedup ** self._alpha for e in pool]
-        return self._rng.choices(pool, weights=weights, k=k)
+            return list(pool)
+        remaining = list(pool)
+        chosen: list[Experience] = []
+        for _ in range(k):
+            weights = [e.speedup ** self._alpha for e in remaining]
+            pick = self._rng.choices(remaining, weights=weights, k=1)[0]
+            chosen.append(pick)
+            remaining.remove(pick)
+        return chosen

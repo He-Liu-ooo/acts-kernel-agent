@@ -13,7 +13,7 @@ import hashlib
 import logging
 from datetime import datetime, timezone
 
-from src.memory.experience import ActionRecord, Experience
+from src.memory.experience import ActionRecord, Experience, _format_condition
 from src.memory.store import KNOWN_VERSION, MemoryStore
 from src.memory.summarizer import SummarizerAgent, SummarizerResult
 
@@ -47,6 +47,7 @@ class Producer:
         action: ActionRecord,
         *,
         iter_no: int = 0,
+        bottleneck=None,
     ) -> None:
         if not self._config.opt_mem_write_enabled:
             return
@@ -90,6 +91,7 @@ class Producer:
         )
         if result is None:
             return
+        condition = _format_condition(bottleneck, action)
         exp = self._build_experience(
             parent_node_id=str(parent_node.id),
             child_node_id=str(child_node.id),
@@ -97,10 +99,11 @@ class Producer:
             speedup=ratio,
             action=action,
             summary=result,
+            condition=condition,
         )
         self._buffer_append(ratio, exp)
 
-    async def finalize(self, baseline_node, best_of_run_node) -> None:
+    async def finalize(self, baseline_node, best_of_run_node, *, bottleneck=None) -> None:
         if not self._config.opt_mem_write_enabled:
             return
         # G3 reserves 1 slot from the total cap; ``cap == 0`` means no slot
@@ -116,6 +119,19 @@ class Producer:
         ratio = baseline_node.runtime_ms / best_of_run_node.runtime_ms
         if ratio < self._config.opt_mem_min_improvement_ratio:
             return
+        # Single-edge run: if the baseline → best edge was actually captured in
+        # the buffer, the run-scope G3 would duplicate it — skip it. Keying on
+        # buffer presence (not ``best.parent_id``) means a single-edge win that
+        # produced no buffered edge (cap=1 → ``_edge_cap()==0``; or that edge's
+        # summarize returned None / was cap-evicted) still writes its G3 row,
+        # so the only lesson of the run is never silently dropped.
+        edge_captured = any(
+            e.provenance.get("parent_node_id") == str(baseline_node.id)
+            and e.provenance.get("child_node_id") == str(best_of_run_node.id)
+            for _, e in self._edge_buffer
+        )
+        if edge_captured:
+            return
         result = await self._summarizer.summarize_run(
             baseline_src=baseline_node.kernel.source_code,
             best_src=best_of_run_node.kernel.source_code,
@@ -127,6 +143,7 @@ class Producer:
         )
         if result is None:
             return
+        condition = _format_condition(bottleneck, None)
         self._g3_row = self._build_experience(
             parent_node_id=str(baseline_node.id),
             child_node_id=str(best_of_run_node.id),
@@ -136,6 +153,7 @@ class Producer:
             # cumulative. ``None`` matches the schema invariant.
             action=None,
             summary=result,
+            condition=condition,
         )
 
     async def flush(self) -> int:
@@ -172,6 +190,7 @@ class Producer:
         speedup: float,
         action: ActionRecord | None,
         summary: SummarizerResult,
+        condition: str,
     ) -> Experience:
         # ``scope`` is part of the digest so G1 (per-edge) and G3
         # (baseline → best-of-run) rows do not collide when the best-of-
@@ -202,4 +221,5 @@ class Producer:
                 "summarizer_model": self._summarizer.model_name,
             },
             created_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            condition=condition,
         )
