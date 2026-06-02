@@ -48,3 +48,47 @@ class Experience:
     snippet_after: str
     provenance: dict[str, str] = field(default_factory=dict)
     created_at: str = ""
+    # Deterministic applicability signature = run bottleneck + action params
+    # (e.g. "compute_bound | BLOCK_N=32"); run-scope rows carry bottleneck
+    # only. Keys dedup (same technique + same condition collapse; different
+    # conditions are preserved) and is surfaced to the Planner as
+    # "applies when: ...". See doc/specs/2026-06-02-optmem-dedup-design.md.
+    condition: str = ""
+
+
+def _format_condition(bottleneck, action: "ActionRecord | None") -> str:
+    """Deterministic applicability signature: ``"<bottleneck> | k=v, k=v"``.
+
+    ``bottleneck`` may be a ``BottleneckType`` (``.value``), a str, or None.
+    Run-scope rows pass ``action=None`` → bottleneck only. Params are sorted
+    for a stable key. Co-located with ``dedup_key``/``dedup_best`` because the
+    condition is part of an Experience's identity; ``producer.py`` re-exports
+    it. (Legacy-row backfill in ``store.py`` also calls this.)"""
+    parts: list[str] = []
+    if bottleneck:
+        parts.append(getattr(bottleneck, "value", bottleneck))
+    if action is not None and action.parameters:
+        params = ", ".join(f"{k}={v}" for k, v in sorted(action.parameters.items()))
+        parts.append(params)
+    return " | ".join(parts)
+
+
+def dedup_key(exp: "Experience") -> tuple:
+    """Identity for dedup: same technique + same condition collapse.
+
+    Run-scope rows (no action) use the sentinel ``"∅"`` for the action
+    component so they key only on (kernel, arch, run, condition=bottleneck)."""
+    action_id = exp.action_applied.action_id if exp.action_applied is not None else "∅"
+    return (exp.kernel_type, exp.hardware_arch, exp.scope, action_id, exp.condition)
+
+
+def dedup_best(rows: list["Experience"]) -> list["Experience"]:
+    """Collapse rows sharing a ``dedup_key`` to the highest-speedup row
+    (ties → most recent ``created_at``). Preserves first-seen key order."""
+    best: dict[tuple, "Experience"] = {}
+    for e in rows:
+        k = dedup_key(e)
+        cur = best.get(k)
+        if cur is None or (e.speedup, e.created_at) > (cur.speedup, cur.created_at):
+            best[k] = e
+    return list(best.values())
