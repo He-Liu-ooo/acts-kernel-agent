@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from pydantic import ValidationError
 
+    from src.actions.registry import Action
     from src.config import HardwareSpec
     from src.eval.types import BottleneckType
 
@@ -308,6 +309,48 @@ def render_kernel_section(kernel_source: str) -> str:
     """
     safe_source = kernel_source.replace("```", r"\`\`\`")
     return "## Current kernel\n```python\n" + safe_source + "\n```"
+
+
+def render_action_menu(actions: list["Action"]) -> str:
+    """Render applicable actions as a compact Planner selection menu.
+
+    One block per action: ``- <id> (<name>, tier <n>): <description>`` plus
+    optional advisory lines (``when:`` preconditions, ``knobs:`` parameters,
+    ``impact:`` expected_impact). Empty optional fields drop their line; an
+    empty ``actions`` list yields "" (caller falls back to the bare-ID list).
+    """
+    if not actions:
+        return ""
+    blocks: list[str] = []
+    for a in actions:
+        tier_no = a.tier.value if hasattr(a.tier, "value") else a.tier
+        lines = [f"- {a.id} ({a.name}, tier {tier_no}): {a.description}"]
+        if a.preconditions:
+            lines.append(f"    when: {', '.join(a.preconditions)}")
+        if a.parameters:
+            knobs = ", ".join(f"{k}={v}" for k, v in a.parameters.items())
+            lines.append(f"    knobs: {knobs}")
+        if a.expected_impact:
+            lines.append(f"    impact: {a.expected_impact}")
+        blocks.append("\n".join(lines))
+    return "\n".join(blocks)
+
+
+def render_technique_guidance(action: "Action") -> str:
+    """Render the SELECTED technique's implementation guidance for the Coder.
+
+    Concatenates ``guidance`` and an ``anti_patterns`` bullet list; returns
+    "" when both are empty (Coder omits the ``## Technique guidance`` section).
+    """
+    parts: list[str] = []
+    if action.guidance:
+        parts.append(action.guidance)
+    if action.anti_patterns:
+        parts.append(
+            "Anti-patterns to avoid:\n"
+            + "\n".join(f"- {ap}" for ap in action.anti_patterns)
+        )
+    return "\n\n".join(parts)
 
 
 def _tensor_core_tile_for(

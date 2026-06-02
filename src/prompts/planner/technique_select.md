@@ -14,10 +14,26 @@ The user prompt is assembled programmatically by `PlannerAgent.build_user_prompt
 ## Profiling summary
 <key metrics from the profiler — pct_peak_*, arithmetic_intensity (MACs/byte, run-level invariant), NCU signals>
 
-## Past experiences
-- <action_name> (tier <N>) [<param>=<val>, ...]: <success|failure>, speedup <X>x, bottleneck_before <label>
-- ...
-(Parameters are included when present, omitted when empty)
+## Past optimization lessons
+Below are past optimization lessons retrieved from similar kernels. Use them
+as inspiration, not directives — the current kernel and profile take
+precedence.
+
+[L1] **<title>**  (scope: edge|run, speedup: <X>x, arch: <hardware_arch>)
+<prose lesson body — no code>
+
+Before:
+```
+<changed-region snippet from the slower kernel>
+```
+
+After:
+```
+<changed-region snippet from the faster kernel>
+```
+
+[L2] ...
+(Block omitted entirely when no lessons are retrieved.)
 
 ## Available actions
 - <action_id_1>
@@ -31,4 +47,6 @@ The user prompt is assembled programmatically by `PlannerAgent.build_user_prompt
 <reviewer's diagnosis and suggestions — omitted on first iteration>
 ```
 
-`Run context` carries the once-per-run bottleneck (`classify_run`). It is stable across iterations because the problem, representative workload, and hardware do not change within a run — so the Planner can rely on it without having to re-derive it from the per-iter profiling metrics. Past experiences no longer carry a `bottleneck_after` field (experiences store only the pre-iteration classification).
+`Run context` carries the once-per-run bottleneck (`classify_run`). It is stable across iterations because the problem, representative workload, and hardware do not change within a run — so the Planner can rely on it without having to re-derive it from the per-iter profiling metrics.
+
+The `Past optimization lessons` block surfaces distilled (title + prose + before/after snippet) rows retrieved by `MemoryRetriever.sample(kernel_type, hardware_arch)`. The Retriever filters by kernel type, prefers same-arch rows, then samples `top_k` weighted by `speedup ** α` (with replacement). Two `scope` values: `edge` (per-iter improving edge captured by the producer) and `run` (cumulative baseline → best-of-run lesson at run end). No profile data — the Planner reasons against the live profile in the `Profiling summary` block above.
