@@ -63,3 +63,14 @@ These waste turns and produce worse outputs:
 - **Making multiple changes after a failure.** If compile/correctness fails, fix **one** issue at a time. Making two changes at once makes it impossible to tell which one was the problem.
 - **Padding `@triton.autotune` to dodge the ≥4-config minimum after exclusion.** If `autotune_exclude` rejects 2 of your 4 configs, do NOT duplicate the remaining 2 with trivial variations (e.g., adding `num_stages=2` and `num_stages=3` versions of the same `(BLOCK_M, BLOCK_N, BLOCK_K, num_warps)` tuple). Each config must be a meaningfully different point in the autotune space — typically varying `BLOCK_M`, `BLOCK_N`, or both. The validator counts ≥4 entries but does not check semantic diversity; padding with near-duplicates wastes Triton's burn-in time and produces no real exploration.
 - **Copying parent's autotune block without re-checking against `shared_mem_per_block_bytes`.** The parent kernel may have targeted a different dtype mix or different `num_stages`; reusing its configs verbatim is the same failure mode the "Regenerate the autotune block" hard rule guards against, now with a concrete cap. The `compile_kernel_tool` will reject Configs whose ptxas SMEM exceeds the cap; check the budget at draft time instead of waiting for the rejection round-trip.
+
+## Triton shared-memory reality
+
+Triton manages shared memory **implicitly** — there is **no** explicit shared-memory
+allocation API. `tl.static_shared_memory`, `tl.static_shared`, and similar primitives **do
+not exist** in `triton.language`; calling them is a guaranteed `CompilationError`. To get
+shared-memory tiling/reuse: load block tiles with `tl.load` and feed them to `tl.dot` (the
+compiler stages the operands through shared memory for you), and tune `num_stages` (software
+pipelining) plus `BLOCK_M`/`BLOCK_N`/`BLOCK_K`. Never try to allocate or address shared
+memory directly — when a plan says "stage into shared memory," express it through `tl.dot`
+tiling + `num_stages`, not a non-existent allocation call.

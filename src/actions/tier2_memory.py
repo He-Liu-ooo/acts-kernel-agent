@@ -11,13 +11,20 @@ def shared_memory_tiling() -> Action:
         id="t2_shared_memory_tiling",
         tier=ActionTier.MEMORY,
         name="Shared Memory Tiling",
-        description="Tile data through shared memory for reuse across threads.",
+        description=(
+            "Increase reuse of frequently-loaded operands so each is read once "
+            "per block and reused across the inner loop."
+        ),
         preconditions=["memory_bound"],
         guidance=(
-            "Stage frequently-reused inputs (matmul A/B tiles, conv filters, reduction operands) into "
-            "`tl.dot`-shaped shared-memory tiles. Each tile should be loaded once per block and reused "
-            "across the full inner loop. Tile size is bounded by shared memory per SM divided by "
-            "concurrent blocks — making tiles too big collapses occupancy."
+            "In Triton, shared-memory tiling is IMPLICIT — load block tiles with "
+            "`tl.load` and feed them to `tl.dot` (the compiler stages the operands "
+            "through shared memory for you), then tune `num_stages` (software "
+            "pipelining) and `BLOCK_M`/`BLOCK_N`/`BLOCK_K` for overlap and reuse. "
+            "Triton has NO explicit shared-memory allocation API — `tl.static_shared_memory` "
+            "and `tl.static_shared` do not exist and will fail to compile. Tile size is "
+            "bounded by shared memory per SM divided by concurrent blocks — oversizing "
+            "collapses occupancy."
         ),
         anti_patterns=[
             "Tiling data with no reuse — pure copy overhead, no speedup.",

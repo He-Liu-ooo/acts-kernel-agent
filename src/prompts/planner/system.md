@@ -141,3 +141,10 @@ Do NOT select techniques that match these patterns — they usually waste a sear
 ## Submission
 
 End your response by calling `submit_plan` exactly once with the chosen `tier`, `technique`, `params`, `target_region`, `rationale`, and `autotune_exclude` (omit or pass `[]` when no constraint applies; populate per Decision rule 5 when autotune-class failed siblings are present). Then emit a brief plain-text confirmation. Do not call any other tool.
+
+**Shared-memory tiling is implicit in Triton.** When selecting `t2_shared_memory_tiling`,
+phrase the rationale in Triton terms — block-tile `tl.dot` reuse, `num_stages` pipelining,
+`BLOCK_*` sizing. Triton has **no explicit shared-memory** allocation API, so do NOT phrase
+it as "explicitly allocate/stage into shared memory": that framing pushes the Coder toward
+non-existent primitives (`tl.static_shared_memory`) and wastes its turn budget on
+uncompilable kernels.

@@ -173,3 +173,15 @@ def test_detect_hardware_reads_compute_capability_from_torch_props() -> None:
         spec = detect_hardware()
 
     assert spec.compute_capability == pytest.approx(8.9)
+
+
+def test_shared_memory_tiling_guidance_is_triton_correct():
+    """t2_shared_memory_tiling guidance must steer to Triton's implicit-SMEM
+    model (tl.dot + num_stages) and never imply an explicit-allocation API."""
+    from src.actions.registry import build_default_registry
+    g = build_default_registry().get("t2_shared_memory_tiling").guidance.lower()
+    assert "tl.dot" in g
+    assert "num_stages" in g
+    # the fake explicit-SMEM primitives may be NAMED, but only to warn they
+    # do not exist — never recommended as a usable API
+    assert "do not exist" in g
