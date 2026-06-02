@@ -1,94 +1,79 @@
-"""Experience retrieval — kernel-type filtering + bottleneck matching."""
+"""Experience retriever — kernel-type + hardware-preferred + speedup-weighted sample.
+
+See ``doc/specs/2026-05-24-optimization-memory-design.md`` §6 + §10.
+"""
 
 from __future__ import annotations
 
-from src.eval.types import BottleneckType
+import random
+from typing import Protocol
+
 from src.memory.experience import Experience
-from src.memory.store import MemoryStore
-
-# Scoring weights
-_BOTTLENECK_MATCH = 10.0
-_SUCCESS_BONUS = 3.0
-_SPEEDUP_CAP = 5.0
 
 
-def _score(exp: Experience, current_bottleneck: BottleneckType) -> float:
-    """Compute relevance score for a single experience."""
-    s = 0.0
-    if exp.bottleneck_before == current_bottleneck:
-        s += _BOTTLENECK_MATCH
-    if exp.success:
-        s += _SUCCESS_BONUS
-    s += min(exp.speedup, _SPEEDUP_CAP)
-    return s
+class _StoreLike(Protocol):
+    def all(self) -> list[Experience]: ...
 
 
 class MemoryRetriever:
-    """Retrieves relevant past experiences for the Planner.
+    """Samples relevant past experiences for the Planner.
 
-    Retrieval strategy:
-        1. Filter by kernel type
-        2. Filter by hardware (prefer same, fall back to cross-hardware)
-        3. Score by bottleneck match + success + speedup
-        4. Select top-K with reserved failure slots
+    Algorithm:
+        1. ``read_enabled`` is False → return ``[]``.
+        2. Filter by ``kernel_type``.
+        3. Hardware-preferred sampling: prefer ``hardware_arch == current``.
+           - same-arch count >= ``top_k`` → weight-sample ``top_k`` from same-arch.
+           - 0 < same-arch count < ``top_k`` → keep ALL same-arch (guaranteed
+             inclusion) and weight-sample the remaining ``top_k - len(same)``
+             slots from the FULL cross-arch pool.
+           - no cross-arch fill available → return whatever fits.
+        4. Weighting: ``random.choices(pool, weights=[s.speedup ** alpha], k=...)``.
+           Sampling is with replacement.
     """
 
-    def __init__(self, store: MemoryStore, top_k: int = 5) -> None:
+    def __init__(
+        self,
+        store: _StoreLike,
+        top_k: int,
+        alpha: float,
+        read_enabled: bool,
+        rng: random.Random | None = None,
+    ) -> None:
         self._store = store
         self._top_k = top_k
+        self._alpha = alpha
+        self._read_enabled = read_enabled
+        self._rng = rng or random.Random()
 
-    def retrieve(
-        self,
-        kernel_type: str,
-        current_bottleneck: BottleneckType,
-        hardware: str = "",
-    ) -> list[Experience]:
-        """Retrieve the most relevant experiences for a planning step."""
+    def sample(self, kernel_type: str, hardware_arch: str) -> list[Experience]:
+        if not self._read_enabled:
+            return []
         candidates = [e for e in self._store.all() if e.kernel_type == kernel_type]
         if not candidates:
             return []
-
-        candidates = self._apply_hardware_filter(candidates, hardware)
-
-        successes = [e for e in candidates if e.success]
-        failures = [e for e in candidates if not e.success]
-
-        key = lambda e: (_score(e, current_bottleneck), e.speedup)
-        successes.sort(key=key, reverse=True)
-        failures.sort(key=key, reverse=True)
-
-        # Reserve failure slots only when both pools exist and top_k >= 2.
-        # top_k==2 keeps 1 failure; >=3 reserves a third (min 1).
-        if successes and failures and self._top_k >= 2:
-            failure_slots = 1 if self._top_k == 2 else max(1, self._top_k // 3)
+        if hardware_arch:
+            same = [e for e in candidates if e.hardware_arch == hardware_arch]
+            other = [e for e in candidates if e.hardware_arch != hardware_arch]
         else:
-            failure_slots = 0
-        picked_failures = failures[:failure_slots]
-        remaining = self._top_k - len(picked_failures)
-        picked_successes = successes[:remaining]
+            same, other = candidates, []
+        if len(same) >= self._top_k:
+            return self._weighted_sample(same, self._top_k)
+        # Fallback: keep ALL same-arch (guaranteed inclusion — the whole
+        # point of the preference), then weight-sample the remaining slots
+        # from the FULL cross-arch pool. Truncating ``other`` to first-N by
+        # storage order before sampling would defeat speedup-weighting on
+        # the fill — the regression this guards against.
+        remaining = self._top_k - len(same)
+        if len(other) <= remaining:
+            return same + other
+        return same + self._weighted_sample(other, remaining)
 
-        # Backfill: if one pool was short, give slots to the other
-        total = len(picked_successes) + len(picked_failures)
-        if total < self._top_k:
-            if len(picked_failures) < failure_slots:
-                extra = self._top_k - total
-                picked_successes = successes[: len(picked_successes) + extra]
-            else:
-                extra = self._top_k - total
-                picked_failures = failures[: len(picked_failures) + extra]
+    def _weighted_sample(self, pool: list[Experience], k: int) -> list[Experience]:
+        """Speedup-weighted random sample with replacement (``random.choices``).
 
-        merged = picked_successes + picked_failures
-        merged.sort(key=key, reverse=True)
-        return merged[: self._top_k]
-
-    def _apply_hardware_filter(
-        self, candidates: list[Experience], hardware: str
-    ) -> list[Experience]:
-        """Prefer same-hardware experiences, fall back if too few."""
-        if not hardware:
-            return candidates
-        same_hw = [e for e in candidates if e.hardware == hardware]
-        if len(same_hw) >= self._top_k:
-            return same_hw
-        other = [e for e in candidates if e.hardware != hardware]
-        return same_hw + other
+        Returns the whole pool unsampled when it does not exceed ``k``.
+        """
+        if len(pool) <= k:
+            return pool
+        weights = [e.speedup ** self._alpha for e in pool]
+        return self._rng.choices(pool, weights=weights, k=k)

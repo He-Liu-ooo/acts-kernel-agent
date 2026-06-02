@@ -787,7 +787,7 @@ def _orch_harness():
     reviewer = MagicMock()
     reviewer.review = AsyncMock()  # test sets return_value
     retriever = MagicMock()
-    retriever.retrieve = MagicMock(return_value=[])
+    retriever.sample = MagicMock(return_value=[])
 
     # Baseline kernel needs nonzero (flop_count, memory_bytes) so the
     # orchestrator's per-iteration roofline-inputs fallback (when no

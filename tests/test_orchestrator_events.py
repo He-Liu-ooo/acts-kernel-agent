@@ -94,7 +94,7 @@ def harness():
         branch_quality=BranchQuality.PROMISING,
     ))
     retriever = MagicMock()
-    retriever.retrieve = MagicMock(return_value=[])
+    retriever.sample = MagicMock(return_value=[])
 
     bench = BenchmarkResult(median_latency_us=100.0, timed_runs=1)
     baseline = _make_kernel("root")

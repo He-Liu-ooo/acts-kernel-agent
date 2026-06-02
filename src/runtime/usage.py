@@ -30,6 +30,7 @@ class AgentLabel(str, Enum):
     CODER = "coder"
     CODER_TRANSLATE = "coder-translate"
     REVIEWER = "reviewer"
+    SUMMARIZER = "summarizer"
 
 
 # Canonical column order for the rendered table + `usage.json#columns`.

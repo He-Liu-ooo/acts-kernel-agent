@@ -58,3 +58,8 @@ traces/
 
 # Per-invocation run directories (run.log + events.jsonl + traces/)
 runs/
+
+# Optimization-memory shared store (JSONL, see doc/memory.md). Accumulates
+# distilled lessons across runs; .gitignored so developer-local stores
+# don't conflict and write-enabled ablation runs don't dirty the index.
+opt_mem/

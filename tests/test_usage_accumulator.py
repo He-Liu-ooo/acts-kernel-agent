@@ -96,7 +96,7 @@ class TestUsageSnapshot:
     def test_canonical_agent_order_constant(self):
         # The constant is the source of truth for column ordering — guard it.
         assert _CANONICAL_AGENT_ORDER == (
-            "planner", "coder", "coder-translate", "reviewer",
+            "planner", "coder", "coder-translate", "reviewer", "summarizer",
         )
 
 
@@ -423,8 +423,9 @@ class TestAgentLabel:
         assert AgentLabel.CODER.value == "coder"
         assert AgentLabel.CODER_TRANSLATE.value == "coder-translate"
         assert AgentLabel.REVIEWER.value == "reviewer"
+        assert AgentLabel.SUMMARIZER.value == "summarizer"
         assert {m.name for m in AgentLabel} == {
-            "PLANNER", "CODER", "CODER_TRANSLATE", "REVIEWER",
+            "PLANNER", "CODER", "CODER_TRANSLATE", "REVIEWER", "SUMMARIZER",
         }
 
     def test_canonical_order_derived_from_enum(self):
@@ -432,7 +433,7 @@ class TestAgentLabel:
         # Keeps a single source of truth for column ordering.
         assert _CANONICAL_AGENT_ORDER == tuple(m.value for m in AgentLabel)
         assert _CANONICAL_AGENT_ORDER == (
-            "planner", "coder", "coder-translate", "reviewer",
+            "planner", "coder", "coder-translate", "reviewer", "summarizer",
         )
 
     def test_value_attribute_is_plain_string(self):

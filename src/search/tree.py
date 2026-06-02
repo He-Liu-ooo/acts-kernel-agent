@@ -68,6 +68,13 @@ class TreeNode:
     # median. ``None`` on the root and on legacy checkpoints predating
     # the field; report.py falls back to the aggregate in that case.
     per_workload_latency_us: dict[str, float] | None = None
+    # Aggregate runtime (ms) — synthetic field set by the orchestrator
+    # right after the node is scored, derived from
+    # ``bench.median_latency_us / 1000``. Read by the opt-mem ``Producer``
+    # to compute parent → child speedup ratios. ``None`` on legacy
+    # checkpoints, on dead-end nodes that never benched, and on root
+    # before baseline benchmarking completes.
+    runtime_ms: float | None = None
     # Counts back-to-back Coder/Planner failures on this parent. Reset
     # to zero whenever an iteration successfully spawns a child off this
     # node. ``frontier()`` excludes nodes at or above
@@ -567,6 +574,7 @@ def _serialize_node(node: TreeNode) -> dict:
         "kernel": _serialize_kernel(node.kernel),
         "profiling": _serialize_profiling(node.profiling),
         "per_workload_latency_us": _serialize_per_workload_latency(node.per_workload_latency_us),
+        "runtime_ms": node.runtime_ms,
         "consecutive_agent_failures": node.consecutive_agent_failures,
         "iter_no": node.iter_no,
         "last_review": _serialize_review_feedback(node.last_review),
@@ -785,6 +793,10 @@ def _deserialize_node(data: dict) -> TreeNode:
         per_workload_latency_us=_deserialize_per_workload_latency(
             data.get("per_workload_latency_us")
         ),
+        # ``.get(..., None)`` keeps pre-opt-mem checkpoints loadable —
+        # legacy nodes have no recorded runtime_ms; downstream
+        # ``Producer.consider`` short-circuits cleanly on ``None``.
+        runtime_ms=data.get("runtime_ms"),
         # ``.get(..., 0)`` keeps pre-quarantine checkpoints loadable —
         # legacy nodes default to "no failures recorded yet."
         consecutive_agent_failures=data.get("consecutive_agent_failures", 0),
