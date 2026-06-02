@@ -25,11 +25,9 @@ crash via ``WorkerCrashed``; the orchestrator owns counter bump +
 """
 from __future__ import annotations
 
-import asyncio
-import json
-import subprocess
-import sys
 from pathlib import Path
+
+from src.eval.worker_spawn import spawn_worker
 
 
 class WorkerCrashed(RuntimeError):
@@ -114,70 +112,24 @@ async def run_bench_subprocess(
     """
     del worker_crash_threshold  # see docstring — orchestrator owns counter
 
-    worker_dir.mkdir(parents=True, exist_ok=True)
-    request_path = worker_dir / "request.json"
-    response_path = worker_dir / "response.json"
-    worker_log_path = worker_dir / "worker.log"
-
-    request_path.write_text(json.dumps(request))
-
-    argv = [
-        sys.executable,
-        "-m",
-        "src.eval.bench_worker",
-        "--request",
-        str(request_path),
-        "--response",
-        str(response_path),
-    ]
-
-    # Keep the log file handle open across the wait — the worker
-    # writes incrementally and we want everything captured even if
-    # the child gets killed mid-write.
-    logfile = worker_log_path.open("w")
-    try:
-        proc = subprocess.Popen(argv, stdout=logfile, stderr=logfile)
-
-        def _wait() -> int:
-            return proc.wait(timeout=worker_timeout_s)
-
-        try:
-            returncode = await asyncio.to_thread(_wait)
-        except subprocess.TimeoutExpired:
-            proc.terminate()
-            await asyncio.sleep(2)
-            if proc.poll() is None:
-                proc.kill()
-            raise WorkerCrashed(
-                returncode=-1,
-                stderr_tail=_read_tail(worker_log_path, 2048),
-            )
-
-        if returncode != 0 or not response_path.exists():
-            raise WorkerCrashed(
-                returncode=returncode,
-                stderr_tail=_read_tail(worker_log_path, 2048),
-            )
-        # Clean exit but unreadable / malformed response.json must
-        # surface as ``WorkerCrashed`` so the orchestrator's crash-
-        # recovery path engages (emit ``bench_worker_crashed``, bump
-        # ``consecutive_worker_crashes``, honor the threshold). Leaking
-        # ``JSONDecodeError`` past ``except WorkerCrashed`` aborts the
-        # whole run on the very first malformed response, ignoring the
-        # configured threshold (Codex 2026-05-26 review P2 fix #2).
-        try:
-            return json.loads(response_path.read_text())
-        except (json.JSONDecodeError, OSError) as exc:
-            raise WorkerCrashed(
-                returncode=returncode,
-                stderr_tail=(
-                    f"malformed response.json ({type(exc).__name__}: "
-                    f"{str(exc)[:200]})\n"
-                    + _read_tail(worker_log_path, 2048)
-                ),
-            ) from exc
-    finally:
-        logfile.close()
+    # The spawn / wait / timeout-kill / malformed-guard sequence is shared
+    # with the correctness helper; ``spawn_worker`` owns it and returns a
+    # structured outcome. The bench contract maps any non-``ok`` status to
+    # ``WorkerCrashed`` — preserving the exact prior payloads: timeout →
+    # returncode -1, crashed/missing → child returncode, malformed → child
+    # returncode with the ``malformed response.json (...)`` prefix.
+    outcome = await spawn_worker(
+        module="src.eval.bench_worker",
+        request=request,
+        worker_dir=worker_dir,
+        timeout_s=worker_timeout_s,
+    )
+    if outcome.status != "ok":
+        raise WorkerCrashed(
+            returncode=outcome.returncode,
+            stderr_tail=outcome.log_tail,
+        )
+    return outcome.response
 
 
 def merge_worker_artifacts(
@@ -240,15 +192,3 @@ def merge_worker_artifacts(
         ncu_rep_count += 1
 
     return {"event_count": event_count, "ncu_rep_count": ncu_rep_count}
-
-
-def _read_tail(path: Path, max_bytes: int) -> str:
-    """Return the last ``max_bytes`` of ``path`` as UTF-8 (errors replaced).
-
-    Empty string if the file is missing — defensive for the
-    crash-before-stderr-open edge case.
-    """
-    if not path.exists():
-        return ""
-    data = path.read_bytes()
-    return data[-max_bytes:].decode("utf-8", errors="replace")

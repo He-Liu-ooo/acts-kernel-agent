@@ -41,6 +41,7 @@ __all__ = [
     "build_normalize_context",
     "compare_outputs",
     "maybe_wrap_dps_candidate",
+    "strict_compare_one_workload",
     "verify_correctness",
 ]
 
@@ -335,6 +336,37 @@ def compare_outputs(
             )
         worst_err = max(worst_err, cmp.max_abs_error)
     return _StageOutcome(match=True, max_abs_error=worst_err, reason="")
+
+
+def strict_compare_one_workload(
+    *,
+    candidate_fn: Callable[..., Any],
+    reference_fn: Callable[..., Any],
+    input_generator: Callable[[int], tuple],
+    definition: Definition | None,
+    kernel: Kernel | None,
+    workload: Workload | None,
+    seed: int,
+    atol: float,
+    rtol: float,
+) -> bool:
+    """Run candidate + reference once at ``seed`` and compare with the given
+    strict tolerance. Shared by the correctness worker's ``strict_recheck``
+    mode and the orchestrator's in-parent reward-hack re-eval fallback so the
+    two cannot drift on wrap/seed/tolerance semantics. Returns True iff the
+    outputs match. Anti-cheat context + RewardHackDetected handling stay at
+    the call sites."""
+    from src.eval.anti_cheat import generate_randomized_inputs  # lazy: avoid import cycle
+    policy = TorchComparisonPolicy()
+    norm = build_normalize_context(definition)
+    wrapped = maybe_wrap_dps_candidate(
+        candidate_fn, kernel=kernel, workload=workload, definition=definition,
+    )
+    inputs = generate_randomized_inputs(input_generator, seed=seed)
+    cand_out = wrapped(*inputs)
+    ref_out = reference_fn(*inputs)
+    outcome = compare_outputs(cand_out, ref_out, policy=policy, atol=atol, rtol=rtol, norm=norm)
+    return bool(outcome.match)
 
 
 def _infer_device(*outputs: Any) -> Any:

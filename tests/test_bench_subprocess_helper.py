@@ -117,7 +117,7 @@ def test_run_bench_subprocess_happy_path(tmp_path, monkeypatch):
     worker_dir.mkdir(parents=True)
 
     monkeypatch.setattr(
-        "src.eval.bench_subprocess.subprocess.Popen",
+        "src.eval.worker_spawn.subprocess.Popen",
         _make_fake_popen_class(returncode=0, write_response=True),
     )
 
@@ -144,7 +144,7 @@ def test_run_bench_subprocess_creates_worker_dir_if_missing(tmp_path, monkeypatc
 
     worker_dir = tmp_path / "iter_0" / "worker"  # does NOT pre-exist
     monkeypatch.setattr(
-        "src.eval.bench_subprocess.subprocess.Popen",
+        "src.eval.worker_spawn.subprocess.Popen",
         _make_fake_popen_class(returncode=0, write_response=True),
     )
 
@@ -173,7 +173,7 @@ def test_non_zero_exit_raises_worker_crashed(tmp_path, monkeypatch):
     worker_dir = tmp_path / "w"
     worker_dir.mkdir()
     monkeypatch.setattr(
-        "src.eval.bench_subprocess.subprocess.Popen",
+        "src.eval.worker_spawn.subprocess.Popen",
         _make_fake_popen_class(
             returncode=1,
             write_response=False,
@@ -201,7 +201,7 @@ def test_signal_killed_returns_negative_returncode(tmp_path, monkeypatch):
     worker_dir = tmp_path / "w"
     worker_dir.mkdir()
     monkeypatch.setattr(
-        "src.eval.bench_subprocess.subprocess.Popen",
+        "src.eval.worker_spawn.subprocess.Popen",
         _make_fake_popen_class(
             returncode=-9,
             write_response=False,
@@ -229,7 +229,7 @@ def test_missing_response_json_treated_as_crash(tmp_path, monkeypatch):
     worker_dir = tmp_path / "w"
     worker_dir.mkdir()
     monkeypatch.setattr(
-        "src.eval.bench_subprocess.subprocess.Popen",
+        "src.eval.worker_spawn.subprocess.Popen",
         _make_fake_popen_class(
             returncode=0,
             write_response=False,
@@ -251,14 +251,13 @@ def test_missing_response_json_treated_as_crash(tmp_path, monkeypatch):
 
 
 def test_timeout_terminates_and_raises(tmp_path, monkeypatch):
-    """proc.wait() raises TimeoutExpired → helper terminate()+kill()s, raises WorkerCrashed."""
+    """proc.wait() raises TimeoutExpired → helper SIGTERM/SIGKILLs the worker's
+    process group and reaps it, then the wrapper raises WorkerCrashed."""
+    import signal as _signal
     from src.eval.bench_subprocess import run_bench_subprocess, WorkerCrashed
 
     worker_dir = tmp_path / "w"
     worker_dir.mkdir()
-
-    terminated = {"flag": False}
-    killed = {"flag": False}
 
     class HangingPopen:
         def __init__(self, args, **kwargs):
@@ -266,25 +265,22 @@ def test_timeout_terminates_and_raises(tmp_path, monkeypatch):
                 kwargs["stderr"].write("hang\n")
                 kwargs["stderr"].flush()
             self.returncode = None
-            self._alive = True
+            # ``start_new_session=True`` makes the child its own group leader,
+            # so its pid is the pgid the helper signals.
+            self.pid = 424242
 
         def wait(self, timeout=None):
+            # Always times out — drives the helper through SIGTERM → grace
+            # wait → SIGKILL → reap wait.
             raise _subprocess.TimeoutExpired(cmd="fake", timeout=timeout)
 
-        def terminate(self):
-            terminated["flag"] = True
-
-        def kill(self):
-            killed["flag"] = True
-            self._alive = False
-
-        def poll(self):
-            # Still alive after terminate() — forces helper to escalate to kill().
-            return None if self._alive else 0
-
-    monkeypatch.setattr("src.eval.bench_subprocess.subprocess.Popen", HangingPopen)
-    # Stub asyncio.sleep so the test doesn't actually wait 2 real seconds.
-    monkeypatch.setattr("src.eval.bench_subprocess.asyncio.sleep", _stub_sleep)
+    signals: list[int] = []
+    monkeypatch.setattr("src.eval.worker_spawn.subprocess.Popen", HangingPopen)
+    monkeypatch.setattr("src.eval.worker_spawn.os.getpgid", lambda pid: pid)
+    monkeypatch.setattr(
+        "src.eval.worker_spawn.os.killpg",
+        lambda pgid, sig: signals.append(sig),
+    )
 
     with pytest.raises(WorkerCrashed) as exc_info:
         asyncio.run(
@@ -296,8 +292,10 @@ def test_timeout_terminates_and_raises(tmp_path, monkeypatch):
             )
         )
     assert exc_info.value.returncode == -1
-    assert terminated["flag"] is True
-    assert killed["flag"] is True
+    # The worker's entire process group is signalled — SIGTERM first, then
+    # SIGKILL after the grace wait still times out.
+    assert _signal.SIGTERM in signals
+    assert _signal.SIGKILL in signals
     assert "hang" in exc_info.value.stderr_tail
 
 
@@ -443,7 +441,7 @@ def test_malformed_response_json_treated_as_crash(tmp_path, monkeypatch):
         def kill(self): pass
         def poll(self): return 0
 
-    monkeypatch.setattr("src.eval.bench_subprocess.subprocess.Popen", FakePopen)
+    monkeypatch.setattr("src.eval.worker_spawn.subprocess.Popen", FakePopen)
 
     with pytest.raises(WorkerCrashed) as exc_info:
         asyncio.run(run_bench_subprocess(

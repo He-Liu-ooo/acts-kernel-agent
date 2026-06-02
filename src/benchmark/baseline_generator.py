@@ -63,6 +63,9 @@ async def generate_triton_baseline(
     cache_dir: Path | None = None,
     policy: ComparisonPolicy | None = None,
     blob_roots: list[Path] | None = None,
+    problem_definition_path: Path | None = None,
+    worker_timeout_s: float = 180.0,
+    allow_in_parent_fallback: bool = False,
 ) -> Kernel:
     """Translate a PyTorch reference into a verified Triton baseline.
 
@@ -76,6 +79,18 @@ async def generate_triton_baseline(
     the search-loop input generators use in ``_load_sol_problem``;
     omitting it here would make any safetensors-bearing problem fail
     before Phase B starts.
+
+    *problem_definition_path* — when set, the LLM baseline's post-verify
+    runs in the crash-isolated worker (``run_correctness_subprocess``,
+    mode ``gate``) instead of launching the untrusted candidate in-parent
+    via ``verify_correctness``. An out-of-bounds LLM baseline would
+    otherwise poison the parent CUDA context before Phase B starts (Codex
+    P1). When falsy, the post-verify runs in-parent **only if**
+    *allow_in_parent_fallback* is explicitly set (trusted/mocked contexts:
+    unit tests / placeholder runs with no SOL problem dir); otherwise it
+    raises ``CorrectnessIsolationError`` so a dropped path fails loud
+    instead of silently launching an untrusted kernel in-parent.
+    *worker_timeout_s* is the per-attempt timeout passed to the worker.
     """
     if coder is None or not coder.has_model:
         raise BaselineGenerationError(
@@ -122,6 +137,13 @@ async def generate_triton_baseline(
                     # with iter=0 instead of iter=null. Fix #8 plumbing.
                     iter_no=0,
                     workload_shapes=[tuple(w.axes.values()) for w in workloads],
+                    # Threads into the in-loop correctness tool so the
+                    # agent's candidate launches run in the crash-isolated
+                    # subprocess (mode gate) instead of in-parent — same
+                    # CUDA-context protection the post-verify below uses.
+                    problem_definition_path=problem_definition_path,
+                    blob_roots=blob_roots,
+                    allow_in_parent_fallback=allow_in_parent_fallback,
                 )
         except ImplementationError as exc:
             prior_failures.append(
@@ -184,25 +206,96 @@ async def generate_triton_baseline(
             )
             continue
 
-        # Walk explicitly so the first failure can be captured for prior_failures.
-        first_failure: "CorrectnessResult | None" = None
-        first_failure_idx: int = -1
-        for idx, (gen, wl) in enumerate(zip(input_generators, workloads)):
-            result = verify_correctness(
-                candidate_fn=compiled.compiled_fn,
-                reference_fn=reference_fn,
-                input_generator=gen,
-                definition=definition,
-                kernel=candidate,
-                workload=wl,
-                policy=policy,
-            )
-            if not result.passed:
-                first_failure = result
-                first_failure_idx = idx
-                break
+        # Post-verify the submitted baseline against every workload. When a
+        # SOL ``problem_definition_path`` is bound, the candidate launch is
+        # crash-isolated in a child process (mode ``gate``) so an
+        # out-of-bounds LLM baseline can't poison the parent CUDA context
+        # before Phase B (Codex P1). Both branches converge on the same
+        # ``post_verify_error`` (None = passed) so the prior_failures /
+        # emit / continue control flow downstream is identical.
+        if problem_definition_path:
+            # Lazy imports for circular-import safety — mirrors how
+            # coder.py reaches _serialize_kernel_spec_for_request.
+            import shutil
+            import tempfile
+            from pathlib import Path as _P
 
-        if first_failure is None:
+            from src.eval.correctness_subprocess import (
+                build_correctness_request,
+                run_correctness_subprocess,
+            )
+
+            request = build_correctness_request(
+                spec=spec,
+                source_code=output.source_code,
+                dps=output.dps,
+                definition_path=problem_definition_path,
+                workloads=workloads,
+                blob_roots=blob_roots,
+                mode="gate",
+                input_seed=0,
+                anti_cheat_critical_names=[],
+            )
+            worker_dir = _P(tempfile.mkdtemp(prefix="acts_baseline_corr_"))
+            try:
+                result = await run_correctness_subprocess(
+                    request=request,
+                    worker_dir=worker_dir,
+                    timeout_s=worker_timeout_s,
+                )
+                if result.passed:
+                    post_verify_error = None
+                else:
+                    idx = result.failed_workload_idx
+                    where = (
+                        f" on workload {idx}/{result.total_workloads}"
+                        if idx is not None
+                        else ""
+                    )
+                    post_verify_error = (
+                        f"{_POST_VERIFY_CORRECTNESS_FAILED}{where} "
+                        f"at stage [{result.failed_stage}]:\n{result.error_message}"
+                    )
+            finally:
+                # Reclaim the per-attempt scratch dir so /tmp doesn't leak one
+                # ``acts_baseline_corr_*`` dir per baseline retry.
+                shutil.rmtree(worker_dir, ignore_errors=True)
+        elif allow_in_parent_fallback:
+            # In-parent fallback (no SOL problem dir): unit tests /
+            # placeholder runs carry no untrusted GPU candidates, and the
+            # caller explicitly opted in. Walk explicitly so the first
+            # failure feeds prior_failures.
+            post_verify_error = None
+            for idx, (gen, wl) in enumerate(zip(input_generators, workloads)):
+                result = verify_correctness(
+                    candidate_fn=compiled.compiled_fn,
+                    reference_fn=reference_fn,
+                    input_generator=gen,
+                    definition=definition,
+                    kernel=candidate,
+                    workload=wl,
+                    policy=policy,
+                )
+                if not result.passed:
+                    post_verify_error = (
+                        f"{_POST_VERIFY_CORRECTNESS_FAILED} on workload "
+                        f"{idx + 1}/{len(workloads)}:\n{result.error_message}"
+                    )
+                    break
+        else:
+            # No definition_path to isolate against AND no explicit opt-in:
+            # launching the untrusted candidate in-parent would re-open the
+            # CUDA-poison hole. Fail loud instead — converts the "no
+            # untrusted launch in the parent" invariant from coincidence to
+            # construction.
+            from src.eval.correctness_subprocess import CorrectnessIsolationError
+            raise CorrectnessIsolationError(
+                "baseline post-verify needs a problem_definition_path to isolate the "
+                "candidate launch; pass allow_in_parent_fallback=True only for "
+                "trusted/mocked contexts."
+            )
+
+        if post_verify_error is None:
             emit(
                 "baseline_success",
                 source_bytes=len(output.source_code),
@@ -213,11 +306,7 @@ async def generate_triton_baseline(
         prior_failures.append(
             AttemptFailure(
                 attempt_no=attempt + 1,
-                tool_errors=[
-                    f"{_POST_VERIFY_CORRECTNESS_FAILED} on workload "
-                    f"{first_failure_idx + 1}/{len(workloads)}:\n"
-                    f"{first_failure.error_message}"
-                ],
+                tool_errors=[post_verify_error],
             )
         )
         emit(

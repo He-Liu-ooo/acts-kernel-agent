@@ -174,6 +174,7 @@ async def test_successful_translate_returns_verified_kernel(patched_io):
     ):
         result = await generate_triton_baseline(
             _make_definition(), spec, coder=coder, workloads=workloads,
+            allow_in_parent_fallback=True,
         )
 
     assert result is not None
@@ -206,6 +207,7 @@ async def test_verify_uses_all_selected_workloads(patched_io):
     ):
         result = await generate_triton_baseline(
             _make_definition(), _make_spec(), coder=coder, workloads=workloads,
+            allow_in_parent_fallback=True,
         )
 
     assert result is not None
@@ -235,6 +237,7 @@ async def test_translate_receives_reference_source_and_all_generators(patched_io
     ):
         await generate_triton_baseline(
             definition, spec, coder=coder, workloads=workloads,
+            allow_in_parent_fallback=True,
         )
 
     kwargs = coder.translate.call_args.kwargs
@@ -270,6 +273,7 @@ async def test_translate_kernel_name_propagates_to_kernel(patched_io):
     ):
         result = await generate_triton_baseline(
             _make_definition(), spec, coder=coder, workloads=workloads,
+            allow_in_parent_fallback=True,
         )
 
     assert result.triton_kernel_name == "main_k"
@@ -302,6 +306,7 @@ async def test_correctness_failure_on_any_workload_triggers_retry(patched_io):
         result = await generate_triton_baseline(
             _make_definition(), _make_spec(),
             coder=coder, workloads=workloads, max_retries=3,
+            allow_in_parent_fallback=True,
         )
 
     assert result is not None
@@ -350,6 +355,7 @@ async def test_entrypoint_binding_mismatch_triggers_retry(patched_io):
         result = await generate_triton_baseline(
             _make_definition(), _make_spec(),
             coder=coder, workloads=workloads, max_retries=3,
+            allow_in_parent_fallback=True,
         )
 
     assert result.source_code == good_source
@@ -386,6 +392,7 @@ async def test_implementation_error_triggers_retry(patched_io):
         result = await generate_triton_baseline(
             _make_definition(), _make_spec(),
             coder=coder, workloads=workloads, max_retries=3,
+            allow_in_parent_fallback=True,
         )
 
     assert result is not None
@@ -435,6 +442,7 @@ async def test_translate_receives_accumulated_prior_failures(patched_io):
         result = await generate_triton_baseline(
             _make_definition(), _make_spec(),
             coder=coder, workloads=workloads, max_retries=3,
+            allow_in_parent_fallback=True,
         )
 
     assert result is not None
@@ -486,6 +494,7 @@ async def test_post_verify_compile_failure_synthesizes_prior_failure(patched_io)
         result = await generate_triton_baseline(
             _make_definition(), _make_spec(),
             coder=coder, workloads=workloads, max_retries=3,
+            allow_in_parent_fallback=True,
         )
 
     assert result is not None
@@ -533,6 +542,7 @@ async def test_post_verify_correctness_failure_synthesizes_prior_failure(patched
         result = await generate_triton_baseline(
             _make_definition(), _make_spec(),
             coder=coder, workloads=workloads, max_retries=3,
+            allow_in_parent_fallback=True,
         )
 
     assert result is not None
@@ -542,6 +552,269 @@ async def test_post_verify_correctness_failure_synthesizes_prior_failure(patched
     assert failure.attempt_no == 1
     assert len(failure.tool_errors) == 1
     assert "Post-verify Correctness FAILED" in failure.tool_errors[0]
+
+
+# ── subprocess-isolated post-verify (Codex P1) ─────────────────────────
+#
+# When a SOL ``problem_definition_path`` is bound, the LLM baseline's
+# post-verify must run in the crash-isolated worker
+# (``run_correctness_subprocess``, mode ``gate``) instead of launching the
+# untrusted kernel in-parent via ``verify_correctness`` — an out-of-bounds
+# LLM baseline would otherwise poison the parent CUDA context before Phase
+# B starts. Without a definition_path (unit tests / placeholder runs) the
+# in-parent loop is preserved.
+
+
+def _sub_pass(max_err: float = 0.0, total: int = 1):
+    from src.eval.correctness_subprocess import CorrectnessResult as SubResult
+    return SubResult(passed=True, max_err=max_err, total_workloads=total)
+
+
+def _sub_fail(stage: str = "numerical", idx: int = 1, total: int = 1):
+    from src.eval.correctness_subprocess import CorrectnessResult as SubResult
+    return SubResult(
+        passed=False, failed_stage=stage, error_message="mismatch at [0]",
+        total_workloads=total, failed_workload_idx=idx,
+    )
+
+
+@pytest.mark.asyncio
+async def test_post_verify_uses_subprocess_when_definition_path_set(patched_io):
+    """With a definition_path bound, post-verify delegates to the
+    crash-isolated worker and NOT to in-parent verify_correctness."""
+    spec = _make_spec()
+    workloads = _make_workloads(n=3)
+    coder = CoderAgent(model=MagicMock())
+    coder.translate = AsyncMock(
+        return_value=_coder_output("@triton.jit\ndef kernel_fn(x): pass")
+    )
+
+    seen = {}
+
+    async def _fake_sub(*, request, worker_dir, timeout_s):
+        seen["mode"] = request["mode"]
+        seen["definition_path"] = request["definition_path"]
+        seen["timeout_s"] = timeout_s
+        seen["n_workloads"] = len(request["workloads"])
+        return _sub_pass(total=3)
+
+    with (
+        patch(
+            "src.eval.correctness_subprocess.run_correctness_subprocess",
+            side_effect=_fake_sub,
+        ),
+        patch(
+            "src.benchmark.baseline_generator.compile_kernel",
+            return_value=_compile_ok(),
+        ),
+        patch(
+            "src.benchmark.baseline_generator.verify_correctness",
+            side_effect=AssertionError("in-parent verify_correctness must not run"),
+        ),
+    ):
+        result = await generate_triton_baseline(
+            _make_definition(), spec, coder=coder, workloads=workloads,
+            problem_definition_path=Path("/problem/definition.json"),
+            worker_timeout_s=42.0,
+        )
+
+    assert result is not None
+    assert seen["mode"] == "gate"
+    assert seen["definition_path"] == "/problem/definition.json"
+    assert seen["timeout_s"] == 42.0
+    assert seen["n_workloads"] == 3
+
+
+@pytest.mark.asyncio
+async def test_post_verify_subprocess_failure_feeds_prior_failures_and_retries(patched_io):
+    """A failing subprocess result consumes one attempt, synthesizes a
+    Post-verify Correctness FAILED entry into prior_failures, and a retry
+    is taken — same control flow as the in-parent path."""
+    from src.agents.coder import AttemptFailure
+
+    workloads = _make_workloads(n=2)
+    coder = CoderAgent(model=MagicMock())
+
+    captured_calls: list[list[AttemptFailure]] = []
+
+    async def fake_translate(*args, prior_failures=(), **kwargs):
+        captured_calls.append(list(prior_failures))
+        return _coder_output("src")
+
+    coder.translate = fake_translate
+
+    sub_outcomes = iter([_sub_fail(stage="numerical", idx=2, total=2), _sub_pass(total=2)])
+
+    async def _fake_sub(*, request, worker_dir, timeout_s):
+        return next(sub_outcomes)
+
+    with (
+        patch(
+            "src.eval.correctness_subprocess.run_correctness_subprocess",
+            side_effect=_fake_sub,
+        ),
+        patch(
+            "src.benchmark.baseline_generator.compile_kernel",
+            return_value=_compile_ok(),
+        ),
+        patch(
+            "src.benchmark.baseline_generator.verify_correctness",
+            side_effect=AssertionError("in-parent verify_correctness must not run"),
+        ),
+    ):
+        result = await generate_triton_baseline(
+            _make_definition(), _make_spec(),
+            coder=coder, workloads=workloads, max_retries=3,
+            problem_definition_path=Path("/problem/definition.json"),
+        )
+
+    assert result is not None
+    assert len(captured_calls) == 2
+    # Attempt 2 carries the synthetic post-verify failure from attempt 1.
+    assert len(captured_calls[1]) == 1
+    failure = captured_calls[1][0]
+    assert failure.attempt_no == 1
+    assert "Post-verify Correctness FAILED" in failure.tool_errors[0]
+    assert "mismatch at [0]" in failure.tool_errors[0]
+
+
+@pytest.mark.asyncio
+async def test_post_verify_subprocess_crash_consumes_attempt(patched_io):
+    """A worker_crashed result (out-of-bounds LLM baseline) is a post-verify
+    failure: the parent stays alive (crash was isolated) and the loop
+    retries instead of propagating a poisoned context."""
+    workloads = _make_workloads(n=1)
+    coder = CoderAgent(model=MagicMock())
+    coder.translate = AsyncMock(side_effect=[_coder_output("oob"), _coder_output("ok")])
+
+    sub_outcomes = iter([
+        _sub_fail(stage="worker_crashed", idx=None, total=1),
+        _sub_pass(total=1),
+    ])
+
+    async def _fake_sub(*, request, worker_dir, timeout_s):
+        return next(sub_outcomes)
+
+    with (
+        patch(
+            "src.eval.correctness_subprocess.run_correctness_subprocess",
+            side_effect=_fake_sub,
+        ),
+        patch(
+            "src.benchmark.baseline_generator.compile_kernel",
+            return_value=_compile_ok(),
+        ),
+    ):
+        result = await generate_triton_baseline(
+            _make_definition(), _make_spec(),
+            coder=coder, workloads=workloads, max_retries=3,
+            problem_definition_path=Path("/problem/definition.json"),
+        )
+
+    assert result is not None
+    assert result.source_code == "ok"
+    assert coder.translate.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_post_verify_in_parent_when_no_definition_path(patched_io):
+    """No definition_path → keep the existing in-parent verify_correctness
+    loop (fallback for tests / placeholder runs with no SOL problem dir)."""
+    workloads = _make_workloads(n=2)
+    coder = CoderAgent(model=MagicMock())
+    coder.translate = AsyncMock(return_value=_coder_output("src"))
+
+    with (
+        patch(
+            "src.benchmark.baseline_generator.compile_kernel",
+            return_value=_compile_ok(),
+        ),
+        patch(
+            "src.benchmark.baseline_generator.verify_correctness",
+            return_value=_pass(),
+        ) as mock_verify,
+    ):
+        result = await generate_triton_baseline(
+            _make_definition(), _make_spec(),
+            coder=coder, workloads=workloads,
+            allow_in_parent_fallback=True,
+        )
+
+    assert result is not None
+    # In-parent verify ran once per workload — no subprocess delegation.
+    assert mock_verify.call_count == 2
+
+
+# ── correctness-isolation trust gate (post-verify) ─────────────────────
+#
+# Absent a definition_path the post-verify can't crash-isolate the
+# candidate launch in a subprocess; launching it in-parent is only safe
+# in a deliberately-trusted/mocked context. The three-way gate raises a
+# typed ``CorrectnessIsolationError`` unless ``allow_in_parent_fallback``
+# opts in — so a dropped path fails loud instead of silently launching an
+# untrusted kernel in the parent CUDA context.
+
+
+@pytest.mark.asyncio
+async def test_generate_triton_baseline_raises_without_isolation_or_optin(patched_io):
+    """No definition_path + no opt-in → the post-verify gate raises
+    CorrectnessIsolationError. translate() is mocked to return a compiling
+    candidate so we reach the post-verify gate (not translate's own
+    construction guard)."""
+    from src.eval.correctness_subprocess import CorrectnessIsolationError
+
+    workloads = _make_workloads(n=1)
+    coder = CoderAgent(model=MagicMock())
+    coder.translate = AsyncMock(
+        return_value=_coder_output("@triton.jit\ndef kernel_fn(x): pass")
+    )
+
+    with (
+        patch(
+            "src.benchmark.baseline_generator.compile_kernel",
+            return_value=_compile_ok(),
+        ),
+        patch(
+            "src.benchmark.baseline_generator.verify_correctness",
+            side_effect=AssertionError("in-parent verify must not run without opt-in"),
+        ),
+        pytest.raises(CorrectnessIsolationError),
+    ):
+        await generate_triton_baseline(
+            _make_definition(), _make_spec(), coder=coder, workloads=workloads,
+            problem_definition_path=None,  # absent
+            # allow_in_parent_fallback defaults False
+        )
+
+
+@pytest.mark.asyncio
+async def test_generate_triton_baseline_in_parent_with_optin(patched_io):
+    """No definition_path but explicit opt-in → the in-parent
+    verify_correctness loop runs and a verified baseline is returned."""
+    workloads = _make_workloads(n=2)
+    coder = CoderAgent(model=MagicMock())
+    coder.translate = AsyncMock(
+        return_value=_coder_output("@triton.jit\ndef kernel_fn(x): pass")
+    )
+
+    with (
+        patch(
+            "src.benchmark.baseline_generator.compile_kernel",
+            return_value=_compile_ok(),
+        ),
+        patch(
+            "src.benchmark.baseline_generator.verify_correctness",
+            return_value=_pass(),
+        ) as mock_verify,
+    ):
+        result = await generate_triton_baseline(
+            _make_definition(), _make_spec(), coder=coder, workloads=workloads,
+            problem_definition_path=None, allow_in_parent_fallback=True,
+        )
+
+    assert result is not None
+    # In-parent verify ran once per workload (the opt-in path).
+    assert mock_verify.call_count == 2
 
 
 @pytest.mark.asyncio
@@ -567,6 +840,7 @@ async def test_compile_failure_in_post_verify_is_treated_as_attempt_failure(patc
         result = await generate_triton_baseline(
             _make_definition(), _make_spec(),
             coder=coder, workloads=workloads, max_retries=3,
+            allow_in_parent_fallback=True,
         )
 
     assert result is not None
@@ -605,6 +879,7 @@ async def test_all_attempts_fail_raises_baseline_error(patched_io):
         await generate_triton_baseline(
             _make_definition(), _make_spec(),
             coder=coder, workloads=workloads, max_retries=3,
+            allow_in_parent_fallback=True,
         )
 
     assert coder.translate.await_count == 3
@@ -650,6 +925,7 @@ async def test_generate_triton_baseline_emits_attempt_events(tmp_path, patched_i
             await generate_triton_baseline(
                 _make_definition(), _make_spec(),
                 coder=coder, workloads=workloads, max_retries=3,
+                allow_in_parent_fallback=True,
             )
     finally:
         events.unbind()
@@ -729,6 +1005,7 @@ async def test_blob_roots_forwarded_to_build_input_generator():
             coder=coder,
             workloads=workloads,
             blob_roots=fake_roots,
+            allow_in_parent_fallback=True,
         )
 
     assert len(seen_roots) == 2  # one build per workload
@@ -757,6 +1034,7 @@ async def test_blob_roots_defaults_to_none_when_omitted(patched_io):
             _make_spec(),
             coder=coder,
             workloads=_make_workloads(n=1),
+            allow_in_parent_fallback=True,
         )
 
     assert result is not None
@@ -868,6 +1146,7 @@ class TestBaselineTraceWrap:
                 coder=coder,
                 workloads=workloads,
                 max_retries=1,
+                allow_in_parent_fallback=True,
             )
 
         # Exactly one trace wrap — happy path takes one attempt.
