@@ -122,6 +122,17 @@ def _neutralize_prompt_markdown(text: str) -> str:
     return re.sub(r"`{3,}", "`", "\n".join(lines))
 
 
+def _neutralize_metadata(text: str) -> str:
+    """Flatten an untrusted single-line metadata value (condition) to one line
+    and collapse code-fence runs, so an injected newline+heading can't escape
+    the metadata parenthetical into the Planner prompt's instruction region.
+    ``" ".join(text.split())`` collapses ALL whitespace incl. newlines/tabs;
+    then collapse any run of 3+ backticks to one. Legitimate machine-generated
+    conditions are already single-line, so this is a no-op for them.
+    Codex 2026-06-02 adversarial review."""
+    return re.sub(r"`{3,}", "`", " ".join(text.split()))
+
+
 def _neutralize_snippet_fence(text: str) -> str:
     """Collapse any run of 4+ backticks in an untrusted snippet to 3, so a
     persisted / hand-seeded snippet can't close the 4-backtick fence that wraps
@@ -168,9 +179,11 @@ def _render_past_experiences(past_experiences: list["Experience"]) -> str:
     for i, e in enumerate(past_experiences, start=1):
         safe_title = _neutralize_prompt_markdown(e.title)
         safe_lesson = _neutralize_prompt_markdown(e.lesson)
+        safe_cond = _neutralize_metadata(e.condition)
+        cond = f", applies when: {safe_cond}" if safe_cond else ""
         parts.append(
             f"[L{i}] **{safe_title}**  "
-            f"(scope: {e.scope}, speedup: {e.speedup:.2f}x, arch: {e.hardware_arch})\n"
+            f"(scope: {e.scope}, speedup: {e.speedup:.2f}x, arch: {e.hardware_arch}{cond})\n"
             f"{safe_lesson}\n\n"
             f"Before:\n````\n{_neutralize_snippet_fence(e.snippet_before)}\n````\n\n"
             f"After:\n````\n{_neutralize_snippet_fence(e.snippet_after)}\n````\n"

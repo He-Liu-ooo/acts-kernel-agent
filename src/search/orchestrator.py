@@ -678,7 +678,7 @@ class Orchestrator:
         # Reset to 0 on every clean worker exit.
         self.consecutive_worker_crashes = 0
 
-    async def _flush_opt_mem(self, root, tree) -> None:
+    async def _flush_opt_mem(self, root, tree, bottleneck=None) -> None:
         """Best-effort opt-mem finalize + flush. Called before every clean
         run() exit. Never raises — opt-mem is best-effort by design and a
         flush hiccup must not turn a successful search into a failure.
@@ -687,7 +687,7 @@ class Orchestrator:
         if self._producer is None:
             return
         try:
-            await self._producer.finalize(root, tree.best_node())
+            await self._producer.finalize(root, tree.best_node(), bottleneck=bottleneck)
             flushed = await self._producer.flush()
             if flushed:
                 logger.info("opt-mem: flushed %d rows", flushed)
@@ -1119,7 +1119,7 @@ class Orchestrator:
             iter_no = iteration + 1
             frontier = tree.frontier()
             if not frontier:
-                await self._flush_opt_mem(root, tree)
+                await self._flush_opt_mem(root, tree, run_bottleneck)
                 return SearchResult(
                     tree.best_node(),
                     iteration,
@@ -1966,6 +1966,7 @@ class Orchestrator:
                 try:
                     await self._producer.consider(
                         parent, child, action_for_opt_mem, iter_no=iter_no,
+                        bottleneck=run_bottleneck,
                     )
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
@@ -1987,7 +1988,7 @@ class Orchestrator:
             # clear ``sol_target`` but be excluded by ``best_node()``;
             # using ``child.score`` here would ship a sub-target winner.
             if best.score.sol_score >= self._config.sol_target:
-                await self._flush_opt_mem(root, tree)
+                await self._flush_opt_mem(root, tree, run_bottleneck)
                 return SearchResult(
                     best,
                     iter_no,
@@ -1998,7 +1999,7 @@ class Orchestrator:
 
             best_scores.append(best.score.sol_score)
             if detect_plateau(best_scores, self._config.sol_plateau_window, self._config.sol_plateau_delta):
-                await self._flush_opt_mem(root, tree)
+                await self._flush_opt_mem(root, tree, run_bottleneck)
                 return SearchResult(
                     best,
                     iter_no,
@@ -2009,7 +2010,7 @@ class Orchestrator:
 
             epsilon = max(self._config.epsilon_end, epsilon - decay)
 
-        await self._flush_opt_mem(root, tree)
+        await self._flush_opt_mem(root, tree, run_bottleneck)
         return SearchResult(
             tree.best_node(),
             self._config.max_depth,

@@ -539,10 +539,11 @@ async def optimize(
     store = MemoryStore(config.opt_mem_store_path)
     # Only touch the file when reads are enabled. With read_enabled=False
     # the retriever short-circuits regardless of cache contents, and the
-    # producer's add_many() doesn't depend on a pre-populated cache (it
-    # just appends + extends in-memory state from this run). Skipping
-    # load() honors the operator's intent when they disable reads to
-    # avoid a known-broken store (legacy / unreadable / mid-corruption).
+    # producer's add_many() is truncation-safe without a pre-populated
+    # cache: the write path re-reads + merges the on-disk store before
+    # rewriting, so write-only mode (no load()) cannot wipe prior lessons.
+    # Skipping load() honors the operator's intent when they disable reads
+    # to avoid a known-broken store (legacy / unreadable / mid-corruption).
     if config.opt_mem_read_enabled:
         store.load()
     retriever = MemoryRetriever(
