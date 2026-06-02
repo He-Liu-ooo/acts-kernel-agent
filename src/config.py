@@ -4,12 +4,20 @@ from __future__ import annotations
 
 import io
 import logging
+import math
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import libconf
 
 logger = logging.getLogger(__name__)
+
+# Project-root anchor for default file paths that should resolve against
+# the repository layout rather than the process's CWD. ``src/config.py``
+# → ``<repo>/src/config.py``, so the parent's parent is the repo root.
+# Used today by ``ACTSConfig.opt_mem_store_path``'s default; add other
+# CWD-sensitive defaults here.
+_PROJECT_ROOT: Path = Path(__file__).resolve().parent.parent
 
 
 # ── ACTS-supplied arch YAML registry (single source of truth) ─────────
@@ -288,6 +296,47 @@ class ACTSConfig:
     # tech-debt — a spawn-vs-lifetime split would let us keep a tight
     # startup guard separately from a generous work guard.
     worker_timeout_s: float = 180000.0
+    # Bounded watchdog on the correctness-check subprocess
+    # (``run_correctness_subprocess``). Correctness workers compile +
+    # verify a candidate against the PyTorch oracle — they never run NCU,
+    # so the ~50h ``worker_timeout_s`` envelope (sized for bench + NCU) is
+    # wildly oversized: a hung correctness candidate would stall the whole
+    # run for ~50h. Default 180s (3 min) is generous for a compile + a
+    # handful of workload verifies while still killing a genuinely frozen
+    # child promptly. Operators with unusually large workloads can raise
+    # this via ``[runtime] correctness_worker_timeout_s``.
+    correctness_worker_timeout_s: float = 180.0
+
+    # Optimization memory (2026-05-24). Distilled lessons from prior runs;
+    # AccelOpt-style summary+snippet rows in a single global JSONL store.
+    # See doc/specs/2026-05-24-optimization-memory-design.md §7.
+    opt_mem_read_enabled: bool = True
+    # OFF by default — ablation runs cannot pollute the shared store
+    # without explicit opt-in. Flip True in blessed-run configs.
+    opt_mem_write_enabled: bool = False
+    # Max rows this run may flush. Top-N by speedup contribution; lower-
+    # ratio buffered rows evict when the cap fills. Cap reserves 1 slot
+    # for the G3 baseline→best-of-run row (so cap-1 slots for G1 edges).
+    opt_mem_writes_per_session_cap: int = 20
+    # δ — per-edge speedup threshold. Below this, kernel-timing noise
+    # dominates on small workloads; above, the row is signal. G3 reuses
+    # the same threshold against cumulative baseline→best speedup.
+    opt_mem_min_improvement_ratio: float = 1.05
+    # α — exponent on speedup for the retriever's weighted random sample.
+    # 0.0 = uniform (AccelOpt-faithful); 1.0 = linear in speedup; higher
+    # = more peaked on top performers.
+    opt_mem_speedup_weight_alpha: float = 1.0
+    # Shared global store. All sessions (read or write) point at this
+    # path; gitignored so accumulated lessons don't end up in commits.
+    # Default anchored at ``_PROJECT_ROOT`` (repo root) — *not* CWD — so
+    # a process launched from a subdir / ``/tmp`` doesn't silently split
+    # the "one shared store" invariant across phantom ``opt_mem/`` dirs.
+    # Operators passing an explicit (relative or absolute) path via cfg
+    # still get exact-as-typed resolution; only the default carries the
+    # project anchor.
+    opt_mem_store_path: Path = field(
+        default_factory=lambda: _PROJECT_ROOT / "opt_mem" / "store.jsonl"
+    )
 
     def __post_init__(self) -> None:
         # Reject non-int / <1: K=0 silently skips iters as "all 0
@@ -307,9 +356,50 @@ class ACTSConfig:
             raise ValueError(
                 f"worker_crash_threshold must be >= 1, got {self.worker_crash_threshold}",
             )
-        if self.worker_timeout_s <= 0:
+        if not math.isfinite(self.worker_timeout_s) or self.worker_timeout_s <= 0:
             raise ValueError(
-                f"worker_timeout_s must be > 0, got {self.worker_timeout_s}",
+                f"worker_timeout_s must be a finite value > 0, got {self.worker_timeout_s}",
+            )
+        if (
+            not math.isfinite(self.correctness_worker_timeout_s)
+            or self.correctness_worker_timeout_s <= 0
+        ):
+            raise ValueError(
+                "correctness_worker_timeout_s must be a finite value > 0, got "
+                f"{self.correctness_worker_timeout_s}",
+            )
+        # Reject ``bool`` explicitly: ``True`` / ``False`` would slip past
+        # the ``< 0`` check because ``bool`` is a subclass of ``int`` in
+        # Python, silently giving cap=1 / cap=0 (the latter disables all
+        # writes — almost certainly not what an operator who wrote
+        # ``cap = true`` in a ``.cfg`` intended).
+        if isinstance(self.opt_mem_writes_per_session_cap, bool) or not isinstance(
+            self.opt_mem_writes_per_session_cap, int
+        ):
+            raise TypeError(
+                f"opt_mem_writes_per_session_cap must be int, got "
+                f"{type(self.opt_mem_writes_per_session_cap).__name__}",
+            )
+        if self.opt_mem_writes_per_session_cap < 0:
+            raise ValueError(
+                f"opt_mem_writes_per_session_cap must be >= 0, "
+                f"got {self.opt_mem_writes_per_session_cap}",
+            )
+        if (
+            not math.isfinite(self.opt_mem_min_improvement_ratio)
+            or self.opt_mem_min_improvement_ratio <= 1.0
+        ):
+            raise ValueError(
+                f"opt_mem_min_improvement_ratio must be a finite value > 1.0, "
+                f"got {self.opt_mem_min_improvement_ratio}",
+            )
+        if (
+            not math.isfinite(self.opt_mem_speedup_weight_alpha)
+            or self.opt_mem_speedup_weight_alpha < 0.0
+        ):
+            raise ValueError(
+                f"opt_mem_speedup_weight_alpha must be a finite value >= 0.0, "
+                f"got {self.opt_mem_speedup_weight_alpha}",
             )
         if self.use_operator_baseline:
             if not self.triton_baseline_path:
@@ -347,7 +437,12 @@ def load_config(path: Path) -> ACTSConfig:
         eval:      { warmup_runs = 20; timed_runs = 100; };
         move_on:   { sol_plateau_window = 3; sol_plateau_delta = 0.01; sol_target = 0.95; };
         debug:     { max_debug_retries = 3; max_baseline_retries = 3; };
-        memory:    { optimization_memory_top_k = 5; };
+        memory:    { optimization_memory_top_k = 5;
+                     opt_mem_read_enabled = true; opt_mem_write_enabled = false;
+                     opt_mem_writes_per_session_cap = 20;
+                     opt_mem_min_improvement_ratio = 1.05;
+                     opt_mem_speedup_weight_alpha = 1.0;
+                     opt_mem_store_path = "opt_mem/store.jsonl"; };
         benchmark: { benchmark_workload_count = 3; };
 
     Hardware specs come from the SOLAR arch YAML at ``hardware.arch_config_path``
@@ -367,7 +462,15 @@ def load_config(path: Path) -> ACTSConfig:
         "eval": ["warmup_runs", "timed_runs"],
         "move_on": ["sol_plateau_window", "sol_plateau_delta", "sol_target"],
         "debug": ["max_debug_retries", "max_baseline_retries"],
-        "memory": ["optimization_memory_top_k"],
+        "memory": [
+            "optimization_memory_top_k",
+            "opt_mem_read_enabled",
+            "opt_mem_write_enabled",
+            "opt_mem_writes_per_session_cap",
+            "opt_mem_min_improvement_ratio",
+            "opt_mem_speedup_weight_alpha",
+            "opt_mem_store_path",
+        ],
         "benchmark": ["benchmark_workload_count"],
         # Invocation-scoped fields absorbed from argparse (2026-05-11).
         "hardware": ["gpu_index"],
@@ -381,6 +484,7 @@ def load_config(path: Path) -> ACTSConfig:
             "bench_use_subprocess",
             "worker_crash_threshold",
             "worker_timeout_s",
+            "correctness_worker_timeout_s",
         ],
     }
     defaults = ACTSConfig()

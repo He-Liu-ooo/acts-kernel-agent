@@ -907,6 +907,30 @@ def test_acts_config_worker_timeout_defaults_180000():
     assert cfg.worker_timeout_s == 180000.0
 
 
+def test_acts_config_correctness_worker_timeout_defaults_180():
+    """Bounded watchdog on the correctness-check subprocess. Correctness
+    workers never run NCU, so they get a short 3-min default instead of
+    inheriting the ~50h ``worker_timeout_s`` (sized for bench + NCU). A
+    hung correctness candidate must not stall the whole run for ~50h."""
+    from src.config import ACTSConfig
+    cfg = ACTSConfig()
+    assert cfg.correctness_worker_timeout_s == 180.0
+
+
+def test_load_config_correctness_worker_timeout_from_cfg():
+    """`load_config` parses runtime.correctness_worker_timeout_s, mirroring
+    how ``worker_timeout_s`` is loaded from the ``runtime`` group."""
+    from src.config import load_config
+
+    cfg_text = "runtime: { correctness_worker_timeout_s = 45.0; };\n"
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".cfg", delete=False) as f:
+        f.write(cfg_text)
+        f.flush()
+        cfg = load_config(Path(f.name))
+
+    assert cfg.correctness_worker_timeout_s == 45.0
+
+
 def test_acts_config_worker_crash_threshold_rejects_zero():
     import pytest
     from src.config import ACTSConfig
@@ -919,3 +943,113 @@ def test_acts_config_worker_timeout_rejects_non_positive():
     from src.config import ACTSConfig
     with pytest.raises(ValueError, match="worker_timeout_s"):
         ACTSConfig(worker_timeout_s=0.0)
+
+
+# === Optimization memory config (T1 of opt-mem plan) ============================
+
+
+def test_opt_mem_config_defaults():
+    from src.config import _PROJECT_ROOT, ACTSConfig
+
+    c = ACTSConfig()
+    assert c.opt_mem_read_enabled is True
+    assert c.opt_mem_write_enabled is False
+    assert c.opt_mem_writes_per_session_cap == 20
+    assert c.opt_mem_min_improvement_ratio == 1.05
+    assert c.opt_mem_speedup_weight_alpha == 1.0
+    # Anchored at repo root (not CWD) so a process launched from a
+    # subdir doesn't silently split the shared store.
+    assert c.opt_mem_store_path == _PROJECT_ROOT / "opt_mem" / "store.jsonl"
+    assert c.opt_mem_store_path.is_absolute()
+
+
+def test_opt_mem_cap_rejects_negative():
+    import pytest
+
+    from src.config import ACTSConfig
+
+    with pytest.raises(ValueError, match="opt_mem_writes_per_session_cap"):
+        ACTSConfig(opt_mem_writes_per_session_cap=-1)
+
+
+def test_opt_mem_delta_rejects_le_one():
+    import pytest
+
+    from src.config import ACTSConfig
+
+    with pytest.raises(ValueError, match="opt_mem_min_improvement_ratio"):
+        ACTSConfig(opt_mem_min_improvement_ratio=1.0)
+    with pytest.raises(ValueError, match="opt_mem_min_improvement_ratio"):
+        ACTSConfig(opt_mem_min_improvement_ratio=0.95)
+
+
+def test_opt_mem_alpha_rejects_negative():
+    import pytest
+
+    from src.config import ACTSConfig
+
+    with pytest.raises(ValueError, match="opt_mem_speedup_weight_alpha"):
+        ACTSConfig(opt_mem_speedup_weight_alpha=-0.1)
+
+
+def test_opt_mem_cap_rejects_bool():
+    """Regression for ultra-review finding: ``bool`` is a subclass of
+    ``int``, so ``True``/``False`` would slip past the ``< 0`` check
+    silently coercing to cap=1/0. Reject the type explicitly."""
+    import pytest
+
+    from src.config import ACTSConfig
+
+    with pytest.raises(TypeError, match="opt_mem_writes_per_session_cap"):
+        ACTSConfig(opt_mem_writes_per_session_cap=True)
+    with pytest.raises(TypeError, match="opt_mem_writes_per_session_cap"):
+        ACTSConfig(opt_mem_writes_per_session_cap=False)
+
+
+# ── worker-timeout finiteness/positivity validation (Codex review) ─────
+
+
+@pytest.mark.parametrize("bad", [0.0, -1.0, float("nan")])
+def test_correctness_worker_timeout_s_rejects_nonpositive_or_nonfinite(bad):
+    """``correctness_worker_timeout_s`` flows into
+    ``subprocess.proc.wait(timeout=...)``: 0/negative cause immediate
+    spurious timeouts, NaN is undefined. __post_init__ must reject all
+    three the same way the sibling ``worker_timeout_s`` field is guarded."""
+    from src.config import ACTSConfig
+
+    with pytest.raises(ValueError):
+        ACTSConfig(correctness_worker_timeout_s=bad)
+
+
+def test_worker_timeout_s_rejects_nan():
+    """``worker_timeout_s`` already rejects 0/negative, but the bare
+    ``<= 0`` check let NaN through (``NaN <= 0`` is False). NaN as a
+    ``proc.wait`` timeout is undefined — reject it explicitly."""
+    from src.config import ACTSConfig
+
+    with pytest.raises(ValueError):
+        ACTSConfig(worker_timeout_s=float("nan"))
+
+
+# ── opt-mem threshold finiteness validation (Codex review P2) ──────────
+
+
+def test_opt_mem_min_improvement_ratio_rejects_nan():
+    """The bare ``<= 1.0`` check let NaN through (``NaN <= 1.0`` is
+    False). A NaN min_improvement_ratio lets regressions pass the
+    producer threshold and pollute the store — reject it explicitly."""
+    from src.config import ACTSConfig
+    import pytest
+    with pytest.raises(ValueError):
+        ACTSConfig(opt_mem_min_improvement_ratio=float("nan"))
+
+
+def test_opt_mem_speedup_weight_alpha_rejects_nan_and_inf():
+    """The bare ``< 0.0`` check let NaN/inf through. A non-finite alpha
+    makes weighted retrieval fail ("non-finite weights") — reject both."""
+    from src.config import ACTSConfig
+    import pytest
+    with pytest.raises(ValueError):
+        ACTSConfig(opt_mem_speedup_weight_alpha=float("nan"))
+    with pytest.raises(ValueError):
+        ACTSConfig(opt_mem_speedup_weight_alpha=float("inf"))

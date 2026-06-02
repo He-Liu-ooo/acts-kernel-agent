@@ -409,6 +409,31 @@ def test_build_user_prompt_omits_autotune_exclude_when_empty():
     assert "Autotune exclude" not in prompt
 
 
+def test_build_user_prompt_renders_technique_guidance_when_present():
+    plan = OptimizationPlan(
+        tier=2, technique="t2_shared_memory_tiling",
+        target_region="inner loop", rationale="reuse",
+    )
+    prompt = CoderAgent.build_user_prompt(
+        kernel_source="@triton.jit\ndef k(): ...",
+        plan=plan,
+        technique_guidance="In Triton this is implicit — use tl.dot and num_stages.",
+    )
+    assert "## Technique guidance" in prompt
+    assert "tl.dot" in prompt
+
+
+def test_build_user_prompt_omits_technique_guidance_when_empty():
+    plan = OptimizationPlan(
+        tier=2, technique="t2_shared_memory_tiling",
+        target_region="inner loop", rationale="reuse",
+    )
+    prompt = CoderAgent.build_user_prompt(
+        kernel_source="def k(): pass", plan=plan,
+    )
+    assert "## Technique guidance" not in prompt
+
+
 def test_build_translate_prompt_no_section_when_prior_failures_empty():
     """Default path (no prior attempts) — section must be absent."""
     prompt = CoderAgent.build_translate_prompt(
@@ -534,11 +559,13 @@ def test_correctness_tool_factory_returns_callable(tmp_path):
         input_generators=[_gen],
         policy=_ScalarPolicy(),
         cache_dir=tmp_path,
+        allow_in_parent_fallback=True,
     )
     assert callable(tool)
 
 
-def test_correctness_tool_reports_compile_error_without_running_correctness(tmp_path):
+@pytest.mark.asyncio
+async def test_correctness_tool_reports_compile_error_without_running_correctness(tmp_path):
     """If the candidate source won't compile, surface that — don't try to run it."""
     calls = {"ref": 0}
 
@@ -552,25 +579,29 @@ def test_correctness_tool_reports_compile_error_without_running_correctness(tmp_
         input_generators=[_gen],
         policy=_ScalarPolicy(),
         cache_dir=tmp_path,
+        allow_in_parent_fallback=True,
     )
-    msg = tool("def kernel_fn(: broken\n")
+    msg = await tool("def kernel_fn(: broken\n")
     assert "compile" in msg.lower()
     assert calls["ref"] == 0  # reference was never invoked
 
 
-def test_correctness_tool_reports_success_on_matching_candidate(tmp_path):
+@pytest.mark.asyncio
+async def test_correctness_tool_reports_success_on_matching_candidate(tmp_path):
     tool = _make_correctness_tool(
         _make_spec(),
         reference_fn=_ref,
         input_generators=[_gen],
         policy=_ScalarPolicy(),
         cache_dir=tmp_path,
+        allow_in_parent_fallback=True,
     )
-    msg = tool("def kernel_fn(x):\n    return x * 2.0\n")
+    msg = await tool("def kernel_fn(x):\n    return x * 2.0\n")
     assert "pass" in msg.lower()
 
 
-def test_correctness_tool_reports_failure_stage_on_mismatch(tmp_path):
+@pytest.mark.asyncio
+async def test_correctness_tool_reports_failure_stage_on_mismatch(tmp_path):
     """Failure messages surface the failed stage so the Coder can diagnose."""
     tool = _make_correctness_tool(
         _make_spec(),
@@ -578,13 +609,15 @@ def test_correctness_tool_reports_failure_stage_on_mismatch(tmp_path):
         input_generators=[_gen],
         policy=_ScalarPolicy(),
         cache_dir=tmp_path,
+        allow_in_parent_fallback=True,
     )
-    msg = tool("def kernel_fn(x):\n    return x * 3.0\n")
+    msg = await tool("def kernel_fn(x):\n    return x * 3.0\n")
     assert "fail" in msg.lower()
     assert "smoke_test" in msg  # first-stage failure for a uniformly-wrong candidate
 
 
-def test_correctness_tool_appends_to_error_log_on_failure(tmp_path):
+@pytest.mark.asyncio
+async def test_correctness_tool_appends_to_error_log_on_failure(tmp_path):
     log: list[str] = []
     tool = _make_correctness_tool(
         _make_spec(),
@@ -593,13 +626,15 @@ def test_correctness_tool_appends_to_error_log_on_failure(tmp_path):
         policy=_ScalarPolicy(),
         cache_dir=tmp_path,
         error_log=log,
+        allow_in_parent_fallback=True,
     )
-    msg = tool("def kernel_fn(x):\n    return x * 3.0\n")
+    msg = await tool("def kernel_fn(x):\n    return x * 3.0\n")
     assert "FAILED" in msg
     assert log == [msg]
 
 
-def test_correctness_tool_appends_to_error_log_on_compile_abort(tmp_path):
+@pytest.mark.asyncio
+async def test_correctness_tool_appends_to_error_log_on_compile_abort(tmp_path):
     """Compile-abort branch inside the correctness tool also logs to error_log."""
     log: list[str] = []
     tool = _make_correctness_tool(
@@ -609,13 +644,15 @@ def test_correctness_tool_appends_to_error_log_on_compile_abort(tmp_path):
         policy=_ScalarPolicy(),
         cache_dir=tmp_path,
         error_log=log,
+        allow_in_parent_fallback=True,
     )
-    msg = tool("def kernel_fn(: broken\n")
+    msg = await tool("def kernel_fn(: broken\n")
     assert "Correctness aborted" in msg
     assert log == [msg]
 
 
-def test_correctness_tool_does_not_append_on_success(tmp_path):
+@pytest.mark.asyncio
+async def test_correctness_tool_does_not_append_on_success(tmp_path):
     log: list[str] = []
     tool = _make_correctness_tool(
         _make_spec(),
@@ -624,8 +661,9 @@ def test_correctness_tool_does_not_append_on_success(tmp_path):
         policy=_ScalarPolicy(),
         cache_dir=tmp_path,
         error_log=log,
+        allow_in_parent_fallback=True,
     )
-    msg = tool("def kernel_fn(x):\n    return x * 2.0\n")
+    msg = await tool("def kernel_fn(x):\n    return x * 2.0\n")
     assert "pass" in msg.lower()
     assert log == []
 
@@ -641,7 +679,52 @@ def test_correctness_tool_empty_generators_raises():
         )
 
 
-def test_correctness_tool_iterates_all_generators_and_reports_first_failure(tmp_path):
+# ── correctness-isolation trust gate (construction guard) ──────────────
+#
+# Absent a ``problem_definition_path`` the candidate launch can't be
+# crash-isolated in a subprocess, so launching it in-parent is only safe
+# in a deliberately-trusted/mocked context. The factory raises a typed
+# ``CorrectnessIsolationError`` unless ``allow_in_parent_fallback=True``
+# opts in — converting the "no untrusted launch in the parent CUDA
+# context" invariant from coincidence to construction.
+
+
+def _dummy_corr_tool(**overrides):
+    kw = dict(
+        kernel_spec=_make_spec(),
+        reference_fn=_ref,
+        input_generators=[_gen],
+        definition=object(),
+        workloads=[object()],
+        problem_definition_path=None,
+        blob_roots=None,
+    )
+    kw.update(overrides)
+    return _make_correctness_tool(**kw)
+
+
+def test_correctness_tool_raises_without_path_or_optin():
+    """No definition path + no opt-in → the construction guard raises."""
+    from src.eval.correctness_subprocess import CorrectnessIsolationError
+
+    with pytest.raises(CorrectnessIsolationError):
+        _dummy_corr_tool()  # no path, flag defaults False
+
+
+def test_correctness_tool_allows_in_parent_with_explicit_optin():
+    """Explicit opt-in (trusted/mocked context) → tool constructs in-parent."""
+    tool = _dummy_corr_tool(allow_in_parent_fallback=True)
+    assert callable(tool)  # constructed, no raise
+
+
+def test_correctness_tool_with_path_constructs_without_optin():
+    """A bound definition path → subprocess branch; the flag is irrelevant."""
+    tool = _dummy_corr_tool(problem_definition_path="/p")
+    assert callable(tool)
+
+
+@pytest.mark.asyncio
+async def test_correctness_tool_iterates_all_generators_and_reports_first_failure(tmp_path):
     """Tool must run each generator until one fails — its output tells the Coder
     which workload broke so retries can actually correct multi-workload bugs."""
     from src.eval.correctness import CorrectnessResult, CorrectnessStage
@@ -662,15 +745,17 @@ def test_correctness_tool_iterates_all_generators_and_reports_first_failure(tmp_
             reference_fn=_ref,
             input_generators=gens,
             cache_dir=tmp_path,
+            allow_in_parent_fallback=True,
         )
-        msg = tool("def kernel_fn(x):\n    return x * 2.0\n")
+        msg = await tool("def kernel_fn(x):\n    return x * 2.0\n")
 
     assert mock_verify.call_count == 2  # short-circuit after first failure
     assert "workload 2" in msg.lower()
     assert "numerical_stability" in msg
 
 
-def test_correctness_tool_reports_success_when_all_generators_pass(tmp_path):
+@pytest.mark.asyncio
+async def test_correctness_tool_reports_success_when_all_generators_pass(tmp_path):
     """All workloads clean → single success message (not one per workload)."""
     from src.eval.correctness import CorrectnessResult
 
@@ -684,11 +769,123 @@ def test_correctness_tool_reports_success_when_all_generators_pass(tmp_path):
             reference_fn=_ref,
             input_generators=gens,
             cache_dir=tmp_path,
+            allow_in_parent_fallback=True,
         )
-        msg = tool("def kernel_fn(x):\n    return x * 2.0\n")
+        msg = await tool("def kernel_fn(x):\n    return x * 2.0\n")
 
     assert mock_verify.call_count == 3
     assert "pass" in msg.lower()
+
+
+# ── correctness tool — subprocess isolation (gate mode) ─────────────────
+#
+# When a real ``problem_definition_path`` is supplied, the tool must
+# delegate the candidate launch to the crash-isolated worker
+# (``run_correctness_subprocess``, mode ``gate``) instead of compiling +
+# launching the kernel on the parent process's CUDA context. The returned
+# tool becomes ``async``; the helper is mocked so these stay Tier-1.
+
+
+class _DummyWorkload:
+    def model_dump(self, mode="json"):
+        return {"uuid": "w0"}
+
+
+async def _aresult(r):  # coroutine returning a pre-built result
+    return r
+
+
+@pytest.mark.asyncio
+async def test_correctness_tool_delegates_to_subprocess(monkeypatch):
+    from src.eval.correctness_subprocess import CorrectnessResult
+
+    seen = {}
+
+    async def _fake_helper(*, request, worker_dir, timeout_s):
+        seen["mode"] = request["mode"]
+        seen["seed"] = request["input_seed"]
+        return CorrectnessResult(
+            passed=False, failed_stage="numerical",
+            error_message="bad at [3]", total_workloads=3,
+            failed_workload_idx=2,
+        )
+
+    monkeypatch.setattr(
+        "src.agents.coder.run_correctness_subprocess", _fake_helper,
+        raising=False,
+    )
+    tool = _make_correctness_tool(
+        _make_spec(),
+        reference_fn=_ref,
+        input_generators=[_gen],
+        definition=object(),
+        workloads=[_DummyWorkload()],
+        problem_definition_path="/p",
+        blob_roots=["/p"],
+        worker_timeout_s=180.0,
+    )
+    msg = await tool("source", dps=False)
+    assert seen["mode"] == "gate"
+    assert seen["seed"] == 0
+    assert "FAILED on workload 2/3" in msg
+    assert "numerical" in msg
+
+
+@pytest.mark.asyncio
+async def test_correctness_tool_passes_message(monkeypatch):
+    from src.eval.correctness_subprocess import CorrectnessResult
+
+    monkeypatch.setattr(
+        "src.agents.coder.run_correctness_subprocess",
+        lambda **kw: _aresult(
+            CorrectnessResult(passed=True, max_err=2e-3, total_workloads=3),
+        ),
+        raising=False,
+    )
+    tool = _make_correctness_tool(
+        _make_spec(),
+        reference_fn=_ref,
+        input_generators=[_gen],
+        definition=object(),
+        workloads=[_DummyWorkload()],
+        problem_definition_path="/p",
+        blob_roots=["/p"],
+        worker_timeout_s=180.0,
+    )
+    msg = await tool("source", dps=False)
+    assert "passed on all 3 workloads" in msg
+    assert "2.000e-03" in msg
+
+
+@pytest.mark.asyncio
+async def test_correctness_tool_reports_gpu_crash(monkeypatch):
+    """worker_crashed / timeout → explicit 'crashed the GPU' message."""
+    from src.eval.correctness_subprocess import CorrectnessResult
+
+    monkeypatch.setattr(
+        "src.agents.coder.run_correctness_subprocess",
+        lambda **kw: _aresult(
+            CorrectnessResult(
+                passed=False, failed_stage="worker_crashed",
+                error_message="device-side assert triggered",
+            ),
+        ),
+        raising=False,
+    )
+    log: list[str] = []
+    tool = _make_correctness_tool(
+        _make_spec(),
+        reference_fn=_ref,
+        input_generators=[_gen],
+        definition=object(),
+        workloads=[_DummyWorkload()],
+        problem_definition_path="/p",
+        blob_roots=["/p"],
+        error_log=log,
+    )
+    msg = await tool("source", dps=False)
+    assert "crashed the GPU" in msg
+    assert log == [msg]
 
 
 # ── implement() — placeholder path (no model) ───────────────────────────
@@ -747,6 +944,7 @@ async def test_implement_calls_llm_and_returns_modified_source():
             kernel_spec=_make_spec(),
             reference_fn=_ref,
             input_generators=[_gen],
+            allow_in_parent_fallback=True,
         )
 
     assert isinstance(result, KernelCodeOutput)
@@ -841,6 +1039,7 @@ async def test_implement_raises_on_llm_failure():
                 kernel_spec=_make_spec(),
                 reference_fn=_ref,
                 input_generators=[_gen],
+                allow_in_parent_fallback=True,
             )
 
 
@@ -866,6 +1065,7 @@ async def test_implement_passes_default_max_turns_when_no_config():
             kernel_spec=_make_spec(),
             reference_fn=_ref,
             input_generators=[_gen],
+            allow_in_parent_fallback=True,
         )
 
     assert mock_run.await_args.kwargs.get("max_turns") == 8
@@ -891,6 +1091,7 @@ async def test_implement_max_turns_derived_from_config():
             kernel_spec=_make_spec(),
             reference_fn=_ref,
             input_generators=[_gen],
+            allow_in_parent_fallback=True,
         )
 
     assert mock_run.await_args.kwargs.get("max_turns") == 12
@@ -917,6 +1118,7 @@ async def test_implement_uses_zero_temperature():
             kernel_spec=_make_spec(),
             reference_fn=_ref,
             input_generators=[_gen],
+            allow_in_parent_fallback=True,
         )
 
     mock_cfg.assert_called_once_with(temperature=0.0)
@@ -946,6 +1148,7 @@ async def test_implement_raises_when_agent_terminates_without_submitting():
                 kernel_spec=_make_spec(),
                 reference_fn=_ref,
                 input_generators=[_gen],
+                allow_in_parent_fallback=True,
             )
 
 
@@ -979,6 +1182,7 @@ async def test_implement_converts_max_turns_exceeded_to_implementation_error():
                 kernel_spec=_make_spec(),
                 reference_fn=_ref,
                 input_generators=[_gen],
+                allow_in_parent_fallback=True,
             )
 
 
@@ -1013,6 +1217,7 @@ async def test_implement_returns_partial_output_when_max_turns_after_submission(
             kernel_spec=_make_spec(),
             reference_fn=_ref,
             input_generators=[_gen],
+            allow_in_parent_fallback=True,
         )
 
     assert isinstance(result, KernelCodeOutput)
@@ -1256,6 +1461,7 @@ async def test_translate_builds_agent_with_three_tools_and_returns_source():
             kernel_spec=_make_spec(),
             reference_fn=_ref,
             input_generators=[_gen],
+            allow_in_parent_fallback=True,
         )
 
     assert isinstance(result, KernelCodeOutput)
@@ -1288,6 +1494,7 @@ async def test_translate_threads_prior_failures_into_user_prompt():
             prior_failures=[
                 AttemptFailure(attempt_no=1, tool_errors=["tl.tanh AttributeError"]),
             ],
+            allow_in_parent_fallback=True,
         )
 
     prompt = mock_run.await_args.args[1]
@@ -1315,6 +1522,7 @@ async def test_translate_no_prior_failures_section_by_default():
             kernel_spec=_make_spec(),
             reference_fn=_ref,
             input_generators=[_gen],
+            allow_in_parent_fallback=True,
         )
 
     prompt = mock_run.await_args.args[1]
@@ -1338,6 +1546,7 @@ async def test_translate_user_prompt_contains_reference_and_entrypoint():
             kernel_spec=_make_spec(entrypoint="my_kernel"),
             reference_fn=_ref,
             input_generators=[_gen],
+            allow_in_parent_fallback=True,
         )
 
     prompt = mock_run.await_args.args[1]
@@ -1362,6 +1571,7 @@ async def test_translate_uses_distinct_translate_instructions():
             kernel_spec=_make_spec(),
             reference_fn=_ref,
             input_generators=[_gen],
+            allow_in_parent_fallback=True,
         )
 
     instructions = mock_agent_cls.call_args.kwargs["instructions"]
@@ -1389,6 +1599,7 @@ async def test_translate_raises_on_llm_failure():
                 kernel_spec=_make_spec(),
                 reference_fn=_ref,
                 input_generators=[_gen],
+                allow_in_parent_fallback=True,
             )
 
 
@@ -1410,9 +1621,67 @@ async def test_translate_uses_zero_temperature():
             kernel_spec=_make_spec(),
             reference_fn=_ref,
             input_generators=[_gen],
+            allow_in_parent_fallback=True,
         )
 
     mock_cfg.assert_called_once_with(temperature=0.0)
+
+
+@pytest.mark.asyncio
+async def test_translate_forwards_definition_path_and_blob_roots_to_run_tool_agent():
+    """translate() must thread problem_definition_path/blob_roots into
+    _run_tool_agent so the baseline-generation correctness tool takes the
+    crash-isolated subprocess path (mode gate) instead of the in-parent
+    _legacy_in_parent_check fallback. Codex P1: an out-of-bounds LLM
+    baseline would otherwise poison the parent CUDA context before Phase B.
+    """
+    captured: dict = {}
+
+    async def fake_run_tool_agent(self, **kwargs):
+        captured.update(kwargs)
+        return KernelCodeOutput.model_construct(
+            source_code=_VALID_SOURCE, triton_kernel_name=_VALID_NAME, dps=False,
+        )
+
+    with patch.object(CoderAgent, "_run_tool_agent", fake_run_tool_agent):
+        agent = CoderAgent(model=MagicMock())
+        await agent.translate(
+            reference_source="def run(x): return x",
+            kernel_spec=_make_spec(),
+            reference_fn=_ref,
+            input_generators=[_gen],
+            problem_definition_path="/problem/definition.json",
+            blob_roots=["/problem"],
+        )
+
+    assert captured["problem_definition_path"] == "/problem/definition.json"
+    assert captured["blob_roots"] == ["/problem"]
+
+
+@pytest.mark.asyncio
+async def test_translate_definition_path_defaults_to_none():
+    """Omitting the new kwargs keeps the existing in-parent fallback shape —
+    non-breaking for callers that don't bind a SOL problem dir."""
+    captured: dict = {}
+
+    async def fake_run_tool_agent(self, **kwargs):
+        captured.update(kwargs)
+        return KernelCodeOutput.model_construct(
+            source_code=_VALID_SOURCE, triton_kernel_name=_VALID_NAME, dps=False,
+        )
+
+    with patch.object(CoderAgent, "_run_tool_agent", fake_run_tool_agent):
+        agent = CoderAgent(model=MagicMock())
+        await agent.translate(
+            reference_source="def run(x): return x",
+            kernel_spec=_make_spec(),
+            reference_fn=_ref,
+            input_generators=[_gen],
+            allow_in_parent_fallback=True,
+        )
+
+    assert captured["problem_definition_path"] is None
+    assert captured["blob_roots"] is None
 
 
 # ── submit-tool factory ────────────────────────────────────────────────
@@ -2448,6 +2717,7 @@ async def test_implement_accepts_shared_sample_args_kwarg():
             input_generators=[_gen],
             iter_no=3,
             sample_args=shared,
+            allow_in_parent_fallback=True,
         )
 
     # The orchestrator-supplied tuple is the SAME object the factory saw —

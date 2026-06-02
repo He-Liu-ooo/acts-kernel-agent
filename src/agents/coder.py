@@ -58,6 +58,7 @@ from src.agents.llm_backend import (
 )
 from src.config import ACTSConfig
 from src.eval.correctness import ComparisonPolicy, verify_correctness
+from src.eval.correctness_subprocess import run_correctness_subprocess
 from src.eval.profiler import triton_kernel_names_in
 from src.eval.smem_check import check_autotune_smem_budget
 from src.kernels.compiler import compile_kernel
@@ -531,7 +532,11 @@ def _make_correctness_tool(
     definition: Any | None = None,
     workloads: list[Any] | None = None,
     error_log: list[str] | None = None,
-) -> Callable[..., str]:
+    problem_definition_path: "str | Path | None" = None,
+    blob_roots: list | None = None,
+    worker_timeout_s: float = 180.0,
+    allow_in_parent_fallback: bool = False,
+) -> Callable[..., Any]:
     """Build a correctness tool bound to a KernelSpec + oracle + workload generators.
 
     The tool recompiles the submitted source (compile is cheap; tools
@@ -561,6 +566,13 @@ def _make_correctness_tool(
             "correctness tool requires at least one input generator — "
             "got an empty list.",
         )
+    if not problem_definition_path and not allow_in_parent_fallback:
+        from src.eval.correctness_subprocess import CorrectnessIsolationError
+        raise CorrectnessIsolationError(
+            "correctness tool needs a problem_definition_path to isolate the candidate "
+            "launch in a subprocess; pass allow_in_parent_fallback=True only for "
+            "trusted/mocked contexts (tests, placeholder)."
+        )
     if workloads is not None and len(workloads) != len(input_generators):
         raise ValueError(
             f"workloads ({len(workloads)}) and input_generators "
@@ -568,7 +580,14 @@ def _make_correctness_tool(
             f"DPS allocate_outputs gets the right resolved axes."
         )
 
-    def check_correctness_tool(source_code: str, dps: bool = False) -> str:
+    def _legacy_in_parent_check(source_code: str, dps: bool) -> str:
+        """In-parent compile + verify (placeholder / no-definition path).
+
+        Used only when no ``problem_definition_path`` is bound — i.e. unit
+        tests / placeholder runs with no SOL problem dir, which carry no
+        untrusted GPU candidates. Preserves the ``cache_dir`` + ``policy``
+        wiring of the original tool body verbatim.
+        """
         kernel = Kernel(spec=kernel_spec, source_code=source_code, dps=dps)
         compiled = compile_kernel(kernel, cache_dir=cache_dir)
         if not compiled.success:
@@ -602,6 +621,62 @@ def _make_correctness_tool(
             f"Correctness verification passed on all {total} workloads "
             f"(5 stages each, max_abs_error={max_err:.3e})."
         )
+
+    async def check_correctness_tool(source_code: str, dps: bool = False) -> str:
+        if not problem_definition_path:
+            return _legacy_in_parent_check(source_code, dps)
+
+        import shutil
+        import tempfile
+        from pathlib import Path as _P
+        from src.eval.correctness_subprocess import build_correctness_request
+
+        request = build_correctness_request(
+            spec=kernel_spec,
+            source_code=source_code,
+            dps=dps,
+            definition_path=problem_definition_path,
+            workloads=workloads or [],
+            blob_roots=blob_roots,
+            mode="gate",
+            input_seed=0,
+            anti_cheat_critical_names=[],
+        )
+        worker_dir = _P(tempfile.mkdtemp(prefix="acts_corr_"))
+        try:
+            result = await run_correctness_subprocess(
+                request=request, worker_dir=worker_dir, timeout_s=worker_timeout_s,
+            )
+            if result.passed:
+                return (
+                    f"Correctness verification passed on all "
+                    f"{result.total_workloads} workloads "
+                    f"(5 stages each, max_abs_error={result.max_err:.3e})."
+                )
+            if result.failed_stage in ("worker_crashed", "timeout"):
+                return _record_failure(
+                    error_log,
+                    f"Correctness ABORTED — the kernel crashed the GPU "
+                    f"({result.failed_stage}). This usually means an "
+                    f"out-of-bounds memory access. Worker log tail:\n"
+                    f"{result.error_message}",
+                )
+            if result.failed_stage == "compile":
+                return _record_failure(
+                    error_log,
+                    "Correctness aborted — candidate failed to compile:\n"
+                    f"{result.error_message}",
+                )
+            return _record_failure(
+                error_log,
+                f"Correctness FAILED on workload {result.failed_workload_idx}/"
+                f"{result.total_workloads} at stage [{result.failed_stage}]:\n"
+                f"{result.error_message}",
+            )
+        finally:
+            # Reclaim the per-candidate scratch dir so /tmp doesn't leak one
+            # ``acts_corr_*`` dir per candidate across iters.
+            shutil.rmtree(worker_dir, ignore_errors=True)
 
     return check_correctness_tool
 
@@ -735,6 +810,7 @@ class CoderAgent:
     ) -> None:
         self._model = model
         cfg = config or ACTSConfig()
+        self._config = cfg
         self._max_turns = 2 * cfg.max_debug_retries + 2
         # Cached hardware spec — threaded into compile_kernel_tool for the
         # Phase B SMEM check (see hw-spec-injection Task 5) and into
@@ -760,6 +836,7 @@ class CoderAgent:
         bottleneck: "BottleneckType | None" = None,
         hardware: "HardwareSpec | None" = None,
         workload_shapes: list[tuple[int, ...]] | None = None,
+        technique_guidance: str = "",
     ) -> str:
         """Assemble the user prompt from the current kernel and the plan.
 
@@ -807,6 +884,9 @@ class CoderAgent:
             )
         sections.append("## Optimization plan\n" + "\n".join(plan_lines))
 
+        if technique_guidance:
+            sections.append("## Technique guidance\n" + technique_guidance)
+
         return "\n\n".join(sections)
 
     async def _run_tool_agent(
@@ -823,6 +903,9 @@ class CoderAgent:
         plan: "OptimizationPlan | None" = None,
         iter_no: int | None = None,
         sample_args: tuple | None = None,
+        problem_definition_path: "str | Path | None" = None,
+        blob_roots: list | None = None,
+        allow_in_parent_fallback: bool = False,
     ) -> KernelCodeOutput:
         # Shared across all three tool factories so every FAILED return
         # rides out via ``ImplementationError.tool_errors`` for the
@@ -871,6 +954,10 @@ class CoderAgent:
                 definition=definition,
                 workloads=workloads,
                 error_log=tool_errors,
+                problem_definition_path=problem_definition_path,
+                blob_roots=blob_roots,
+                worker_timeout_s=self._config.correctness_worker_timeout_s,
+                allow_in_parent_fallback=allow_in_parent_fallback,
             )
         )
         captured: dict = {}
@@ -930,6 +1017,10 @@ class CoderAgent:
         iter_no: int | None = None,
         sample_args: tuple | None = None,
         workload_shapes: list[tuple[int, ...]] | None = None,
+        problem_definition_path: "str | Path | None" = None,
+        blob_roots: list | None = None,
+        allow_in_parent_fallback: bool = False,
+        technique_guidance: str = "",
     ) -> KernelCodeOutput:
         """Apply the optimization plan to the kernel source code.
 
@@ -970,6 +1061,7 @@ class CoderAgent:
                 bottleneck=bottleneck,
                 hardware=self._hardware if self._hardware.name else None,
                 workload_shapes=workload_shapes,
+                technique_guidance=technique_guidance,
             ),
             kernel_spec=kernel_spec,
             reference_fn=reference_fn,
@@ -979,6 +1071,9 @@ class CoderAgent:
             plan=plan,
             iter_no=iter_no,
             sample_args=sample_args,
+            problem_definition_path=problem_definition_path,
+            blob_roots=blob_roots,
+            allow_in_parent_fallback=allow_in_parent_fallback,
         )
 
     @staticmethod
@@ -1070,6 +1165,9 @@ class CoderAgent:
         bottleneck: "BottleneckType | None" = None,
         iter_no: int | None = None,
         workload_shapes: list[tuple[int, ...]] | None = None,
+        problem_definition_path: "str | Path | None" = None,
+        blob_roots: list | None = None,
+        allow_in_parent_fallback: bool = False,
     ) -> KernelCodeOutput:
         """Port a PyTorch reference into a Triton kernel in one agent run.
 
@@ -1091,6 +1189,14 @@ class CoderAgent:
         ``baseline_generator.generate_triton_baseline`` after each
         ``ImplementationError`` catch. Default empty tuple = no section
         rendered.
+
+        *problem_definition_path* / *blob_roots* — threaded into the
+        in-loop correctness tool so the baseline-generation path runs the
+        agent's candidate launches in the crash-isolated subprocess
+        (mode ``gate``) instead of the in-parent
+        ``_legacy_in_parent_check`` fallback. Without these an
+        out-of-bounds LLM baseline poisons the parent CUDA context before
+        Phase B starts. Mirror of the same kwargs ``implement()`` threads.
         """
         if self._model is None:
             raise ImplementationError(
@@ -1115,4 +1221,7 @@ class CoderAgent:
             definition=definition,
             workloads=workloads,
             iter_no=iter_no,
+            problem_definition_path=problem_definition_path,
+            blob_roots=blob_roots,
+            allow_in_parent_fallback=allow_in_parent_fallback,
         )

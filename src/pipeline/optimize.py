@@ -484,8 +484,10 @@ async def optimize(
     from src.agents.planner import PlannerAgent
     from src.agents.reviewer import ReviewerAgent
     from src.config import ACTSConfig, detect_hardware
+    from src.memory.producer import Producer
     from src.memory.retriever import MemoryRetriever
     from src.memory.store import MemoryStore
+    from src.memory.summarizer import SummarizerAgent
     from src.search.orchestrator import Orchestrator
 
     if config is None:
@@ -529,11 +531,51 @@ async def optimize(
         input_generators = []
         definition_path = None
 
-    store_path = Path("memory_store.json")
-    store = MemoryStore(store_path)
-    if store_path.exists():
+    # Opt-mem store + retriever (always constructed). Producer is only
+    # built when the run is opted in to writes — ablation runs default
+    # to write_enabled=False so they read accumulated lessons without
+    # polluting the shared global store. See doc/specs/2026-05-24-
+    # optimization-memory-design.md §7.
+    store = MemoryStore(config.opt_mem_store_path)
+    # Only touch the file when reads are enabled. With read_enabled=False
+    # the retriever short-circuits regardless of cache contents, and the
+    # producer's add_many() doesn't depend on a pre-populated cache (it
+    # just appends + extends in-memory state from this run). Skipping
+    # load() honors the operator's intent when they disable reads to
+    # avoid a known-broken store (legacy / unreadable / mid-corruption).
+    if config.opt_mem_read_enabled:
         store.load()
-    retriever = MemoryRetriever(store, top_k=config.optimization_memory_top_k)
+    retriever = MemoryRetriever(
+        store,
+        top_k=config.optimization_memory_top_k,
+        alpha=config.opt_mem_speedup_weight_alpha,
+        read_enabled=config.opt_mem_read_enabled,
+    )
+
+    producer: Producer | None = None
+    if model is not None and config.opt_mem_write_enabled:
+        summarizer = SummarizerAgent(
+            model=model,
+            summarizer_model_name=getattr(model, "model", "unknown"),
+        )
+        # Use the canonical RunContext run_dir name as the opt-mem run_id
+        # so an Experience row's ``provenance.run_id`` joins cleanly back
+        # to events.jsonl / tree_dump / traces under the same run dir.
+        # Falls back to a synthetic stamp for direct-call paths without
+        # a RunContext (tests + the no-LLM placeholder demo).
+        if run_dir is not None:
+            opt_mem_run_id = run_dir.name
+        else:
+            from datetime import datetime, timezone
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+            opt_mem_run_id = f"no-run-dir-{stamp}"
+        producer = Producer(
+            store=store,
+            summarizer=summarizer,
+            config=config,
+            run_id=opt_mem_run_id,
+            kernel_type=baseline.spec.kernel_type.value,
+        )
 
     orchestrator = Orchestrator(
         config=config,
@@ -541,6 +583,7 @@ async def optimize(
         coder=coder,
         reviewer=reviewer,
         retriever=retriever,
+        producer=producer,
     )
     result = await orchestrator.run(
         baseline,
@@ -590,6 +633,7 @@ async def _dispatch_baseline(
     coder: "CoderAgent | None",
     workloads: list["Workload"],
     blob_roots: list[Path],
+    definition_path: Path | None = None,
 ) -> "Kernel":
     """Pick the operator-supplied or LLM-translated baseline strategy.
 
@@ -627,6 +671,11 @@ async def _dispatch_baseline(
         workloads=workloads,
         max_retries=config.max_baseline_retries,
         blob_roots=blob_roots,
+        # Threads the SOL definition into the baseline's post-verify so the
+        # untrusted LLM candidate launches in the crash-isolated worker
+        # instead of poisoning the parent CUDA context before Phase B.
+        problem_definition_path=definition_path,
+        worker_timeout_s=config.correctness_worker_timeout_s,
     )
 
 
@@ -751,6 +800,7 @@ async def _load_sol_problem(
         coder=coder,
         workloads=workloads,
         blob_roots=blob_roots,
+        definition_path=definition_path,
     )
 
     reference_fn = build_reference_fn(definition.reference)

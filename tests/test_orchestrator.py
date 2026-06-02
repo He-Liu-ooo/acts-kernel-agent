@@ -99,7 +99,7 @@ def harness():
         branch_quality=BranchQuality.PROMISING,
     ))
     retriever = MagicMock()
-    retriever.retrieve = MagicMock(return_value=[])
+    retriever.sample = MagicMock(return_value=[])
 
     bench = BenchmarkResult(median_latency_us=100.0, timed_runs=1)
     baseline = _make_kernel("root")
@@ -551,6 +551,7 @@ async def test_reward_hack_re_eval_clears_matching_tuple_output(harness):
             [input_generator],
             reference_fn=reference_fn,
             definition=_two_out_definition(),
+            allow_in_parent_fallback=True,
         )
 
     assert cleared is True, (
@@ -609,6 +610,7 @@ async def test_reward_hack_re_eval_rejects_mismatched_tuple_output(harness):
             [input_generator],
             reference_fn=reference_fn,
             definition=_two_out_definition(),
+            allow_in_parent_fallback=True,
         )
 
     assert cleared is False, (
@@ -660,6 +662,136 @@ def _dps_workload(n: int = 64):
         "axes": {"N": n},
         "inputs": {"x": {"type": "random"}},
     })
+
+
+# ── reward_hack re-eval: subprocess isolation ─────────────────────────
+#
+# Invariant: when a real ``problem_definition_path`` is supplied,
+# ``_reward_hack_re_eval`` must route the candidate launch through the
+# crash-isolated worker (``run_correctness_subprocess``, mode
+# ``strict_recheck``) instead of compiling + launching the kernel on the
+# parent process's CUDA context. This is Tier-1 (the helper is mocked, no
+# torch / GPU needed).
+
+
+@pytest.mark.asyncio
+async def test_reward_hack_re_eval_uses_subprocess(harness, monkeypatch):
+    """A re-eval with a definition path must delegate to the subprocess
+    helper (strict_recheck), NOT launch the kernel in-parent."""
+    from src.search.orchestrator import Orchestrator
+
+    captured = {}
+
+    async def _fake_helper(*, request, worker_dir, timeout_s):
+        captured["mode"] = request["mode"]
+        captured["seed"] = request["input_seed"]
+        from src.eval.correctness_subprocess import CorrectnessResult
+        return CorrectnessResult(passed=True)
+
+    monkeypatch.setattr(
+        "src.search.orchestrator.run_correctness_subprocess",
+        _fake_helper,
+        raising=False,
+    )
+
+    orch = Orchestrator(
+        harness.config, harness.planner, harness.coder, harness.reviewer,
+        harness.retriever,
+    )
+    # Real KernelSpec so the request builder's ``asdict`` walk works; a
+    # workload with ``model_dump`` so the request serializes.
+    kernel = _make_kernel("rh-subproc")
+    workload = SimpleNamespace(model_dump=lambda mode="json": {"uuid": "w0"})
+
+    cleared = await orch._reward_hack_re_eval(
+        SimpleNamespace(id="n1"),
+        kernel,
+        [workload],
+        [lambda s: ()],
+        reference_fn=lambda *a: a,
+        definition=SimpleNamespace(),
+        problem_definition_path="/p",
+        blob_roots=["/p"],
+    )
+
+    assert cleared is True
+    assert captured["mode"] == "strict_recheck"
+    assert captured["seed"] == 42
+
+
+# ── reward_hack re-eval: isolation trust gate ─────────────────────────
+#
+# Invariant: with no ``problem_definition_path`` (can't isolate the
+# candidate launch in a subprocess), the in-parent compare path runs ONLY
+# when the caller explicitly opts in via ``allow_in_parent_fallback=True``.
+# Absent both, the re-eval raises ``CorrectnessIsolationError`` rather than
+# silently launching an untrusted kernel in the parent CUDA context. These
+# are Tier-1 (no path → no subprocess; the in-parent compare is mocked).
+
+
+@pytest.mark.asyncio
+async def test_reward_hack_re_eval_raises_without_path_or_optin(harness):
+    """No definition path + no opt-in → fail loud, not an in-parent launch."""
+    from src.eval.correctness_subprocess import CorrectnessIsolationError
+    from src.search.orchestrator import Orchestrator
+
+    orch = Orchestrator(
+        harness.config, harness.planner, harness.coder, harness.reviewer,
+        harness.retriever,
+    )
+
+    with pytest.raises(CorrectnessIsolationError):
+        await orch._reward_hack_re_eval(
+            SimpleNamespace(id="n1"),
+            SimpleNamespace(),
+            [object()],
+            [lambda s: ()],
+            reference_fn=lambda *a: a,
+            definition=SimpleNamespace(),
+            problem_definition_path=None,
+            blob_roots=None,
+            # allow_in_parent_fallback defaults False
+        )
+
+
+@pytest.mark.asyncio
+async def test_reward_hack_re_eval_in_parent_with_optin(harness, monkeypatch):
+    """No definition path + explicit opt-in → in-parent compare runs and
+    clears the suspect when the comparator passes."""
+    from src.kernels.compiler import CompilationResult
+    from src.search.orchestrator import Orchestrator
+
+    monkeypatch.setattr(
+        "src.eval.correctness.strict_compare_one_workload",
+        lambda **kwargs: True,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "src.kernels.compiler.compile_kernel",
+        lambda kernel: CompilationResult(
+            success=True, compiled_fn=lambda *a: a,
+        ),
+        raising=False,
+    )
+
+    orch = Orchestrator(
+        harness.config, harness.planner, harness.coder, harness.reviewer,
+        harness.retriever,
+    )
+
+    cleared = await orch._reward_hack_re_eval(
+        SimpleNamespace(id="n1"),
+        SimpleNamespace(),
+        [object()],
+        [lambda s: ()],
+        reference_fn=lambda *a: a,
+        definition=SimpleNamespace(),
+        problem_definition_path=None,
+        blob_roots=None,
+        allow_in_parent_fallback=True,
+    )
+
+    assert cleared is True
 
 
 @pytest.mark.gpu
@@ -727,6 +859,7 @@ async def test_reward_hack_re_eval_dps_clears_matching_kernel(harness):
             [input_generator],
             reference_fn=reference_fn,
             definition=_dps_one_out_definition(),
+            allow_in_parent_fallback=True,
         )
 
     assert cleared is True, (
@@ -796,6 +929,7 @@ async def test_reward_hack_re_eval_dps_rejects_mismatched_kernel(harness):
             [input_generator],
             reference_fn=reference_fn,
             definition=_dps_one_out_definition(),
+            allow_in_parent_fallback=True,
         )
 
     assert cleared is False, (
@@ -895,3 +1029,85 @@ async def test_orchestrator_threads_workloads_and_definition_into_coder(
     kwargs = harness.coder.implement.call_args.kwargs
     assert kwargs.get("workloads") == [workload]
     assert kwargs.get("definition") is definition
+
+
+# ── swallowed-exception logging (Task 5) ────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_logs_on_input_generator_failure(
+    tmp_path, harness, caplog,
+):
+    """A raising input generator (poisoned CUDA context) must surface a
+    WARNING at both fail-open swallow sites — the baseline dtype-gather and
+    the per-iter shared_sample_args gather — instead of degrading silently."""
+    import logging
+
+    from sol_execbench.core.data import Definition, Workload
+    from src.search.orchestrator import Orchestrator
+
+    definition = Definition.model_validate({
+        "name": "noop",
+        "axes": {"N": {"type": "var"}},
+        "inputs": {"x": {"shape": ["N"], "dtype": "float32"}},
+        "outputs": {"y": {"shape": ["N"], "dtype": "float32"}},
+        "reference": "def run(x): return x\n",
+    })
+    workload = Workload.model_validate(
+        {"uuid": "wl0", "axes": {"N": 256}, "inputs": {}}
+    )
+    roofline_with_counts = RooflineResult(
+        t_sol_us=harness.roofline.t_sol_us,
+        bottleneck=harness.roofline.bottleneck,
+        source="solar",
+        total_flops=1_000_000,
+        total_fused_bytes=100_000,
+    )
+    bench = BenchmarkResult(
+        median_latency_us=100.0,
+        timed_runs=1,
+        per_workload_latency_us={"wl0": 42.0},
+    )
+
+    def _boom(_seed):
+        raise RuntimeError("CUDA error: device-side assert triggered")
+
+    caplog.set_level(logging.WARNING, logger="src.search.orchestrator")
+    with (
+        patch("src.eval.benchmark.benchmark_kernel", return_value=bench),
+        patch("src.eval.profiler.profile_kernel", return_value=_make_profile()),
+    ):
+        orch = Orchestrator(
+            harness.config, harness.planner, harness.coder, harness.reviewer,
+            harness.retriever,
+        )
+        await orch.run(
+            harness.baseline,
+            workloads=[workload],
+            roofline=roofline_with_counts,
+            definition=definition,
+            input_generators=[_boom],
+        )
+
+    messages = [r.message for r in caplog.records]
+    assert any("baseline dtype-gather" in m for m in messages), messages
+    assert any("shared_sample_args" in m for m in messages), messages
+
+
+def test_select_technique_guidance_returns_guidance_for_known_technique():
+    from src.actions.registry import build_default_registry
+    from src.search.orchestrator import _select_technique_guidance
+    reg = build_default_registry()
+    applicable = [reg.get("t2_shared_memory_tiling")]
+    g = _select_technique_guidance(applicable, "t2_shared_memory_tiling")
+    assert "tl.dot" in g.lower()
+
+
+def test_select_technique_guidance_empty_for_unknown_technique():
+    """The no-model placeholder plan uses technique='block_size_tuning' which
+    is NOT a registered action id — guidance must degrade to ""."""
+    from src.actions.registry import build_default_registry
+    from src.search.orchestrator import _select_technique_guidance
+    reg = build_default_registry()
+    applicable = [reg.get("t2_shared_memory_tiling")]
+    assert _select_technique_guidance(applicable, "block_size_tuning") == ""

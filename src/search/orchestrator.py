@@ -17,7 +17,10 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
+from src.agents.llm_backend import render_action_menu, render_technique_guidance
 from src.agents.reviewer import BranchQuality, _render_review_for_planner
+from src.eval.correctness_subprocess import run_correctness_subprocess
+from src.memory.experience import ActionRecord
 from src.runtime import tree_dump
 from src.runtime.events import (
     DeadReason,
@@ -61,7 +64,10 @@ class CUDAContextPoisoned(RuntimeError):
     bench (the child process owns CUDA touches; sticky errors die with
     the child). The class + ``_CUDA_STICKY_PATTERNS`` set stay in code
     as defensive guards for any remaining parent-side CUDA touches
-    (Coder's ``run_correctness`` tool, Phase C re-profile).
+    (Phase C re-profile, the Coder's SMEM compile-tool host-wrapper,
+    and the opt-in in-parent correctness fallback). The Coder's
+    correctness check itself moved to a crash-isolated subprocess
+    2026-05-31 — see ``src/eval/correctness_subprocess.py``.
     """
 
 
@@ -85,6 +91,7 @@ class WorkerProcessUnstable(RuntimeError):
 if TYPE_CHECKING:
     from sol_execbench.core.data import Definition, Workload
 
+    from src.actions.registry import Action
     from src.agents.coder import CoderAgent
     from src.agents.reviewer import ReviewerAgent
     from src.agents.planner import PlannerAgent
@@ -93,6 +100,7 @@ if TYPE_CHECKING:
     from src.eval.roofline import RooflineResult
     from src.eval.types import BottleneckType
     from src.kernels.kernel import Kernel
+    from src.memory.producer import Producer
     from src.memory.retriever import MemoryRetriever
     from src.search.tree import SearchTree, TreeNode
 
@@ -422,7 +430,7 @@ def _render_profiling_for_planner(profiling, roofline=None) -> str:
     if profiling.has_analytical:
         a = profiling.analytical
         lines.extend([
-            f"pct_peak_compute={a.pct_peak_compute * 100:.1f}%",
+            f"pct_peak_compute={a.pct_peak_compute * 100:.1f}% [{a.compute_peak_dtype}]",
             f"pct_peak_bandwidth={a.pct_peak_bandwidth * 100:.1f}%",
         ])
     if roofline is not None:
@@ -461,6 +469,26 @@ def _emit_dead_end(iter_no: int, reason: DeadReason, *, detail: str | None = Non
         payload["detail"] = detail
     emit("branch_dead_end", iter=iter_no, **payload)
     emit("iter_end", iter=iter_no, outcome=ITER_DEAD_END)
+
+
+def _is_reviewer_rejected(node: Any) -> bool:
+    """True iff *node* is a DEAD_END the Reviewer rejected (not beam-pruned).
+
+    ``branch_quality == DEAD_END`` collapses several distinct causes (see
+    ``DeadReason``). The opt-mem write gate must skip ONLY Reviewer-judged
+    rejections — those are quality-shaped (reward-hack suspicion, over-
+    optimization, style regression), not lessons worth distilling.
+
+    A ``DeadReason.BEAM_PRUNED`` node is explicitly NOT reviewer-rejected:
+    it ran fine and may well have improved its parent — it just lost the
+    beam competition. Letting it through to ``Producer.consider`` is safe
+    because the Producer's δ-improvement gate is the proper arbiter of
+    whether the edge lands in the store.
+    """
+    return (
+        node.branch_quality == BranchQuality.DEAD_END
+        and node.dead_reason != DeadReason.BEAM_PRUNED
+    )
 
 
 def detect_plateau(
@@ -555,6 +583,14 @@ def _persist_iter_failure_summary(
     )
 
 
+def _select_technique_guidance(applicable: list["Action"], technique: str) -> str:
+    """Render the chosen technique's Coder guidance, or "" when the technique
+    id is not in the applicable set (e.g. the no-model placeholder plan, whose
+    technique id is not a registered action). Keeps the Coder render fail-soft."""
+    selected = next((a for a in applicable if a.id == technique), None)
+    return render_technique_guidance(selected) if selected is not None else ""
+
+
 def _render_and_emit_sibling_context(
     tree: "SearchTree",
     parent: "TreeNode",
@@ -618,6 +654,7 @@ class Orchestrator:
         coder: CoderAgent,
         reviewer: ReviewerAgent,
         retriever: MemoryRetriever,
+        producer: "Producer | None" = None,
     ) -> None:
         from src.actions.registry import build_default_registry
 
@@ -626,6 +663,7 @@ class Orchestrator:
         self._coder = coder
         self._reviewer = reviewer
         self._retriever = retriever
+        self._producer = producer
         self._action_registry = build_default_registry()
         self._tree: SearchTree | None = None
         # Cached SOL ``Environment`` for ``trace_emitted``. Built lazily
@@ -639,6 +677,22 @@ class Orchestrator:
         # ``consecutive_cuda_errors`` shape (counter + escalation).
         # Reset to 0 on every clean worker exit.
         self.consecutive_worker_crashes = 0
+
+    async def _flush_opt_mem(self, root, tree) -> None:
+        """Best-effort opt-mem finalize + flush. Called before every clean
+        run() exit. Never raises — opt-mem is best-effort by design and a
+        flush hiccup must not turn a successful search into a failure.
+        See doc/specs/2026-05-24-optimization-memory-design.md §8.
+        """
+        if self._producer is None:
+            return
+        try:
+            await self._producer.finalize(root, tree.best_node())
+            flushed = await self._producer.flush()
+            if flushed:
+                logger.info("opt-mem: flushed %d rows", flushed)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("opt-mem flush failed (ignored): %s", exc)
 
     def _kill_branch(
         self,
@@ -829,6 +883,11 @@ class Orchestrator:
         # report.py degrades every winner workload as
         # ``per_workload_latency_missing``.
         root.per_workload_latency_us = baseline_bench.per_workload_latency_us
+        # Opt-mem Producer reads node.runtime_ms to compute parent → child
+        # speedup ratios. Stash the baseline median latency on root so the
+        # G3 "baseline → best-of-run" finalize call works regardless of
+        # whether iter 1 expanded root or some other parent.
+        root.runtime_ms = baseline_bench.median_latency_us / 1000.0
 
         # Persist the baseline root to <run_dir>/tree/node_0/. Mirrors the
         # child-side dump_node call (advance path) and the dead-end dump
@@ -851,13 +910,12 @@ class Orchestrator:
             baseline_spec=baseline.spec,
         )
 
-        available_actions = [
-            a.id
-            for a in self._action_registry.list_applicable(
-                baseline.spec.kernel_type.value,
-                hardware=self._config.hardware,
-            )
-        ]
+        applicable_actions = self._action_registry.list_applicable(
+            baseline.spec.kernel_type.value,
+            hardware=self._config.hardware,
+        )
+        available_actions = [a.id for a in applicable_actions]
+        action_menu = render_action_menu(applicable_actions)
 
         root.score = compute_sol_score(
             baseline_bench.median_latency_us,
@@ -933,6 +991,25 @@ class Orchestrator:
             and baseline_repr_latency_s is not None
             and math.isfinite(baseline_repr_latency_s)
         ):
+            # Capture input dtypes for pct_peak.compute denominator
+            # selection. Errors collapse to []; analytical falls back
+            # to fp32_fallback with calibration_warning=True.
+            from src.eval.profiler import _collect_input_dtypes
+            try:
+                _repr_inputs = repr_input_generator(0)
+            except Exception as exc:
+                logger.warning(
+                    "baseline dtype-gather: input generator raised %s: %s — "
+                    "baseline pct_peak.compute will use fp32_fallback",
+                    type(exc).__name__, exc,
+                )
+                _repr_inputs = ()
+            _repr_dtypes = _collect_input_dtypes(_repr_inputs)
+            # Only the dtype strings are needed downstream; the
+            # representative CUDA tensors would otherwise stay referenced
+            # for the whole run(). Drop them so the device memory frees now.
+            del _repr_inputs
+
             try:
                 root.profiling = profile_kernel(
                     baseline,
@@ -947,6 +1024,7 @@ class Orchestrator:
                         self._config.safetensors_blob_roots,
                         problem_definition_path,
                     ),
+                    input_dtypes=_repr_dtypes,
                 )
             except ProfilerError as exc:
                 logger.warning(
@@ -1041,6 +1119,7 @@ class Orchestrator:
             iter_no = iteration + 1
             frontier = tree.frontier()
             if not frontier:
+                await self._flush_opt_mem(root, tree)
                 return SearchResult(
                     tree.best_node(),
                     iteration,
@@ -1060,13 +1139,16 @@ class Orchestrator:
                 selected_by="epsilon_greedy",
             )
 
-            # Retriever + Planner + Reviewer all share the run-level
-            # bottleneck — classification is invariant per
-            # (problem, representative workload, hardware) so we do not
-            # derive it per-iteration from profiling results.
-            experiences = self._retriever.retrieve(
+            # Retriever surfaces distilled opt-mem lessons for the Planner.
+            # Filtered by kernel_type, hardware-preferred, speedup-weighted
+            # random sample. The run-level bottleneck is still threaded
+            # through Planner / Reviewer for in-prompt reasoning, but the
+            # retriever no longer keys on it (lessons are kernel-shaped,
+            # not symptom-shaped). See
+            # doc/specs/2026-05-24-optimization-memory-design.md §10.
+            experiences = self._retriever.sample(
                 baseline.spec.kernel_type.value,
-                run_bottleneck,
+                self._config.hardware.name,
             )
 
             # Root-to-parent trajectory — consumed by the Planner so it can
@@ -1099,6 +1181,7 @@ class Orchestrator:
                         profiling_summary=parent_profiling_summary,
                         past_experiences=experiences,
                         available_actions=available_actions,
+                        action_menu=action_menu,
                         tree_context=tree.render_path(parent.id),
                         reviewer_feedback=_render_review_for_planner(parent.last_review),
                         bottleneck=run_bottleneck,
@@ -1129,6 +1212,10 @@ class Orchestrator:
                 rationale_short=plan.rationale[:120],
             )
 
+            technique_guidance = _select_technique_guidance(
+                applicable_actions, plan.technique
+            )
+
             # K-way Coder fan-out: K parallel ``coder.implement`` calls
             # via ``asyncio.gather``. Decoder diversity at the forced
             # T=1.0 (configs/models/deepseek.json) produces variance —
@@ -1155,7 +1242,12 @@ class Orchestrator:
             if input_generators:
                 try:
                     shared_sample_args = input_generators[0](0)
-                except Exception:
+                except Exception as exc:
+                    logger.warning(
+                        "shared_sample_args: input generator raised %s: %s — "
+                        "smem check will skip with sample_args_missing",
+                        type(exc).__name__, exc,
+                    )
                     shared_sample_args = None
 
             async def _run_one_coder(_cand_idx: int):
@@ -1178,6 +1270,12 @@ class Orchestrator:
                         iter_no=iter_no,
                         sample_args=shared_sample_args,
                         workload_shapes=workload_shapes_for_prompt,
+                        technique_guidance=technique_guidance,
+                        problem_definition_path=problem_definition_path,
+                        blob_roots=_resolve_blob_roots(
+                            self._config.safetensors_blob_roots,
+                            problem_definition_path,
+                        ),
                     )
 
             candidate_results = await asyncio.gather(
@@ -1653,6 +1751,9 @@ class Orchestrator:
                 roofline.t_sol_us,
             )
             child.per_workload_latency_us = bench.per_workload_latency_us
+            # Stash aggregate runtime (ms) for the opt-mem Producer's
+            # parent → child speedup ratio. See TreeNode.runtime_ms.
+            child.runtime_ms = bench.median_latency_us / 1000.0
 
             # Channel B reward-hack flow: ``reward_hack_suspect`` is the
             # SOL scorer's "T_k < ~T_SOL margin" signal. Re-eval with
@@ -1668,6 +1769,13 @@ class Orchestrator:
                 cleared = await self._reward_hack_re_eval(
                     child, child_kernel, workloads, input_generators,
                     reference_fn=reference_fn, definition=definition,
+                    problem_definition_path=problem_definition_path,
+                    blob_roots=_resolve_blob_roots(
+                        self._config.safetensors_blob_roots,
+                        problem_definition_path,
+                    ),
+                    run_dir=_effective_run_dir,
+                    iter_no=iter_no,
                 )
                 if not cleared:
                     emit(
@@ -1824,6 +1932,46 @@ class Orchestrator:
             )
             tree_dump.dump_node(child, iter_no=iter_no, ncu_rep_src=ncu_rep_src)
 
+            # Opt-mem write side: distill the improving (parent → child)
+            # edge into a stored lesson. All gating happens inside the
+            # Producer (write_enabled flag, δ improvement threshold,
+            # cap eviction, summarizer-call failure handling) — best-
+            # effort, never raises. See doc/specs/2026-05-24-
+            # optimization-memory-design.md §8 + §9.
+            #
+            # Skip Reviewer-rejected DEAD_END children: a kernel that
+            # benches faster but the Reviewer marked DEAD_END (reward-
+            # hack suspicion, over-optimization, style regression) is
+            # not a lesson worth distilling — writing it would pollute
+            # the global store with patterns the Reviewer would reject
+            # again on the next run. ``compiled``/``correct``-style gates
+            # in the Producer don't catch this case because the kernel
+            # IS compiled and correct; the rejection is quality-shaped.
+            #
+            # Note: ``beam_prune`` above also marks valid-but-non-frontier
+            # children DEAD_END (``DeadReason.BEAM_PRUNED``). Those are
+            # INTENTIONALLY allowed through — they ran fine and may have
+            # improved their parent. The Producer's δ-improvement gate is
+            # the arbiter for those edges, so gating on ``branch_quality``
+            # alone (the pre-fix behavior) would have silently dropped an
+            # improving edge once the beam filled. ``_is_reviewer_rejected``
+            # distinguishes the two DEAD_END causes via ``dead_reason``.
+            if self._producer is not None and not _is_reviewer_rejected(child):
+                action_for_opt_mem = ActionRecord(
+                    action_id=plan.technique,
+                    tier=plan.tier,
+                    name=plan.technique,
+                    parameters={str(k): str(v) for k, v in plan.params.items()},
+                )
+                try:
+                    await self._producer.consider(
+                        parent, child, action_for_opt_mem, iter_no=iter_no,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "opt-mem producer.consider failed (ignored): %s", exc
+                    )
+
             # Attach summary sibling alongside the winner on mixed
             # outcomes; no-op when all K candidates succeeded.
             _persist_iter_failure_summary(
@@ -1839,6 +1987,7 @@ class Orchestrator:
             # clear ``sol_target`` but be excluded by ``best_node()``;
             # using ``child.score`` here would ship a sub-target winner.
             if best.score.sol_score >= self._config.sol_target:
+                await self._flush_opt_mem(root, tree)
                 return SearchResult(
                     best,
                     iter_no,
@@ -1849,6 +1998,7 @@ class Orchestrator:
 
             best_scores.append(best.score.sol_score)
             if detect_plateau(best_scores, self._config.sol_plateau_window, self._config.sol_plateau_delta):
+                await self._flush_opt_mem(root, tree)
                 return SearchResult(
                     best,
                     iter_no,
@@ -1859,6 +2009,7 @@ class Orchestrator:
 
             epsilon = max(self._config.epsilon_end, epsilon - decay)
 
+        await self._flush_opt_mem(root, tree)
         return SearchResult(
             tree.best_node(),
             self._config.max_depth,
@@ -1866,6 +2017,17 @@ class Orchestrator:
             tree,
             run_bottleneck=run_bottleneck,
         )
+
+    def _reward_hack_worker_dir(self, run_dir, iter_no, child) -> Path:
+        """Worker scratch dir for a reward-hack re-eval child process.
+
+        ``<run_dir>/iter_<n>/rh_<id>/`` when a real run_dir is set, else a
+        fresh ``tempfile.mkdtemp()`` (placeholder / test paths). Mirrors how
+        the per-iter bench path derives its ``worker_dir``.
+        """
+        if run_dir is not None:
+            return Path(run_dir) / f"iter_{iter_no}" / f"rh_{child.id}"
+        return Path(tempfile.mkdtemp(prefix="acts_rh_"))
 
     async def _reward_hack_re_eval(
         self,
@@ -1876,6 +2038,11 @@ class Orchestrator:
         *,
         reference_fn,
         definition,
+        problem_definition_path=None,
+        blob_roots=None,
+        run_dir=None,
+        iter_no=0,
+        allow_in_parent_fallback: bool = False,
     ) -> bool:
         """Re-eval a suspect candidate with strict tolerance + fresh anti_cheat.
 
@@ -1889,21 +2056,59 @@ class Orchestrator:
         (placeholder runs), return True so the suspect is implicitly
         cleared — there's no oracle to compare against anyway, and the
         scorer's reward_hack_suspect bit is the only signal we'd have.
-        """
-        from src.eval.anti_cheat import (
-            generate_randomized_inputs,
-            per_iter_anti_cheat,
-        )
-        from src.eval.correctness import (
-            TorchComparisonPolicy,
-            build_normalize_context,
-            compare_outputs,
-            maybe_wrap_dps_candidate,
-        )
-        from sol_execbench.core.bench.reward_hack import RewardHackDetected
 
+        Isolation: when a real ``problem_definition_path`` is supplied, the
+        candidate is recompiled + re-launched inside a crash-isolated
+        subprocess (``run_correctness_subprocess``, mode ``strict_recheck``)
+        so an out-of-bounds launch poisons the (now-dead) child's CUDA
+        context, never the parent's. When no definition path is available
+        the legacy in-parent compare path below runs ONLY if the caller
+        explicitly opts in via ``allow_in_parent_fallback=True`` (trusted /
+        mocked contexts that carry no untrusted GPU candidates); absent both
+        a path and the opt-in, ``CorrectnessIsolationError`` is raised so a
+        forgotten ``problem_definition_path`` fails loud instead of silently
+        launching an untrusted kernel in the parent CUDA context.
+        """
         if reference_fn is None or not input_generators or not workloads:
             return True
+
+        if problem_definition_path:
+            from src.eval.correctness_subprocess import build_correctness_request
+
+            request = build_correctness_request(
+                spec=kernel.spec,
+                source_code=kernel.source_code,
+                dps=getattr(kernel, "dps", False),
+                definition_path=problem_definition_path,
+                workloads=workloads,
+                blob_roots=blob_roots,
+                mode="strict_recheck",
+                input_seed=42,
+                anti_cheat_critical_names=self._config.anti_cheat_critical_names,
+                strict_atol=1e-5,
+                strict_rtol=1e-4,
+            )
+            worker_dir = self._reward_hack_worker_dir(run_dir, iter_no, child)
+            result = await run_correctness_subprocess(
+                request=request,
+                worker_dir=worker_dir,
+                timeout_s=self._config.correctness_worker_timeout_s,
+            )
+            return result.passed
+
+        if not allow_in_parent_fallback:
+            from src.eval.correctness_subprocess import CorrectnessIsolationError
+
+            raise CorrectnessIsolationError(
+                "reward-hack re-eval needs a problem_definition_path to isolate "
+                "the candidate launch; pass allow_in_parent_fallback=True only "
+                "for trusted/mocked contexts."
+            )
+
+        # ── Legacy in-parent compare (opt-in, no definition path) ─────────
+        from src.eval.anti_cheat import per_iter_anti_cheat
+        from src.eval.correctness import strict_compare_one_workload
+        from sol_execbench.core.bench.reward_hack import RewardHackDetected
 
         # Resolve the candidate entrypoint once. ``compile_kernel`` may
         # be expensive and we want all workloads to share one fn handle.
@@ -1917,48 +2122,41 @@ class Orchestrator:
         except Exception:
             return False
 
-        # Use the normalized comparator so multi-output (tuple/dict)
-        # returns are compared name-by-name via SOL's ``normalize_outputs``.
-        # The prior tensor-only branch fell through on tuple/dict and
-        # returned True, fail-OPEN — a suspect multi-output kernel was
-        # auto-cleared without any output comparison. ``norm`` is None
-        # when ``definition`` is absent (placeholder runs); in that case
-        # ``compare_outputs`` delegates to ``policy.compare`` which handles
-        # single tensors and falls back to the catch-all ``except Exception``
-        # below for any other shape — fail-closed by construction.
-        policy = TorchComparisonPolicy()
-        norm = build_normalize_context(definition)
-
+        # ``strict_compare_one_workload`` uses the normalized comparator so
+        # multi-output (tuple/dict) returns are compared name-by-name via
+        # SOL's ``normalize_outputs``. The prior tensor-only branch fell
+        # through on tuple/dict and returned True, fail-OPEN — a suspect
+        # multi-output kernel was auto-cleared without any output comparison.
+        # When ``definition`` is absent (placeholder runs) the normalize
+        # context is None and ``compare_outputs`` delegates to
+        # ``policy.compare`` (single tensors), falling back to the catch-all
+        # ``except Exception`` below for any other shape — fail-closed by
+        # construction.
         try:
             with per_iter_anti_cheat(self._config.anti_cheat_critical_names):
                 # Workloads + input_generators are 1:1 paired (same invariant
                 # the benchmark loop relies on at src/eval/benchmark.py:156).
-                # We zip here because ``maybe_wrap_dps_candidate`` needs the
-                # per-workload axes to resolve output shapes for
-                # ``allocate_outputs``. The unwrapped ``cand_fn(*inputs)``
-                # raised TypeError on DPS kernels (host wrapper expects
-                # ``(*inputs, *outputs)``); the catch-all ``except Exception``
-                # returned False, auto-confirming any DPS branch that hit
-                # ``reward_hack_suspect`` as a hack regardless of correctness.
+                # We zip here because the per-workload axes are needed to
+                # resolve DPS output shapes for ``allocate_outputs`` (handled
+                # inside ``strict_compare_one_workload``'s
+                # ``maybe_wrap_dps_candidate``). An unwrapped
+                # ``cand_fn(*inputs)`` raised TypeError on DPS kernels (host
+                # wrapper expects ``(*inputs, *outputs)``); the catch-all
+                # ``except Exception`` returned False, auto-confirming any DPS
+                # branch that hit ``reward_hack_suspect`` as a hack regardless
+                # of correctness.
                 for wl, gen in zip(workloads, input_generators):
-                    wrapped_cand = maybe_wrap_dps_candidate(
-                        cand_fn,
+                    if not strict_compare_one_workload(
+                        candidate_fn=cand_fn,
+                        reference_fn=reference_fn,
+                        input_generator=gen,
+                        definition=definition,
                         kernel=kernel,
                         workload=wl,
-                        definition=definition,
-                    )
-                    inputs = generate_randomized_inputs(gen, seed=42)
-                    cand_out = wrapped_cand(*inputs)
-                    ref_out = reference_fn(*inputs)
-                    outcome = compare_outputs(
-                        cand_out,
-                        ref_out,
-                        policy=policy,
+                        seed=42,
                         atol=1e-5,
                         rtol=1e-4,
-                        norm=norm,
-                    )
-                    if not outcome.match:
+                    ):
                         return False
         except RewardHackDetected:
             return False
