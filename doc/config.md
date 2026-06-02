@@ -108,7 +108,7 @@ Mutable dataclass. All parameters for a single optimization run.
 **Other:**
 - `max_debug_retries` (3): Coder's self-correction attempts per iteration. `CoderAgent` reads this field at construction and derives the SDK tool-loop bound as `max_turns = 2 * max_debug_retries + 2` (default 8 = 3 compile+correctness cycles × 2 turns + 1 `submit_kernel` tool call + 1 final plain-text confirmation). See `doc/agents.md` → "Turn budget" for the full derivation.
 - `max_baseline_retries` (3): Triton baseline generation attempts before skipping problem.
-- `optimization_memory_top_k` (5): past experiences injected into Planner's context.
+- `optimization_memory_top_k` (5): distilled lessons sampled into Planner's context per iter. Detailed opt-mem knobs documented under "Optimization memory" below.
 - `benchmark_workload_count` (3): representative workloads for iterative benchmarking.
 - `arch_config_path` (""): path to SOLAR arch YAML. If empty, `detect_hardware()` is used.
 - `hardware`: populated from arch YAML or `detect_hardware()` at startup.
@@ -158,6 +158,7 @@ Per-iter K-way bench, autotune burn-in, and the NCU profile gauntlet run in a sh
 | `bench_use_subprocess` | `bool` | `True` | **Dispatch flag.** When True, per-iter bench + autotune burn-in + NCU profile gauntlet run in a `python -m src.eval.bench_worker` subprocess. When False, runs in-process (single-step debugging without IPC overhead); the orchestrator loses crash isolation. |
 | `worker_crash_threshold` | `int` | `3` | Consecutive worker-process non-zero exits (or signal-kills) before raising `WorkerProcessUnstable` and aborting the whole run. Mirrors `CUDAContextPoisoned`'s 3-strike escalation. Must be `>= 1` (enforced in `__post_init__`). |
 | `worker_timeout_s` | `float` | `180000.0` | Total-lifetime watchdog passed to `proc.wait(timeout=...)`. On expiry the helper calls `terminate()` then `kill()` and raises `WorkerCrashed`. Default 180000s (~50 h) **effectively disables the watchdog** while the subprocess refactor beds in — there is no evidence yet of a frozen-child failure mode that needs a tight watchdog, and the original 30s default killed healthy workers mid-NCU (Codex 2026-05-26). Operators with hard wallclock budgets should set this explicitly to the actual envelope (worst-case K-way bench (warmup + timed × workloads × K) + NCU profile (~60s) + import overhead is in the low thousands of seconds). **Renamed from `worker_startup_timeout_s`** (Codex 2026-05-26: original name implied startup-only scope but the field has always been the total-lifetime watchdog). Must be `> 0` (enforced in `__post_init__`). A spawn-vs-lifetime split is deferred — see PROCESS / spec §13. |
+| `correctness_worker_timeout_s` | `float` | `180.0` | Bounded watchdog for `run_correctness_subprocess` (the correctness / reward-hack / baseline-post-verify subprocess). Correctness workers only compile + verify a candidate against the PyTorch oracle and **never run NCU**, so the bench `worker_timeout_s` envelope (~50 h, sized for bench + NCU) would be wildly oversized — a hung correctness candidate would otherwise stall the whole run for ~2 days. Default 180s (3 min) is generous for a compile + a handful of workload verifies while still killing a genuinely frozen / nonterminating child promptly. Operators with unusually large workloads can raise it. |
 
 ```libconfig
 runtime:
@@ -165,10 +166,45 @@ runtime:
     bench_use_subprocess = true;
     worker_crash_threshold = 3;
     worker_timeout_s = 180000.0;
+    correctness_worker_timeout_s = 180.0;
 };
 ```
 
 `load_config` extends the `_section_map` `[runtime]` keys to include all three fields; the cfg loader does not accept the old name `worker_startup_timeout_s`.
+
+### Optimization memory
+
+Distilled lessons from prior runs, summarized by an LLM and stored as JSONL in one shared global file. AccelOpt-style (summary + before/after code snippets); no profile data, no full kernel source. Read path injects retrieved lessons into the Planner prompt; write path is opt-in per run. All fields read from the `.cfg` `[memory]` section. See `doc/memory.md` and `doc/specs/2026-05-24-optimization-memory-design.md`.
+
+| Field | Type | Default | Purpose |
+|-------|------|---------|---------|
+| `opt_mem_read_enabled` | `bool` | `True` | When False, `MemoryRetriever.sample()` short-circuits to `[]` without opening the store. Default on so a normal run benefits from accumulated lessons. |
+| `opt_mem_write_enabled` | `bool` | `False` | OFF by default — ablation runs cannot pollute the shared store without explicit opt-in. Flip True in blessed-run configs that should contribute lessons. The `Producer` is only constructed when this is True AND an LLM model is configured. |
+| `opt_mem_writes_per_session_cap` | `int` | `20` | Max `Experience` rows a single session may flush. The cap reserves 1 slot for the run-scope (baseline → best-of-run) G3 lesson; G1 edge lessons contend for `cap - 1` slots. Lowest-speedup-contribution pending rows evict when the cap is exceeded. Must be `>= 0` (enforced in `__post_init__`). |
+| `opt_mem_min_improvement_ratio` | `float` | `1.05` | **δ** — per-edge speedup threshold (`parent.runtime_ms / child.runtime_ms >= δ`) for G1 producer gating. Below this, kernel-timing noise dominates on small workloads. Also applied to G3 cumulative ratio. Must be `> 1.0` (enforced in `__post_init__`). |
+| `opt_mem_speedup_weight_alpha` | `float` | `1.0` | **α** — exponent on speedup for the retriever's weighted random sample (`weight = speedup ** α`). `0.0` = uniform random (AccelOpt-faithful); `1.0` = linear in speedup; higher = more peaked on top performers. Sampling is with replacement. Must be `>= 0.0` (enforced in `__post_init__`). |
+| `opt_mem_store_path` | `Path` | `<repo>/opt_mem/store.jsonl` (anchored at `src/config.py`'s `_PROJECT_ROOT` — *not* CWD) | Shared global store path. All sessions (read or write) point at this same file. `.gitignored` so accumulated lessons don't end up in commits and developer-local stores don't conflict. Lazy `mkdir(parents=True)` on first write. The repo-root anchor on the default avoids the silent CWD split: a process launched from `/tmp/` or any subdir still resolves to `<repo>/opt_mem/store.jsonl`, not a phantom dir. Operators passing an explicit (relative or absolute) path via cfg get exact-as-typed resolution. |
+
+```libconfig
+memory:
+{
+    optimization_memory_top_k = 5;
+    opt_mem_read_enabled = true;
+    opt_mem_write_enabled = false;
+    opt_mem_writes_per_session_cap = 20;
+    opt_mem_min_improvement_ratio = 1.05;
+    opt_mem_speedup_weight_alpha = 1.0;
+    opt_mem_store_path = "opt_mem/store.jsonl";
+};
+```
+
+**Cap edge cases:**
+
+- `opt_mem_writes_per_session_cap == 0` — neither G1 edge lessons nor the G3 run lesson fire (the cap-remaining gate trips on iter 1; `finalize()` short-circuits because no slot is available). Equivalent to `opt_mem_write_enabled=false` in practice; the latter is the cleaner way to disable.
+- `opt_mem_writes_per_session_cap == 1` — only the G3 row survives. G1 may write to the buffer transiently during the run, but every buffered G1 row is evicted by `finalize()` when it claims its reserved slot. If the run achieves no overall improvement (`finalize()` short-circuits on the δ gate), the last G1 row in the buffer is **not** automatically promoted — the slot stays empty and `flush()` writes 0 rows. Deliberate: `cap=1` expresses "I only care about end-of-run strategy lessons."
+- `opt_mem_writes_per_session_cap >= 2` — normal operation: up to `cap - 1` G1 rows + 1 G3 row.
+
+`load_config` extends the `_section_map` `[memory]` keys to include all six opt-mem fields alongside `optimization_memory_top_k`.
 
 ## Functions
 

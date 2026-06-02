@@ -124,6 +124,8 @@ Compilation and correctness run inside the Coder's turn. The Coder calls these t
 | `compiler.py` | Coder's `compile_kernel_tool` | Triton compilation |
 | `correctness.py` + `anti_cheat.py` | Coder's `check_correctness_tool` | 5-stage correctness gate |
 
+**Correctness-isolation invariant (safety property):** No untrusted (agent-generated) kernel launch ever runs on the parent process's CUDA context. All correctness verification launches go to a crash-isolated subprocess (`src.eval.correctness_worker` via `correctness_subprocess.run_correctness_subprocess`), fail-closed on crash/timeout. The three previously in-parent launch sites — the Coder correctness tool, the orchestrator reward-hack re-eval, and baseline post-verification — are all isolated. The invariant is enforced by construction: a correctness call without a `problem_definition_path` and without an explicit in-parent opt-in raises `CorrectnessIsolationError` rather than silently launching in-parent. Accepted residual: the Coder's SMEM compile-tool still executes LLM-authored host-wrapper Python in-parent, but the untrusted Triton kernel itself does not launch there (compile-only) — tracked as a deferred hardening.
+
 Note: `anti_cheat.py` has three landed surfaces (real, not skeleton). **Correctness-level** (above): `generate_randomized_inputs` + `strict_tolerance_check` provide randomized inputs and strict precision checks — runs inside the Coder's turn. **Performance-level**: `scorer.py` flags `reward_hack_suspect` when `T_k < T_SOL` — the orchestrator routes flagged candidates through additional anti-cheat inspection (see SOL Score Invariant Violations). **Process-level** (added 2026-04-27 scope expansion): the `per_iter_anti_cheat` context manager (yielding an `AntiCheatContext`) plus `check_lazy_outputs_after_bench` wrap the SOL `reward_hack` detector set (`check_monkey_patch`, `check_thread_injection`, `check_lazy_outputs`, `snapshot_critical_functions` + `check_eval_integrity`) — caught torch primitive rebinding, thread injection, lazy/deferred outputs, and namespace tampering between snapshot and check. See JOURNAL → "SOL integration scope expansion — adopt every applicable primitive (2026-04-27)" for the full integration plan.
 
 #### 5-Stage Correctness Gate
@@ -156,7 +158,7 @@ The orchestrator runs benchmarking and profiling on the Coder's output. These ar
 | `profiler.py` | Orchestrator (via `bench_worker` subprocess for per-iter; parent for Phase C) | Per-iter analytical roofline diagnostics (arithmetic intensity, achieved TFLOPs / GB·s, pct-of-peak — free) + curated NCU section subprocess for occupancy/L2/TC/stall (every iter, representative workload); full-workload re-profile at Phase C. Bottleneck *classification* is computed once-per-run by `eval/roofline.py::classify_run` (Phase A) and threaded through; the per-iter analytical block refines diagnosis but never re-classifies. See JOURNAL "Profiler approach: analytical classification + curated NCU section (2026-04-20)" and "Bottleneck classify-once (2026-04-22)". |
 | `scorer.py` | Orchestrator | SOL score computation (using static T_SOL from roofline.py) |
 
-Per-iter K-way `benchmark.py` + `profiler.py` execution lives in a per-iter subprocess (`src.eval.bench_worker`, dispatched via `src.eval.bench_subprocess`) for blast-radius containment — sticky CUDA-context errors (`cudaErrorIllegalAddress` etc.) die with the child instead of poisoning the rest of the run. The parent handles dispatch + response-handling + artifact merge. Phase C winner re-profile in `pipeline/report.py` still runs in the parent (single trusted candidate, no isolation needed).
+Per-iter K-way `benchmark.py` + `profiler.py` execution lives in a per-iter subprocess (`src.eval.bench_worker`, dispatched via `src.eval.bench_subprocess`) for blast-radius containment — sticky CUDA-context errors (`cudaErrorIllegalAddress` etc.) die with the child instead of poisoning the rest of the run. The parent handles dispatch + response-handling + artifact merge. Phase C winner re-profile in `pipeline/report.py` still runs in the parent (single trusted candidate, no isolation needed). The orchestrator's reward-hack re-eval (`strict_recheck` mode) is likewise crash-isolated via `correctness_subprocess`, per the correctness-isolation invariant in Coder-Side Eval.
 
 | Metric | Tool | Method |
 |--------|------|--------|
@@ -313,41 +315,53 @@ Why per-iter SOLAR re-invocation is still off the table even though `SolarResult
 
 ## Optimization Memory — Persistent Cross-Task Learning
 
+Distilled lessons from prior runs in AccelOpt's row shape: `(title, lesson, snippet_before, snippet_after)` produced by a summarizer LLM from a `(parent, child, speedup)` triple. **No profile data, no full kernel source.** Profile data is live-only — consumed by the Planner via the current-iter profile dump, never persisted into opt-mem. See `doc/specs/2026-05-24-optimization-memory-design.md` for the full design and `doc/memory.md` for the operational model.
+
 ### Experience Schema
 
 ```
 Experience = {
-    kernel_type: str,
-    action_applied: ActionRecord,
-    metrics: {latency, sol_score},
-    speedup: float,
-    reviewer_summary: str,
-    bottleneck_before: BottleneckType,  # run-level classification; invariant per run
-    hardware: str,
-    success: bool
+    row_id: str,                 # sha256(run_id ‖ parent_id ‖ child_id ‖ scope)[:16] — idempotent; scope discriminates G1 edge vs G3 run on same (parent, child)
+    schema_version: int,         # always KNOWN_VERSION=1 on write; tolerant on read
+    kernel_type: str,            # retrieval-filter key
+    hardware_arch: str,          # retrieval-preference key (e.g. "RTX6000Ada")
+    scope: "edge" | "run",       # G1 per-iter edge vs G3 baseline→best-of-run
+    speedup: float,              # always >= δ for stored rows
+    action_applied: ActionRecord | None,  # None for scope=="run" (G3 cumulative — no single action)
+    title: str,                  # short summarizer-emitted title
+    lesson: str,                 # 2–5 sentences, no code
+    snippet_before: str,         # changed region only — not the whole file
+    snippet_after: str,
+    provenance: dict[str, str],  # {run_id, parent_node_id, child_node_id, summarizer_model}
+    created_at: str,             # ISO8601 UTC
 }
 ```
 
-No `bottleneck_after` — classification is once-per-run (invariant per `(problem, representative workload, hardware)`), so a pre/post pair would always carry the same value.
+Only successful improvements are stored: gate is `speedup >= opt_mem_min_improvement_ratio` (δ, default 1.05). The v1 `success: bool` field is gone — every stored row is a success by construction.
 
-No kernel code stored — only summaries. Both successes and failures stored.
-
-Under K-way Coder fan-out (`coder_n_candidates>1`), MemoryStore growth is unchanged: one `Experience` per advanced iter (the winner), not K. The K-1 losing candidates exist as K per-candidate `coder_failed` records in `events.jsonl`, plus one collapsed `failure_summary_added` record per iter and one `DeadReason.CODER_FAILED` failure-summary node under the parent (its `failure_details` list carries all K candidate failures; the `render_siblings` FAILED block is capped per parent by `failure_sibling_cap`, default 8, after flattening). MemoryStore still records only the winner — persisting losers in MemoryStore would dilute its `success=False` retrieval semantics.
+Under K-way Coder fan-out (`coder_n_candidates > 1`), opt-mem growth is unchanged: at most one G1 row per advanced iter (the winner that beat its parent by δ), not K. The K-1 losing candidates exist as `coder_failed` records in `events.jsonl` and `DeadReason.CODER_FAILED` failure-summary nodes in the search tree — they never enter opt-mem.
 
 ### Storage & Retrieval
 
-- **Backend**: JSON files. Simple, git-friendly, human-readable. No database.
-- **Retrieval**: (1) Filter by kernel type, (2) prefer same-hardware experiences (fall back to cross-hardware if insufficient), (3) score by bottleneck match + success + speedup, (4) select top-K with reserved failure slots so the Planner sees both what worked and what to avoid.
-- **Injection**: Planner only, contrastive summary format.
+- **Backend**: JSONL append-only, one shared global file at `opt_mem/store.jsonl` (config-driven via `ACTSConfig.opt_mem_store_path`). Append is O(1) per row; `f.flush()` after each `write` for per-row crash safety. The path is `.gitignored` so developer-local stores don't conflict.
+- **Retrieval**: `MemoryRetriever.sample(kernel_type, hardware_arch)` — (1) filter by kernel type, (2) prefer same-`hardware_arch` rows (fall back to other archs if same-arch count < `top_k`), (3) `random.choices` weighted by `speedup ** α` (with replacement); `α=0` is uniform random. Pool ≤ `top_k` returns the whole pool unsampled.
+- **Injection**: Planner only. Rendered as `[L1]..[Lk]` blocks with structured fields (title / scope / speedup / arch / lesson / before / after). Empty `past_experiences` omits the block entirely.
+- **Producer gating**: per-iter `Producer.consider(parent, child, action)` after the child is scored; gates on `opt_mem_write_enabled`, child compile + correctness (implicit in tree membership), timings present, `parent.runtime_ms / child.runtime_ms >= δ`, summarizer non-None. End-of-run `Producer.finalize(baseline, best_of_run)` writes one G3 row when cumulative ratio passes δ. Cap reserves 1 slot for G3; G1 edges contend for `cap - 1`, with lowest-ratio rows evicting on overflow.
+
+### Read/write flags
+
+- `opt_mem_read_enabled` (default **True**): when False, `MemoryRetriever.sample()` short-circuits to `[]` without opening the store.
+- `opt_mem_write_enabled` (default **False**): off by default so ad-hoc / ablation runs cannot pollute the shared store without explicit opt-in. Blessed runs flip True in their `.cfg`.
 
 ### Relationship to Search Tree
 
 | | Search Tree | Optimization Memory |
 |--|-------------|-------------------|
-| Scope | Intra-task (one kernel) | Inter-task (all past kernels) |
-| Lifetime | Task start → task end | Permanent |
-| Granularity | Full state per node | Distilled summary |
+| Scope | Intra-run (one kernel optimization) | Inter-run (all past kernels) |
+| Lifetime | Run start → run end (in-memory; tree-dump → run dir, cleaned later) | Permanent (shared global file) |
+| Granularity | Full node state (kernel source, profile, score, branch quality) | Distilled lesson (no profile, no full source) |
 | Consumer | Orchestrator | Planner |
+| Producer | Orchestrator + Coder | Summarizer LLM (driven by Producer at improving-edge points) |
 
 ---
 

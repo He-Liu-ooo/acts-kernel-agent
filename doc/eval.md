@@ -37,7 +37,7 @@ Driven by the orchestrator but **not all in-process**. Never part of the Coder's
 
 Per-iter K-way bench + autotune burn-in + profile gauntlet are executed inside a `python -m src.eval.bench_worker` subprocess (one per iter). The parent does dispatch + response-handling only; this isolates per-iter GPU state and lets the orchestrator survive worker crashes without bringing down the search loop. Parent-side eval paths that **do** stay in-process: operator-baseline gate, baseline / winner-verification, and the Phase C winner re-profile in `pipeline/report.py` (unchanged — `cache_dir or _ncu_tmpdir()` source path).
 
-The IPC + artifact-merge boundary: `src/eval/bench_worker.py::run_iter` (worker side: builds the bench + profile-gauntlet response from the parent's request, including `cand_<winner_idx>.ncu-rep` under `<run_dir>/iter_<n>/worker/`) and `src/eval/bench_subprocess.py::run_bench_subprocess` + `merge_worker_artifacts` (parent side: async dispatch, response decode, and on clean exit copy the worker's `.ncu-rep` into both the shared source-hash-keyed NCU cache and `tree/node_<id>/ncu.ncu-rep`). The worker no longer emits per-candidate events; the parent re-emits from the response. `merge_worker_artifacts` is always called. See `doc/search.md` and `doc/runtime.md` for the orchestrator wiring + event taxonomy.
+The IPC + artifact-merge boundary: `src/eval/bench_worker.py::run_iter` (worker side: builds the bench + profile-gauntlet response from the parent's request, including `cand_<winner_idx>.ncu-rep` under `<run_dir>/iter_<n>/worker/`) and `src/eval/bench_subprocess.py::run_bench_subprocess` + `merge_worker_artifacts` (parent side: async dispatch, response decode, and on clean exit copy the worker's `.ncu-rep` into both the shared source-hash-keyed NCU cache and `tree/node_<id>/ncu.ncu-rep`). `run_bench_subprocess` no longer carries the spawn loop itself: the mkdir → write `request.json` → `Popen -m <worker>` → `to_thread(proc.wait, timeout)` → terminate/sleep(2)/kill-on-timeout sequence now lives in `src/eval/worker_spawn.py::spawn_worker`, which both `run_bench_subprocess` and `correctness_subprocess.run_correctness_subprocess` delegate to. `run_bench_subprocess` maps any non-`ok` `WorkerOutcome` to `WorkerCrashed` (preserving the prior payloads: timeout → returncode `-1`, crashed/missing → child returncode, malformed → child returncode with the `malformed response.json (...)` prefix). The worker no longer emits per-candidate events; the parent re-emits from the response. `merge_worker_artifacts` is always called. See `doc/search.md` and `doc/runtime.md` for the orchestrator wiring + event taxonomy.
 
 ## 5-Stage Correctness Gate — `correctness.py`
 
@@ -106,6 +106,54 @@ Real implementation. Coordinates three layers of reward-hack defense:
 - `AntiCheatContext` — dataclass holding `snapshot: dict[str, int]`, `namespace: MappingProxyType[str, Any]` (read-only view over `torch.cuda.Event`'s namespace, prevents accidental mutation across the per-iter window), and `threads_before: int`.
 - `generate_randomized_inputs(input_generator, seed) -> list` — thin wrapper that materializes a tuple from the per-seed generator (used by Stage 5 + the re-eval).
 - `strict_tolerance_check(candidate_output, reference_output, *, atol=1e-5, rtol=1e-4) -> bool` — strict-spec wrapper around `compute_error_stats` with `required_matched_ratio=1.0` (zero slack); used by the SOLAR-strict re-eval.
+
+## Correctness subprocess isolation
+
+The invariant: **no agent-generated kernel ever launches on the parent process's CUDA context.** Every correctness verification of an untrusted candidate runs in a `python -m src.eval.correctness_worker` child, so an out-of-bounds launch that poisons the CUDA context dies in the (now-dead) child rather than corrupting the orchestrator. Mirrors the bench-subprocess isolation above; the two share the spawn skeleton.
+
+### `correctness_worker.py` — the child
+
+Rebuilds the candidate from the request, compiles, and verifies it **in this process**. Two modes:
+
+- **`"gate"`** — runs `verify_correctness` (the 5-stage gate above) per workload, short-circuiting on the first failing workload and reporting its 1-indexed `failed_workload_idx` + stage slug. The Coder's `check_correctness_tool` drives this.
+- **`"strict_recheck"`** — the reward-hack re-eval: wraps the loop in `per_iter_anti_cheat(critical_names)` and calls `strict_compare_one_workload` per workload under strict atol/rtol. A `RewardHackDetected` from the anti-cheat layer maps to `failed_stage="reward_hack"`; a strict-tolerance mismatch maps to `failed_stage="strict_mismatch"`.
+
+The worker reads `blob_roots` from the **top-level** request field (`correctness_worker.py:43`, `request.get("blob_roots")`) — *unlike* `bench_worker`, which reads `profile_config.blob_roots`. Reusing bench's namesake silently dropped blob roots so `SafetensorsInput` workloads failed to load (Codex adversarial review 2026-05-30). torch/SOL are imported lazily so the module loads under the Tier-1 torchless venv. An uncaught exception in the CLI prints the traceback and exits non-zero, which the parent treats as a worker crash.
+
+### `correctness_subprocess.py` — the parent-side helper
+
+`async run_correctness_subprocess(*, request, worker_dir, timeout_s) -> CorrectnessResult` is **fail-closed** — it never raises for a misbehaving child:
+
+| Outcome | Result |
+|---------|--------|
+| Worker crash / non-zero exit / missing-or-malformed `response.json` | `CorrectnessResult(passed=False, failed_stage="worker_crashed")` |
+| Watchdog timeout | `CorrectnessResult(passed=False, failed_stage="timeout")` |
+
+In both cases the `worker.log` tail rides along as `error_message`. `CorrectnessResult` fields: `passed`, `failed_stage`, `error_message`, `max_err`, `total_workloads`, `failed_workload_idx`.
+
+`CorrectnessIsolationError` is a **misconfiguration tripwire**, distinct from a correctness FAILURE (`CorrectnessResult(passed=False)`) and from a worker crash. It is raised at the in-parent fallback gates (`coder.py:571`, `baseline_generator.py:292`, `orchestrator.py:2084`) when there is no `problem_definition_path` to isolate against **and** the caller did not explicitly opt in via `allow_in_parent_fallback=True` — so a forgotten path fails loud instead of silently launching an untrusted kernel in the parent.
+
+`build_correctness_request(...)` is the single source of truth for the IPC request schema, used by all three callers below (the prior hand-maintained copies are gone). For `mode == "strict_recheck"` it stamps the `strict_atol` / `strict_rtol` defaults (`1e-5` / `1e-4`).
+
+### Shared spawn skeleton — `worker_spawn.py`
+
+`spawn_worker(*, module, request, worker_dir, timeout_s, argv_prefix=None) -> WorkerOutcome` (plus `_read_tail`) owns the parent-side spawn sequence shared by **both** `bench_subprocess.run_bench_subprocess` and `correctness_subprocess.run_correctness_subprocess`: mkdir the worker dir → write `request.json` → `Popen` a `python -m <module> --request <r> --response <w>` child (both streams to `worker.log`) → `await asyncio.to_thread(proc.wait, timeout_s)` → on a watchdog timeout `terminate()` / `sleep(2)` / `kill()` the straggler. It returns a structured `WorkerOutcome` (`status` ∈ `"ok"` / `"timeout"` / `"crashed"`, `returncode`, parsed `response`, `log_tail`); each caller maps it onto its own contract (bench → `WorkerCrashed`; correctness → fail-closed `CorrectnessResult`). The `argv_prefix` override lets `correctness_subprocess` inject a stub worker script in tests.
+
+### Bounded timeout
+
+The three correctness calls pass `correctness_worker_timeout_s` (default **180s**, `src/config.py:307`). The bench path keeps `worker_timeout_s` (default ~50h — sized to cover compile + autotune burn-in + K-way bench + **NCU**). Correctness workers never run NCU, so the ~50h envelope would let a hung correctness candidate stall the whole run; 180s is generous for a compile plus a handful of workload verifies while still killing a frozen child promptly.
+
+### `strict_compare_one_workload` (`correctness.py:341`)
+
+The shared comparator behind both reward-hack re-eval paths: the worker's `strict_recheck` mode (`correctness_worker.py:95`) and the orchestrator's **in-parent** legacy fallback (`orchestrator.py:2131`). It runs candidate + reference once at a seed under a strict tolerance and returns a bool — anti-cheat context + `RewardHackDetected` handling stay at the call sites — so the two paths cannot drift on wrap/seed/tolerance semantics.
+
+### The three callers
+
+| Caller | Mode | Site |
+|--------|------|------|
+| Coder gate tool | `gate` | `src/agents/coder.py` |
+| Baseline post-verify | `gate` | `src/benchmark/baseline_generator.py` |
+| Reward-hack strict re-eval | `strict_recheck` | `src/search/orchestrator.py` |
 
 ## Benchmark — `benchmark.py`
 

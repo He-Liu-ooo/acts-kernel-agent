@@ -1519,6 +1519,44 @@ Triton effectively gives us Tiers 1-3.5. CUDA gives all 6 tiers — but the agen
 
 ---
 
+## Memory
+
+### Optimization-memory rewrite — distilled lessons, not raw experiences (2026-05-28)
+
+**Rationale**: The v1 `Experience` schema (`metrics`, `reviewer_summary`, `bottleneck_before`, `success`, `hardware`) had a retriever wired into the orchestrator but **no producer code anywhere in `src/`** — the store was read-only by construction. The schema also blurred two questions the literature treats separately: what raw evidence was collected (profile dict, bottleneck label, correctness flags) and what reusable optimization advice the run produced. The first changes every iter; the second is what cross-run transfer learning actually needs.
+
+**Decision**: Rewrite the schema as an AccelOpt-style distilled lesson — `(title, lesson, snippet_before, snippet_after)` produced by a summarizer LLM from a `(parent_kernel, child_kernel, speedup)` triple — and add the missing producer. The row carries the lesson + the changed-region snippets, not the raw profile or full source. Profile data stays live-only (consumed by the Planner via the current-iter profile dump, never persisted into opt-mem).
+
+Concrete axes (see `doc/specs/2026-05-24-optimization-memory-design.md` for the full decision table):
+
+| Axis | Choice | Why |
+|------|--------|-----|
+| Granularity | Per-improving-edge (G1) + one cumulative G3 row at run end | The orchestrator tree already exposes every (parent → child) edge with score and runtime; G1 is plumbing. G3 captures multi-step strategy the per-edge rows lose. |
+| Row shape | Distilled summary + snippet (B-Lesson) | AccelOpt has shipped numbers showing this works; B-Raw (profile-delta rows) is what we'd be inventing without prior art. |
+| Injection | Planner only (I1) | ACTS's Planner picks from a typed action vocabulary — cross-kernel lessons are highest-leverage at action selection. The Coder's decisions (tile sizes, vectorization) are kernel-specific; lessons are noise there. |
+| Retrieval | Kernel-type filter + same-arch preference + `speedup ** α` weighted random with replacement (R3) | Pool size on day 1 is zero; on day N is a few hundred. Random sampling within filters keeps the Planner seeing diverse lessons instead of the same top-3 every iter; α weights toward higher-impact lessons without hard-pinning. |
+| Storage | JSONL append-only, one global shared file (S2) | Append is O(1) per row (vs. v1's whole-file rewrite per `add`), crash-safe per row via `f.flush()`, greppable for debugging "why did the Planner choose X." |
+| Payload | Summary + snippets embedded in the row; no full source, no sidecar | User confirmed run dirs get cleaned (so any pointer back into a run dir would dangle); single self-contained file. |
+| Class name | Kept `Experience` (rewrite fields only) | Rename to `Lesson` was taxonomy-for-its-own-sake; the class still represents "something we learned from one optimization attempt." Less churn across `planner.py`, tests, and downstream docs. |
+| Summarizer model | Reuse shared `self._model` (M1) | Per-role model dispatch is a separate, larger refactor that affects all four agents equally. Defer until there's empirical evidence the summarizer wants a different model. |
+
+**Config** — five new knobs on `ACTSConfig`, all under `[memory]` in the `.cfg`:
+
+- `opt_mem_read_enabled=True` — short-circuit retrieval to `[]` when False.
+- `opt_mem_write_enabled=False` — **OFF by default**, opt-in per run. Ablation runs cannot pollute the shared store without explicit intent.
+- `opt_mem_writes_per_session_cap=20` — top-N edge rows by speedup; cap reserves 1 slot for the G3 cumulative row.
+- `opt_mem_min_improvement_ratio=1.05` (δ) — per-edge threshold; below this, kernel-timing noise dominates.
+- `opt_mem_speedup_weight_alpha=1.0` (α) — exponent on speedup in the retriever's weighted sample.
+- `opt_mem_store_path=Path("opt_mem/store.jsonl")` — single shared global file.
+
+**Failure modes** are bounded: every summarizer error path (LLM raises, malformed JSON, `"No optimization found"` title, empty/identical snippets) returns `None` with a single warn log. The orchestrator's `_flush_opt_mem(root, tree)` helper wraps finalize + flush in a try/except so opt-mem hiccups never break a successful search return. Matches `coder.py`'s skip-iter-on-agent-hiccup pattern: opt-mem is best-effort by design.
+
+**Migration**: zero call sites referenced v1 fields outside the memory module + the unwired orchestrator integration. No production data existed (no writer was ever wired). Wholesale rewrite in place, no deprecation cycle, no legacy file handling.
+
+**Deferred** (out of scope for this round; spec §14): in-session reflexion (KernelAgent-style "what worked / avoid_patterns"), per-role model dispatch (Summarizer with its own model config), workload-shape similarity in retrieval, symptom-keyed retrieval (would require putting profile data back in the store, which the B-Lesson decision rejects), seeded pattern library, concurrent-writer safety (`flock()`).
+
+---
+
 ## Development Process
 
 ### CLI → cfg consolidation (2026-05-11)
@@ -1982,4 +2020,20 @@ The Scope B+ refactor (per-iter bench + NCU child process; spec at `doc/specs/20
 **Tier 3 catalogue.** 15 items are recorded under PROCESS.md "Trigger-gated tech-debt" → "Bench-subprocess isolation Tier 3 follow-ups" with explicit triggers + fix shapes: falsy-zero in `_bench_config_shim`, falsy-zero in `t_sol_us` / `baseline_latency_us`, asyncio.to_thread cancellation can't interrupt subprocess, non-atomic `response.json` write, `request["ncu_cache_dir"]` unread by child, profile-gauntlet placeholder lambda → ProfilerError, `coder_submitted.n_profile_attempts` hardcoded to 1, `_emit` locale encoding, dead `agent_failure_count` bump, entrypoint pre-filter silent on coder_failed, `_rehydrate_hardware_spec` zero-HardwareSpec, `_read_tail` full-file read, zombie process from `proc.kill()` without `proc.wait()`, `autotune_burn_in_done` semantic drift via `_child_autotuner`, and the lazy-import test isolation hypothetical from `/code-review` fix #8. Each entry carries a concrete trigger condition + a fix sketch so re-entry on any of them is cheap when evidence accumulates.
 
 **Pointer.** Spec: `doc/specs/2026-05-24-bench-subprocess-isolation-design.md`. Plan: `doc/plans/2026-05-24-bench-subprocess-isolation-plan.md`. Both uncommitted per CLAUDE.md "specs and plans are never committed."
+
+### Correctness-subprocess isolation — closing the last in-parent untrusted-launch site (2026-05-31)
+
+**Root cause.** `runs/run_20260529T142421_439323Z` produced zero improvement across the whole run, and the diagnosis traced to a sticky CUDA-context poison in the long-lived parent process — the same failure *class* as the Scope B+ bench poisoning, but a different *site*. After Scope B+ moved bench + NCU profile into a per-iter child, correctness verification was the last untrusted-kernel-launch site still running IN-PARENT. One out-of-bounds candidate launched during the in-parent correctness check fired a device-side assert that poisoned the parent context for the rest of the run; every subsequent `torch.randn(device="cuda")` / input-gen in the parent failed from that point on. The failures were invisible because three fail-open input-generator sites caught and swallowed the sticky error silently — the run kept "advancing" through iters that could no longer produce a working candidate, with no surfaced signal that the context was dead.
+
+**Decision — subprocess isolation (mirror Scope B+, applied to correctness).** Route all untrusted correctness launches through a crash-isolated `correctness_worker` subprocess via `run_correctness_subprocess`, fail-closed. Three parent-side launch sites are isolated: the Coder's `check_correctness` tool (now async), the orchestrator's reward-hack re-eval (`mode="strict_recheck"`), and the baseline post-verify. Subprocess-per-call was chosen over a persistent worker because the run is LLM-bound — cold-start is ~1% of wallclock, so the simplicity of spawn-per-call beats the lifecycle complexity of a pooled worker for no meaningful wallclock cost. It was also chosen over the alternative of dropping numeric verification entirely and running a compile-only Coder loop: keeping a live subprocess preserves real numeric-correctness feedback to the Coder, which is load-bearing signal we did not want to trade away to dodge the poison.
+
+**Decision — trust gate by construction, not by coincidence.** `allow_in_parent_fallback=False` makes the "no untrusted launch in the parent" invariant enforced at construction time rather than relying on the coincidence that real runs happen to carry a `problem_definition_path` (which is what would route the launch to the child). Previously, a code path that forgot to thread the definition path would silently fall back to launching in the parent — re-opening the exact poison hole. With the gate, a forgotten path now raises `CorrectnessIsolationError` loudly instead of degrading silently into the failure mode this PR exists to close.
+
+**Bounded timeout — do not inherit the bench timeout.** New `correctness_worker_timeout_s` (default 180s). The correctness path must NOT reuse the bench `worker_timeout_s` (~50h, sized for NCU profiling), because a hung correctness candidate under that ceiling would stall the run for ~2 days before the watchdog fired. Correctness is a fast check; 180s is generous for it and bounds the hang.
+
+**Consolidations / hygiene.** Bench and correctness now share `worker_spawn.spawn_worker` for the Popen + watchdog + crash-classification dance (one implementation, two callers). New `strict_compare_one_workload` and `build_correctness_request` factor the per-workload compare and request-construction out of the worker. The three fail-open input-generator sites now swallow-LOG (the sticky error is recorded, not silently eaten) so a future poison surfaces in the logs even if some fail-open behavior is retained. `del _repr_inputs` after the dtype-probe frees the probe tensors' VRAM. Correctness scratch dirs are cleaned up after each call.
+
+**Accepted residual (b) + revisit trigger.** The Coder's SMEM compile-tool still drives LLM-authored host-wrapper PYTHON in-parent. This is a deliberately-accepted residual, not an oversight: the untrusted Triton *kernel* itself does not launch there — the recorder no-ops `autotuner.run` and the per-config `warmup` is compile-only — so the poison risk is low (no device-side kernel execution on the untrusted path). It does, however, run arbitrary host Python with no timeout, so a hang is theoretically possible. It is deliberately NOT isolated now because the compile tool fires per self-check (high frequency), which makes subprocess-per-call a bad cost ratio against a low residual risk. **Revisit → full compile-tool subprocess isolation ONLY if** a host-wrapper poisoning OR a hang is observed in a real run; absent that evidence, the per-self-check spawn cost is not justified.
+
+**Pointer.** Trigger run: `runs/run_20260529T142421_439323Z` (zero-improvement run, parent-context poison from the in-parent correctness launch). New modules: `src/eval/correctness_subprocess.py`, `src/eval/correctness_worker.py`, `src/eval/worker_spawn.py`.
 
