@@ -107,27 +107,6 @@ CORE_EVENT_KINDS: frozenset[str] = frozenset({
     "operator_baseline_load",
     "operator_baseline_success",
     "operator_baseline_failure",
-    # Hardware-spec injection — Phase B SMEM check inside compile_kernel_tool.
-    # See doc/specs/2026-05-24-coding-hw-spec-design.md §9.
-    # ``smem_overflow_detected`` payload: ``role`` ("coder"), ``violation_count``,
-    # ``worst_footprint_bytes``, ``cap_bytes``. Fires once per compile-tool
-    # rejection (multiple violating Configs aggregated into one event).
-    # ``smem_check_skipped`` payload: ``role``, ``reason`` ∈ {``no_autotuner``,
-    # ``no_hardware_cap``, ``sample_args_missing``, ``host_wrapper_failed``,
-    # ``recorder_no_capture``, ``warmup_failed``}, optional ``config_idx``.
-    # Six skip reasons (recorder-patch redesign 2026-05-25 added the
-    # ``host_wrapper_failed`` and ``recorder_no_capture`` cases). First three
-    # fire at most once per compile-tool call; ``warmup_failed`` fires
-    # per-Config; ``host_wrapper_failed`` + ``recorder_no_capture`` fire
-    # once per host-wrapper drive. ``warmup_failed`` additionally carries
-    # ``exc_class`` (exception type name) + ``exc_traceback`` (last 2KB of
-    # ``traceback.format_exception``, tail-sliced so Triton's
-    # ``at <line>:<col>:`` annotation survives the cap) so the swallowed
-    # exception is fully recoverable from events.jsonl. Replaces the
-    # 160-char ``exc_msg`` cap from 2026-05-25 which was cutting the
-    # source annotation mid-line (run_20260527T150715_440277Z).
-    "smem_overflow_detected",
-    "smem_check_skipped",
     # Bench-subprocess isolation (2026-05-24). Per-iter K-way bench + NCU
     # profile runs in a fresh ``python -m src.eval.bench_worker`` child;
     # parent merges artifacts on clean exit, bumps a crash counter on

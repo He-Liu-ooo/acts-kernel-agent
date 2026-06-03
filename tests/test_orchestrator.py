@@ -1039,8 +1039,8 @@ async def test_orchestrator_logs_on_input_generator_failure(
     tmp_path, harness, caplog,
 ):
     """A raising input generator (poisoned CUDA context) must surface a
-    WARNING at both fail-open swallow sites — the baseline dtype-gather and
-    the per-iter shared_sample_args gather — instead of degrading silently."""
+    WARNING at the baseline dtype-gather fail-open swallow site — instead of
+    degrading silently."""
     import logging
 
     from sol_execbench.core.data import Definition, Workload
@@ -1091,7 +1091,6 @@ async def test_orchestrator_logs_on_input_generator_failure(
 
     messages = [r.message for r in caplog.records]
     assert any("baseline dtype-gather" in m for m in messages), messages
-    assert any("shared_sample_args" in m for m in messages), messages
 
 
 def test_select_technique_guidance_returns_guidance_for_known_technique():

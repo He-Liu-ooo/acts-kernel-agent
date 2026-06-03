@@ -51,8 +51,8 @@ Frozen dataclass using the SOLAR arch YAML schema. Load from YAML via `load_hard
 | `SRAM_byte_per_cycle` | float | L2 bandwidth per cycle |
 | `DRAM_capacity` | int | Total GPU memory in bytes |
 | `DRAM_byte_per_cycle` | float | DRAM bandwidth per cycle |
-| `shared_mem_per_block_bytes` | int | Per-block shared memory budget (opt-in dynamic SMEM ceiling). Default `0` = unknown. Populated by `detect_hardware()` from `props.shared_memory_per_block_optin` (defensive `getattr` fallback to `.shared_memory_per_block` on older torch). Read from YAML via `raw.get("shared_mem_per_block_bytes", 0)`. Consumed by the Phase B SMEM check in `compile_kernel_tool` and the `## Run context` prompt block rendered by `render_run_context()`. |
-| `shared_mem_per_multiprocessor_bytes` | int | Per-SM shared memory budget (architectural ceiling). Default `0` = unknown. Populated by `detect_hardware()` from `props.shared_memory_per_multiprocessor`. Read from YAML via `raw.get("shared_mem_per_multiprocessor_bytes", 0)`. Same Phase B / run-context consumers as the per-block field. |
+| `shared_mem_per_block_bytes` | int | Per-block shared memory budget (opt-in dynamic SMEM ceiling). Default `0` = unknown. Populated by `detect_hardware()` from `props.shared_memory_per_block_optin` (defensive `getattr` fallback to `.shared_memory_per_block` on older torch). Read from YAML via `raw.get("shared_mem_per_block_bytes", 0)`. Injected into the `## Run context` prompt block rendered by `render_run_context()` as a config-sizing hint for all three agents. |
+| `shared_mem_per_multiprocessor_bytes` | int | Per-SM shared memory budget (architectural ceiling). Default `0` = unknown. Populated by `detect_hardware()` from `props.shared_memory_per_multiprocessor`. Read from YAML via `raw.get("shared_mem_per_multiprocessor_bytes", 0)`. Same `## Run context` prompt-injection consumer as the per-block field. |
 | `MAC_per_cycle_fp32_sm` | float | FP32 MACs/cycle (CUDA cores) |
 | `MAC_per_cycle_tf32_tc` | float | TF32 MACs/cycle (Tensor Cores) |
 | `MAC_per_cycle_fp16_tc` | float | FP16 MACs/cycle (Tensor Cores) |
