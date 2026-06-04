@@ -16,7 +16,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from src.agents.coder import AttemptFailure, CoderAgent, ImplementationError
-from src.eval.correctness import verify_correctness
+from src.eval.correctness import run_correctness_gate
 from src.eval.inputs import build_input_generator, build_reference_fn
 from src.eval.profiler import find_jit_name_in_entrypoint, triton_kernel_names_in
 from src.kernels.compiler import compile_kernel
@@ -263,25 +263,20 @@ async def generate_triton_baseline(
         elif allow_in_parent_fallback:
             # In-parent fallback (no SOL problem dir): unit tests /
             # placeholder runs carry no untrusted GPU candidates, and the
-            # caller explicitly opted in. Walk explicitly so the first
-            # failure feeds prior_failures.
+            # caller explicitly opted in. The shared gate walks every
+            # workload and reports the first failure, feeding prior_failures.
             post_verify_error = None
-            for idx, (gen, wl) in enumerate(zip(input_generators, workloads)):
-                result = verify_correctness(
-                    candidate_fn=compiled.compiled_fn,
-                    reference_fn=reference_fn,
-                    input_generator=gen,
-                    definition=definition,
-                    kernel=candidate,
-                    workload=wl,
-                    policy=policy,
+            failure = run_correctness_gate(
+                compiled.compiled_fn, reference_fn, input_generators, workloads,
+                definition=definition, kernel=candidate, policy=policy,
+            )
+            if failure is not None and failure.exception is not None:
+                raise failure.exception
+            if failure is not None:
+                post_verify_error = (
+                    f"{_POST_VERIFY_CORRECTNESS_FAILED} on workload "
+                    f"{failure.index + 1}/{len(workloads)}:\n{failure.result.error_message}"
                 )
-                if not result.passed:
-                    post_verify_error = (
-                        f"{_POST_VERIFY_CORRECTNESS_FAILED} on workload "
-                        f"{idx + 1}/{len(workloads)}:\n{result.error_message}"
-                    )
-                    break
         else:
             # No definition_path to isolate against AND no explicit opt-in:
             # launching the untrusted candidate in-parent would re-open the
@@ -464,22 +459,18 @@ async def load_operator_baseline(
         build_input_generator(definition, w, blob_roots=blob_roots)
         for w in workloads
     ]
-    for idx, (gen, wl) in enumerate(zip(input_generators, workloads)):
-        result = verify_correctness(
-            candidate_fn=compiled.compiled_fn,
-            reference_fn=reference_fn,
-            input_generator=gen,
-            definition=definition,
-            kernel=kernel,
-            workload=wl,
-            policy=policy,
+    failure = run_correctness_gate(
+        compiled.compiled_fn, reference_fn, input_generators, workloads,
+        definition=definition, kernel=kernel, policy=policy,
+    )
+    if failure is not None and failure.exception is not None:
+        raise failure.exception
+    if failure is not None:
+        raise _fail_operator(
+            f"{_OPERATOR_STAGE_CORRECTNESS} wl {failure.index + 1}/{len(workloads)}",
+            f"Operator baseline correctness FAILED on workload "
+            f"{failure.index + 1}/{len(workloads)}: {failure.result.error_message}",
         )
-        if not result.passed:
-            raise _fail_operator(
-                f"{_OPERATOR_STAGE_CORRECTNESS} wl {idx + 1}/{len(workloads)}",
-                f"Operator baseline correctness FAILED on workload "
-                f"{idx + 1}/{len(workloads)}: {result.error_message}",
-            )
 
     emit(
         "operator_baseline_success",

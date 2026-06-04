@@ -162,7 +162,11 @@ from src.benchmark.baseline_generator import (
     BaselineGenerationError,
     load_operator_baseline,
 )
-from src.eval.correctness import CorrectnessResult, CorrectnessStage
+from src.eval.correctness import (
+    CorrectnessGateFailure,
+    CorrectnessResult,
+    CorrectnessStage,
+)
 from src.kernels.compiler import CompilationResult
 from src.kernels.kernel import KernelSpec, KernelType
 
@@ -266,16 +270,24 @@ def _make_spec(entrypoint: str = "my_kernel") -> KernelSpec:
     )
 
 
-def _pass() -> CorrectnessResult:
-    return CorrectnessResult(passed=True, max_abs_error=0.0)
-
-
 def _fail() -> CorrectnessResult:
     return CorrectnessResult(
         passed=False,
         failed_stage=CorrectnessStage.SMOKE_TEST,
         error_message="mismatch",
         max_abs_error=1.0,
+    )
+
+
+def _gate_pass() -> None:
+    """run_correctness_gate returns None when every workload passes."""
+    return None
+
+
+def _gate_fail(index: int, workloads: list) -> CorrectnessGateFailure:
+    """run_correctness_gate's first-failure report (verify ran and failed)."""
+    return CorrectnessGateFailure(
+        index=index, workload=workloads[index], result=_fail(),
     )
 
 
@@ -308,7 +320,7 @@ async def test_loader_happy_path_single_kernel_no_autotune(tmp_path, patched_io)
     path.write_text(_NO_AUTOTUNE_KERNEL)
     with (
         patch("src.benchmark.baseline_generator.compile_kernel", return_value=_compile_ok()),
-        patch("src.benchmark.baseline_generator.verify_correctness", return_value=_pass()),
+        patch("src.benchmark.baseline_generator.run_correctness_gate", return_value=_gate_pass()),
     ):
         kernel = await load_operator_baseline(
             _make_definition(), _make_spec(),
@@ -326,7 +338,7 @@ async def test_loader_happy_path_with_autotune_enforced(tmp_path, patched_io):
     path.write_text(_AUTOTUNE_KERNEL)
     with (
         patch("src.benchmark.baseline_generator.compile_kernel", return_value=_compile_ok()),
-        patch("src.benchmark.baseline_generator.verify_correctness", return_value=_pass()),
+        patch("src.benchmark.baseline_generator.run_correctness_gate", return_value=_gate_pass()),
     ):
         kernel = await load_operator_baseline(
             _make_definition(), _make_spec(),
@@ -393,7 +405,7 @@ async def test_loader_accepts_multi_kernel_with_override(tmp_path, patched_io):
     path.write_text(_MULTI_KERNEL_ENTRYPOINT_LAUNCHES_OTHER)
     with (
         patch("src.benchmark.baseline_generator.compile_kernel", return_value=_compile_ok()),
-        patch("src.benchmark.baseline_generator.verify_correctness", return_value=_pass()),
+        patch("src.benchmark.baseline_generator.run_correctness_gate", return_value=_gate_pass()),
     ):
         kernel = await load_operator_baseline(
             _make_definition(), _make_spec(entrypoint="kernel_fn"),
@@ -465,7 +477,7 @@ async def test_loader_accepts_override_via_dot_run_launch(tmp_path, patched_io):
     path.write_text(_MULTI_KERNEL_DOT_RUN)
     with (
         patch("src.benchmark.baseline_generator.compile_kernel", return_value=_compile_ok()),
-        patch("src.benchmark.baseline_generator.verify_correctness", return_value=_pass()),
+        patch("src.benchmark.baseline_generator.run_correctness_gate", return_value=_gate_pass()),
     ):
         kernel = await load_operator_baseline(
             _make_definition(), _make_spec(entrypoint="kernel_fn"),
@@ -482,7 +494,7 @@ async def test_loader_accepts_override_via_single_level_alias(tmp_path, patched_
     path.write_text(_MULTI_KERNEL_ALIAS_LAUNCH)
     with (
         patch("src.benchmark.baseline_generator.compile_kernel", return_value=_compile_ok()),
-        patch("src.benchmark.baseline_generator.verify_correctness", return_value=_pass()),
+        patch("src.benchmark.baseline_generator.run_correctness_gate", return_value=_gate_pass()),
     ):
         kernel = await load_operator_baseline(
             _make_definition(), _make_spec(entrypoint="kernel_fn"),
@@ -558,18 +570,19 @@ async def test_loader_compile_failure(tmp_path, patched_io):
 async def test_loader_correctness_failure_first_workload_wins(tmp_path, patched_io):
     path = tmp_path / "kernel.py"
     path.write_text(_NO_AUTOTUNE_KERNEL)
+    workloads = _make_workloads(3)
     with (
         patch("src.benchmark.baseline_generator.compile_kernel", return_value=_compile_ok()),
         patch(
-            "src.benchmark.baseline_generator.verify_correctness",
-            side_effect=[_pass(), _fail(), _pass()],
+            "src.benchmark.baseline_generator.run_correctness_gate",
+            return_value=_gate_fail(index=1, workloads=workloads),
         ),
     ):
         with pytest.raises(BaselineGenerationError, match=r"\[correctness wl 2/3\]"):
             await load_operator_baseline(
                 _make_definition(), _make_spec(),
                 path=path, dps=False, kernel_name_override=None,
-                enforce_autotune=False, workloads=_make_workloads(3),
+                enforce_autotune=False, workloads=workloads,
             )
 
 
@@ -584,7 +597,7 @@ async def test_loader_emits_events_on_success(tmp_path, patched_io):
 
     with (
         patch("src.benchmark.baseline_generator.compile_kernel", return_value=_compile_ok()),
-        patch("src.benchmark.baseline_generator.verify_correctness", return_value=_pass()),
+        patch("src.benchmark.baseline_generator.run_correctness_gate", return_value=_gate_pass()),
         patch("src.benchmark.baseline_generator.emit", side_effect=_capture),
     ):
         await load_operator_baseline(

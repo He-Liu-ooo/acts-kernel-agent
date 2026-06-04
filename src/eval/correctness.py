@@ -35,12 +35,14 @@ if TYPE_CHECKING:
 __all__ = [
     "ComparisonPolicy",
     "ComparisonResult",
+    "CorrectnessGateFailure",
     "CorrectnessResult",
     "CorrectnessStage",
     "TorchComparisonPolicy",
     "build_normalize_context",
     "compare_outputs",
     "maybe_wrap_dps_candidate",
+    "run_correctness_gate",
     "strict_compare_one_workload",
     "verify_correctness",
 ]
@@ -67,6 +69,17 @@ class CorrectnessResult:
     failed_stage: CorrectnessStage | None = None
     error_message: str = ""
     max_abs_error: float = 0.0
+
+
+@dataclass(frozen=True)
+class CorrectnessGateFailure:
+    """First failure from ``run_correctness_gate`` — exactly one of
+    ``result`` (verify ran and failed) / ``exception`` (verify raised) is set."""
+
+    index: int  # 0-based workload position
+    workload: "Workload"
+    result: "CorrectnessResult | None" = None
+    exception: Exception | None = None
 
 
 class ComparisonPolicy(Protocol):
@@ -637,3 +650,49 @@ def _stage_outputs_bitwise_equal(
         output_dtypes=norm.output_dtypes,
     )
     return all(policy.bitwise_equal(d1[name], d2[name]) for name in norm.output_names)
+
+
+def run_correctness_gate(
+    candidate_fn: Callable[..., Any],
+    reference_fn: Callable[..., Any],
+    input_generators: list[Callable[[int], tuple]],
+    workloads: list["Workload"],
+    *,
+    definition: "Definition | None" = None,
+    kernel: "Kernel | None" = None,
+    policy: "ComparisonPolicy | None" = None,
+) -> CorrectnessGateFailure | None:
+    """Run ``verify_correctness`` once per (generator, workload) pair and
+    *report* the first failure — the shared core of three per-workload gate
+    loops: baseline_generator's in-parent post-verify fallback, the operator
+    baseline's gate 7, and reference_baseline's correctness gate.
+
+    Returns ``None`` when every workload passes. On the first failing
+    workload, stops iterating and returns a ``CorrectnessGateFailure``
+    carrying its 0-based ``index`` and ``workload``: ``result`` is set when
+    verify ran and returned ``not passed``, ``exception`` is set when verify
+    raised. This helper never re-raises a candidate failure — each call site
+    keeps its own failure disposition (raise / record / break).
+    """
+    if len(workloads) != len(input_generators):
+        raise ValueError(
+            f"workloads ({len(workloads)}) and input_generators "
+            f"({len(input_generators)}) must be the same length"
+        )
+
+    for idx, (gen, wl) in enumerate(zip(input_generators, workloads)):
+        try:
+            result = verify_correctness(
+                candidate_fn=candidate_fn,
+                reference_fn=reference_fn,
+                input_generator=gen,
+                definition=definition,
+                kernel=kernel,
+                workload=wl,
+                policy=policy,
+            )
+        except Exception as exc:
+            return CorrectnessGateFailure(index=idx, workload=wl, exception=exc)
+        if not result.passed:
+            return CorrectnessGateFailure(index=idx, workload=wl, result=result)
+    return None

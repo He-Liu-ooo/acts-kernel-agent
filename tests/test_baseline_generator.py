@@ -31,7 +31,11 @@ from src.benchmark.baseline_generator import (
     BaselineGenerationError,
     generate_triton_baseline,
 )
-from src.eval.correctness import CorrectnessResult, CorrectnessStage
+from src.eval.correctness import (
+    CorrectnessGateFailure,
+    CorrectnessResult,
+    CorrectnessStage,
+)
 from src.kernels.compiler import CompilationResult
 from src.kernels.kernel import KernelSpec, KernelType
 
@@ -79,14 +83,25 @@ def _make_spec(name: str = "test_prob", entrypoint: str = "kernel_fn") -> Kernel
     )
 
 
-def _pass() -> CorrectnessResult:
-    return CorrectnessResult(passed=True, max_abs_error=0.0)
-
-
 def _fail(stage: CorrectnessStage = CorrectnessStage.SMOKE_TEST) -> CorrectnessResult:
     return CorrectnessResult(
         passed=False, failed_stage=stage, error_message="mismatch", max_abs_error=1.0,
     )
+
+
+def _gate_pass() -> None:
+    """run_correctness_gate returns None when every workload passes."""
+    return None
+
+
+def _gate_fail(
+    index: int = 0,
+    workloads: list | None = None,
+    stage: CorrectnessStage = CorrectnessStage.SMOKE_TEST,
+) -> CorrectnessGateFailure:
+    """run_correctness_gate's first-failure report (verify ran and failed)."""
+    wl = workloads[index] if workloads is not None else _make_workloads(index + 1)[index]
+    return CorrectnessGateFailure(index=index, workload=wl, result=_fail(stage))
 
 
 @pytest.fixture
@@ -168,8 +183,8 @@ async def test_successful_translate_returns_verified_kernel(patched_io):
             return_value=_compile_ok(),
         ),
         patch(
-            "src.benchmark.baseline_generator.verify_correctness",
-            return_value=_pass(),
+            "src.benchmark.baseline_generator.run_correctness_gate",
+            return_value=_gate_pass(),
         ) as mock_verify,
     ):
         result = await generate_triton_baseline(
@@ -180,13 +195,13 @@ async def test_successful_translate_returns_verified_kernel(patched_io):
     assert result is not None
     assert result.source_code == "@triton.jit\ndef kernel_fn(x): pass"
     assert result.spec is spec
-    assert mock_verify.call_count == 3  # once per workload
+    assert mock_verify.call_count == 1  # gate runs once per attempt
     coder.translate.assert_awaited_once()
 
 
 @pytest.mark.asyncio
 async def test_verify_uses_all_selected_workloads(patched_io):
-    """One input_generator per selected workload; verify_correctness runs once per."""
+    """One input_generator per selected workload; the gate receives every one."""
     workloads = _make_workloads(n=3)
     coder = CoderAgent(model=MagicMock())
     coder.translate = AsyncMock(return_value=_coder_output("src"))
@@ -201,8 +216,8 @@ async def test_verify_uses_all_selected_workloads(patched_io):
             return_value=_compile_ok(),
         ),
         patch(
-            "src.benchmark.baseline_generator.verify_correctness",
-            return_value=_pass(),
+            "src.benchmark.baseline_generator.run_correctness_gate",
+            return_value=_gate_pass(),
         ) as mock_verify,
     ):
         result = await generate_triton_baseline(
@@ -212,7 +227,11 @@ async def test_verify_uses_all_selected_workloads(patched_io):
 
     assert result is not None
     assert mock_build_gen.call_count == 3  # one generator per workload
-    assert mock_verify.call_count == 3
+    assert mock_verify.call_count == 1  # gate runs once per attempt
+    gate_args = mock_verify.call_args
+    # The gate gets all three generators + all three workloads to walk.
+    assert len(gate_args.args[2]) == 3  # input_generators
+    assert len(gate_args.args[3]) == 3  # workloads
 
 
 @pytest.mark.asyncio
@@ -231,8 +250,8 @@ async def test_translate_receives_reference_source_and_all_generators(patched_io
             return_value=_compile_ok(),
         ),
         patch(
-            "src.benchmark.baseline_generator.verify_correctness",
-            return_value=_pass(),
+            "src.benchmark.baseline_generator.run_correctness_gate",
+            return_value=_gate_pass(),
         ),
     ):
         await generate_triton_baseline(
@@ -269,7 +288,7 @@ async def test_translate_kernel_name_propagates_to_kernel(patched_io):
 
     with (
         patch("src.benchmark.baseline_generator.compile_kernel", return_value=_compile_ok()),
-        patch("src.benchmark.baseline_generator.verify_correctness", return_value=_pass()),
+        patch("src.benchmark.baseline_generator.run_correctness_gate", return_value=_gate_pass()),
     ):
         result = await generate_triton_baseline(
             _make_definition(), spec, coder=coder, workloads=workloads,
@@ -290,16 +309,16 @@ async def test_correctness_failure_on_any_workload_triggers_retry(patched_io):
         side_effect=[_coder_output("bad source"), _coder_output("good source")]
     )
 
-    # Attempt 1: workload 0 passes, workload 1 fails (short-circuit).
-    # Attempt 2: all three pass.
-    correctness_sequence = [_pass(), _fail(), _pass(), _pass(), _pass()]
+    # Attempt 1: gate reports workload 1 failed (short-circuit inside the gate).
+    # Attempt 2: gate passes (None).
+    correctness_sequence = [_gate_fail(index=1, workloads=workloads), _gate_pass()]
     with (
         patch(
             "src.benchmark.baseline_generator.compile_kernel",
             return_value=_compile_ok(),
         ),
         patch(
-            "src.benchmark.baseline_generator.verify_correctness",
+            "src.benchmark.baseline_generator.run_correctness_gate",
             side_effect=correctness_sequence,
         ),
     ):
@@ -348,8 +367,8 @@ async def test_entrypoint_binding_mismatch_triggers_retry(patched_io):
             return_value=_compile_ok(),
         ),
         patch(
-            "src.benchmark.baseline_generator.verify_correctness",
-            return_value=_pass(),
+            "src.benchmark.baseline_generator.run_correctness_gate",
+            return_value=_gate_pass(),
         ),
     ):
         result = await generate_triton_baseline(
@@ -385,8 +404,8 @@ async def test_implementation_error_triggers_retry(patched_io):
             return_value=_compile_ok(),
         ),
         patch(
-            "src.benchmark.baseline_generator.verify_correctness",
-            return_value=_pass(),
+            "src.benchmark.baseline_generator.run_correctness_gate",
+            return_value=_gate_pass(),
         ),
     ):
         result = await generate_triton_baseline(
@@ -435,8 +454,8 @@ async def test_translate_receives_accumulated_prior_failures(patched_io):
             return_value=_compile_ok(),
         ),
         patch(
-            "src.benchmark.baseline_generator.verify_correctness",
-            return_value=_pass(),
+            "src.benchmark.baseline_generator.run_correctness_gate",
+            return_value=_gate_pass(),
         ),
     ):
         result = await generate_triton_baseline(
@@ -487,8 +506,8 @@ async def test_post_verify_compile_failure_synthesizes_prior_failure(patched_io)
             side_effect=lambda *a, **k: next(compile_outcomes),
         ),
         patch(
-            "src.benchmark.baseline_generator.verify_correctness",
-            return_value=_pass(),
+            "src.benchmark.baseline_generator.run_correctness_gate",
+            return_value=_gate_pass(),
         ),
     ):
         result = await generate_triton_baseline(
@@ -525,9 +544,8 @@ async def test_post_verify_correctness_failure_synthesizes_prior_failure(patched
 
     coder.translate = fake_translate
 
-    # Attempt 1: wl 0 passes, wl 1 fails.
-    # Attempt 2: both pass.
-    correctness_outcomes = iter([_pass(), _fail(), _pass(), _pass()])
+    # Attempt 1: gate reports wl 1 failed. Attempt 2: gate passes.
+    correctness_outcomes = iter([_gate_fail(index=1, workloads=workloads), _gate_pass()])
 
     with (
         patch(
@@ -535,8 +553,8 @@ async def test_post_verify_correctness_failure_synthesizes_prior_failure(patched
             return_value=_compile_ok(),
         ),
         patch(
-            "src.benchmark.baseline_generator.verify_correctness",
-            side_effect=lambda **kw: next(correctness_outcomes),
+            "src.benchmark.baseline_generator.run_correctness_gate",
+            side_effect=lambda *a, **kw: next(correctness_outcomes),
         ),
     ):
         result = await generate_triton_baseline(
@@ -608,8 +626,8 @@ async def test_post_verify_uses_subprocess_when_definition_path_set(patched_io):
             return_value=_compile_ok(),
         ),
         patch(
-            "src.benchmark.baseline_generator.verify_correctness",
-            side_effect=AssertionError("in-parent verify_correctness must not run"),
+            "src.benchmark.baseline_generator.run_correctness_gate",
+            side_effect=AssertionError("in-parent correctness gate must not run"),
         ),
     ):
         result = await generate_triton_baseline(
@@ -658,8 +676,8 @@ async def test_post_verify_subprocess_failure_feeds_prior_failures_and_retries(p
             return_value=_compile_ok(),
         ),
         patch(
-            "src.benchmark.baseline_generator.verify_correctness",
-            side_effect=AssertionError("in-parent verify_correctness must not run"),
+            "src.benchmark.baseline_generator.run_correctness_gate",
+            side_effect=AssertionError("in-parent correctness gate must not run"),
         ),
     ):
         result = await generate_triton_baseline(
@@ -730,8 +748,8 @@ async def test_post_verify_in_parent_when_no_definition_path(patched_io):
             return_value=_compile_ok(),
         ),
         patch(
-            "src.benchmark.baseline_generator.verify_correctness",
-            return_value=_pass(),
+            "src.benchmark.baseline_generator.run_correctness_gate",
+            return_value=_gate_pass(),
         ) as mock_verify,
     ):
         result = await generate_triton_baseline(
@@ -741,8 +759,8 @@ async def test_post_verify_in_parent_when_no_definition_path(patched_io):
         )
 
     assert result is not None
-    # In-parent verify ran once per workload — no subprocess delegation.
-    assert mock_verify.call_count == 2
+    # In-parent gate ran once for the attempt — no subprocess delegation.
+    assert mock_verify.call_count == 1
 
 
 # ── correctness-isolation trust gate (post-verify) ─────────────────────
@@ -775,8 +793,8 @@ async def test_generate_triton_baseline_raises_without_isolation_or_optin(patche
             return_value=_compile_ok(),
         ),
         patch(
-            "src.benchmark.baseline_generator.verify_correctness",
-            side_effect=AssertionError("in-parent verify must not run without opt-in"),
+            "src.benchmark.baseline_generator.run_correctness_gate",
+            side_effect=AssertionError("in-parent gate must not run without opt-in"),
         ),
         pytest.raises(CorrectnessIsolationError),
     ):
@@ -803,8 +821,8 @@ async def test_generate_triton_baseline_in_parent_with_optin(patched_io):
             return_value=_compile_ok(),
         ),
         patch(
-            "src.benchmark.baseline_generator.verify_correctness",
-            return_value=_pass(),
+            "src.benchmark.baseline_generator.run_correctness_gate",
+            return_value=_gate_pass(),
         ) as mock_verify,
     ):
         result = await generate_triton_baseline(
@@ -813,8 +831,8 @@ async def test_generate_triton_baseline_in_parent_with_optin(patched_io):
         )
 
     assert result is not None
-    # In-parent verify ran once per workload (the opt-in path).
-    assert mock_verify.call_count == 2
+    # In-parent gate ran once for the attempt (the opt-in path).
+    assert mock_verify.call_count == 1
 
 
 @pytest.mark.asyncio
@@ -833,8 +851,8 @@ async def test_compile_failure_in_post_verify_is_treated_as_attempt_failure(patc
             side_effect=compile_sequence,
         ),
         patch(
-            "src.benchmark.baseline_generator.verify_correctness",
-            return_value=_pass(),
+            "src.benchmark.baseline_generator.run_correctness_gate",
+            return_value=_gate_pass(),
         ) as mock_verify,
     ):
         result = await generate_triton_baseline(
@@ -845,7 +863,7 @@ async def test_compile_failure_in_post_verify_is_treated_as_attempt_failure(patc
 
     assert result is not None
     assert result.source_code == "good source"
-    # verify_correctness never ran on the failed-compile attempt
+    # The gate never ran on the failed-compile attempt; only the second.
     assert mock_verify.call_count == 1
     assert coder.translate.await_count == 2
 
@@ -871,8 +889,8 @@ async def test_all_attempts_fail_raises_baseline_error(patched_io):
             return_value=_compile_ok(),
         ),
         patch(
-            "src.benchmark.baseline_generator.verify_correctness",
-            return_value=_fail(),
+            "src.benchmark.baseline_generator.run_correctness_gate",
+            return_value=_gate_fail(index=0, workloads=workloads),
         ),
         pytest.raises(BaselineGenerationError, match="3 attempts"),
     ):
@@ -918,8 +936,8 @@ async def test_generate_triton_baseline_emits_attempt_events(tmp_path, patched_i
                 return_value=_compile_ok(),
             ),
             patch(
-                "src.benchmark.baseline_generator.verify_correctness",
-                return_value=_pass(),
+                "src.benchmark.baseline_generator.run_correctness_gate",
+                return_value=_gate_pass(),
             ),
         ):
             await generate_triton_baseline(
@@ -995,8 +1013,8 @@ async def test_blob_roots_forwarded_to_build_input_generator():
             return_value=_compile_ok(),
         ),
         patch(
-            "src.benchmark.baseline_generator.verify_correctness",
-            return_value=_pass(),
+            "src.benchmark.baseline_generator.run_correctness_gate",
+            return_value=_gate_pass(),
         ),
     ):
         await generate_triton_baseline(
@@ -1025,8 +1043,8 @@ async def test_blob_roots_defaults_to_none_when_omitted(patched_io):
             return_value=_compile_ok(),
         ),
         patch(
-            "src.benchmark.baseline_generator.verify_correctness",
-            return_value=_pass(),
+            "src.benchmark.baseline_generator.run_correctness_gate",
+            return_value=_gate_pass(),
         ),
     ):
         result = await generate_triton_baseline(
@@ -1136,8 +1154,8 @@ class TestBaselineTraceWrap:
                 return_value=_compile_ok(),
             ),
             patch(
-                "src.benchmark.baseline_generator.verify_correctness",
-                return_value=_pass(),
+                "src.benchmark.baseline_generator.run_correctness_gate",
+                return_value=_gate_pass(),
             ),
         ):
             await generate_triton_baseline(
