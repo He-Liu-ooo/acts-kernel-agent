@@ -9,7 +9,7 @@ A framework for LLM-driven GPU kernel optimization that combines structured sear
 **V1: Pure latency optimization only.** The sole metric is kernel execution time (μs), lower is better.
 
 - **Evaluation harness**: Measures latency via CUDA Events + NCU hardware profiling. No power measurement in V1.
-- **Beam scoring**: SOL Score — measures how much of the baseline-to-hardware-limit gap a candidate kernel closes. Range [0, 1].
+- **Beam scoring**: SOL Score — measures how much of the baseline-to-hardware-limit gap a candidate kernel closes. Range [0, 1]. The baseline anchor `T_b` is the Triton root's latency by default, or an external reference implementation's measured latency when `reference_baseline_path` is configured ("beat the reference" scoring).
 - **Memory store**: Experiences record latency, speedup, and SOL score.
 - **Move-on criteria**: SOL score plateau detection or SOL score approaching 1.0 (hardware limit reached).
 
@@ -199,6 +199,8 @@ SOL-ExecBench provides only PyTorch references. Since ACTS optimizes Triton code
 - **LLM translation** (default — `generate_triton_baseline`): the Coder agent produces a one-shot PyTorch-to-Triton translation at problem load time. Coder receives the PyTorch reference and problem definition, produces a functionally equivalent Triton kernel, correctness is verified against the PyTorch reference (same 5-stage gate), and Coder retries up to `max_baseline_retries` attempts on failure; if all retries fail, the problem is skipped.
 - **Operator-supplied** (`load_operator_baseline`): when `[runtime] use_operator_baseline=true` in the run config, the file at `[runtime] triton_baseline_path` is loaded as the search-tree root after compile + per-workload correctness, bypassing the LLM Coder entirely. Any gate miss is a hard fail — no retry, no fallback. This is the sibling of investigation item C4 (curated per-op starter library): same idea, operator-supplied vs framework-baked.
 
+The two sources above select the **search root** (the tree node the optimization loop expands). Orthogonal to that choice is an optional **scoring overlay**: a third config surface (`reference_baseline_path` / `reference_baseline_entrypoint`) measures an external, non-Triton reference implementation (e.g. the kda flashinfer wrapper) and uses *its* median latency as the SOL-score `T_b` instead of the root's own latency — "beat the reference" scoring. The reference is loaded and measured exactly once in Phase A by `src/benchmark/reference_baseline.py::measure_reference_baseline`: it is 5-stage correctness-gated against the PyTorch reference on every workload (hard fail on any miss) and timed black-box via `benchmark_kernel`. It is never a tree node and is never expanded — it only supplies the scoring anchor. The overlay composes with either root source (LLM-translated or operator-supplied). Default off (`reference_baseline_path` unset) → root-anchored scoring, the behavior described in **SOL Score Baseline (T_b)** below.
+
 See `doc/eval.md` and `doc/config.md` for the gate sequence and configuration details.
 
 ### Correctness Reference
@@ -207,7 +209,7 @@ The PyTorch reference is always the ground truth for correctness checking — bo
 
 ### SOL Score Baseline (T_b)
 
-`T_b` is derived from the **Triton baseline**, not the PyTorch reference. The SOL score formula anchors S=0.5 at T_b, meaning "no improvement over starting point." Since ACTS optimizes Triton code, the meaningful zero-progress point is the Triton starting point. The SOL-ExecBench `sol_score.py` explicitly allows T_b to be set to any fast implementation.
+By default `T_b` is derived from the **Triton baseline**, not the PyTorch reference. The SOL score formula anchors S=0.5 at T_b, meaning "no improvement over starting point." Since ACTS optimizes Triton code, the meaningful zero-progress point is the Triton starting point. The SOL-ExecBench `sol_score.py` explicitly allows T_b to be set to any fast implementation — which is also how the external-reference overlay (above) substitutes a non-Triton reference's median for `T_b` when configured.
 
 `T_b` is measured once at problem load time with robust methodology (same warmup + timed iterations as candidate kernels, GPU clocks locked). It remains constant throughout the optimization search — recomputing T_b each iteration would introduce metric noise and break plateau detection.
 
@@ -242,7 +244,7 @@ The SOL Score (SOL-ExecBench, NVIDIA 2026) measures how much of the baseline-to-
 S(T_k) = (T_b - T_SOL) / ((T_k - T_SOL) + (T_b - T_SOL))
 ```
 
-Where `T_b` = Triton baseline runtime, `T_SOL` = SOLAR-derived hardware limit, `T_k` = candidate kernel runtime.
+Where `T_b` = Triton baseline runtime (or the external reference's measured median when `reference_baseline_path` is configured), `T_SOL` = SOLAR-derived hardware limit, `T_k` = candidate kernel runtime.
 
 | Condition | SOL Score | Meaning |
 |-----------|-----------|---------|
@@ -465,6 +467,8 @@ Phase A: Load SOL Definition + Workloads
   -> verify Triton baseline correctness against PyTorch reference
      -> retry up to max_baseline_retries on failure; skip problem if exhausted
   -> measure T_b (Triton baseline latency, CUDA events, locked clocks)
+     -> if reference_baseline_path set: measure external reference once
+        (5-stage gate vs PyTorch ref, hard fail) and use its median as T_b
   -> select representative workloads for iterative benchmarking (2-3 of 7-48)
   -> baseline SOL score = 0.5 by definition
 
@@ -583,6 +587,7 @@ acts-kernel-agent/
 |   |-- benchmark/              (kernel-side helpers — not benchmark-source loaders)
 |   |   |-- __init__.py
 |   |   |-- baseline_generator.py
+|   |   |-- reference_baseline.py (external non-Triton T_b reference: load -> 5-stage gate -> measure, Phase A only)
 |   |   |-- roofline_shapes.py
 |   |   |-- solar_adapter.py
 |   |   +-- workload_selector.py

@@ -86,6 +86,42 @@ The three SOL-aware kwargs drive the multi-output / DPS flow:
 
 `workload` also carries the per-problem tolerance: when `workload.tolerance` is non-None, its `max_atol` / `max_rtol` override the `atol` / `rtol` kwargs **and** the `strict_atol` / `strict_rtol` kwargs for stage 5. The override is opt-in via workload presence — callers that want the prior tighter anti-cheat behaviour pass `workload=None` and keep the hardcoded defaults.
 
+### `run_correctness_gate` — shared per-workload gate
+
+```python
+run_correctness_gate(
+    candidate_fn, reference_fn, input_generators, workloads,
+    *, definition=None, kernel=None, policy=None,
+) -> CorrectnessGateFailure | None
+```
+
+The single per-workload sweep shared by every parent-side correctness gate. Zips `input_generators` × `workloads` (`ValueError` on length mismatch), runs `verify_correctness` per pair, and returns the **first** failure — `None` means every workload passed. Named "gate" (not "sweep" — that name is already the stage-2 shape-sweep). Stays torch-free at import (it only calls `verify_correctness`, whose torch use is lazy). Each pair gets the workload threaded through as `verify_correctness`'s `workload=` arg, so per-problem `tolerance` overrides apply per workload.
+
+Crucially the helper **never re-raises**: a candidate that raises mid-verify is captured into the returned struct, so call sites own the failure disposition. The frozen result dataclass:
+
+```python
+@dataclass(frozen=True)
+class CorrectnessGateFailure:
+    index: int                          # 0-based workload position
+    workload: Workload
+    result: CorrectnessResult | None = None   # verify ran and returned not-passed
+    exception: Exception | None = None        # verify raised
+```
+
+Exactly one of `result` / `exception` is set. `index` is 0-based; call sites render it 1-indexed (`index + 1`).
+
+**Three consumers, each keeping its own failure handling:**
+
+| Consumer | Site | On failure |
+|----------|------|------------|
+| `generate_triton_baseline` in-parent post-verify (the `allow_in_parent_fallback` branch) | `baseline_generator.py` | re-raise a captured `exception` **raw**; a `result` failure becomes a `prior_failures` retry-feedback string |
+| `load_operator_baseline` gate 7 | `baseline_generator.py` | re-raise a captured `exception` **raw**; a `result` failure becomes `_fail_operator(...)` → `BaselineGenerationError` |
+| `measure_reference_baseline` | `reference_baseline.py` | wrap **both** `exception` and `result` into `ReferenceBaselineError` (never re-raises raw) |
+
+The first two re-raise captured crashes raw (the crash is a Coder/operator bug to surface); the reference-baseline path wraps everything so the pipeline aborts the run on any miss.
+
+Both `run_correctness_gate` and `CorrectnessGateFailure` are in `correctness.py`'s `__all__`. Tests: `tests/test_correctness_gate.py` (5 Tier-1 tests: all-pass `None`, first-failure index, `exception` captured not raised, length-mismatch `ValueError`, single-workload).
+
 ### `anti_cheat.py`
 
 Real implementation. Coordinates three layers of reward-hack defense:
@@ -214,7 +250,7 @@ Bridges SOL `Definition` + `Workload` directly to the pair of callables `verify_
 
 ## Baseline construction — `src/benchmark/baseline_generator.py`
 
-Two entry points produce the search-tree root `Kernel`. Both run the same compile + per-workload `verify_correctness` gate at the tail; they differ only in how the source is sourced.
+Two entry points produce the search-tree root `Kernel`. Both run the same compile + per-workload correctness gate (`run_correctness_gate`, see above) at the tail; they differ only in how the source is sourced. (A third, non-Triton baseline path — `measure_reference_baseline` — also shares that gate; see "External reference baseline" below.)
 
 - `generate_triton_baseline(...)` — LLM path. Calls `CoderAgent.translate()` inside an `acts_baseline` trace span; retries up to `max_retries` on `ImplementationError`, entrypoint-binding miss, compile failure, or first-workload correctness failure. Each failure is appended to `prior_failures` (carried into the next attempt's prompt) and emits a `baseline_failure` event with the stage in the reason prefix. Success emits `baseline_success`. Budget exhaustion raises `BaselineGenerationError`.
 - `load_operator_baseline(...)` — operator path. Reads a `.py` file supplied via `[runtime] triton_baseline_path` and bypasses the Coder. No retry loop, no fallback to the LLM path — hard-fail by design (the operator chose the file; if it doesn't pass the gate, surface the cause rather than silently re-translate).
@@ -232,9 +268,18 @@ Each gate raises `BaselineGenerationError` with the stage embedded as `[<stage>]
 | 4 | `autotune_validate` | only when `enforce_autotune=True`: construct `KernelCodeOutput(...)` to run the `@triton.autotune` AST validator (≥4 configs, non-empty `key=[...]`) |
 | 5 | (no stage slug) | `Kernel(...)` construction (its `__post_init__` parses autotune metadata; lenient when no decorator is present) |
 | 6 | `compile` | `compile_kernel(kernel, cache_dir)` inside the `acts_operator_baseline` trace span |
-| 7 | `correctness wl K/N` | `verify_correctness` per workload; first failure wins and K/N (1-indexed) is embedded in the stage slug |
+| 7 | `correctness wl K/N` | `run_correctness_gate` over all workloads; first failure wins and K/N (1-indexed) is embedded in the stage slug. A captured `exception` re-raises raw; a `result` failure becomes `_fail_operator(...)` |
 
 Gate 4 reuses the Coder's `KernelCodeOutput` Pydantic validator so the autotune contract enforced on LLM-generated kernels (4+ configs, non-empty `key`) applies symmetrically to operator-supplied ones — without duplicating the AST walk.
+
+### External reference baseline — `src/benchmark/reference_baseline.py` (eval-surface contact points)
+
+A third baseline path (`measure_reference_baseline`) times a **non-Triton** reference callable (e.g. a flashinfer wrapper) to produce the SOL-score `T_b`. Two eval surfaces touch it:
+
+- **Correctness** — it runs the same `run_correctness_gate` (all workloads, vs the PyTorch `reference_fn`) before timing. Any gate failure — captured `exception` or `result` — is wrapped into `ReferenceBaselineError`, which the pipeline lets abort the run (a wrong scoring baseline silently corrupts every downstream score).
+- **Benchmark** — the resolved callable is timed black-box through `benchmark_kernel(kernel_shell, config, ..., kernel_fn=<resolved callable>, autotuner=None)`: no autotune winner capture, no profiling. Empty/mismatched workload lists are rejected up front so the bench loop can't hit `benchmark_kernel`'s 100us sentinel and fabricate a baseline.
+
+The reference module itself (load/entrypoint resolution, pipeline wiring) is documented in `doc/pipeline.md`; only its eval-surface contacts are noted here.
 
 ## Profiler — `profiler.py`
 

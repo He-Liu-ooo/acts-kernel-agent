@@ -54,7 +54,7 @@ Fans out each call to two sinks:
 Contract:
 
 - `kind` must be in `CORE_EVENT_KINDS`; other kinds log a warning and are still written (schema drift stays visible, never silent).
-- `iter` is an explicit keyword. It appears on per-iteration events (`iter_start`, `planner_selected`, `planner_failed`, `coder_submitted`, `coder_failed`, `bench_done`, `profile_done`, `score_computed`, `reviewer_feedback`, `reviewer_metric_query`, `branch_dead_end`, `iter_end`, `trace_emitted`, `reward_hack_detected`, `reward_hack_confirmed`, `reward_hack_cleared`, `calibration_warning`, `sibling_context_rendered`, `failure_summary_added`, `repeated_pathway_dead_end`) and is `None` on run-scope events (`run_start`, `baseline_*`, `verify_*`, `run_end`, `clock_lock_unavailable`, `clock_drift_detected`).
+- `iter` is an explicit keyword. It appears on per-iteration events (`iter_start`, `planner_selected`, `planner_failed`, `coder_submitted`, `coder_failed`, `bench_done`, `profile_done`, `score_computed`, `reviewer_feedback`, `reviewer_metric_query`, `branch_dead_end`, `iter_end`, `trace_emitted`, `reward_hack_detected`, `reward_hack_confirmed`, `reward_hack_cleared`, `calibration_warning`, `sibling_context_rendered`, `failure_summary_added`, `repeated_pathway_dead_end`) and is `None` on run-scope events (`run_start`, `baseline_*`, `reference_baseline_*`, `verify_*`, `run_end`, `clock_lock_unavailable`, `clock_drift_detected`). The `reference_baseline_*` quartet is emitted with `iter=0` (external reference-baseline measurement happens at iteration 0, alongside the in-run baseline).
 - **Never raises.** Serialization failures are caught and logged; file-handle errors during write do not propagate.
 - Skips serialization entirely when `logger.isEnabledFor(INFO)` is false — cheap to leave in hot paths.
 - All additional `**fields` are merged flat into the JSON object. Use `finite_or_none(x)` on any float that could be `inf`/`nan` (e.g. latency after a failed bench) so JSON stays valid.
@@ -69,9 +69,9 @@ Module-level handle registration, guarded by `_lock`. `RunContext.create` calls 
 
 ### Event catalog — `CORE_EVENT_KINDS`
 
-Frozenset of 40 kinds:
+Frozenset of 42 kinds:
 
-**Run scope** — `run_start`, `baseline_attempt`, `baseline_success`, `baseline_failure`, `baseline_ready`, `verify_start`, `verify_done`, `run_end`, `clock_lock_unavailable`, `clock_drift_detected`.
+**Run scope** — `run_start`, `baseline_attempt`, `baseline_success`, `baseline_failure`, `baseline_ready`, `operator_baseline_load`, `operator_baseline_success`, `operator_baseline_failure`, `reference_baseline_loaded`, `reference_baseline_verified`, `reference_baseline_benchmarked`, `reference_baseline_failed`, `verify_start`, `verify_done`, `run_end`, `clock_lock_unavailable`, `clock_drift_detected`.
 
 **Per-iteration** — `iter_start`, `planner_selected`, `planner_failed`, `coder_submitted`, `coder_failed`, `bench_done`, `profile_done`, `score_computed`, `reviewer_feedback`, `reviewer_metric_query`, `branch_dead_end`, `iter_end`, `trace_emitted`, `reward_hack_detected`, `reward_hack_confirmed`, `reward_hack_cleared`, `calibration_warning`, `sibling_context_rendered`, `failure_summary_added`, `repeated_pathway_dead_end`, `autotune_burn_in_done`, `bench_worker_spawned`, `bench_worker_exited`, `bench_worker_crashed`, `worker_chunk_merged`.
 
@@ -96,6 +96,13 @@ Frozenset of 40 kinds:
 
 **Triton autotune integration sub-grouping** (added 2026-05-14, A1 PR 1):
 - `autotune_burn_in_done` (per-iter) — fires once per iter after benchmark-captured autotune winners are copied onto the kernel. Payload: `iter`, `workload_count: int`, `winner_count: int`. Per-workload winners themselves persist on `Kernel.autotune_winner: dict[workload.uuid, cfg]`.
+
+**External reference baseline sub-grouping** (added 2026-06-03, Option C; all run-scope, emitted with `iter=0`). Fired by `src/pipeline/optimize.py` around `src/benchmark/reference_baseline.py::measure_reference_baseline(...)` when `config.reference_baseline_path` is set — an operator-supplied external reference whose benchmarked latency becomes the SOL-score `T_b`. The flow is load → correctness-gate (all workloads) → benchmark; any miss raises `ReferenceBaselineError` and hard-fails the run.
+
+- `reference_baseline_loaded` (run-scope) — fires once at loader entry, immediately before `measure_reference_baseline(...)`. Payload: `path: str`, `entrypoint: str`.
+- `reference_baseline_verified` (run-scope) — fires after the correctness gate passes on every workload. Payload: `workloads: int` (workload count gated).
+- `reference_baseline_benchmarked` (run-scope) — fires after the benchmark completes. Payload: `latency_us: float` (median latency used as `T_b`).
+- `reference_baseline_failed` (run-scope) — fires immediately before `ReferenceBaselineError` re-raises. Payload: `stage` (`"validate"` | `"load"` | `"correctness"` | `"benchmark"` — peeled from the error message's `[<stage>]` prefix by `optimize.py`; falls back to `"unknown"` if a message ever lacks the prefix), `reason: str` (full error text, truncated to 200 chars). The `"validate"` stage covers the fail-closed pre-load checks (missing definition / `reference_fn`, empty workload list, workload↔input-generator length mismatch).
 
 **Hardware-spec injection sub-grouping** (added 2026-05-24; see [`doc/specs/2026-05-24-coding-hw-spec-design.md`](specs/2026-05-24-coding-hw-spec-design.md) §9). This feature is now prompt-side only — the per-block SMEM cap is injected into the agent prompts as a config-sizing hint and emits no events. (The compile-time autotune SMEM-budget check that previously emitted the two SMEM telemetry events was removed 2026-06-03 as redundant with Triton's runtime config pruning + the compile/correctness/bench gauntlet — see the JOURNAL entry "Autotune SMEM-budget check — removed (2026-06-03)".)
 

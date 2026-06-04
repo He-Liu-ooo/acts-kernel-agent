@@ -4,13 +4,16 @@ Global configuration and hardware detection.
 
 ## Configuration File
 
-Run parameters are set through `.cfg` files (libconfig format, parsed via `libconf` in `load_config()`). Unspecified groups + keys fall back to `ACTSConfig` dataclass defaults. Hardware specs are loaded from a SOLAR arch YAML when `hardware.arch_config_path` is set, otherwise detected at runtime. See `configs/example.cfg` for the canonical reference.
+Run parameters are set through `.cfg` files (libconfig format, parsed via `libconf` in `load_config()`). Unspecified groups + keys fall back to `ACTSConfig` dataclass defaults. Hardware specs are loaded from a SOLAR arch YAML when `hardware.arch_config_path` is set, otherwise detected at runtime. See `configs/example.cfg` for the canonical reference (comment-free) and `configs/example_comment.cfg` for the fully-commented twin (same values); both demonstrate the FlashInfer-trace DSA setup — external reference baseline + container-level `safetensors_blob_roots`. Keep the two in sync.
 
 ```libconfig
 runtime:
 {
     problem_path = "placeholder";
     reset_clocks = false;
+    reference_baseline_path = "ref.py";
+    reference_baseline_entrypoint = "run";
+    safetensors_blob_roots = ["/path/to/blob/container"];
 };
 
 hardware:
@@ -112,7 +115,7 @@ Mutable dataclass. All parameters for a single optimization run.
 - `benchmark_workload_count` (3): representative workloads for iterative benchmarking.
 - `arch_config_path` (""): path to SOLAR arch YAML. If empty, `detect_hardware()` is used.
 - `hardware`: populated from arch YAML or `detect_hardware()` at startup.
-- `safetensors_blob_roots` (None: `list[Path] | None`): override the default `[problem_dir]` blob_roots used by `build_input_generator` to resolve `SafetensorsInput` workloads. When `None`, the dispatcher falls back to `[problem_path]`, preserving the in-tree fixture layout. Useful when blobs live outside the problem directory (e.g. a shared model-weight staging area).
+- `safetensors_blob_roots` (None: `list[Path] | None`): override the default `[problem_dir]` blob_roots used by `build_input_generator` to resolve `SafetensorsInput` workloads. When `None`, the dispatcher falls back to `[problem_path]`, preserving the in-tree fixture layout. Useful when blobs live outside the problem directory (e.g. a shared model-weight staging area). **Cfg-loadable** from the `[runtime]` section (key added to `load_config`'s `_section_map["runtime"]`). The generic coercion loop stores libconf's parsed array as-is (a tuple of `str`), so a post-loop normalization re-coerces it to `list[Path]`; a bare string is tolerated as a single root (without the str-guard the `[Path(p) for p in ...]` comprehension would explode the string into one root per character). Documented use case: the FlashInfer-trace layout keeps one container-level blob symlink (`benchmarks/flashinfer_trace/blob`) shared by all problems under the container, which the default `[problem_path]` can't reach from a sibling problem dir.
 - `benchmark_adapter` (None: `str | None`): explicit override for the `_load_problem` dispatcher's adapter choice. Values: `"sol_execbench"` (also auto-selected when `definition.json` is present), `"kernelbench"` (raises `NotImplementedError` until that adapter ships). When `None`, the dispatcher inspects the problem directory and either picks an adapter or raises `UnknownBenchmarkFormat`.
 - `anti_cheat_critical_names` (`list[str]`, default `["elapsed_time", "synchronize", "wait", "record", "query"]`): names of methods on `torch.cuda.Event` whose `id()` is snapshotted on entry to `per_iter_anti_cheat` and re-checked on exit. A monkey-patch substitution between snapshot and check raises `RewardHackDetected` and the orchestrator marks the branch DEAD_END. Default covers the timing primitives a candidate would need to patch to fake faster-than-SOL latencies; operators can extend without code change.
 
@@ -148,6 +151,32 @@ The `load_config` `FileNotFoundError` guard is correspondingly scoped: it fires 
 **Autotune-enforce trade-off.** Default skip preserves compatibility with operator kernels that intentionally bypass `@triton.autotune` (e.g. `@triton.heuristics`, single hand-tuned config). Set `triton_baseline_enforce_autotune = true` to apply the same well-formedness gate the LLM-translation path uses when the operator wants matching strictness.
 
 `load_config` also extends the `_section_map` `[runtime]` keys to absorb the five fields, with a third coercion branch: when `default_val is None` (Optional fields), libconf's native value is stored directly — the previous `type(default_val)(value)` path tried `NoneType(value)` → `TypeError`.
+
+### External reference baseline
+
+Override the SOL-score denominator `T_b` with the measured median of an external reference implementation, instead of the search-tree root's own median. Option C of the reference-baseline design: the `.py` at `reference_baseline_path` (entrypoint resolved by name) is measured **once** in Phase A, and its median latency becomes the `T_b` used to compute the SOL score for the root **and every child**. Read from the `.cfg` `[runtime]` section. See `doc/specs/2026-06-03-external-reference-baseline-design.md` for the design rationale.
+
+This is an opt-in overlay that is **orthogonal to `use_operator_baseline`** — it composes with either root path (LLM-translated baseline or operator-supplied Triton baseline). When both fields are `None` (the default), behavior is unchanged: `T_b` is the Triton-root median.
+
+| Field | Type | Default | Purpose |
+|-------|------|---------|---------|
+| `reference_baseline_path` | `str \| None` | `None` | Path to a plain `.py` reference implementation. Measured once in Phase A; its median becomes `T_b` for root + children. `None` (default) keeps `T_b` = Triton-root median. |
+| `reference_baseline_entrypoint` | `str \| None` | `None` | Name of the entrypoint function to resolve inside `reference_baseline_path`. Required whenever the path is set. |
+
+```libconfig
+runtime:
+{
+    reference_baseline_path = "benchmarks/.../reference_flashinfer.py";
+    reference_baseline_entrypoint = "run";
+};
+```
+
+**Asymmetric consistency rules** (enforced in `__post_init__`), mirroring the operator-baseline pattern — raise where the misconfig would silently waste a run, warn where it's inert:
+
+- **`reference_baseline_path` set + `reference_baseline_entrypoint` empty → `ValueError`.** The operator named a reference file but no entrypoint to call; there's no way to measure it. Raise.
+- **`reference_baseline_entrypoint` set + `reference_baseline_path` empty → `logger.warning` "dead config".** The entrypoint name is inert without a file to resolve it in; no reference baseline will be measured. Warn so the operator can carry a ready-to-flip entrypoint without scrubbing the cfg.
+
+Both fields are absorbed into `load_config`'s `_section_map["runtime"]` and ride the same `default_val is None` Optional-coercion branch as the operator-baseline path fields (libconf's native string stored directly).
 
 ### Bench-subprocess isolation knobs
 

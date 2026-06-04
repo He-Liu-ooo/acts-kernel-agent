@@ -43,6 +43,15 @@ Everything algorithmic + invocation (problem path, GPU index, reset-clocks, beam
 5. **Baseline dispatch** (`_dispatch_baseline`, defined above `_load_problem`): the cfg flag `config.use_operator_baseline` chooses between two paths that both return a verified `Kernel` of identical shape — downstream code is unchanged. `triton_baseline_path` still names WHERE the operator-supplied Triton file lives; `use_operator_baseline` is the toggle that decides whether to read it. When the flag is False (default), `generate_triton_baseline()` (see `baseline_generator.py` below) drives `CoderAgent.translate()` to port the PyTorch reference into a Triton kernel, post-verifying on every selected workload. When the flag is True, `load_operator_baseline()` reads the operator-supplied Triton source from `config.triton_baseline_path` and runs it through the same loader gate sequence (compile → autotune-shape check → DPS routing → correctness over every selected workload) — `CoderAgent.translate()` is bypassed entirely, so SOL mode no longer requires a model when the operator pre-supplies the baseline. The flag/path pair is enforced asymmetrically at cfg load: `use_operator_baseline=True` with an empty `triton_baseline_path` raises, while `use_operator_baseline=False` with a stray path only warns (see `doc/config.md` for the exact rule and the rest of the `triton_baseline_*` cfg fields). The returned `Kernel` is the search-tree root. The imports of `generate_triton_baseline` / `load_operator_baseline` inside `_dispatch_baseline` are **function-local on purpose**: existing pipeline tests patch the canonical `src.benchmark.baseline_generator.{generate_triton_baseline,load_operator_baseline}` attributes, and the deferred import makes the dispatcher pick the patched callables up at call time instead of binding the originals at module import. See `doc/eval.md` for the loader gate sequence.
 6. `build_reference_fn()` + `build_input_generator()` produce the oracle + one generator per workload; these are forwarded to `Orchestrator.run()` so Phase B's correctness tool binds to every workload the baseline was verified against.
 
+**External reference baseline** (Option C, `config.reference_baseline_path` set): after `_load_problem` returns, `optimize()` measures a non-Triton reference implementation (e.g. a FlashInfer wrapper) once and uses its median latency as the SOL-score `T_b` for the whole run; default (path `None`) leaves `T_b = ` the Triton root's own median. The reference is a **side-channel measurement, not a tree node** — it never enters the search. Wiring:
+
+1. emit `reference_baseline_loaded` (payload `path`, `entrypoint`);
+2. call `measure_reference_baseline(definition, …, kernel_type=baseline.spec.kernel_type, …)` (the `kernel_type` is taken from the already-loaded Triton baseline's spec, so the reference shares the problem's `KernelType`);
+3. on success: record `ref.median_latency_us`, emit `reference_baseline_verified` (payload `workloads=len(workloads)`) + `reference_baseline_benchmarked` (payload `latency_us`);
+4. on `ReferenceBaselineError`: peel the `[<stage>]` tag off the message prefix (`load` / `validate` / `correctness` / `benchmark`, else `unknown`), emit `reference_baseline_failed` (payload `stage`, `reason` truncated to 200 chars), then **re-raise** — a hard abort. A wrong scoring baseline silently corrupts every score, so it must not be allowed to score the run.
+
+The measured latency threads into `orchestrator.run(reference_baseline_latency_us=…)`. The function-local import of `measure_reference_baseline` mirrors `_dispatch_baseline` so test patches resolve at call time. See `src/benchmark/reference_baseline.py` below.
+
 **Model load** (`_load_model_if_configured`): reads `$ACTS_MODEL_CONFIG` or falls back to `configs/models/deepseek.json`; the JSON's `api_key` field is optional and falls back to `$OPENAI_API_KEY` then `$DEEPSEEK_API_KEY` (`ValueError` if none supply a key), so the key can live in the env rather than the committed JSON. Gated on SOL mode — placeholder mode intentionally runs with `model=None` so the CLI stays executable without credentials. Without an SDK install or without a model config on disk, returns `None` and every agent stays in no-op mode.
 
 **Placeholder mode** (`_load_placeholder`): loads `make_matmul_kernel(1024, 1024, 1024)` directly; no oracle, no workloads, no roofline. Exercises the scaffold end-to-end only.
@@ -88,6 +97,24 @@ Runs at problem-load time. Drives `CoderAgent.translate()` to port the PyTorch r
 
 `ValueError` is raised for a caller bug — an empty `workloads` list.
 
+## reference_baseline.py — External Reference Baseline (Option C)
+
+Sibling to `baseline_generator.py`. Loads a non-Triton reference implementation, verifies it against the PyTorch reference via the 5-stage correctness gate, and times it black-box through `benchmark_kernel`. The median becomes the SOL-score `T_b`. Runs **once in Phase A, in-process**; the reference is a side-channel measurement, never a search-tree node. Every failure raises `ReferenceBaselineError`, which `optimize()` lets abort the run. Spec: `doc/specs/2026-06-03-external-reference-baseline-design.md` (uncommitted).
+
+`load_reference_callable(*, path, entrypoint, kernel_type) -> tuple[Kernel, Callable]`
+
+Builds a non-Triton `Kernel` shell — `triton_kernel_name=""`, `flop_count=0` / `memory_bytes=0` (the reference is never profiled or roofline-scored, so the counts are unused) — and resolves the entrypoint via `compile_kernel`. A missing path or a compile failure (`result.success is False` / `compiled_fn is None`) raises `ReferenceBaselineError("[load] …")`. Returns the `(Kernel, compiled_fn)` pair.
+
+`measure_reference_baseline(definition, *, path, entrypoint, kernel_type, workloads, input_generators, reference_fn, config, policy=None, cache_dir=None) -> ReferenceBaselineResult`
+
+Three stages, each failure a stage-tagged `ReferenceBaselineError`:
+
+1. **`[validate]`** — fail-closed guards before any load/bench call: `definition` and `reference_fn` non-`None`, non-empty `workloads`, and `len(workloads) == len(input_generators)`. These guard against the benchmark's 100us-sentinel: an empty / mismatched workload list would skip the correctness loop and hit `benchmark_kernel`'s sentinel, fabricating a scoring baseline.
+2. **`[correctness]`** — `load_reference_callable` resolves the entrypoint, then `run_correctness_gate` (from `src/eval/correctness`) runs the 5-stage gate vs the PyTorch `reference_fn` on every workload. The first failing workload's `CorrectnessGateFailure` is rendered with its `result.error_message` + workload index/uuid; a gate crash carries the exception (`raise … from failure.exception`).
+3. **`[benchmark]`** — `benchmark_kernel(kernel, config, …, kernel_fn=fn, autotuner=None)` times the reference black-box. Any exception (e.g. `BenchmarkError` when >half the workloads fail) is wrapped; a partial-workload failure (`bench.is_fully_successful is False`) also raises.
+
+Returns `ReferenceBaselineResult(median_latency_us, per_workload_latency_us)` sourced from the `BenchmarkResult`.
+
 ## verify.py — Post-Optimization Verification
 
 Re-runs the correctness gate on the best kernel to confirm results are reproducible. Recompiles the winner, then delegates to `verify_correctness` against the PyTorch reference. Compile failures surface as `passed=False` with a compile-phrased detail string.
@@ -104,14 +131,18 @@ The returned `OptimizationReport` also carries `hardware_spec: HardwareSpec | No
 
 Reads the best node's `ScoreResult` and walks `result.tree.path_to_node(best.id)` to build the root-to-best action sequence. The root's `action_applied` is the empty-string baseline placeholder and is filtered out of the trace. When `best.score is None` (scoring failed), the returned report surfaces only `termination_reason` + `total_iterations` without crashing.
 
+`reference_baseline_latency_us` and `acts_root_latency_us` are sourced **inside `generate_report` directly from the `SearchResult`** (`result.reference_baseline_latency_us` and `result.baseline_root_latency_us`) — there is **no post-assignment in `optimize()`** for these two. (`usage_stats` remains the only field `main()` post-assigns; see its row below.) `optimize()`'s sole responsibility for the reference path is measuring it in Phase A and threading the latency into `Orchestrator.run()`; the orchestrator carries both numbers out on the `SearchResult`, and the report reads them off it.
+
 When `workloads` + `hardware_spec` are supplied, `generate_report` iterates the selected workloads once. Per-workload bottlenecks are sourced from SOLAR via `derive_t_sol_from_solar(definition, workload, hardware_spec, arch_yaml_path=...).bottleneck` (SOLAR is authoritative). Workloads where SOLAR returns `None` or where `definition is None` are **omitted** from `winner_per_workload_bottlenecks` rather than falling back to the analytical band classifier (`classify_bottleneck` in `eval/roofline.py` is the analytical band classifier; it is no longer used for per-workload labels). When `input_generators` is also supplied, the same loop re-profiles the winning kernel on each workload into `winner_profiling_per_workload`. **Loop order**: SOLAR runs first per workload, then `_resolve_workload_roofline(definition, w, best.kernel, roofline=solar)` derives `(flops, nbytes)` — SOLAR's `total_flops` / `total_fused_bytes` outrank the shape-formula fallback (same precedence as the orchestrator), and the shape formulas only fire when SOLAR is unavailable or returns `None`. `_resolve_workload_roofline` returns `(0, nbytes)` when only flops can't be derived, and `(0, 0)` only when shape resolution also fails; **there is no `(flops, nbytes)` skip gate** — `profile_kernel` is always called for any selected workload with a valid per-workload latency (`profile_kernel` handles `nbytes=0` internally by emitting a degraded result with `analytical=None`). `blob_roots` is forwarded into `profile_kernel` so the NCU subprocess driver resolves safetensors-backed inputs against the same root list as the in-process generator (defaults to `[definition_path.parent]` when unspecified).
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `baseline_latency_us` | float | Starting latency |
+| `baseline_latency_us` | float | Scoring baseline latency `T_b`. Legacy mode: the Triton root's own median. Option C (reference active): the **reference** median, not the Triton root's. |
 | `best_latency_us` | float | Best achieved latency |
 | `sol_score` | float | Final SOL score |
-| `speedup` | float | Baseline / best |
+| `speedup` | float | `baseline_latency_us / best_latency_us` (`T_b` / candidate). In Option C `T_b` is the reference median, so this is speedup-vs-reference. |
+| `reference_baseline_latency_us` | `float \| None` | External reference baseline median (Option C). Sourced **directly** from `result.reference_baseline_latency_us` (the SearchResult), which `optimize()` threaded into `Orchestrator.run()`. `None` on legacy (no reference) runs. |
+| `acts_root_latency_us` | `float \| None` | The ACTS Triton root's own median latency. Sourced **directly** from `result.baseline_root_latency_us` (the SearchResult), which the orchestrator fills from the root's `baseline_bench.median_latency_us`. `None` when no scored root exists. Distinct from `baseline_latency_us`, which holds the reference `T_b` when a reference is active. |
 | `technique_trace` | `list[str]` | Root-to-best action sequence (root baseline filtered out) |
 | `bottleneck` | `BottleneckType \| None` | Once-per-run classification, copied verbatim from `SearchResult.run_bottleneck` (produced by `classify_run` in `eval/roofline.py`). `None` on the placeholder path that has no roofline. |
 | `winner_per_workload_bottlenecks` | `dict[str, BottleneckType]` | Per-workload classification sourced from SOLAR via `derive_t_sol_from_solar(...).bottleneck`, keyed by `Workload.uuid`. Populated only when `workloads` + `hardware_spec` + `definition` are all provided; workloads where SOLAR returns `None` (or `definition is None`) are **omitted** — no analytical-band fallback. |
@@ -126,7 +157,19 @@ When `workloads` + `hardware_spec` are supplied, `generate_report` iterates the 
 
 `render_report(report: OptimizationReport) -> str`
 
-Multi-line CLI summary. Skips the scoring block when `baseline_latency_us == 0` so a degenerate run (no scored best node) doesn't print misleading "0.00us / 0.00x" lines. Emits `Bottleneck (run): <label>` when `report.bottleneck` is set, and `Bottleneck (per workload): uuid=label, ...` when the per-workload dict is non-empty (enum values are rendered via `.value` at the string boundary). When `reward_hack_suspect` / `calibration_warning` are set, emits an `[AUDIT]` line per flag so operators scanning the output can't miss a physics-violating or poorly-calibrated result.
+Multi-line CLI summary. Skips the scoring block when `baseline_latency_us == 0` so a degenerate run (no scored best node) doesn't print misleading "0.00us / 0.00x" lines.
+
+**Scoring block — two shapes.** When `reference_baseline_latency_us is not None` (Option C active), `render_report` emits a **dual block** that separates the scoring baseline from the ACTS Triton root:
+
+- `Scoring baseline: flashinfer reference   T_b = <ref> us` — `baseline_latency_us` holds the reference `T_b` here, so the reference median is rendered as the scoring baseline.
+- `ACTS Triton root: <acts_root_latency_us or "n/a">` — the Triton root's own median. When `acts_root_latency_us is None` it renders `n/a` rather than falling back to `baseline_latency_us` (which holds the reference `T_b` here and would mislabel it as the Triton root).
+- `Best: <best> us`
+- `SOL score: <sol_score>  (vs reference; headroom …%)`
+- `Speedup vs reference: <speedup>x` — reuses `report.speedup`, which already equals `T_b` / candidate (i.e. reference / candidate in Option C, since `score.baseline_latency_us` IS the reference `T_b`); `compute_sol_score` guards the zero-candidate division, so there is no inline recompute.
+
+When `reference_baseline_latency_us is None` (legacy / no reference) the block is unchanged: `Baseline` / `Best` / `SOL score` / `Speedup`.
+
+Emits `Bottleneck (run): <label>` when `report.bottleneck` is set, and `Bottleneck (per workload): uuid=label, ...` when the per-workload dict is non-empty (enum values are rendered via `.value` at the string boundary). When `reward_hack_suspect` / `calibration_warning` are set, emits an `[AUDIT]` line per flag so operators scanning the output can't miss a physics-violating or poorly-calibrated result.
 
 Between the `[AUDIT]` lines and the `Hardware spec` block, `_render_usage_block(snapshot)` (in `src/pipeline/report.py`) emits a `Resource usage (LLM)` table when `report.usage_stats` is populated: header row `Iter | <agent columns...> | total`, then per-iter rows where each cell is formatted `<calls> (<turns>) / <input>→<output>` with em-dash for empty cells (rows where every agent cell is empty are skipped). Token counts go through `_fmt_tokens` (k/M abbreviation: <1000 exact, <1M one-decimal k, ≥1M one-decimal M). A run-total row closes the table; `of which cached input: X (Y%)` and `of which reasoning output: X (Y%)` lines follow only when those counters are non-zero so non-thinking-model runs aren't cluttered. When `report.usage_stats is None` or the snapshot is empty, the block degrades to a single line: `Resource usage (LLM): (no LLM usage captured)`.
 

@@ -109,6 +109,9 @@ async def run(
     input_generators: list[Callable[[int], tuple]] | None = None,
     problem_definition_path: Path | None = None,
     definition: Definition | None = None,
+    run_dir: Path | None = None,
+    ncu_cache_dir: Path | None = None,
+    reference_baseline_latency_us: float | None = None,
 ) -> SearchResult
 ```
 
@@ -121,6 +124,32 @@ async def run(
 | `input_generators` | One seed→args generator per selected workload. Threaded verbatim into the Coder's correctness tool so every iteration verifies on the full coverage set |
 | `problem_definition_path` | SOL-ExecBench `definition.json` path. The profiler subprocess driver re-loads it to rebuild the (unpicklable) input generator. `None` falls back to `module.make_inputs` or `spec['args']` — only safe for Tier 2 self-contained kernels |
 | `definition` | Parsed SOL `Definition` (the SOL-ExecBench replacement for the legacy ACTS `Problem` type, which has been removed). Used once per run to derive the hoisted `(flops, nbytes)` for the analytical profiler via `compute_roofline_inputs(definition, workloads[repr_idx], roofline=roofline)` (run-level `roofline` is threaded in so SOLAR's `total_flops` / `total_fused_bytes` outrank the shape-formula fallback — important on op_type=None problems where the formula bails), and threaded into `benchmark_kernel` for DPS-mode output allocation. `None` falls back to `baseline.spec.flop_count` / `memory_bytes` — correct for placeholder starter kernels |
+| `run_dir` | The run's on-disk root. Threaded into the per-iter bench-worker dispatch (`<run_dir>/iter_<n>/worker/`) and reward-hack re-eval worker dirs. `None` (tests, or a RunContext disk-full fallback) disables bench-subprocess isolation — bench runs in-process via the inline `run_iter` bypass and a throwaway `tempfile.mkdtemp` stands in for artifact merges |
+| `ncu_cache_dir` | Shared NCU `.ncu-rep` cache root for the bench worker; `None` falls back to `<run_dir>/ncu_cache` so the cache survives across iters |
+| `reference_baseline_latency_us` | External-reference baseline latency (Option C) — the measured median of a non-Triton reference (e.g. an operator/PyTorch baseline measured by `pipeline/optimize.py` via `measure_reference_baseline`). When provided, it overrides the Triton root's own median as the **SOL-score T_b denominator** at every scoring site (see "SOL-score T_b denominator" below). `None` (the default) keeps the legacy behavior where T_b is the baseline-bench median. Echoed back on `SearchResult.reference_baseline_latency_us` |
+
+### SOL-score T_b denominator
+
+`T_b` (the SOL-score baseline denominator) is **not** unconditionally the baseline-bench median. A single scalar `scoring_baseline_latency_us` is resolved **once**, immediately after the Phase-A baseline benchmark clears `is_fully_successful`:
+
+```python
+scoring_baseline_latency_us = (
+    reference_baseline_latency_us
+    if reference_baseline_latency_us is not None
+    else baseline_bench.median_latency_us
+)
+```
+
+That scalar is THE T_b at exactly four scoring sites:
+
+1. The root's `compute_sol_score(scoring_baseline_latency_us, baseline_bench.median_latency_us, roofline.t_sol_us)` — note T_b is the override (first arg) while the root's *own* measured median stays the second arg (the root's `T_k`).
+2. The per-iter child's `compute_sol_score(scoring_baseline_latency_us, bench.median_latency_us, roofline.t_sol_us)` (first arg).
+3. `profile_config["baseline_latency_us"]` shipped into the bench-worker request, which the worker uses to rank + select the K-way candidates against the same T_b.
+4. The `score_computed` event's `t_b_us` field.
+
+Non-scoring uses of `baseline_bench.median_latency_us` are unchanged — `root.runtime_ms` (opt-mem Producer speedup ratio) and the `baseline_ready` event's `latency_us` still report the Triton root's own measured median, *not* the override.
+
+**Semantics with a reference active.** With `reference_baseline_latency_us` set, `S = 0.5` means "ties the external reference"; the Triton root scores **below 0.5** when it is slower than the reference. The reference is a side-channel measurement, **not** a tree node — the tree structure is unchanged (root is still the Triton baseline), and the only thing the override touches is the SOL-score denominator at the four sites above.
 
 ### Fail-fast hardware guard
 
@@ -207,9 +236,21 @@ Three independent detector channels feed the same DEAD_END routing pipeline, wit
 
 ### SearchResult
 
-Output: `{best_node, total_iterations, termination_reason, tree, run_bottleneck}`. `tree` is the full `SearchTree` carried forward so Phase C (`pipeline/report.py`) can reconstruct the root-to-best path for `technique_trace` without the orchestrator having to denormalize every path-derived view upfront. See PROCESS.md → Deferred Improvements (`SearchResult.tree` → lighter path snapshot) for when to swap this for a precomputed `best_path` / `technique_trace`.
+| Field | Type | Description |
+|-------|------|-------------|
+| `best_node` | `TreeNode` | Highest eligible SOL score (`tree.best_node()`) |
+| `total_iterations` | int | Iterations executed before termination |
+| `termination_reason` | `TerminationReason` | Why the loop exited |
+| `tree` | `SearchTree` | Full tree carried forward (see below) |
+| `run_bottleneck` | `BottleneckType \| None` | Once-per-run classification (see below) |
+| `reference_baseline_latency_us` | `float \| None` | The `reference_baseline_latency_us` override echoed back verbatim (`None` when no external reference was supplied). Lets Phase C label the score against the right baseline |
+| `baseline_root_latency_us` | `float \| None` | The Triton root's **own** measured median (`baseline_bench.median_latency_us`) — set at **all** `return SearchResult(...)` sites regardless of whether a reference override was active. Distinct from the T_b denominator: this is always the root's own latency, so a report can show both "external reference T_b" and "Triton root latency" side by side |
+
+`tree` is the full `SearchTree` carried forward so Phase C (`pipeline/report.py`) can reconstruct the root-to-best path for `technique_trace` without the orchestrator having to denormalize every path-derived view upfront. See PROCESS.md → Deferred Improvements (`SearchResult.tree` → lighter path snapshot) for when to swap this for a precomputed `best_path` / `technique_trace`.
 
 `run_bottleneck` is the once-per-run `BottleneckType` produced by `eval/roofline.py::classify_run` immediately after roofline resolution. It is the single source of truth for retriever / planner / reviewer across every iteration (per-iter re-classification would only recompute the same answer because the problem + representative workload + hardware don't change within a run). Phase C reads it straight into `OptimizationReport.bottleneck`.
+
+**Consumers.** `pipeline/report.py::generate_report` sources BOTH `reference_baseline_latency_us` and `baseline_root_latency_us` straight from the `SearchResult` (passing them through to `OptimizationReport.reference_baseline_latency_us` / `acts_root_latency_us`), so the report can render the external-reference comparison without re-measuring either baseline.
 
 ### Score + profile ordering (fail-closed on profile failure)
 
