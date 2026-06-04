@@ -531,6 +531,56 @@ async def optimize(
         input_generators = []
         definition_path = None
 
+    # External reference baseline (Option C, 2026-06-03). When configured,
+    # measure the reference implementation's median latency once and use it
+    # as the SOL-score T_b for the whole run; default (path None) leaves
+    # T_b = the Triton root's own median. Function-local import mirrors
+    # ``_dispatch_baseline`` so test patches resolve at call time. Any
+    # ``ReferenceBaselineError`` is re-raised — a wrong scoring baseline
+    # silently corrupts every score, so it must hard-fail the run.
+    reference_baseline_latency_us: float | None = None
+    if config.reference_baseline_path:
+        from src.runtime.events import emit
+        from src.benchmark.reference_baseline import (
+            ReferenceBaselineError,
+            measure_reference_baseline,
+        )
+
+        emit(
+            "reference_baseline_loaded",
+            path=config.reference_baseline_path,
+            entrypoint=config.reference_baseline_entrypoint,
+        )
+        try:
+            ref = measure_reference_baseline(
+                definition,
+                path=config.reference_baseline_path,
+                entrypoint=config.reference_baseline_entrypoint,
+                kernel_type=baseline.spec.kernel_type,
+                workloads=workloads,
+                input_generators=input_generators,
+                reference_fn=reference_fn,
+                config=config,
+            )
+        except ReferenceBaselineError as exc:
+            # ReferenceBaselineError messages are prefixed ``[<stage>] ...``
+            # (load|correctness|benchmark); peel the stage tag off for the
+            # event payload, leave the rest as the reason.
+            text = str(exc)
+            stage = (
+                text[1 : text.index("]")]
+                if text.startswith("[") and "]" in text
+                else "unknown"
+            )
+            emit("reference_baseline_failed", stage=stage, reason=text[:200])
+            raise
+        reference_baseline_latency_us = ref.median_latency_us
+        emit("reference_baseline_verified", workloads=len(workloads))
+        emit(
+            "reference_baseline_benchmarked",
+            latency_us=ref.median_latency_us,
+        )
+
     # Opt-mem store + retriever (always constructed). Producer is only
     # built when the run is opted in to writes — ablation runs default
     # to write_enabled=False so they read accumulated lessons without
@@ -603,6 +653,7 @@ async def optimize(
         # bench-subprocess-isolation-design.md §3 decisions #6 + #7.
         run_dir=run_dir,
         ncu_cache_dir=(run_dir / "ncu_cache") if run_dir is not None else None,
+        reference_baseline_latency_us=reference_baseline_latency_us,
     )
 
     from src.pipeline.report import generate_report
@@ -825,6 +876,8 @@ _OP_TYPE_TO_KERNEL_TYPE: dict[str, str] = {
     "gqa_ragged": "GQA",
     "gqa_paged": "GQA",
     "attention": "ATTENTION",
+    # FlashInfer-trace vocabulary (kda dataset): DSA sparse attention.
+    "dsa_paged": "ATTENTION",
     "moe": "MOE",
     "moe_dispatch": "MOE",
     "embedding": "EMBEDDING",

@@ -1053,3 +1053,73 @@ def test_opt_mem_speedup_weight_alpha_rejects_nan_and_inf():
         ACTSConfig(opt_mem_speedup_weight_alpha=float("nan"))
     with pytest.raises(ValueError):
         ACTSConfig(opt_mem_speedup_weight_alpha=float("inf"))
+
+
+# ── external reference baseline (Option C) consistency rules ───────────
+
+
+def test_reference_baseline_path_requires_entrypoint():
+    from src.config import ACTSConfig
+    with pytest.raises(ValueError, match="reference_baseline_entrypoint"):
+        ACTSConfig(reference_baseline_path="/tmp/ref.py")
+
+
+def test_reference_baseline_entrypoint_without_path_warns(caplog):
+    from src.config import ACTSConfig
+    with caplog.at_level("WARNING", logger="src.config"):
+        ACTSConfig(reference_baseline_entrypoint="run")  # no path
+    assert any(
+        "reference_baseline_entrypoint" in rec.message for rec in caplog.records
+    )
+
+
+def test_reference_baseline_defaults_off():
+    from src.config import ACTSConfig
+    cfg = ACTSConfig()
+    assert cfg.reference_baseline_path is None
+    assert cfg.reference_baseline_entrypoint is None
+
+
+# === safetensors_blob_roots loadable from cfg =================================
+
+
+def test_load_config_safetensors_blob_roots_list_from_cfg():
+    """`load_config` parses runtime.safetensors_blob_roots (a libconf array)
+    into a ``list[Path]`` so the container-level blob layout is configurable."""
+    from src.config import load_config
+
+    cfg_text = 'runtime: { safetensors_blob_roots = ["/tmp/a", "/tmp/b"]; };\n'
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".cfg", delete=False) as f:
+        f.write(cfg_text)
+        f.flush()
+        cfg = load_config(Path(f.name))
+
+    assert cfg.safetensors_blob_roots == [Path("/tmp/a"), Path("/tmp/b")]
+    assert all(isinstance(p, Path) for p in cfg.safetensors_blob_roots)
+
+
+def test_load_config_safetensors_blob_roots_bare_string_from_cfg():
+    """A bare string is tolerated as a single root and wrapped in a list,
+    not iterated character-by-character."""
+    from src.config import load_config
+
+    cfg_text = 'runtime: { safetensors_blob_roots = "/tmp/a"; };\n'
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".cfg", delete=False) as f:
+        f.write(cfg_text)
+        f.flush()
+        cfg = load_config(Path(f.name))
+
+    assert cfg.safetensors_blob_roots == [Path("/tmp/a")]
+
+
+def test_load_config_safetensors_blob_roots_omitted_uses_default():
+    """When ``runtime`` omits the key, the dataclass default (None) stands."""
+    from src.config import load_config
+
+    cfg_text = "runtime: { reset_clocks = true; };\n"
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".cfg", delete=False) as f:
+        f.write(cfg_text)
+        f.flush()
+        cfg = load_config(Path(f.name))
+
+    assert cfg.safetensors_blob_roots is None

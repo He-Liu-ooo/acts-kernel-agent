@@ -107,6 +107,17 @@ CORE_EVENT_KINDS: frozenset[str] = frozenset({
     "operator_baseline_load",
     "operator_baseline_success",
     "operator_baseline_failure",
+    # External reference baseline (Option C, 2026-06-03). All iter=0.
+    # ``reference_baseline_loaded`` payload: path (str), entrypoint (str).
+    # ``reference_baseline_verified`` payload: workloads (int).
+    # ``reference_baseline_benchmarked`` payload: latency_us (float).
+    # ``reference_baseline_failed`` payload: stage ("validate"|"load"|
+    #   "correctness"|"benchmark"; "unknown" fallback when the message
+    #   lacks a [stage] prefix), reason (str, truncated 200).
+    "reference_baseline_loaded",
+    "reference_baseline_verified",
+    "reference_baseline_benchmarked",
+    "reference_baseline_failed",
     # Bench-subprocess isolation (2026-05-24). Per-iter K-way bench + NCU
     # profile runs in a fresh ``python -m src.eval.bench_worker`` child;
     # parent merges artifacts on clean exit, bumps a crash counter on

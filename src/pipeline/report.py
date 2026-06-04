@@ -105,6 +105,8 @@ class OptimizationReport:
     best_latency_us: float = 0.0
     sol_score: float = 0.0
     speedup: float = 0.0
+    reference_baseline_latency_us: float | None = None
+    acts_root_latency_us: float | None = None
     technique_trace: list[str] = field(default_factory=list)
     bottleneck: BottleneckType | None = None
     winner_per_workload_bottlenecks: dict[str, BottleneckType] = field(default_factory=dict)
@@ -289,6 +291,8 @@ def generate_report(
         best_latency_us=score.candidate_latency_us,
         sol_score=score.sol_score,
         speedup=score.speedup,
+        reference_baseline_latency_us=result.reference_baseline_latency_us,
+        acts_root_latency_us=result.baseline_root_latency_us,
         technique_trace=trace,
         bottleneck=result.run_bottleneck,
         winner_per_workload_bottlenecks=per_workload_bottlenecks,
@@ -320,12 +324,37 @@ def render_report(report: OptimizationReport) -> str:
         f"  Iterations: {report.total_iterations}",
     ]
     if report.baseline_latency_us > 0:
-        lines.extend([
-            f"  Baseline:  {report.baseline_latency_us:.2f} us",
-            f"  Best:      {report.best_latency_us:.2f} us",
-            f"  SOL score: {report.sol_score:.4f}  (headroom {report.remaining_headroom_pct:.1f}%)",
-            f"  Speedup:   {report.speedup:.2f}x",
-        ])
+        if report.reference_baseline_latency_us is not None:
+            ref = report.reference_baseline_latency_us
+            # In Option C, ``baseline_latency_us`` holds the scoring T_b, so
+            # the Triton root's own median is carried separately. When the
+            # root median is absent, render "n/a" rather than falling back
+            # to ``baseline_latency_us`` (which holds the reference T_b here
+            # and would mislabel it as the Triton root).
+            root_str = (
+                f"{report.acts_root_latency_us:.2f} us"
+                if report.acts_root_latency_us is not None
+                else "n/a"
+            )
+            lines.extend([
+                f"  Scoring baseline: flashinfer reference   T_b = {ref:.2f} us",
+                f"  ACTS Triton root: {root_str}   (SOL score vs reference below)",
+                f"  Best:      {report.best_latency_us:.2f} us",
+                f"  SOL score: {report.sol_score:.4f}  (vs reference; "
+                f"headroom {report.remaining_headroom_pct:.1f}%)",
+                # ``report.speedup`` already equals reference/candidate in
+                # Option C (score.baseline_latency_us IS the reference T_b and
+                # best_latency_us IS the candidate), and compute_sol_score
+                # guards the zero-candidate division — so no inline recompute.
+                f"  Speedup vs reference: {report.speedup:.2f}x",
+            ])
+        else:
+            lines.extend([
+                f"  Baseline:  {report.baseline_latency_us:.2f} us",
+                f"  Best:      {report.best_latency_us:.2f} us",
+                f"  SOL score: {report.sol_score:.4f}  (headroom {report.remaining_headroom_pct:.1f}%)",
+                f"  Speedup:   {report.speedup:.2f}x",
+            ])
     if report.technique_trace:
         lines.append(f"  Trace: {' → '.join(report.technique_trace)}")
     if report.bottleneck is not None:

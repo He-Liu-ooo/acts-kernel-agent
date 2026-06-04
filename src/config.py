@@ -270,6 +270,16 @@ class ACTSConfig:
     triton_baseline_kernel_name: str | None = None
     triton_baseline_enforce_autotune: bool = False
 
+    # External reference baseline (Option C, 2026-06-03). Opt-in overlay:
+    # when set, the implementation at ``reference_baseline_path`` (a plain
+    # .py with ``reference_baseline_entrypoint`` resolvable) is measured and
+    # its median latency becomes the SOL-score T_b for the root AND every
+    # child. Orthogonal to use_operator_baseline — composes with either
+    # root path. Default None → today's behavior (T_b = Triton-root median).
+    # See doc/specs/2026-06-03-external-reference-baseline-design.md.
+    reference_baseline_path: str | None = None
+    reference_baseline_entrypoint: str | None = None
+
     # Bench-subprocess isolation (2026-05-24). Per-iter bench + NCU profile
     # runs in a short-lived ``python -m src.eval.bench_worker`` subprocess;
     # flip to False for in-process debugging (single-step into bench without
@@ -424,6 +434,17 @@ class ACTSConfig:
                     ", ".join(stray),
                 )
 
+        if self.reference_baseline_path and not self.reference_baseline_entrypoint:
+            raise ValueError(
+                "reference_baseline_path set but reference_baseline_entrypoint "
+                "is empty/None — the entrypoint function name is required.",
+            )
+        if self.reference_baseline_entrypoint and not self.reference_baseline_path:
+            logger.warning(
+                "reference_baseline_entrypoint set but reference_baseline_path "
+                "is empty — dead config; no reference baseline will be measured.",
+            )
+
 
 def load_config(path: Path) -> ACTSConfig:
     """Load ACTSConfig from a libconfig-format ``.cfg`` file via ``libconf``.
@@ -431,7 +452,8 @@ def load_config(path: Path) -> ACTSConfig:
     Schema (every group + key optional; absent fields fall back to ``ACTSConfig``
     dataclass defaults)::
 
-        runtime:   { problem_path = "..."; reset_clocks = false; };
+        runtime:   { problem_path = "..."; reset_clocks = false;
+                     safetensors_blob_roots = ["<container>"]; };
         hardware:  { gpu_index = 0; arch_config_path = "..."; };
         search:    { beam_width = 10; beam_diversity = true; ... };
         eval:      { warmup_runs = 20; timed_runs = 100; };
@@ -481,10 +503,13 @@ def load_config(path: Path) -> ACTSConfig:
             "triton_baseline_dps",
             "triton_baseline_kernel_name",
             "triton_baseline_enforce_autotune",
+            "reference_baseline_path",
+            "reference_baseline_entrypoint",
             "bench_use_subprocess",
             "worker_crash_threshold",
             "worker_timeout_s",
             "correctness_worker_timeout_s",
+            "safetensors_blob_roots",
         ],
     }
     defaults = ACTSConfig()
@@ -525,6 +550,15 @@ def load_config(path: Path) -> ACTSConfig:
                 f"to exist on disk; got {baseline_path!r} "
                 f"(resolved to {resolved})",
             )
+    # safetensors_blob_roots: the generic loop stored libconf's parsed value
+    # as-is (a tuple of str for an array), but consumers need ``list[Path]``.
+    # Tolerate a bare string as a single root — without the str-guard the
+    # comprehension would explode it into characters.
+    blob_roots = kwargs.get("safetensors_blob_roots")
+    if blob_roots is not None:
+        if isinstance(blob_roots, str):
+            blob_roots = [blob_roots]
+        kwargs["safetensors_blob_roots"] = [Path(p) for p in blob_roots]
     # Hardware: load from SOLAR arch YAML if specified, else detect at runtime
     arch_path_str = (cfg.get("hardware") or {}).get("arch_config_path", "")
     if arch_path_str:

@@ -383,6 +383,105 @@ async def test_optimize_forwards_correctness_context_to_orchestrator():
     assert kwargs["input_generators"] == gens
 
 
+# ── external reference baseline (Option C) Phase-A wiring ─────────────
+
+
+@pytest.mark.asyncio
+async def test_reference_baseline_threads_into_run_and_report():
+    """When ``config.reference_baseline_path`` is set, Phase A measures the
+    external reference once and threads its median into ``Orchestrator.run``
+    as ``reference_baseline_latency_us``. The orchestrator stamps that value
+    onto the SearchResult, which ``generate_report`` then sources directly —
+    so the value reaches the report without any external post-assign."""
+    ref_fn = lambda x: x
+    gens = [lambda seed: ()]
+    baseline = Kernel(spec=_spec(), source_code="src")
+
+    fake_orch = MagicMock()
+    # The real orchestrator stamps reference_baseline_latency_us onto the
+    # result; the fake mirrors that so we can assert generate_report sources
+    # it from the result rather than via a post-assign.
+    fake_result = MagicMock(reference_baseline_latency_us=10.0)
+    fake_orch.run = AsyncMock(return_value=fake_result)
+    report_obj = MagicMock()
+
+    config = ACTSConfig(
+        reference_baseline_path="/fake/ref.py",
+        reference_baseline_entrypoint="run",
+    )
+
+    with (
+        patch("src.pipeline.optimize._load_model_if_configured", return_value=None),
+        patch("src.search.orchestrator.Orchestrator", return_value=fake_orch),
+        patch("src.memory.store.MemoryStore", return_value=MagicMock()),
+        patch(
+            "src.pipeline.optimize._load_problem",
+            new_callable=AsyncMock,
+            return_value=(
+                baseline, MagicMock(), [MagicMock()], None,
+                ref_fn, gens, Path("/fake/definition.json"),
+            ),
+        ),
+        patch("pathlib.Path.is_dir", return_value=True),
+        patch.object(Path, "exists", autospec=True, return_value=True),
+        patch("src.pipeline.report.generate_report", return_value=report_obj) as mock_gen,
+        patch(
+            "src.benchmark.reference_baseline.measure_reference_baseline",
+            return_value=MagicMock(median_latency_us=10.0),
+        ) as mock_measure,
+    ):
+        _result, report = await optimize("/fake/problem", config=config)
+
+    mock_measure.assert_called_once()
+    # The real threading contract: the measured reference median reaches the
+    # orchestrator, which is the single source generate_report reads from.
+    assert fake_orch.run.call_args.kwargs["reference_baseline_latency_us"] == 10.0
+    # generate_report is handed the orchestrator result carrying the value;
+    # no post-assign happens after the call.
+    gen_result = mock_gen.call_args.args[0]
+    assert gen_result is fake_result
+    assert gen_result.reference_baseline_latency_us == 10.0
+
+
+@pytest.mark.asyncio
+async def test_no_reference_path_skips_measurement():
+    """Default config (no ``reference_baseline_path``) must not measure any
+    reference: ``measure_reference_baseline`` is never called and the latency
+    threaded into ``run`` (the single source generate_report reads from) is
+    None."""
+    ref_fn = lambda x: x
+    gens = [lambda seed: ()]
+    baseline = Kernel(spec=_spec(), source_code="src")
+
+    fake_orch = MagicMock()
+    fake_orch.run = AsyncMock(return_value=MagicMock(reference_baseline_latency_us=None))
+    report_obj = MagicMock()
+
+    with (
+        patch("src.pipeline.optimize._load_model_if_configured", return_value=None),
+        patch("src.search.orchestrator.Orchestrator", return_value=fake_orch),
+        patch("src.memory.store.MemoryStore", return_value=MagicMock()),
+        patch(
+            "src.pipeline.optimize._load_problem",
+            new_callable=AsyncMock,
+            return_value=(
+                baseline, MagicMock(), [MagicMock()], None,
+                ref_fn, gens, Path("/fake/definition.json"),
+            ),
+        ),
+        patch("pathlib.Path.is_dir", return_value=True),
+        patch.object(Path, "exists", autospec=True, return_value=True),
+        patch("src.pipeline.report.generate_report", return_value=report_obj),
+        patch(
+            "src.benchmark.reference_baseline.measure_reference_baseline",
+        ) as mock_measure,
+    ):
+        _result, report = await optimize("/fake/problem")
+
+    mock_measure.assert_not_called()
+    assert fake_orch.run.call_args.kwargs["reference_baseline_latency_us"] is None
+
+
 @pytest.mark.asyncio
 async def test_placeholder_substitutes_nonzero_hardware_spec():
     """``detect_hardware()`` returns a zeroed HardwareSpec until real detection
@@ -1758,6 +1857,46 @@ def test_main_does_not_call_finalize_tree_on_exception(tmp_path, monkeypatch):
 import json as _json
 
 from src.runtime.usage import UsageBucket, UsageSnapshot
+
+
+def _definition_with_op_type(op_type: str):
+    """Build a minimal real pydantic ``Definition`` carrying ``op_type``.
+
+    Mirrors the elementwise fixture style used by the Phase-A tests above;
+    only ``op_type`` varies, since that is all the mapping reads.
+    """
+    from sol_execbench.core.data import Definition
+
+    return Definition.model_validate({
+        "name": "p",
+        "axes": {"N": {"type": "var"}},
+        "inputs": {"x": {"shape": ["N"], "dtype": "float32"}},
+        "outputs": {"y": {"shape": ["N"], "dtype": "float32"}},
+        "reference": "def run(x): return x * 2.0\n",
+        "op_type": op_type,
+    })
+
+
+def test_definition_to_kernel_spec_maps_dsa_paged_to_attention():
+    """FlashInfer-trace (kda) DSA problems carry ``op_type: "dsa_paged"``;
+    the mapping must route them to ATTENTION so the attention-gated Tier-6
+    planner actions and opt-mem lesson keying apply, not the CUSTOM fallback."""
+    from src.pipeline.optimize import _definition_to_kernel_spec
+
+    spec = _definition_to_kernel_spec(
+        _definition_with_op_type("dsa_paged"), Path("/fake/definition.json")
+    )
+    assert spec.kernel_type is KernelType.ATTENTION
+
+
+def test_definition_to_kernel_spec_unmapped_op_type_falls_back_to_custom():
+    """An op_type absent from the vocabulary falls back to CUSTOM."""
+    from src.pipeline.optimize import _definition_to_kernel_spec
+
+    spec = _definition_to_kernel_spec(
+        _definition_with_op_type("not_a_real_op_type"), Path("/fake/definition.json")
+    )
+    assert spec.kernel_type is KernelType.CUSTOM
 
 
 def _snap_with_one_call() -> UsageSnapshot:

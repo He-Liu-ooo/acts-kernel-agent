@@ -101,6 +101,21 @@ class TestGenerateReport:
         )
         assert generate_report(result).technique_trace == []
 
+    def test_sources_reference_and_acts_root_latency_from_result(self):
+        """generate_report must source BOTH ``reference_baseline_latency_us``
+        and ``acts_root_latency_us`` from the SearchResult itself — no
+        external post-assign. A direct ``generate_report(result)`` caller
+        (test / tool / doc) must get both populated so render_report takes
+        the dual-baseline overlay branch rather than the legacy fallback."""
+        result = _build_result(best_id=2)
+        result.reference_baseline_latency_us = 10.0
+        result.baseline_root_latency_us = 25.0
+
+        report = generate_report(result)
+
+        assert report.reference_baseline_latency_us == 10.0
+        assert report.acts_root_latency_us == 25.0
+
     def test_bottleneck_defaults_empty_when_no_run_bottleneck(self):
         """Placeholder path: SearchResult carries no run_bottleneck, no
         workloads/problem passed — both bottleneck surfaces stay empty.
@@ -275,6 +290,44 @@ class TestRenderReport:
         ))
         assert "reward" not in text.lower()
         assert "calibration" not in text.lower()
+
+    def test_render_report_shows_reference_baseline_when_set(self):
+        """Dual-baseline overlay (Option C): when an external reference T_b
+        is present, render the flashinfer scoring baseline alongside the
+        ACTS Triton root and score 'vs reference'.
+
+        In Option C, ``baseline_latency_us`` carries the scoring T_b (the
+        reference, 10), while ``acts_root_latency_us`` carries the Triton
+        root's own median (25). The ACTS Triton root line must print the
+        root median (25), not the reference — so the root's real latency
+        isn't lost behind T_b. ``baseline_latency_us`` is set to T_b (10)
+        here so that "25.00" can only originate from ``acts_root_latency_us``.
+        """
+        text = render_report(OptimizationReport(
+            baseline_latency_us=10.0,          # T_b (== reference in Option C)
+            best_latency_us=15.0,
+            sol_score=0.62,
+            speedup=1.67,
+            reference_baseline_latency_us=10.0,
+            acts_root_latency_us=25.0,         # Triton root's own median
+            termination_reason="budget",
+        ))
+        assert "flashinfer reference" in text
+        root_line = next(ln for ln in text.splitlines() if "ACTS Triton root" in ln)
+        scoring_line = next(ln for ln in text.splitlines() if "Scoring baseline" in ln)
+        assert "25.00" in root_line       # root median, NOT the reference
+        assert "10.00" in scoring_line    # T_b on the scoring line
+        assert "vs reference" in text
+
+    def test_render_report_omits_reference_when_none(self):
+        text = render_report(OptimizationReport(
+            baseline_latency_us=25.0,
+            best_latency_us=15.0,
+            sol_score=0.5,
+            speedup=1.0,
+            termination_reason="budget",
+        ))
+        assert "flashinfer reference" not in text
 
 
 class TestRenderProfilingBlock:

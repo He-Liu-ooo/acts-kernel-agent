@@ -107,3 +107,15 @@ def test_emit_coerces_nonjson_values(tmp_path):
     rec = json.loads((tmp_path / "events.jsonl").read_text().splitlines()[0])
     assert rec["path"] == "/tmp/x"
     assert rec["tag"] == "MyEnum.A" or "MyEnum" in rec["tag"]
+
+
+def test_reference_baseline_event_kinds_registered():
+    from src.runtime.events import CORE_EVENT_KINDS
+
+    for kind in (
+        "reference_baseline_loaded",
+        "reference_baseline_verified",
+        "reference_baseline_benchmarked",
+        "reference_baseline_failed",
+    ):
+        assert kind in CORE_EVENT_KINDS

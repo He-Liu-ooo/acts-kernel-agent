@@ -353,6 +353,8 @@ class SearchResult:
     termination_reason: TerminationReason
     tree: SearchTree
     run_bottleneck: BottleneckType | None = None
+    reference_baseline_latency_us: float | None = None
+    baseline_root_latency_us: float | None = None
 
 
 def _apply_baseline_feedback_to_root(root, feedback) -> None:
@@ -760,6 +762,7 @@ class Orchestrator:
         definition: Definition | None = None,
         run_dir: Path | None = None,
         ncu_cache_dir: Path | None = None,
+        reference_baseline_latency_us: float | None = None,
     ) -> SearchResult:
         """Execute the full search loop from baseline to best kernel.
 
@@ -858,6 +861,14 @@ class Orchestrator:
                 f"SOL scoring requires a complete baseline measurement"
             )
 
+        # T_b for SOL scoring: the external reference's measured median when
+        # provided (Option C), else the Triton root's own median (default).
+        scoring_baseline_latency_us = (
+            reference_baseline_latency_us
+            if reference_baseline_latency_us is not None
+            else baseline_bench.median_latency_us
+        )
+
         # A1 PR 1/B: benchmark_kernel captures per-workload autotune
         # winners by diffing Triton's cache around each workload burn-in.
         # Skipped on the lazy-compile fallback path, on placeholder
@@ -918,7 +929,7 @@ class Orchestrator:
         action_menu = render_action_menu(applicable_actions)
 
         root.score = compute_sol_score(
-            baseline_bench.median_latency_us,
+            scoring_baseline_latency_us,
             baseline_bench.median_latency_us,
             roofline.t_sol_us,
         )
@@ -1126,6 +1137,8 @@ class Orchestrator:
                     TerminationReason.ALL_DEAD_END,
                     tree,
                     run_bottleneck=run_bottleneck,
+                    reference_baseline_latency_us=reference_baseline_latency_us,
+                    baseline_root_latency_us=baseline_bench.median_latency_us,
                 )
 
             parent = select_next(tree, epsilon)
@@ -1416,7 +1429,7 @@ class Orchestrator:
                     # subprocess loses the inputs it needs to
                     # reconstruct workload state on profile.
                     "t_sol_us": roofline.t_sol_us,
-                    "baseline_latency_us": baseline_bench.median_latency_us,
+                    "baseline_latency_us": scoring_baseline_latency_us,
                     "problem_definition_path": (
                         str(problem_definition_path)
                         if problem_definition_path is not None else None
@@ -1725,7 +1738,7 @@ class Orchestrator:
                     tensor_core_util_pct=tc_util,
                 )
             child.score = compute_sol_score(
-                baseline_bench.median_latency_us,
+                scoring_baseline_latency_us,
                 bench.median_latency_us,
                 roofline.t_sol_us,
             )
@@ -1790,7 +1803,7 @@ class Orchestrator:
                 reward_hack_suspect=child.score.reward_hack_suspect,
                 calibration_warning=child.score.calibration_warning,
                 t_k_us=bench.median_latency_us,
-                t_b_us=baseline_bench.median_latency_us,
+                t_b_us=scoring_baseline_latency_us,
                 t_sol_us=roofline.t_sol_us,
                 t_sol_source=roofline.source,
             )
@@ -1974,6 +1987,8 @@ class Orchestrator:
                     TerminationReason.SOL_TARGET,
                     tree,
                     run_bottleneck=run_bottleneck,
+                    reference_baseline_latency_us=reference_baseline_latency_us,
+                    baseline_root_latency_us=baseline_bench.median_latency_us,
                 )
 
             best_scores.append(best.score.sol_score)
@@ -1985,6 +2000,8 @@ class Orchestrator:
                     TerminationReason.PLATEAU,
                     tree,
                     run_bottleneck=run_bottleneck,
+                    reference_baseline_latency_us=reference_baseline_latency_us,
+                    baseline_root_latency_us=baseline_bench.median_latency_us,
                 )
 
             epsilon = max(self._config.epsilon_end, epsilon - decay)
@@ -1996,6 +2013,8 @@ class Orchestrator:
             TerminationReason.BUDGET,
             tree,
             run_bottleneck=run_bottleneck,
+            reference_baseline_latency_us=reference_baseline_latency_us,
+            baseline_root_latency_us=baseline_bench.median_latency_us,
         )
 
     def _reward_hack_worker_dir(self, run_dir, iter_no, child) -> Path:
