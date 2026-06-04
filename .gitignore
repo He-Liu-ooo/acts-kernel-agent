@@ -63,3 +63,9 @@ runs/
 # distilled lessons across runs; .gitignored so developer-local stores
 # don't conflict and write-enabled ablation runs don't dirty the index.
 opt_mem/
+
+# Host-local FlashInfer-trace DSA blob (absolute symlink → off-repo kda dataset).
+# Dangles on any other machine, so it must never be staged; the portable text
+# fixtures alongside it (definition.json, workload.jsonl, reference_flashinfer.py)
+# stay tracked.
+benchmarks/flashinfer_trace/blob

@@ -49,6 +49,20 @@ analysis = [
 sol = [
     "sol-execbench",
 ]
+# Tier-2 / run-only extra. flashinfer supplies the external reference
+# baseline (Option C): its measured latency becomes the SOL-score T_b for
+# the flashinfer-trace problems (see
+# doc/specs/2026-06-03-external-reference-baseline-design.md). Pinned to
+# 0.6.12 to match the wrapper sources extracted from the mit-han-lab-kda
+# contest repo (their requirements.txt hard-pins flashinfer-python==0.6.12,
+# the API the reference_flashinfer.py wrapper was authored against). Only
+# needed in the tier-2 GPU venv; the tier-1 torchless venv never imports it.
+# Install with the torch already pinned (cu128 torch 2.11) — installing
+# flashinfer with --upgrade churns torch/CUDA, so pin torch in the same
+# resolve or install flashinfer last. See configs/venvs/3.12.md.
+run = [
+    "flashinfer-python==0.6.12",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]
